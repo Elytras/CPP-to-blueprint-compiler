@@ -26,6 +26,11 @@ and a compiler message in [Diagnostics](#diagnostics).
 Most sections open with what they cover and the one rule most worth remembering. Tables follow, one row per construct:
 what you write, what it does, and its status. Snippets and notes come after the tables.
 
+Every row has an id, such as `switch.switch-code`, which is also its link anchor (`REFERENCE.md#switch.switch-code`).
+`python tools/docq.py <words>` finds the rows that hold all the words and names, for each, the test in
+`tools/test_bytecode.py` that proves it: that test's `proves('<id>')` line. The suite fails when a row has no proving
+test and is not listed in `tools/unproved.txt`, a list that only shrinks.
+
 ### Status
 
 Some C++ has no exact Blueprint equivalent. AssetGen then compiles the nearest equivalent and prints a `warning:` that
@@ -94,13 +99,13 @@ the one its `UE_CLASS` names. The others import it.
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_MOD_PACKAGE("/Game/_MyMods/Hello");` | Names the `/Game` folder for everything the source cooks. Write it once, at file scope. It is the only place the path is written: the bpbuild manifest does not repeat it. | Yes |
-| a source with no `UE_MOD_PACKAGE` | Refused: "the source declares no UE_MOD_PACKAGE". | Refused |
-| a second `UE_MOD_PACKAGE` in one source | Refused by clang: "redefinition of 'UeModPackage'". The macro declares a variable. | Refused |
-| a source with nothing to cook | Refused: "the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit". A class with no base does not count. | Refused |
-| `class Hello : public AActor {};` | One package per class, named after it: `/Game/_MyMods/Hello/Hello`. The class inside is `Hello_C`, as the editor names a Blueprint's generated class, and the asset registry lists `/Game/_MyMods/Hello/Hello.Hello_C`. The name is the C++ name as written, prefix included: `UTurretDef` becomes `UTurretDef_C`. | Yes |
-| several classes in one source | Each class is its own package in the mod folder. The classes can name each other's types and share [global variables](#global-variables). | Yes |
-| two declarations that land on one package | Refused, naming both: "would both be cooked as". Package names are compared ignoring case. | Refused |
+| <a id="the-mod-package.ue-mod-package-game-mymods"></a>`UE_MOD_PACKAGE("/Game/_MyMods/Hello");` | Names the `/Game` folder for everything the source cooks. Write it once, at file scope. It is the only place the path is written: the bpbuild manifest does not repeat it. | Yes |
+| <a id="the-mod-package.ue-mod-package"></a>a source with no `UE_MOD_PACKAGE` | Refused: "the source declares no UE_MOD_PACKAGE". | Refused |
+| <a id="the-mod-package.ue-mod-package-2"></a>a second `UE_MOD_PACKAGE` in one source | Refused by clang: "redefinition of 'UeModPackage'". The macro declares a variable. | Refused |
+| <a id="the-mod-package.a-source-with-nothing-to"></a>a source with nothing to cook | Refused: "the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit". A class with no base does not count. | Refused |
+| <a id="the-mod-package.class-hello-public-aactor"></a>`class Hello : public AActor {};` | One package per class, named after it: `/Game/_MyMods/Hello/Hello`. The class inside is `Hello_C`, as the editor names a Blueprint's generated class, and the asset registry lists `/Game/_MyMods/Hello/Hello.Hello_C`. The name is the C++ name as written, prefix included: `UTurretDef` becomes `UTurretDef_C`. | Yes |
+| <a id="the-mod-package.several-classes-in-one-source"></a>several classes in one source | Each class is its own package in the mod folder. The classes can name each other's types and share [global variables](#global-variables). | Yes |
+| <a id="the-mod-package.two-declarations-that-land-on"></a>two declarations that land on one package | Refused, naming both: "would both be cooked as". Package names are compared ignoring case. | Refused |
 
 ```cpp
 #include "UeApi/Types.h"
@@ -134,13 +139,13 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `namespace Weapons { class Rifle : public AActor {}; }` | A namespace is a subfolder. `Rifle` is cooked at `/Game/_MyMods/Hello/Weapons/Rifle`, and child classes, calls, variable types and the registry all use that path. The same holds for a `UE_STRUCT`, an interface, a `UE_ENUM` and a braced asset. | Yes |
-| `Rifle` inside `namespace Weapons`, `Weapons::Rifle` outside it | Both name the same class, as in C++. | Yes |
-| `Weapons::Rifle *` inside `namespace Game::_MyMods`, where the class is `Game::_MyMods::Weapons::Rifle` | The same class, qualified only as far as the namespace needs. clang also spells a type this way, for example a `?:` over two such pointers where a parameter named after the class hides it. When another namespace also declares a `Rifle`, write the full name. | Yes |
-| `namespace Game::WeaponsNTools::GrapplingGun { ... }` | A namespace that starts at `Game` is an absolute `/Game` path. The class leaves the mod folder and is cooked at `/Game/WeaponsNTools/GrapplingGun/<Class>`. The SDK declares each game Blueprint in the namespace of its folder, so a class that extends one can sit beside it. | Yes |
-| `namespace Tally { int32 Hits; }` | A global variable in a namespace gets no subfolder. See [Global variables](#global-variables). | Yes |
-| `namespace Game::_MyMods::Hello { class Hello : public AActor {}; }` beside a plain `class Hello` | Both land on `/Game/_MyMods/Hello/Hello`. Refused: "would both be cooked as". | Refused |
-| `class Pistol : public Rifle` in `namespace Weapons`, when another namespace also declares a `Rifle` | Refused: "derives from an undeclared class: Rifle". Write `Weapons::Rifle`. | Refused |
+| <a id="namespaces-and-folders.namespace-weapons-class-rifle"></a>`namespace Weapons { class Rifle : public AActor {}; }` | A namespace is a subfolder. `Rifle` is cooked at `/Game/_MyMods/Hello/Weapons/Rifle`, and child classes, calls, variable types and the registry all use that path. The same holds for a `UE_STRUCT`, an interface, a `UE_ENUM` and a braced asset. | Yes |
+| <a id="namespaces-and-folders.rifle"></a>`Rifle` inside `namespace Weapons`, `Weapons::Rifle` outside it | Both name the same class, as in C++. | Yes |
+| <a id="namespaces-and-folders.weapons-rifle"></a>`Weapons::Rifle *` inside `namespace Game::_MyMods`, where the class is `Game::_MyMods::Weapons::Rifle` | The same class, qualified only as far as the namespace needs. clang also spells a type this way, for example a `?:` over two such pointers where a parameter named after the class hides it. When another namespace also declares a `Rifle`, write the full name. | Yes |
+| <a id="namespaces-and-folders.namespace-game-weaponsntools"></a>`namespace Game::WeaponsNTools::GrapplingGun { ... }` | A namespace that starts at `Game` is an absolute `/Game` path. The class leaves the mod folder and is cooked at `/Game/WeaponsNTools/GrapplingGun/<Class>`. The SDK declares each game Blueprint in the namespace of its folder, so a class that extends one can sit beside it. | Yes |
+| <a id="namespaces-and-folders.namespace-tally-int32-hits"></a>`namespace Tally { int32 Hits; }` | A global variable in a namespace gets no subfolder. See [Global variables](#global-variables). | Yes |
+| <a id="namespaces-and-folders.namespace-game-mymods-hello"></a>`namespace Game::_MyMods::Hello { class Hello : public AActor {}; }` beside a plain `class Hello` | Both land on `/Game/_MyMods/Hello/Hello`. Refused: "would both be cooked as". | Refused |
+| <a id="namespaces-and-folders.class-pistol-public-rifle"></a>`class Pistol : public Rifle` in `namespace Weapons`, when another namespace also declares a `Rifle` | Refused: "derives from an undeclared class: Rifle". Write `Weapons::Rifle`. | Refused |
 
 ```cpp
 namespace Weapons {
@@ -174,14 +179,14 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_CLASS("/Game/_MyMods/Turrets/UTurretDef", "UTurretDef_C");` in a class of a shared header | Records the class's package and its UE name. A source cooks the class only when that package is exactly the path the source would give it: its `UE_MOD_PACKAGE`, then any namespace, then the class name. Every other source that includes the header imports the class and cooks no copy. | Yes |
-| `UE_CLASS_IN("/Game/_MyMods/Turrets");` in UTurretDef | The same as the row above, the class written once: it names the owning mod's `UE_MOD_PACKAGE`, and the compiler appends the namespaces and class name for the package and `_C` for the UE name. Use it for a mod's own classes; `UE_CLASS` stays for an engine class or a name that differs from the C++ one. | Yes |
-| `UE_CLASS("/Game/_MyMods/Turrets", "UTurretDef_C");` | The package names the folder, not the class's own asset. Refused: "does not end in the asset that declares UTurretDef_C", with the path it should be. | Refused |
-| `UE_CLASS("/Game/_MyMods/Turrets/UTurretDef", "UTurretDef");` in the mod that cooks it | A cooked Blueprint class is named `<Class>_C`. Refused: "cooking it here requires", with the right name. | Refused |
-| `UE_CLASS("/Script/Engine", "KismetSystemLibrary");` | Names an engine class: a `/Script` package and the native name, with no `_C`. The class is imported, never cooked, and needs no base. The SDK headers declare every class this way. Write one by hand for an engine class or function the SDK leaves out. | Yes |
-| `UE_STRUCT_IN("/Game/_MyMods/Turrets");`, `UE_ENUM_IN(EMood, "/Game/_MyMods/Turrets");` | The same one-owner rule for a struct and an enum. These name the owning mod's `UE_MOD_PACKAGE`, not the type's own package. See [Structs](#structs) and [Enums](#enums). | Yes |
-| `T->Fire(2);`, `T->OnFired.Add(this, &Gunner::OnHeard);` on a `Turret *T`, where a shared header declares `class Turret : public AActor { public: UE_CLASS("/Game/_MyMods/Turrets/Turret", "Turret_C"); int32 Shots = 0; int32 Fire(int32 N); UE_DISPATCHER(OnFired, int32 Total); };` | Calls and binds another mod's actor class. The header declares the methods, the owner's source defines them (`int32 Turret::Fire(int32 N) { ... }`), and a user finds an instance as it would a game actor, for example with `UGameplayStatics::GetAllActorsOfClass(Turret::StaticClass(), Found)`, then `Cast<Turret>`. Compiled, not run in game. | Yes |
-| `&OtherData`, where `OtherData` is another mod's asset of a class that a shared header declares without `UE_CLASS` | Refused: the reference would load as null. The message names the `UE_CLASS` line that fixes it. See [Game assets](#game-assets). | Refused |
+| <a id="sharing-a-class.ue-class-game-mymods-turrets"></a>`UE_CLASS("/Game/_MyMods/Turrets/UTurretDef", "UTurretDef_C");` in a class of a shared header | Records the class's package and its UE name. A source cooks the class only when that package is exactly the path the source would give it: its `UE_MOD_PACKAGE`, then any namespace, then the class name. Every other source that includes the header imports the class and cooks no copy. | Yes |
+| <a id="sharing-a-class.ue-class-in-game-mymods"></a>`UE_CLASS_IN("/Game/_MyMods/Turrets");` in UTurretDef | The same as the row above, the class written once: it names the owning mod's `UE_MOD_PACKAGE`, and the compiler appends the namespaces and class name for the package and `_C` for the UE name. Use it for a mod's own classes; `UE_CLASS` stays for an engine class or a name that differs from the C++ one. | Yes |
+| <a id="sharing-a-class.ue-class-game-mymods-turrets-2"></a>`UE_CLASS("/Game/_MyMods/Turrets", "UTurretDef_C");` | The package names the folder, not the class's own asset. Refused: "does not end in the asset that declares UTurretDef_C", with the path it should be. | Refused |
+| <a id="sharing-a-class.ue-class-game-mymods-turrets-3"></a>`UE_CLASS("/Game/_MyMods/Turrets/UTurretDef", "UTurretDef");` in the mod that cooks it | A cooked Blueprint class is named `<Class>_C`. Refused: "cooking it here requires", with the right name. | Refused |
+| <a id="sharing-a-class.ue-class-script-engine"></a>`UE_CLASS("/Script/Engine", "KismetSystemLibrary");` | Names an engine class: a `/Script` package and the native name, with no `_C`. The class is imported, never cooked, and needs no base. The SDK headers declare every class this way. Write one by hand for an engine class or function the SDK leaves out. | Yes |
+| <a id="sharing-a-class.ue-struct-in-game-mymods"></a>`UE_STRUCT_IN("/Game/_MyMods/Turrets");`, `UE_ENUM_IN(EMood, "/Game/_MyMods/Turrets");` | The same one-owner rule for a struct and an enum. These name the owning mod's `UE_MOD_PACKAGE`, not the type's own package. See [Structs](#structs) and [Enums](#enums). | Yes |
+| <a id="sharing-a-class.t-fire-2"></a>`T->Fire(2);`, `T->OnFired.Add(this, &Gunner::OnHeard);` on a `Turret *T`, where a shared header declares `class Turret : public AActor { public: UE_CLASS("/Game/_MyMods/Turrets/Turret", "Turret_C"); int32 Shots = 0; int32 Fire(int32 N); UE_DISPATCHER(OnFired, int32 Total); };` | Calls and binds another mod's actor class. The header declares the methods, the owner's source defines them (`int32 Turret::Fire(int32 N) { ... }`), and a user finds an instance as it would a game actor, for example with `UGameplayStatics::GetAllActorsOfClass(Turret::StaticClass(), Found)`, then `Cast<Turret>`. Compiled, not run in game. | Yes |
+| <a id="sharing-a-class.otherdata"></a>`&OtherData`, where `OtherData` is another mod's asset of a class that a shared header declares without `UE_CLASS` | Refused: the reference would load as null. The message names the `UE_CLASS` line that fixes it. See [Game assets](#game-assets). | Refused |
 
 ```cpp
 // Turrets.h, included by both mods
@@ -249,13 +254,13 @@ starts private.
 
 | You write | What it does | Status |
 |---|---|---|
-| `class Hello : public AActor { ... };` | A Blueprint class (a BlueprintGeneratedClass) whose parent is `AActor`, as if made in the editor with that parent. | Yes |
-| `class Helper { ... };` | A class with no base is plain C++. Nothing is cooked for it. | Yes |
-| `class X : public ANotIncluded {};` | Refused by clang, "expected class name", when no included header declares the base. Include the SDK header that declares it. | Refused |
-| `class InitCave : public Hello {};` | A child of another class of the mod. A parent in the same source is used from there. A parent pinned with `UE_CLASS` to another mod is imported from that mod. | Yes |
-| `class Turret final : public AActor { ... };` | A class with no subclass. Its functions, overrides and interface implementations aside, are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
-| `UE_FINAL_AS(UTurretBase, Turret);` at namespace scope, after UTurretBase | Final through one leaf: declares `class Turret final : public UTurretBase {}`, the class that is made, in the namespace it is written in (its package path, as for any class). UTurretBase's own code is then compiled as if it were final: its own functions, overrides and interface implementations aside, are cooked Final, and its calls on `this` to them are direct and usually copied in. A call to one of its overrides, or to a function it inherits, goes by name, as the editor calls a function that is not Final; with Turret the only class made, it reaches the same function. UTurretBase is cooked Abstract, and any other class deriving from it is refused, so put the macro in the header beside UTurretBase: a mod that includes the header is refused a subclass too. When UTurretBase has a `UE_CLASS` (a header mods share), Turret is pinned beside it, so only the mod that owns UTurretBase cooks Turret and every other mod imports it, and a second UE_FINAL_AS on the same base is refused ("has two UE_FINAL_AS leaves"). Such a base is final only through the UE_FINAL_AS in the header that declares it, which its owner sees too: one written in another mod's own source, its `.cpp` or a header of its own that re-declares the base, is refused ("only the UE_FINAL_AS in the header that declares it ..."), since its owner would never cook that leaf. The header counts as the owner's when a source beside it includes it whose `UE_MOD_PACKAGE` is the owner's, or that has none in a folder whose only `UE_MOD_PACKAGE` is the owner's (a mod of several sources). A game Blueprint base is refused ("is the game's Blueprint ..."): no mod cooks it, so it stays as the game has it. A base left with a `= 0` method is refused ("would be abstract"): Turret brings no method of its own, so it would be abstract too and nothing could be made. | Yes |
-| `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). The child loads after every default subobject the parent's default object exports, which UeApi lists only when genueapi had `--game`: against a UeApi made without it, the class is refused, saying to regenerate with `--game`. | Yes |
+| <a id="blueprint-classes.class-hello-public-aactor"></a>`class Hello : public AActor { ... };` | A Blueprint class (a BlueprintGeneratedClass) whose parent is `AActor`, as if made in the editor with that parent. | Yes |
+| <a id="blueprint-classes.class-helper"></a>`class Helper { ... };` | A class with no base is plain C++. Nothing is cooked for it. | Yes |
+| <a id="blueprint-classes.class-x-public-anotincluded"></a>`class X : public ANotIncluded {};` | Refused by clang, "expected class name", when no included header declares the base. Include the SDK header that declares it. | Refused |
+| <a id="blueprint-classes.class-initcave-public-hello"></a>`class InitCave : public Hello {};` | A child of another class of the mod. A parent in the same source is used from there. A parent pinned with `UE_CLASS` to another mod is imported from that mod. | Yes |
+| <a id="blueprint-classes.class-turret-final-public-aactor"></a>`class Turret final : public AActor { ... };` | A class with no subclass. Its functions, overrides and interface implementations aside, are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
+| <a id="blueprint-classes.ue-final-as-uturretbase-turret"></a>`UE_FINAL_AS(UTurretBase, Turret);` at namespace scope, after UTurretBase | Final through one leaf: declares `class Turret final : public UTurretBase {}`, the class that is made, in the namespace it is written in (its package path, as for any class). UTurretBase's own code is then compiled as if it were final: its own functions, overrides and interface implementations aside, are cooked Final, and its calls on `this` to them are direct and usually copied in. A call to one of its overrides, or to a function it inherits, goes by name, as the editor calls a function that is not Final; with Turret the only class made, it reaches the same function. UTurretBase is cooked Abstract, and any other class deriving from it is refused, so put the macro in the header beside UTurretBase: a mod that includes the header is refused a subclass too. When UTurretBase has a `UE_CLASS` (a header mods share), Turret is pinned beside it, so only the mod that owns UTurretBase cooks Turret and every other mod imports it, and a second UE_FINAL_AS on the same base is refused ("has two UE_FINAL_AS leaves"). Such a base is final only through the UE_FINAL_AS in the header that declares it, which its owner sees too: one written in another mod's own source, its `.cpp` or a header of its own that re-declares the base, is refused ("only the UE_FINAL_AS in the header that declares it ..."), since its owner would never cook that leaf. The header counts as the owner's when a source beside it includes it whose `UE_MOD_PACKAGE` is the owner's, or that has none in a folder whose only `UE_MOD_PACKAGE` is the owner's (a mod of several sources). A game Blueprint base is refused ("is the game's Blueprint ..."): no mod cooks it, so it stays as the game has it. A base left with a `= 0` method is refused ("would be abstract"): Turret brings no method of its own, so it would be abstract too and nothing could be made. | Yes |
+| <a id="blueprint-classes.class-wpn-grapplinggun-long"></a>`class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). The child loads after every default subobject the parent's default object exports, which UeApi lists only when genueapi had `--game`: against a UeApi made without it, the class is refused, saying to regenerate with `--game`. | Yes |
 
 Notes:
 
@@ -276,16 +281,16 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `: public AActor`, or any actor class | An actor Blueprint. Only a class whose parents reach `AActor` has a construction script, and so components. | Yes |
-| `: public UObject` | A plain object Blueprint. Create one at run time; see [Creating objects](#creating-objects). | Yes |
-| `: public UBlueprintFunctionLibrary` | A Blueprint Function Library, a class of static functions. See [Functions](#functions). | Yes |
-| `: public UPrimaryDataAsset`, `: public UDataAsset` | A data asset class. Its instances are braced variables at namespace scope; see [Data assets](#data-assets). | Yes |
-| `: public USaveGame`, `: public UFSDSaveGame` | A save game class. | Yes |
-| `: public UActorComponent`, `: public USceneComponent` | A component Blueprint, with the component class flags. Add one to an actor at run time with `AddComponentByType<T>(Owner)`, the editor's Add Component by Class node. Its own events to override are `ReceiveBeginPlay`, `ReceiveEndPlay` and `ReceiveTick`. It cannot be a `UE_COMPONENT` of a mod actor, which takes engine component classes only; see [Components](#components). | Yes |
-| `void ReceiveTick(float DeltaSeconds)` in a component class | Turns the component's ticking on: it sets `PrimaryComponentTick.bCanEverTick` on the class default object, as the editor's compiler does. UActorComponent leaves it off. | Yes |
-| `: public UUserWidget` | A widget with logic and no layout. `CreateWidget<T>` makes one. Its events, such as `Construct`, are overrides. | Yes |
-| `void Tick(FGeometry MyGeometry, float InDeltaTime)` or `void OnPaint(FPaintContext &Context) const` in a widget class | Turns that event on for the class. The engine calls a widget's `Tick` and `OnPaint` only while `bHasScriptImplementedTick` and `bHasScriptImplementedPaint` are set on its class default object, and AssetGen sets each where the class overrides the event itself, as the editor's widget compiler does. A parent's override does not count: in a subclass without one of its own the event never runs, the parent's version included. AssetGen warns, "the Tick it inherits from ... never runs": override it in the subclass and call the parent's. | Yes |
-| a designer layout (a widget tree) for a mod widget | Declared with `UE_WIDGET` and laid out in the constructor: see [Widget layouts](#widget-layouts). A widget class with none starts with an empty tree, under a game widget Blueprint parent too, and shows nothing of its own: AssetGen warns, "has no widget tree", unless the class or a mod class above it sets `WidgetTree->RootWidget` (in `OnInitialized`, before the widget is first shown), or the class itself overrides `OnPaint`. | Yes |
+| <a id="parent-classes.public-aactor"></a>`: public AActor`, or any actor class | An actor Blueprint. Only a class whose parents reach `AActor` has a construction script, and so components. | Yes |
+| <a id="parent-classes.public-uobject"></a>`: public UObject` | A plain object Blueprint. Create one at run time; see [Creating objects](#creating-objects). | Yes |
+| <a id="parent-classes.public-ublueprintfunctionlibrary"></a>`: public UBlueprintFunctionLibrary` | A Blueprint Function Library, a class of static functions. See [Functions](#functions). | Yes |
+| <a id="parent-classes.public-uprimarydataasset"></a>`: public UPrimaryDataAsset`, `: public UDataAsset` | A data asset class. Its instances are braced variables at namespace scope; see [Data assets](#data-assets). | Yes |
+| <a id="parent-classes.public-usavegame"></a>`: public USaveGame`, `: public UFSDSaveGame` | A save game class. | Yes |
+| <a id="parent-classes.public-uactorcomponent"></a>`: public UActorComponent`, `: public USceneComponent` | A component Blueprint, with the component class flags. Add one to an actor at run time with `AddComponentByType<T>(Owner)`, the editor's Add Component by Class node. Its own events to override are `ReceiveBeginPlay`, `ReceiveEndPlay` and `ReceiveTick`. A mod actor can also declare it with `UE_COMPONENT`; see [Declaring components](#declaring-components.ue-component-ucharges-ammo). | Yes |
+| <a id="parent-classes.void-receivetick-float"></a>`void ReceiveTick(float DeltaSeconds)` in a component class | Turns the component's ticking on: it sets `PrimaryComponentTick.bCanEverTick` on the class default object, as the editor's compiler does. UActorComponent leaves it off. | Yes |
+| <a id="parent-classes.public-uuserwidget"></a>`: public UUserWidget` | A widget with logic and no layout. `CreateWidget<T>` makes one. Its events, such as `Construct`, are overrides. | Yes |
+| <a id="parent-classes.void-tick-fgeometry-mygeometry"></a>`void Tick(FGeometry MyGeometry, float InDeltaTime)` or `void OnPaint(FPaintContext &Context) const` in a widget class | Turns that event on for the class. The engine calls a widget's `Tick` and `OnPaint` only while `bHasScriptImplementedTick` and `bHasScriptImplementedPaint` are set on its class default object, and AssetGen sets each where the class overrides the event itself, as the editor's widget compiler does. A parent's override does not count: in a subclass without one of its own the event never runs, the parent's version included. AssetGen warns, "the Tick it inherits from ... never runs": override it in the subclass and call the parent's. | Yes |
+| <a id="parent-classes.a-designer-layout-a-widget"></a>a designer layout (a widget tree) for a mod widget | Declared with `UE_WIDGET` and laid out in the constructor: see [Widget layouts](#widget-layouts). A widget class with none starts with an empty tree, under a game widget Blueprint parent too, and shows nothing of its own: AssetGen warns, "has no widget tree", unless the class or a mod class above it sets `WidgetTree->RootWidget` (in `OnInitialized`, before the widget is first shown), or the class itself overrides `OnPaint`. | Yes |
 
 ```cpp
 class Turret : public AActor { public: int32 Shots = 0; };
@@ -361,24 +366,24 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 Health = 100;` | A Blueprint variable of the class. Blueprints get and set it, and it is editable in Class Defaults but not on a placed instance. | Yes |
-| `bool`, `uint8`, `int32`, `int64`, `float`, `FName`, `FString`, `FText` | Blueprint's Boolean, Byte, Integer, Integer64, Float, Name, String and Text variables. | Yes |
-| `EMood Mood;` | An enum variable. A `uint8` enum is cooked as a Byte of that enum, except a game `enum class`, which is an enum property over a byte as in the editor; an `int32` or `int64` enum is an enum property over that integer. See [Enums](#enums). | Yes |
-| `AActor *Target;`, `UClass *Cls;`, `TSubclassOf<AActor> Kind;` | Object and class references. See [Types](#types). | Yes |
-| `USceneComponent *Spare;`, `TArray<UStaticMeshComponent *> Pieces;`, `FHitResult LastHit;` | A reference to a component or widget, or a container or struct that holds one, is flagged instanced, as the editor flags it, so an actor spawned from the class gets its own copy of what the class default points at, not the default's. | Yes |
-| `TSoftObjectPtr<T>`, `TSoftClassPtr<T>`, `TScriptInterface<I>` | Soft object and soft class references, and an interface reference. | Yes |
-| `TEnum<EMood>` | The enum itself, plus `.Name()` and `.String()`. See [TEnum](#tenum). | Yes |
-| `TEnumMask<EMood>` | An int32 bitmask over the enum, with `.Has()`, `.Add()`, `.Remove()` and `.Clear()`. See [TEnumMask](#tenummask). | Yes |
-| `FVector Home;`, `FAmmo Ammo;` | An engine or game struct, or a mod `UE_STRUCT`. See [Structs](#structs). | Yes |
-| `TArray<FVector>`, `TSet<int32>`, `TMap<FName, int32>` | Array, Set and Map variables. A container inside a container goes through a generated wrapper struct; see [Containers](#containers). | Yes |
-| `TSet<bool>`, `TMap<FText, int32>`, `TSet<FRotator>` | Refused: "cannot hash, and the engine hashes each one". A set element or map key must hash: not a bool, an FText or a delegate, and an engine struct only if it has a GetTypeHash (FVector, FGuid, FGameplayTag and others do; FRotator, FHitResult, FTransform do not). A `UE_STRUCT` always hashes. | Refused |
-| `UE_DISPATCHER(OnScored, int32 Score);` | An event dispatcher. See [Event dispatchers](#event-dispatchers). | Yes |
-| `int32 *Raw;` | A pointer to anything but a UObject is an address, held in an Integer64 variable. See [Pointers and memory](#pointers-and-memory). | Yes |
-| `uint16 W;`, `double D;` | Refused: "unimplemented property W: uint16". UE 4.27 Blueprint has no such type; see [Types](#types). | Refused |
-| a member whose type is a game class the source only forward-declares | Refused, with the `#include "UeApi/Game/<Class>.h"` line to add. | Refused |
-| `static constexpr int32 kSlots = 12;`, `static inline const TArray<int32> kPrimes = {2, 3, 5};` | No variable is cooked. Each use is the value, and a braced list is built where it is used. See [Constants](#constants). | Yes |
-| `static inline float Loose = 0.25f;` | A static that is not const is refused where it is used: a Blueprint class has no static storage. See [Constants](#constants). | Refused |
-| `const int32 Limit = 3;` | A read-only variable. See Access, read-only and categories below. | Yes |
+| <a id="member-variables.int32-health-100"></a>`int32 Health = 100;` | A Blueprint variable of the class. Blueprints get and set it, and it is editable in Class Defaults but not on a placed instance. | Yes |
+| <a id="member-variables.bool"></a>`bool`, `uint8`, `int32`, `int64`, `float`, `FName`, `FString`, `FText` | Blueprint's Boolean, Byte, Integer, Integer64, Float, Name, String and Text variables. | Yes |
+| <a id="member-variables.emood-mood"></a>`EMood Mood;` | An enum variable. A `uint8` enum is cooked as a Byte of that enum, except a game `enum class`, which is an enum property over a byte as in the editor; an `int32` or `int64` enum is an enum property over that integer. See [Enums](#enums). | Yes |
+| <a id="member-variables.aactor-target"></a>`AActor *Target;`, `UClass *Cls;`, `TSubclassOf<AActor> Kind;` | Object and class references. See [Types](#types). | Yes |
+| <a id="member-variables.uscenecomponent-spare"></a>`USceneComponent *Spare;`, `TArray<UStaticMeshComponent *> Pieces;`, `FHitResult LastHit;` | A reference to a component or widget, or a container or struct that holds one, is flagged instanced, as the editor flags it, so an actor spawned from the class gets its own copy of what the class default points at, not the default's. | Yes |
+| <a id="member-variables.tsoftobjectptr-t"></a>`TSoftObjectPtr<T>`, `TSoftClassPtr<T>`, `TScriptInterface<I>` | Soft object and soft class references, and an interface reference. | Yes |
+| <a id="member-variables.tenum-emood"></a>`TEnum<EMood>` | The enum itself, plus `.Name()` and `.String()`. See [TEnum](#tenum). | Yes |
+| <a id="member-variables.tenummask-emood"></a>`TEnumMask<EMood>` | An int32 bitmask over the enum, with `.Has()`, `.Add()`, `.Remove()` and `.Clear()`. See [TEnumMask](#tenummask). | Yes |
+| <a id="member-variables.fvector-home"></a>`FVector Home;`, `FAmmo Ammo;` | An engine or game struct, or a mod `UE_STRUCT`. See [Structs](#structs). | Yes |
+| <a id="member-variables.tarray-fvector"></a>`TArray<FVector>`, `TSet<int32>`, `TMap<FName, int32>` | Array, Set and Map variables. A container inside a container goes through a generated wrapper struct; see [Containers](#containers). | Yes |
+| <a id="member-variables.tset-bool"></a>`TSet<bool>`, `TMap<FText, int32>`, `TSet<FRotator>` | Refused: "cannot hash, and the engine hashes each one". A set element or map key must hash: not a bool, an FText or a delegate, and an engine struct only if it has a GetTypeHash (FVector, FGuid, FGameplayTag and others do; FRotator, FHitResult, FTransform do not). A `UE_STRUCT` always hashes. | Refused |
+| <a id="member-variables.ue-dispatcher-onscored-int32"></a>`UE_DISPATCHER(OnScored, int32 Score);` | An event dispatcher. See [Event dispatchers](#event-dispatchers). | Yes |
+| <a id="member-variables.int32-raw"></a>`int32 *Raw;` | A pointer to anything but a UObject is an address, held in an Integer64 variable. See [Pointers and memory](#pointers-and-memory). | Yes |
+| <a id="member-variables.uint16-w"></a>`uint16 W;`, `double D;` | Refused: "unimplemented property W: uint16". UE 4.27 Blueprint has no such type; see [Types](#types). | Refused |
+| <a id="member-variables.a-member-whose-type-is"></a>a member whose type is a game class the source only forward-declares | Refused, with the `#include "UeApi/Game/<Class>.h"` line to add. | Refused |
+| <a id="member-variables.static-constexpr-int32-kslots-12"></a>`static constexpr int32 kSlots = 12;`, `static inline const TArray<int32> kPrimes = {2, 3, 5};` | No variable is cooked. Each use is the value, and a braced list is built where it is used. See [Constants](#constants). | Yes |
+| <a id="member-variables.static-inline-float-loose-0"></a>`static inline float Loose = 0.25f;` | A static that is not const is refused where it is used: a Blueprint class has no static storage. See [Constants](#constants). | Refused |
+| <a id="member-variables.const-int32-limit-3"></a>`const int32 Limit = 3;` | A read-only variable. See Access, read-only and categories below. | Yes |
 
 ```cpp
 enum class EMood : uint8 { Calm, Angry };
@@ -412,18 +417,18 @@ public:
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 Budget = kSlots * 2 + 1;` | The compiler works the initializer out when the mod is built and writes it into the class default object: the variable's default value in Class Defaults. Nothing runs in game to set it. | Yes |
-| `int32 Hits = 0;`, `int32 Hits;` | A zero default writes nothing, as the engine cooks it, and the variable starts at zero. The same holds for the zero enumerator, `nullptr` and an empty string. | Yes |
-| `int32 Hits{};`, `EMood Mood = EMood();`, `int32 Budget{25};` | `{}` and `T()` are the zero, and write nothing; braces around one value are that value. | Yes |
-| `int32 X = UKismetMathLibrary::RandomInteger(5);` | Refused: "a default is a value known when the mod is built". Set such a value in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
-| `static constexpr int32 kSeed = Fnv("types");` then `int32 Seed = kSeed;` | A call counts as a default only through a `consteval` function, which clang runs itself. A call to a plain `constexpr` function is refused like any call. See [Constants](#constants). | Yes |
-| `TSubclassOf<AActor> Kind = AActor::StaticClass();`, `UClass *Any = AMyEnemy::StaticClass();` | The class is the default, as picking it under Class Defaults makes it: an engine or game class, a game Blueprint, or one of the mod's own classes, this one included. The same holds in a container's braces, a struct value, a `UE_DEFAULTS` statement and an asset's braces. `= nullptr` is the zero. | Yes |
-| `TSubclassOf<APawn> Kind = AActor::StaticClass();` | Refused: "a TSubclassOf<APawn> holds APawn or a subclass of it, and AActor is neither". C++ converts any class to a `TSubclassOf`, but the editor's class picker offers only those. | Refused |
-| `TSoftClassPtr<AActor> Soft = "/Game/A/BP_A.BP_A_C";` | A soft reference's default is its path. `"/Game/Dir/Pkg"` means `Pkg.Pkg`, so write the full path for a Blueprint class. See [Types](#types). | Yes |
-| `TArray<uint8> Payload = __EmbedFile__("data/blob.bin");` | Reads the file when the mod is built, from a path relative to the source's folder, and writes its bytes into the default, one element per byte. The compile prints `embed          -> Payload  (3 bytes)`. The file is not needed at run time. `__EmbedFile__` comes from `Intrin.h` in AssetGen's `include/` folder, included by its path as `Objects.h` is. | Yes |
-| `__EmbedFile__("missing.bin")`, `__EmbedFile__(kPath)` | Refused: a missing or empty file ("cannot read (or empty)"), and a path that is not a string literal ("the path must be a string literal"). It works only as the initializer of a `TArray<uint8>` member; clang refuses it for any other array type. | Refused |
-| `UE_ENUM_MAP(EMood, FName, Names);` | Declares a `TMap<EMood, FName>` member holding a name table that the compiler fills in when the mod is built, as a member default only. See [Enums](#enums). | Yes |
-| `AMyActor() { Charges = 5; }`, `AMyActor() : Charges(5) {}` | The same as `int32 Charges = 5;`: a default constructor is read as the class's defaults. See [Constructors](#constructors). | Yes |
+| <a id="defaults.int32-budget-kslots-2-1"></a>`int32 Budget = kSlots * 2 + 1;` | The compiler works the initializer out when the mod is built and writes it into the class default object: the variable's default value in Class Defaults. Nothing runs in game to set it. | Yes |
+| <a id="defaults.int32-hits-0"></a>`int32 Hits = 0;`, `int32 Hits;` | A zero default writes nothing, as the engine cooks it, and the variable starts at zero. The same holds for the zero enumerator, `nullptr` and an empty string. | Yes |
+| <a id="defaults.int32-hits"></a>`int32 Hits{};`, `EMood Mood = EMood();`, `int32 Budget{25};` | `{}` and `T()` are the zero, and write nothing; braces around one value are that value. | Yes |
+| <a id="defaults.int32-x-ukismetmathlibrary"></a>`int32 X = UKismetMathLibrary::RandomInteger(5);` | Refused: "a default is a value known when the mod is built". Set such a value in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
+| <a id="defaults.static-constexpr-int32-kseed-fnv"></a>`static constexpr int32 kSeed = Fnv("types");` then `int32 Seed = kSeed;` | A call counts as a default only through a `consteval` function, which clang runs itself. A call to a plain `constexpr` function is refused like any call. See [Constants](#constants). | Yes |
+| <a id="defaults.tsubclassof-aactor-kind-aactor"></a>`TSubclassOf<AActor> Kind = AActor::StaticClass();`, `UClass *Any = AMyEnemy::StaticClass();` | The class is the default, as picking it under Class Defaults makes it: an engine or game class, a game Blueprint, or one of the mod's own classes, this one included. The same holds in a container's braces, a struct value, a `UE_DEFAULTS` statement and an asset's braces. `= nullptr` is the zero. | Yes |
+| <a id="defaults.tsubclassof-apawn-kind-aactor"></a>`TSubclassOf<APawn> Kind = AActor::StaticClass();` | Refused: "a TSubclassOf<APawn> holds APawn or a subclass of it, and AActor is neither". C++ converts any class to a `TSubclassOf`, but the editor's class picker offers only those. | Refused |
+| <a id="defaults.tsoftclassptr-aactor-soft-game-a"></a>`TSoftClassPtr<AActor> Soft = "/Game/A/BP_A.BP_A_C";` | A soft reference's default is its path. `"/Game/Dir/Pkg"` means `Pkg.Pkg`, so write the full path for a Blueprint class. See [Types](#types). | Yes |
+| <a id="defaults.tarray-uint8-payload-embedfile"></a>`TArray<uint8> Payload = __EmbedFile__("data/blob.bin");` | Reads the file when the mod is built, from a path relative to the source's folder, and writes its bytes into the default, one element per byte. The compile prints `embed          -> Payload  (3 bytes)`. The file is not needed at run time. `__EmbedFile__` comes from `Intrin.h` in AssetGen's `include/` folder, included by its path as `Objects.h` is. | Yes |
+| <a id="defaults.embedfile-missing-bin"></a>`__EmbedFile__("missing.bin")`, `__EmbedFile__(kPath)` | Refused: a missing or empty file ("cannot read (or empty)"), and a path that is not a string literal ("the path must be a string literal"). It works only as the initializer of a `TArray<uint8>` member; clang refuses it for any other array type. | Refused |
+| <a id="defaults.ue-enum-map-emood-fname"></a>`UE_ENUM_MAP(EMood, FName, Names);` | Declares a `TMap<EMood, FName>` member holding a name table that the compiler fills in when the mod is built, as a member default only. See [Enums](#enums). | Yes |
+| <a id="defaults.amyactor-charges-5"></a>`AMyActor() { Charges = 5; }`, `AMyActor() : Charges(5) {}` | The same as `int32 Charges = 5;`: a default constructor is read as the class's defaults. See [Constructors](#constructors). | Yes |
 
 ```cpp
 // in a class; EMood is a UE_ENUM
@@ -458,13 +463,13 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `public:`, `protected:`, `private:` before a function | The function is cooked as public, protected or private, and the editor allows or refuses a call node to it the same way. An override keeps its parent's access. Nothing is checked at run time. | Yes |
-| `private:` before a variable | The variable is still cooked on the class, but the editor API stub leaves it out. A Blueprint variable has no other access: a protected one and a public one look the same. | Yes |
-| `const int32 Limit = 3;` | A read-only variable (BlueprintReadOnly): the editor offers a Get node and no Set node. The initializer is the default. clang refuses a write in C++, and the Blueprint VM does not check it. | Yes |
-| `UE_READONLY int32 Cap = 5;` | Read-only the same way (BlueprintReadOnly), but it can still be written: a subclass's `UE_DEFAULTS` may give it a default, and a write from code compiles with `warning: <Class>::<Function>: Cap is BlueprintReadOnly; the editor would not set it`, because the VM allows the write (for example, setting a deferred spawn's members before FinishSpawning). UeApi declares the engine's and game's BlueprintReadOnly properties this way. | Yes |
-| `UE_CATEGORY("Turret\|Setup");` | Gives the functions and variables declared after it that category. `\|` starts a subcategory, and `UE_CATEGORY("")` ends the category. It is positional, like an access specifier. | Yes |
-| `UE_TOOLTIP("Adds charges.") UE_KEYWORDS("refill reload") void Recharge(int32 By);` | The function's tooltip, shown over its call node and in the action menu, and extra words the action menu's search finds it by: the Description and Keywords of the editor's function details. Like a category, they reach the editor API stub only. The cooked game keeps no editor metadata, so the pak carries neither, and nothing changes in game. | Yes |
-| `UE_TOOLTIP("Count") int32 N;` | Refused: "marks no method". They describe the method that follows them. | Refused |
+| <a id="access-read-only.public"></a>`public:`, `protected:`, `private:` before a function | The function is cooked as public, protected or private, and the editor allows or refuses a call node to it the same way. An override keeps its parent's access. Nothing is checked at run time. | Yes |
+| <a id="access-read-only.private"></a>`private:` before a variable | The variable is still cooked on the class, but the editor API stub leaves it out. A Blueprint variable has no other access: a protected one and a public one look the same. | Yes |
+| <a id="access-read-only.const-int32-limit-3"></a>`const int32 Limit = 3;` | A read-only variable (BlueprintReadOnly): the editor offers a Get node and no Set node. The initializer is the default. clang refuses a write in C++, and the Blueprint VM does not check it. | Yes |
+| <a id="access-read-only.ue-readonly-int32-cap-5"></a>`UE_READONLY int32 Cap = 5;` | Read-only the same way (BlueprintReadOnly), but it can still be written: a subclass's `UE_DEFAULTS` may give it a default, and a write from code compiles with `warning: <Class>::<Function>: Cap is BlueprintReadOnly; the editor would not set it`, because the VM allows the write (for example, setting a deferred spawn's members before FinishSpawning). UeApi declares the engine's and game's BlueprintReadOnly properties this way. | Yes |
+| <a id="access-read-only.ue-category-turret-setup"></a>`UE_CATEGORY("Turret\|Setup");` | Gives the functions and variables declared after it that category. `\|` starts a subcategory, and `UE_CATEGORY("")` ends the category. It is positional, like an access specifier. | Yes |
+| <a id="access-read-only.ue-tooltip-adds-charges-ue"></a>`UE_TOOLTIP("Adds charges.") UE_KEYWORDS("refill reload") void Recharge(int32 By);` | The function's tooltip, shown over its call node and in the action menu, and extra words the action menu's search finds it by: the Description and Keywords of the editor's function details. Like a category, they reach the editor API stub only. The cooked game keeps no editor metadata, so the pak carries neither, and nothing changes in game. | Yes |
+| <a id="access-read-only.ue-tooltip-count-int32-n"></a>`UE_TOOLTIP("Count") int32 N;` | Refused: "marks no method". They describe the method that follows them. | Refused |
 
 ```cpp
 class Turret : public AActor {
@@ -500,11 +505,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Index_0 = 7;`, for a member the SDK spells `Index_0` | Write the SDK's spelling. Dumper-7 respells names that C++ cannot use: a clash gets a suffix (`Name` becomes `Name_0`), an illegal character becomes `_` (`Audio Flying` becomes `Audio_Flying`), and a leading digit becomes a word (`3P` becomes `ThreeP`). The SDK keeps the real name beside the member, and everything the compiler cooks uses the real name. | Yes |
-| `class Größe : public AActor { FName Umlaut = "Größe"; };` | Non-ASCII class, member and asset names, and non-ASCII name and string defaults, are cooked and registered correctly. | Yes |
-| `using FTarget = AActor;`, then `FTarget *Aimed;` | An alias of a UObject class is still an object reference, not an address. It works at namespace scope and at class scope. | Yes |
-| `using FMoods = TArray<EMood>;`, `using Factory = TScriptInterface<IFoo>;` | A global alias of a template type is that type wherever it is used, in out-of-line method definitions too. A global alias of a class is that class the same way, so an override may spell a parameter through it. | Yes |
-| `using Grapple = Game::WeaponsNTools::GrapplingGun::WPN_GrapplingGun_C;` | An alias to a game class's full `Game::` path. The SDK gives a game class a short name at global scope only when no other game package has a class of that name. For one that does, write such an alias. | Yes |
+| <a id="names.index-0-7"></a>`Index_0 = 7;`, for a member the SDK spells `Index_0` | Write the SDK's spelling. Dumper-7 respells names that C++ cannot use: a clash gets a suffix (`Name` becomes `Name_0`), an illegal character becomes `_` (`Audio Flying` becomes `Audio_Flying`), and a leading digit becomes a word (`3P` becomes `ThreeP`). The SDK keeps the real name beside the member, and everything the compiler cooks uses the real name. | Yes |
+| <a id="names.class-gr-e-public-aactor"></a>`class Größe : public AActor { FName Umlaut = "Größe"; };` | Non-ASCII class, member and asset names, and non-ASCII name and string defaults, are cooked and registered correctly. | Yes |
+| <a id="names.using-ftarget-aactor"></a>`using FTarget = AActor;`, then `FTarget *Aimed;` | An alias of a UObject class is still an object reference, not an address. It works at namespace scope and at class scope. | Yes |
+| <a id="names.using-fmoods-tarray-emood"></a>`using FMoods = TArray<EMood>;`, `using Factory = TScriptInterface<IFoo>;` | A global alias of a template type is that type wherever it is used, in out-of-line method definitions too. A global alias of a class is that class the same way, so an override may spell a parameter through it. | Yes |
+| <a id="names.using-grapple-game-weaponsntools"></a>`using Grapple = Game::WeaponsNTools::GrapplingGun::WPN_GrapplingGun_C;` | An alias to a game class's full `Game::` path. The SDK gives a game class a short name at global scope only when no other game package has a class of that name. For one that does, write such an alias. | Yes |
 
 ```cpp
 class NameTest : public UFSDSaveGame {
@@ -531,13 +536,13 @@ The rule to remember: define a global in the source that uses it.
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 Counter = 5;` | A variable that every class of the source shares. Its holder is a generated `UObject` class at `<UE_MOD_PACKAGE>/Counter`, with one member of the same name and type. The initializer is its default. | Yes |
-| `namespace Tally { int32 Hits; }` | A namespace gives no subfolder here: the holder is `<UE_MOD_PACKAGE>/Tally__Hits`. A global with no initializer starts at zero, as in C++. | Yes |
-| `Counter += By;`, `++Tally::Hits;`, `return Counter++;` | Assignment, compound assignment, `++` and a postfix read all work on a global. | Yes |
-| `constexpr int32 kStep = 3;`, `const int32 kMask = 1 << 4;` | A `const` or `constexpr` global is not stored: each use is its value. See [Constants](#constants). | Yes |
-| a global that no function uses | Gets no holder class. Nothing is written for it. | Yes |
-| `UMoodDef GlobalDef;`, a variable of a UObject class by value | Refused where it is used: "is an asset, not a value". Declare a braced asset of the mod or name an existing one with `UE_ASSET_AT`, and point at it with `&`. See [Data assets](#data-assets). | Refused |
-| `extern int32 Shared;`, used but not defined in this source | Refused: "declared extern but not defined in this source". | Refused |
+| <a id="namespace-scope.int32-counter-5"></a>`int32 Counter = 5;` | A variable that every class of the source shares. Its holder is a generated `UObject` class at `<UE_MOD_PACKAGE>/Counter`, with one member of the same name and type. The initializer is its default. | Yes |
+| <a id="namespace-scope.namespace-tally-int32-hits"></a>`namespace Tally { int32 Hits; }` | A namespace gives no subfolder here: the holder is `<UE_MOD_PACKAGE>/Tally__Hits`. A global with no initializer starts at zero, as in C++. | Yes |
+| <a id="namespace-scope.counter-by"></a>`Counter += By;`, `++Tally::Hits;`, `return Counter++;` | Assignment, compound assignment, `++` and a postfix read all work on a global. | Yes |
+| <a id="namespace-scope.constexpr-int32-kstep-3"></a>`constexpr int32 kStep = 3;`, `const int32 kMask = 1 << 4;` | A `const` or `constexpr` global is not stored: each use is its value. See [Constants](#constants). | Yes |
+| <a id="namespace-scope.a-global-that-no-function"></a>a global that no function uses | Gets no holder class. Nothing is written for it. | Yes |
+| <a id="namespace-scope.umooddef-globaldef"></a>`UMoodDef GlobalDef;`, a variable of a UObject class by value | Refused where it is used: "is an asset, not a value". Declare a braced asset of the mod or name an existing one with `UE_ASSET_AT`, and point at it with `&`. See [Data assets](#data-assets). | Refused |
+| <a id="namespace-scope.extern-int32-shared"></a>`extern int32 Shared;`, used but not defined in this source | Refused: "declared extern but not defined in this source". | Refused |
 
 ```cpp
 UE_MOD_PACKAGE("/Game/_MyMods/Tally");
@@ -569,9 +574,9 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 Counter = 5;` in two sources with different `UE_MOD_PACKAGE`s | Two separate variables. Each holder sits under its own source's package, so they never collide. | Yes |
-| `int32 Counter = 5;` in two sources with the same `UE_MOD_PACKAGE` | Both sources write the same holder package, byte for byte, so both name one variable. | Yes |
-| `extern int32 Counter;` to reach another source's global | Refused, as above. Each source that uses a global cooks its holder, so the global is defined where it is used. | Refused |
+| <a id="globals-across-sources.int32-counter-5"></a>`int32 Counter = 5;` in two sources with different `UE_MOD_PACKAGE`s | Two separate variables. Each holder sits under its own source's package, so they never collide. | Yes |
+| <a id="globals-across-sources.int32-counter-5-2"></a>`int32 Counter = 5;` in two sources with the same `UE_MOD_PACKAGE` | Both sources write the same holder package, byte for byte, so both name one variable. | Yes |
+| <a id="globals-across-sources.extern-int32-counter"></a>`extern int32 Counter;` to reach another source's global | Refused, as above. Each source that uses a global cooks its holder, so the global is defined where it is used. | Refused |
 
 ## Types
 
@@ -584,20 +589,20 @@ sections of their own. The rule to remember: a variable can only have a type tha
 
 | You write | What it does | Status |
 |---|---|---|
-| `bool bArmed = true;` | A Boolean variable. | Yes |
-| `uint8 Charges = 3;` | A Byte variable. `unsigned char` is the same type. | Yes |
-| `int32 Kills;` | An Integer variable. `int` is the same type. | Yes |
-| `int64 Stamp;` | An Integer64 variable. `long long` is the same type. | Yes |
-| `float Ratio = 0.5f;` | A Float variable. | Yes |
-| `FString Label;` | A String variable. A `const char *` member or parameter is a String too. | Yes |
-| `FName Key = "alpha";` | A Name variable. | Yes |
-| `FText Caption;` | A Text variable. | Yes |
-| `AActor *Target;` | An Object Reference variable. See the next table. | Yes |
-| `EMood Mood;` | An enum variable: [Enums](#enums). | Yes |
-| `FVector Home;` | A struct variable: [Structs](#structs). | Yes |
-| `TArray<int32> Scores;` | An Array, Set or Map variable: [Containers](#containers). | Yes |
-| `uint32 Mask;` | Refused (`unimplemented property Mask: uint32`): Blueprint 4.27 has no such type. The same holds for `int8`, `int16`, `uint16` and `uint64`, as a member, parameter, local or return value. Use `int32` or `int64`. | Refused |
-| `double D;` | Refused (`unimplemented property D: double`): Blueprint reals in 4.27 are `float`. Use `float`. | Refused |
+| <a id="variable-types.bool-barmed-true"></a>`bool bArmed = true;` | A Boolean variable. | Yes |
+| <a id="variable-types.uint8-charges-3"></a>`uint8 Charges = 3;` | A Byte variable. `unsigned char` is the same type. | Yes |
+| <a id="variable-types.int32-kills"></a>`int32 Kills;` | An Integer variable. `int` is the same type. | Yes |
+| <a id="variable-types.int64-stamp"></a>`int64 Stamp;` | An Integer64 variable. `long long` is the same type. | Yes |
+| <a id="variable-types.float-ratio-0-5f"></a>`float Ratio = 0.5f;` | A Float variable. | Yes |
+| <a id="variable-types.fstring-label"></a>`FString Label;` | A String variable. A `const char *` member or parameter is a String too. | Yes |
+| <a id="variable-types.fname-key-alpha"></a>`FName Key = "alpha";` | A Name variable. | Yes |
+| <a id="variable-types.ftext-caption"></a>`FText Caption;` | A Text variable. | Yes |
+| <a id="variable-types.aactor-target"></a>`AActor *Target;` | An Object Reference variable. See the next table. | Yes |
+| <a id="variable-types.emood-mood"></a>`EMood Mood;` | An enum variable: [Enums](#enums). | Yes |
+| <a id="variable-types.fvector-home"></a>`FVector Home;` | A struct variable: [Structs](#structs). | Yes |
+| <a id="variable-types.tarray-int32-scores"></a>`TArray<int32> Scores;` | An Array, Set or Map variable: [Containers](#containers). | Yes |
+| <a id="variable-types.uint32-mask"></a>`uint32 Mask;` | Refused (`unimplemented property Mask: uint32`): Blueprint 4.27 has no such type. The same holds for `int8`, `int16`, `uint16` and `uint64`, as a member, parameter, local or return value. Use `int32` or `int64`. | Refused |
+| <a id="variable-types.double-d"></a>`double D;` | Refused (`unimplemented property D: double`): Blueprint reals in 4.27 are `float`. Use `float`. | Refused |
 
 Notes:
 - A member's initializer is its default in Class Defaults: [Classes and variables](#classes-and-variables).
@@ -611,16 +616,16 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `APawn *Spotted;` | An Object Reference variable of that class. Its default can only be `nullptr` or `&Asset`. | Yes |
-| `using FTarget = AActor;` then `FTarget *Aimed;` | An alias of a class is still an Object Reference: [Classes and variables](#classes-and-variables). | Yes |
-| `int32 *P;` | A pointer to a type that is not a UObject is an int64 address: [Pointers and memory](#pointers-and-memory). | Yes |
-| `TSubclassOf<AActor> Kind;` | A Class Reference limited to `AActor` and its subclasses. | Yes |
-| `UClass *Raw;` | A Class Reference that takes any class. | Yes |
-| `Raw = Kind; Kind = Raw;` | Each converts to the other. Nothing checks at run time that the class in `Raw` derives from `AActor`. | Yes |
-| `TSubclassOf<AActor> Kind = AActor::StaticClass();` | The class as the default. `TSubclassOf<APawn> Kind = AActor::StaticClass();` is refused: a class the `TSubclassOf` does not take. See [Classes and variables](#classes-and-variables). | Yes |
-| `TScriptInterface<IHealth> Health;` | An Interface variable: [Interfaces](#interfaces). | Yes |
-| `Data.Instigator->K2_GetPawn()`, `AActor *A = Data.DamageCauser;`, `if (Data.Component)`, `Cast<AProjectileBase>(Data.DamageCauser)` on a game struct's `TWeakObjectPtr` member (FDamageData's) | Reads it like an object reference, as the editor's Break node does: EX_StructMemberContext of the member, whose read hands out the object, None once it is gone. Assigning one is refused ("an assignment to a TWeakObjectPtr member"): the game's are read-only, and EX_Let would store an object into the weak pointer's bytes. | Yes |
-| `TWeakObjectPtr<AActor> Last;` | Refused: "TODO: unimplemented property Last" (a member or local of the mod's own). Keep an object pointer and test it with `if (Obj)`, or keep a soft reference. | Refused |
+| <a id="object-and-class.apawn-spotted"></a>`APawn *Spotted;` | An Object Reference variable of that class. Its default can only be `nullptr` or `&Asset`. | Yes |
+| <a id="object-and-class.using-ftarget-aactor"></a>`using FTarget = AActor;` then `FTarget *Aimed;` | An alias of a class is still an Object Reference: [Classes and variables](#classes-and-variables). | Yes |
+| <a id="object-and-class.int32-p"></a>`int32 *P;` | A pointer to a type that is not a UObject is an int64 address: [Pointers and memory](#pointers-and-memory). | Yes |
+| <a id="object-and-class.tsubclassof-aactor-kind"></a>`TSubclassOf<AActor> Kind;` | A Class Reference limited to `AActor` and its subclasses. | Yes |
+| <a id="object-and-class.uclass-raw"></a>`UClass *Raw;` | A Class Reference that takes any class. | Yes |
+| <a id="object-and-class.raw-kind-kind-raw"></a>`Raw = Kind; Kind = Raw;` | Each converts to the other. Nothing checks at run time that the class in `Raw` derives from `AActor`. | Yes |
+| <a id="object-and-class.tsubclassof-aactor-kind-aactor"></a>`TSubclassOf<AActor> Kind = AActor::StaticClass();` | The class as the default. `TSubclassOf<APawn> Kind = AActor::StaticClass();` is refused: a class the `TSubclassOf` does not take. See [Classes and variables](#classes-and-variables). | Yes |
+| <a id="object-and-class.tscriptinterface-ihealth-health"></a>`TScriptInterface<IHealth> Health;` | An Interface variable: [Interfaces](#interfaces). | Yes |
+| <a id="object-and-class.data-instigator-k2-getpawn"></a>`Data.Instigator->K2_GetPawn()`, `AActor *A = Data.DamageCauser;`, `if (Data.Component)`, `Cast<AProjectileBase>(Data.DamageCauser)` on a game struct's `TWeakObjectPtr` member (FDamageData's) | Reads it like an object reference, as the editor's Break node does: EX_StructMemberContext of the member, whose read hands out the object, None once it is gone. Assigning one is refused ("an assignment to a TWeakObjectPtr member"): the game's are read-only, and EX_Let would store an object into the weak pointer's bytes. | Yes |
+| <a id="object-and-class.tweakobjectptr-aactor-last"></a>`TWeakObjectPtr<AActor> Last;` | Refused: "TODO: unimplemented property Last" (a member or local of the mod's own). Keep an object pointer and test it with `if (Obj)`, or keep a soft reference. | Refused |
 
 Notes:
 - A class that the headers only forward-declare cannot be a variable's type. The message says which `UeApi/Game/...`
@@ -630,33 +635,33 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Cast<APawn>(Obj)` | The Cast To node: the object if it is an `APawn`, otherwise null. The class must be one the headers declare, or the cast is refused with "Cast<> to an unknown class". | Yes |
-| `static_cast<APawn *>(A)` | Compiles to nothing. The reference passes through unchecked, as in C++. Use `Cast<T>` when the object may not be a `T`. | Yes |
-| `AActor *U = P;` | An upcast. It compiles to nothing. | Yes |
-| `AActor::StaticClass()` | The class as a constant, like a class picked on a pin. On one of the mod's own classes it names that class: [Creating objects](#creating-objects). | Yes |
-| `Other->GetClass()` | The Get Class node. The other object helpers: [Working with other objects](#working-with-other-objects). | Yes |
-| `if (Target)` | Is Valid, so an object that is being destroyed tests false. `Target != nullptr` is a plain compare. See [Working with other objects](#working-with-other-objects). | Yes |
-| `A < B` on object pointers | Refused: Blueprint compares object references only with `==` and `!=`. See [Operators](#operators). | Refused |
+| <a id="casts-and-class.cast-apawn-obj"></a>`Cast<APawn>(Obj)` | The Cast To node: the object if it is an `APawn`, otherwise null. The class must be one the headers declare, or the cast is refused with "Cast<> to an unknown class". | Yes |
+| <a id="casts-and-class.static-cast-apawn-a"></a>`static_cast<APawn *>(A)` | Compiles to nothing. The reference passes through unchecked, as in C++. Use `Cast<T>` when the object may not be a `T`. | Yes |
+| <a id="casts-and-class.aactor-u-p"></a>`AActor *U = P;` | An upcast. It compiles to nothing. | Yes |
+| <a id="casts-and-class.aactor-staticclass"></a>`AActor::StaticClass()` | The class as a constant, like a class picked on a pin. On one of the mod's own classes it names that class: [Creating objects](#creating-objects). | Yes |
+| <a id="casts-and-class.other-getclass"></a>`Other->GetClass()` | The Get Class node. The other object helpers: [Working with other objects](#working-with-other-objects). | Yes |
+| <a id="casts-and-class.if-target"></a>`if (Target)` | Is Valid, so an object that is being destroyed tests false. `Target != nullptr` is a plain compare. See [Working with other objects](#working-with-other-objects). | Yes |
+| <a id="casts-and-class.a-b"></a>`A < B` on object pointers | Refused: Blueprint compares object references only with `==` and `!=`. See [Operators](#operators). | Refused |
 
 ### Soft references
 
 | You write | What it does | Status |
 |---|---|---|
-| `TSoftObjectPtr<UTexture2D> Icon = "/Game/UI/Icons/T_Icon.T_Icon";` | A Soft Object Reference. Its default is the asset's path. Nothing is loaded with the class. | Yes |
-| `TSoftClassPtr<AActor> Kind = "/Game/A/BP_A.BP_A_C";` | A Soft Class Reference. For a Blueprint class the path names the generated class, `<Name>_C`. | Yes |
-| `TArray<TSoftClassPtr<AActor>> Kinds = {"/Game/A/BP_A.BP_A_C"};` | An array of soft references, with paths as its default. | Yes |
-| `= "/Game/Dir/Pkg"` in a default | A path with no object name means `Pkg.Pkg`. | Yes |
-| `Icon = "/Game/UI/Icons/T_Icon.T_Icon";` in a function | A soft path constant, written exactly as given. | Yes |
-| `Seen = A;` | An object converts to a soft reference (To Soft Object Reference); a class converts to a soft class reference. | Yes |
-| `Kinds.Contains(A->GetClass())` | The class converts to a soft class reference where one is wanted, as the editor does. | Yes |
-| `(AActor *)Seen`, `(UClass *)Kind` | Resolve Soft Reference: the object or class, or null if it is not loaded. The cast is explicit so that the null is visible in the source. | Yes |
-| `FString Path = Seen;` | The path as a string, and through it an FName or FText. | Yes |
-| `FString(TSoftClassPtr<AActor>(A->GetClass()))` | A class's path. `FString(A->GetClass())` would give its name. | Yes |
-| `Kind == Other` | Compares the two paths (Equal (Soft Class Reference)), whatever class each one is of. Nothing is loaded. | Yes |
-| `TSoftObjectPtr<UObject> Any = Icon;` | A soft reference to a subclass passes where one to its parent is wanted, with no conversion node. | Yes |
-| `UKismetSystemLibrary::LoadAsset_Blocking(Icon)` | Loads the asset now and returns it. `LoadClassAsset_Blocking(Kind)` does the same for a class. | Yes |
-| `UKismetSystemLibrary::LoadAsset(Icon)` | The latent Async Load Asset node: the function waits, and the call's value is the object. `LoadAssetClass` loads a class. See [Latent calls](#latent-calls). | Yes |
-| `UKismetSystemLibrary::IsValidSoftObjectReference(Icon)` | Whether a path is set. It loads nothing. | Yes |
+| <a id="soft-references.tsoftobjectptr-utexture2d-icon"></a>`TSoftObjectPtr<UTexture2D> Icon = "/Game/UI/Icons/T_Icon.T_Icon";` | A Soft Object Reference. Its default is the asset's path. Nothing is loaded with the class. | Yes |
+| <a id="soft-references.tsoftclassptr-aactor-kind-game-a"></a>`TSoftClassPtr<AActor> Kind = "/Game/A/BP_A.BP_A_C";` | A Soft Class Reference. For a Blueprint class the path names the generated class, `<Name>_C`. | Yes |
+| <a id="soft-references.tarray-tsoftclassptr-aactor"></a>`TArray<TSoftClassPtr<AActor>> Kinds = {"/Game/A/BP_A.BP_A_C"};` | An array of soft references, with paths as its default. | Yes |
+| <a id="soft-references.game-dir-pkg"></a>`= "/Game/Dir/Pkg"` in a default | A path with no object name means `Pkg.Pkg`. | Yes |
+| <a id="soft-references.icon-game-ui-icons-t"></a>`Icon = "/Game/UI/Icons/T_Icon.T_Icon";` in a function | A soft path constant, written exactly as given. | Yes |
+| <a id="soft-references.seen-a"></a>`Seen = A;` | An object converts to a soft reference (To Soft Object Reference); a class converts to a soft class reference. | Yes |
+| <a id="soft-references.kinds-contains-a-getclass"></a>`Kinds.Contains(A->GetClass())` | The class converts to a soft class reference where one is wanted, as the editor does. | Yes |
+| <a id="soft-references.aactor-seen"></a>`(AActor *)Seen`, `(UClass *)Kind` | Resolve Soft Reference: the object or class, or null if it is not loaded. The cast is explicit so that the null is visible in the source. | Yes |
+| <a id="soft-references.fstring-path-seen"></a>`FString Path = Seen;` | The path as a string, and through it an FName or FText. | Yes |
+| <a id="soft-references.fstring-tsoftclassptr-aactor-a"></a>`FString(TSoftClassPtr<AActor>(A->GetClass()))` | A class's path. `FString(A->GetClass())` would give its name. | Yes |
+| <a id="soft-references.kind-other"></a>`Kind == Other` | Compares the two paths (Equal (Soft Class Reference)), whatever class each one is of. Nothing is loaded. | Yes |
+| <a id="soft-references.tsoftobjectptr-uobject-any-icon"></a>`TSoftObjectPtr<UObject> Any = Icon;` | A soft reference to a subclass passes where one to its parent is wanted, with no conversion node. | Yes |
+| <a id="soft-references.ukismetsystemlibrary-loadasset"></a>`UKismetSystemLibrary::LoadAsset_Blocking(Icon)` | Loads the asset now and returns it. `LoadClassAsset_Blocking(Kind)` does the same for a class. | Yes |
+| <a id="soft-references.ukismetsystemlibrary-loadasset-2"></a>`UKismetSystemLibrary::LoadAsset(Icon)` | The latent Async Load Asset node: the function waits, and the call's value is the object. `LoadAssetClass` loads a class. See [Latent calls](#latent-calls). | Yes |
+| <a id="soft-references.ukismetsystemlibrary"></a>`UKismetSystemLibrary::IsValidSoftObjectReference(Icon)` | Whether a path is set. It loads nothing. | Yes |
 
 ```cpp
 TSoftClassPtr<AActor> Kind = "/Game/A/BP_A.BP_A_C";
@@ -689,17 +694,17 @@ float value needs its `f`. `X * 0.5` is a double operation in C++, and Blueprint
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 Mask = 0xFF;` | An int32 constant. | Yes |
-| `int64 Big = 1234567890123;` | An int64 constant when the value does not fit in int32. A literal is never truncated. | Yes |
-| `(int64)18446744073709551615ULL` | A uint64 literal past int64's range keeps its bits, as the C++ cast does: this is -1. | Yes |
-| `float Reach = 300.f;` | A Float constant. A literal beyond float's range, `(float)1e39`, is infinity. | Yes |
-| `X * 0.5`, `X > 0.5` | Refused (`no Kismet conversion from float to double`): C++ makes this double math. Write `0.5f`. | Refused |
-| `float Y = 0.5;`, `return 0.25;`, `FVector(1.0, 2.0, X)` | A double literal on its own converts to float where a float is wanted. So does a default, `float Delay = 0.75;`. | Yes |
-| `'A'`, `('a' - 'A')` | The int constant of its code unit. A plain `char` is signed, so `'\xff'` is -1. | Yes |
-| `nullptr` | None for an object or class. For a `TScriptInterface` it is the null interface. Where an int64 address is wanted it is 0. | Yes |
-| `int32 N{7};`, `EMood M{EMood::Angry};` | Braces around one value of a type that is not a struct are that value. | Yes |
-| `EMood M{};`, `int32 N = int32();`, `AActor* A{};`, `Mood = {};`, `return {};` | C++'s value-initialisation: the type's zero, the zero enumerator or None. In a function and as a default, where a zero writes nothing. In `UE_DEFAULTS` the zero is written, as `= 0` is (see [Class defaults](#class-defaults)). | Yes |
-| `"text"`, `L"wide"` | A String, Name or Text constant: [Strings and text](#strings-and-text). | Yes |
+| <a id="number-literals.int32-mask-0xff"></a>`int32 Mask = 0xFF;` | An int32 constant. | Yes |
+| <a id="number-literals.int64-big-1234567890123"></a>`int64 Big = 1234567890123;` | An int64 constant when the value does not fit in int32. A literal is never truncated. | Yes |
+| <a id="number-literals.int64-18446744073709551615ull"></a>`(int64)18446744073709551615ULL` | A uint64 literal past int64's range keeps its bits, as the C++ cast does: this is -1. | Yes |
+| <a id="number-literals.float-reach-300-f"></a>`float Reach = 300.f;` | A Float constant. A literal beyond float's range, `(float)1e39`, is infinity. | Yes |
+| <a id="number-literals.x-0-5"></a>`X * 0.5`, `X > 0.5` | Refused (`no Kismet conversion from float to double`): C++ makes this double math. Write `0.5f`. | Refused |
+| <a id="number-literals.float-y-0-5"></a>`float Y = 0.5;`, `return 0.25;`, `FVector(1.0, 2.0, X)` | A double literal on its own converts to float where a float is wanted. So does a default, `float Delay = 0.75;`. | Yes |
+| <a id="number-literals.a"></a>`'A'`, `('a' - 'A')` | The int constant of its code unit. A plain `char` is signed, so `'\xff'` is -1. | Yes |
+| <a id="number-literals.nullptr"></a>`nullptr` | None for an object or class. For a `TScriptInterface` it is the null interface. Where an int64 address is wanted it is 0. | Yes |
+| <a id="number-literals.int32-n-7"></a>`int32 N{7};`, `EMood M{EMood::Angry};` | Braces around one value of a type that is not a struct are that value. | Yes |
+| <a id="number-literals.emood-m"></a>`EMood M{};`, `int32 N = int32();`, `AActor* A{};`, `Mood = {};`, `return {};` | C++'s value-initialisation: the type's zero, the zero enumerator or None. In a function and as a default, where a zero writes nothing. In `UE_DEFAULTS` the zero is written, as `= 0` is (see [Class defaults](#class-defaults)). | Yes |
+| <a id="number-literals.text"></a>`"text"`, `L"wide"` | A String, Name or Text constant: [Strings and text](#strings-and-text). | Yes |
 
 ```cpp
 float Delay = 0.75;                        // a lone double literal is fine
@@ -714,18 +719,18 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Ratio = Count;` | int32 to float (Conv_IntToFloat). Every widening is the matching Kismet conversion node: int32 to int64, uint8 to int32, bool to int32, uint8 to float. A literal converts with no node. | Yes |
-| `Big = Count;` | int32 to int64. A uint8 or bool reaches int64 through int32. | Yes |
-| `int32 N = X;`, `(int32)X`, `(int64)X` | float to integer, truncated toward zero as in C++ (the Truncate node): -2.75 becomes -2. | Yes |
-| `(uint8)X` with `float X` | Refused (`no Kismet conversion from float to uint8`). Write `(uint8)(int32)X`, which then wraps the int as C++ does. | Refused |
-| `(uint8)V`, `(int32)Big` | A narrowing cast wraps: 511 becomes 255, and 2^32+5 becomes 5. It happens even in the middle of a chain of casts, and an implicit int64 to int32 assignment wraps the same way. | Yes |
-| `(float)Big` with `int64 Big` | Warns: UE 4.27 has no int64 to float node, so the value goes through int32. A value outside int32's range wraps (2^32+5 becomes 5.0). | Warns |
-| `Charges += 200;` with `uint8 Charges` | The byte is promoted to int32 for the math, and the store back wraps modulo 256, as in C++. | Yes |
-| `Sum / N` with two int32 | Integer division, as in C++. Each operation takes the type C++ promotes to: float if either side is float, otherwise int64 if either side is int64, otherwise int32. | Yes |
-| `A / B` with `int32 A`, `float B` | `A` converts to float, then a float divide. | Yes |
-| `(bool)F`, `bool B = Count;` | True when nonzero, as in C++. An int32 goes through ToBool (integer) (Conv_IntToBool); a float, int64, byte or enum is compared with zero, so a NaN is true. Conditions of every type: [Statements and control flow](#statements-and-control-flow). | Yes |
-| `+`, `%`, `<<`, `~` and the other operators | The Kismet math nodes: [Operators](#operators). A shift amount must be a constant, and `%` on int64 is refused. | Yes |
-| `Take(Hit.Location)` with `Take(const FTransform&)`, `FVector V = Hit.ImpactPoint;` | A struct derived from another (FVector_NetQuantize from FVector) takes its base's conversion node, here Conv_VectorToTransform, and passes where its base is wanted as is. | Yes |
+| <a id="number-conversions.ratio-count"></a>`Ratio = Count;` | int32 to float (Conv_IntToFloat). Every widening is the matching Kismet conversion node: int32 to int64, uint8 to int32, bool to int32, uint8 to float. A literal converts with no node. | Yes |
+| <a id="number-conversions.big-count"></a>`Big = Count;` | int32 to int64. A uint8 or bool reaches int64 through int32. | Yes |
+| <a id="number-conversions.int32-n-x"></a>`int32 N = X;`, `(int32)X`, `(int64)X` | float to integer, truncated toward zero as in C++ (the Truncate node): -2.75 becomes -2. | Yes |
+| <a id="number-conversions.uint8-x"></a>`(uint8)X` with `float X` | Refused (`no Kismet conversion from float to uint8`). Write `(uint8)(int32)X`, which then wraps the int as C++ does. | Refused |
+| <a id="number-conversions.uint8-v"></a>`(uint8)V`, `(int32)Big` | A narrowing cast wraps: 511 becomes 255, and 2^32+5 becomes 5. It happens even in the middle of a chain of casts, and an implicit int64 to int32 assignment wraps the same way. | Yes |
+| <a id="number-conversions.float-big"></a>`(float)Big` with `int64 Big` | Warns: UE 4.27 has no int64 to float node, so the value goes through int32. A value outside int32's range wraps (2^32+5 becomes 5.0). | Warns |
+| <a id="number-conversions.charges-200"></a>`Charges += 200;` with `uint8 Charges` | The byte is promoted to int32 for the math, and the store back wraps modulo 256, as in C++. | Yes |
+| <a id="number-conversions.sum-n"></a>`Sum / N` with two int32 | Integer division, as in C++. Each operation takes the type C++ promotes to: float if either side is float, otherwise int64 if either side is int64, otherwise int32. | Yes |
+| <a id="number-conversions.a-b"></a>`A / B` with `int32 A`, `float B` | `A` converts to float, then a float divide. | Yes |
+| <a id="number-conversions.bool-f"></a>`(bool)F`, `bool B = Count;` | True when nonzero, as in C++. An int32 goes through ToBool (integer) (Conv_IntToBool); a float, int64, byte or enum is compared with zero, so a NaN is true. Conditions of every type: [Statements and control flow](#statements-and-control-flow). | Yes |
+| <a id="number-conversions.row"></a>`+`, `%`, `<<`, `~` and the other operators | The Kismet math nodes: [Operators](#operators). A shift amount must be a constant, and `%` on int64 is refused. | Yes |
+| <a id="number-conversions.take-hit-location"></a>`Take(Hit.Location)` with `Take(const FTransform&)`, `FVector V = Hit.ImpactPoint;` | A struct derived from another (FVector_NetQuantize from FVector) takes its base's conversion node, here Conv_VectorToTransform, and passes where its base is wanted as is. | Yes |
 
 ```cpp
 int32 Count;
@@ -757,11 +762,11 @@ the `UKismetStringLibrary` nodes, and text functions the `UKismetTextLibrary` no
 
 | You write | What it does | Status |
 |---|---|---|
-| `Label = "Ready";` | A literal where an FString, FName or FText is wanted is a constant of that type, like a value typed on a pin. No conversion node runs. | Yes |
-| `FName Named = "plain name";`, `FText Literal = "plain text";` | The same as a default. | Yes |
-| `FString()`, `FName()`, `FText()` | The empty string, None and the empty text. | Yes |
-| `FName Umlaut = "Größe";` | Non-ASCII text is written as UTF-16 and reads back exactly as written, in code and in defaults. It is the same FName you get by converting the string at run time. | Yes |
-| `FString Wide = L"wide";` | An `L`, `u` or `U` literal is a Unicode string constant. | Yes |
+| <a id="string-literals.label-ready"></a>`Label = "Ready";` | A literal where an FString, FName or FText is wanted is a constant of that type, like a value typed on a pin. No conversion node runs. | Yes |
+| <a id="string-literals.fname-named-plain-name"></a>`FName Named = "plain name";`, `FText Literal = "plain text";` | The same as a default. | Yes |
+| <a id="string-literals.fstring"></a>`FString()`, `FName()`, `FText()` | The empty string, None and the empty text. | Yes |
+| <a id="string-literals.fname-umlaut-gr-e"></a>`FName Umlaut = "Größe";` | Non-ASCII text is written as UTF-16 and reads back exactly as written, in code and in defaults. It is the same FName you get by converting the string at run time. | Yes |
+| <a id="string-literals.fstring-wide-l-wide"></a>`FString Wide = L"wide";` | An `L`, `u` or `U` literal is a Unicode string constant. | Yes |
 
 Notes:
 - A text literal, in code or as a default, is culture-invariant. It is not gathered for localization.
@@ -770,13 +775,13 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `FString("Kills: ") + Count + ", ratio " + Ratio` | Every `+` that involves a string converts each operand to a string (the ToString nodes) and joins them with Append. Strings, names, texts, numbers, bools, objects and structs with a ToString node can all be mixed. | Yes |
-| `Key = Label + "_key";` | The joined string converts to the destination: String to Name here. | Yes |
-| `Caption = Label + Key + Caption;` | String to Text. The text is culture-invariant, since it comes from a string. | Yes |
-| `"Kills: " + Count`, `Count + " left"` | In C++ this is pointer arithmetic; AssetGen reads it as the concatenation you meant. | Yes |
-| `"a" + N + "b"`, `"a" + Ratio` | Refused by clang (pointer + pointer, pointer + float). Only one literal and an integer can start a chain. Start it with `FString("a")`. | Refused |
-| `FString(" (") + this + ")"` | An object converts to its name (ToString (Object)). A class converts to its name too, not its path. | Yes |
-| `FString("Home: ") + Home` | A struct with a Kismet ToString node (FVector, FRotator, FTransform, FLinearColor, FVector2D, FIntPoint...) converts to that node's text. | Yes |
+| <a id="joining-strings.fstring-kills-count-ratio-ratio"></a>`FString("Kills: ") + Count + ", ratio " + Ratio` | Every `+` that involves a string converts each operand to a string (the ToString nodes) and joins them with Append. Strings, names, texts, numbers, bools, objects and structs with a ToString node can all be mixed. | Yes |
+| <a id="joining-strings.key-label-key"></a>`Key = Label + "_key";` | The joined string converts to the destination: String to Name here. | Yes |
+| <a id="joining-strings.caption-label-key-caption"></a>`Caption = Label + Key + Caption;` | String to Text. The text is culture-invariant, since it comes from a string. | Yes |
+| <a id="joining-strings.kills-count"></a>`"Kills: " + Count`, `Count + " left"` | In C++ this is pointer arithmetic; AssetGen reads it as the concatenation you meant. | Yes |
+| <a id="joining-strings.a-n-b"></a>`"a" + N + "b"`, `"a" + Ratio` | Refused by clang (pointer + pointer, pointer + float). Only one literal and an integer can start a chain. Start it with `FString("a")`. | Refused |
+| <a id="joining-strings.fstring-this"></a>`FString(" (") + this + ")"` | An object converts to its name (ToString (Object)). A class converts to its name too, not its path. | Yes |
+| <a id="joining-strings.fstring-home-home"></a>`FString("Home: ") + Home` | A struct with a Kismet ToString node (FVector, FRotator, FTransform, FLinearColor, FVector2D, FIntPoint...) converts to that node's text. | Yes |
 
 ```cpp
 FString Label;
@@ -800,32 +805,32 @@ FName MakeKey(FText Prefix, int32 Index) { return Prefix + "_" + Index; }
 
 | You write | What it does | Status |
 |---|---|---|
-| `Key = Label;` | FString to FName (String to Name). | Yes |
-| `Caption = Key;` | FName to FText (Name to Text). | Yes |
-| `FString S = Caption;` | FText to FString (Text to String). FText to FName goes through FString. | Yes |
-| `FString A = Count;`, `FString C = bDone;` | A number or bool converts through its ToString node: 3 becomes "3", false becomes "false". | Yes |
-| `Caption = Big;` with `int64 Big` | UE 4.27 has no int64 to string node, so an int64 goes Int64 to Text, then Text to String when a string is wanted. Integer text has no digit grouping. | Yes |
-| `FName N = Big;` with `int64 Big` | Refused. clang calls the conversion ambiguous, and `FName(FString(Big))` is refused with "no Kismet conversion from int64 to FName". Convert through a local: `FString S = Big; Key = S;`. | Refused |
-| `Count = int(Label);`, `float F = float(Label);` | String to Int, String to Float. Text that is not a number gives 0. The cast must be explicit. FName and FText parse by way of FString. | Yes |
-| `FString Path = Soft;` | A soft reference's path: [Types](#types). | Yes |
+| <a id="converting-strings.key-label"></a>`Key = Label;` | FString to FName (String to Name). | Yes |
+| <a id="converting-strings.caption-key"></a>`Caption = Key;` | FName to FText (Name to Text). | Yes |
+| <a id="converting-strings.fstring-s-caption"></a>`FString S = Caption;` | FText to FString (Text to String). FText to FName goes through FString. | Yes |
+| <a id="converting-strings.fstring-a-count"></a>`FString A = Count;`, `FString C = bDone;` | A number or bool converts through its ToString node: 3 becomes "3", false becomes "false". | Yes |
+| <a id="converting-strings.caption-big"></a>`Caption = Big;` with `int64 Big` | UE 4.27 has no int64 to string node, so an int64 goes Int64 to Text, then Text to String when a string is wanted. Integer text has no digit grouping. | Yes |
+| <a id="converting-strings.fname-n-big"></a>`FName N = Big;` with `int64 Big` | Refused. clang calls the conversion ambiguous, and `FName(FString(Big))` is refused with "no Kismet conversion from int64 to FName". Convert through a local: `FString S = Big; Key = S;`. | Refused |
+| <a id="converting-strings.count-int-label"></a>`Count = int(Label);`, `float F = float(Label);` | String to Int, String to Float. Text that is not a number gives 0. The cast must be explicit. FName and FText parse by way of FString. | Yes |
+| <a id="converting-strings.fstring-path-soft"></a>`FString Path = Soft;` | A soft reference's path: [Types](#types). | Yes |
 
 ### Comparing and testing strings
 
 | You write | What it does | Status |
 |---|---|---|
-| `S == "gold"` | FString `==` ignores case (Equal, Case Insensitive), as UE's own FString `==` does. | Yes |
-| `UKismetStringLibrary::EqualEqual_StrStr(A, B)` | The case-sensitive compare. | Yes |
-| `A != B` with two FNames | Names compare ignoring case. | Yes |
-| `A == B` with two FTexts | The Equal, Case Insensitive (text) node: texts compare ignoring case too. | Yes |
-| `A < B` with two FStrings | Refused by clang (`invalid operands to binary expression`): no Kismet node orders strings. | Refused |
-| `if (N)`, `!N` with `FName N` | Tests `N != None`. Conditions of every type: [Statements and control flow](#statements-and-control-flow). | Yes |
+| <a id="comparing-and-testing.s-gold"></a>`S == "gold"` | FString `==` ignores case (Equal, Case Insensitive), as UE's own FString `==` does. | Yes |
+| <a id="comparing-and-testing.ukismetstringlibrary-equalequal"></a>`UKismetStringLibrary::EqualEqual_StrStr(A, B)` | The case-sensitive compare. | Yes |
+| <a id="comparing-and-testing.a-b"></a>`A != B` with two FNames | Names compare ignoring case. | Yes |
+| <a id="comparing-and-testing.a-b-2"></a>`A == B` with two FTexts | The Equal, Case Insensitive (text) node: texts compare ignoring case too. | Yes |
+| <a id="comparing-and-testing.a-b-3"></a>`A < B` with two FStrings | Refused by clang (`invalid operands to binary expression`): no Kismet node orders strings. | Refused |
+| <a id="comparing-and-testing.if-n"></a>`if (N)`, `!N` with `FName N` | Tests `N != None`. Conditions of every type: [Statements and control flow](#statements-and-control-flow). | Yes |
 
 ### String functions
 
 | You write | What it does | Status |
 |---|---|---|
-| `UKismetStringLibrary::Len(S)` | The Len node. Every string operation is a `UKismetStringLibrary` static: `Mid`, `Replace`, `ToUpper`, `ParseIntoArray` and the rest. | Yes |
-| `S.Len()`, `S.ToUpper()` | The same nodes as methods, with the string first: `S.Len()` is `UKismetStringLibrary::Len(S)`. See [Methods on structs, text and soft pointers](#methods-on-structs-text-and-soft-pointers). | Yes |
+| <a id="string-functions.ukismetstringlibrary-len-s"></a>`UKismetStringLibrary::Len(S)` | The Len node. Every string operation is a `UKismetStringLibrary` static: `Mid`, `Replace`, `ToUpper`, `ParseIntoArray` and the rest. | Yes |
+| <a id="string-functions.s-len"></a>`S.Len()`, `S.ToUpper()` | The same nodes as methods, with the string first: `S.Len()` is `UKismetStringLibrary::Len(S)`. See [Methods on structs, text and soft pointers](#methods-on-structs-text-and-soft-pointers). | Yes |
 
 ## Constants
 
@@ -839,14 +844,14 @@ is not run at build time.
 
 | You write | What it does | Status |
 |---|---|---|
-| `constexpr int32 kStep = 3;` at namespace scope | No storage. Each use, in a function or a default, is the value 3. | Yes |
-| `const int32 kMask = 1 << 4 \| kStep;` at namespace scope | A top-level `const` variable is a constant too. | Yes |
-| `static constexpr int32 kSlots = kStep * 4;` in a class | A class-scope constant. `static const` works the same way. | Yes |
-| `int32 Budget = kSlots * 2 + 1;` | A default from a constant expression is folded when the mod is built. Each step is rounded to its C++ type: `1 / 2.f` is 0.5 and `1 << 31` wraps. | Yes |
-| `bool Ready = kStep > 2 && kStep < 10;` | Comparisons, `&&`, `\|\|` and `?:` fold too, as do casts, enum constants and unary `-`, `~` and `!`. | Yes |
-| `int32 Counter = 5;` at namespace scope | Not a constant: a variable every class of the mod shares. See [Global variables](#global-variables). | Yes |
-| `TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};` | Refused (`a default is a value known when the mod is built`): a default cannot call a function. Compute it in `ReceiveBeginPlay`. See [Classes and variables](#classes-and-variables). | Refused |
-| `sizeof(FVector)`, `alignof(FTransform)` in code | The game's layout: [Pointers and memory](#pointers-and-memory). Refused in a default. | Yes |
+| <a id="constants-and-constant.constexpr-int32-kstep-3"></a>`constexpr int32 kStep = 3;` at namespace scope | No storage. Each use, in a function or a default, is the value 3. | Yes |
+| <a id="constants-and-constant.const-int32-kmask-1-4"></a>`const int32 kMask = 1 << 4 \| kStep;` at namespace scope | A top-level `const` variable is a constant too. | Yes |
+| <a id="constants-and-constant.static-constexpr-int32-kslots"></a>`static constexpr int32 kSlots = kStep * 4;` in a class | A class-scope constant. `static const` works the same way. | Yes |
+| <a id="constants-and-constant.int32-budget-kslots-2-1"></a>`int32 Budget = kSlots * 2 + 1;` | A default from a constant expression is folded when the mod is built. Each step is rounded to its C++ type: `1 / 2.f` is 0.5 and `1 << 31` wraps. | Yes |
+| <a id="constants-and-constant.bool-ready-kstep-2-kstep"></a>`bool Ready = kStep > 2 && kStep < 10;` | Comparisons, `&&`, `\|\|` and `?:` fold too, as do casts, enum constants and unary `-`, `~` and `!`. | Yes |
+| <a id="constants-and-constant.int32-counter-5"></a>`int32 Counter = 5;` at namespace scope | Not a constant: a variable every class of the mod shares. See [Global variables](#global-variables). | Yes |
+| <a id="constants-and-constant.tarray-int32-rolls"></a>`TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};` | Refused (`a default is a value known when the mod is built`): a default cannot call a function. Compute it in `ReceiveBeginPlay`. See [Classes and variables](#classes-and-variables). | Refused |
+| <a id="constants-and-constant.sizeof-fvector"></a>`sizeof(FVector)`, `alignof(FTransform)` in code | The game's layout: [Pointers and memory](#pointers-and-memory). Refused in a default. | Yes |
 
 Notes:
 - How constant subexpressions fold inside a function body: [The optimizer](#the-optimizer).
@@ -855,12 +860,12 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `static constexpr int32 kSeed = Fnv("types");` | clang runs a `consteval` function while it compiles the mod, and AssetGen uses the result. The body can be any C++: loops, `uint32` math, pointers. | Yes |
-| `int32 Seed = kSeed;` | The result as a default, through the constant. | Yes |
-| `int32 Seed = Fnv("types");` | Refused (`a default is a value known when the mod is built`): a call in a default counts only through a constant, `constexpr int32 kSeed = Fnv("types");`. | Refused |
-| `return N + Fnv("angry");` | The result as a constant in code. | Yes |
-| `Fnv(Name)` with a run-time argument | Refused by clang (`call to consteval function ... is not a constant expression`). The arguments must be constants. | Refused |
-| `int32 V = Twice(3);` with a `constexpr` (not `consteval`) `Twice` | Refused with the default rule's message, which points at `consteval`. A plain `constexpr` call is not evaluated at build time, in a default or in code: [Inline functions and templates](#inline-functions-and-templates). | Refused |
+| <a id="consteval-functions.static-constexpr-int32-kseed-fnv"></a>`static constexpr int32 kSeed = Fnv("types");` | clang runs a `consteval` function while it compiles the mod, and AssetGen uses the result. The body can be any C++: loops, `uint32` math, pointers. | Yes |
+| <a id="consteval-functions.int32-seed-kseed"></a>`int32 Seed = kSeed;` | The result as a default, through the constant. | Yes |
+| <a id="consteval-functions.int32-seed-fnv-types"></a>`int32 Seed = Fnv("types");` | Refused (`a default is a value known when the mod is built`): a call in a default counts only through a constant, `constexpr int32 kSeed = Fnv("types");`. | Refused |
+| <a id="consteval-functions.return-n-fnv-angry"></a>`return N + Fnv("angry");` | The result as a constant in code. | Yes |
+| <a id="consteval-functions.fnv-name"></a>`Fnv(Name)` with a run-time argument | Refused by clang (`call to consteval function ... is not a constant expression`). The arguments must be constants. | Refused |
+| <a id="consteval-functions.int32-v-twice-3"></a>`int32 V = Twice(3);` with a `constexpr` (not `consteval`) `Twice` | Refused with the default rule's message, which points at `consteval`. A plain `constexpr` call is not evaluated at build time, in a default or in code: [Inline functions and templates](#inline-functions-and-templates). | Refused |
 
 ```cpp
 constexpr int32 kStep = 3;
@@ -889,16 +894,16 @@ public:
 
 | You write | What it does | Status |
 |---|---|---|
-| `static inline const float kHold = 0.75f;` | A value that is not a Blueprint variable. It cooks nothing: no variable and no default. Each use is its initializer, evaluated where it is used, here the literal 0.75. | Yes |
-| `static inline const FName kTag = "types";` | Each use is the Name constant. | Yes |
-| `static inline const TArray<int32> kPrimes = {2, 3, 5, 7, 11};` | Each use is a Make Array. `kPrimes[I]` and `kPrimes.Num()` each make the array. | Yes |
-| `static inline const TMap<int32, float> kRates = {{1, 0.5f}, {3, 1.5f}};` | Each use is a Make Map; a TSet is a Make Set. | Yes |
-| `kPrimes.Contains(N)` | Makes no array: `N` is evaluated once and compared with each element in turn. This holds for an inline TArray or TSet of constants whose `==` is exact: numbers, bools, enums, names, strings, objects, classes and soft references. | Yes |
-| `for (int32 P : kPrimes)` | Makes no array when an inline TArray holds at most 16 constants and the loop variable has the element type: each pass picks its element by the loop index. Anything else (17 or more elements, a TSet or TMap, elements that are not all constants, a loop variable of another type) makes the container once, before the loop. | Yes |
-| `kHold`, `this->kHold` | Both name the constant. | Yes |
-| `Me()->kHold` | Refused (`kHold is static: name it without the object in front`): the object would never be evaluated. | Refused |
-| `static inline float Loose = 0.25f;` | Refused wherever it is used (`a Blueprint class has no static storage`). Make it `static inline const` or `static constexpr`, or a plain member if it has to keep a value. | Refused |
-| `kHold = 1.0f;` | Refused by clang: the member is `const`. | Refused |
+| <a id="inline-class-variables.static-inline-const-float-khold"></a>`static inline const float kHold = 0.75f;` | A value that is not a Blueprint variable. It cooks nothing: no variable and no default. Each use is its initializer, evaluated where it is used, here the literal 0.75. | Yes |
+| <a id="inline-class-variables.static-inline-const-fname-ktag"></a>`static inline const FName kTag = "types";` | Each use is the Name constant. | Yes |
+| <a id="inline-class-variables.static-inline-const-tarray-int32"></a>`static inline const TArray<int32> kPrimes = {2, 3, 5, 7, 11};` | Each use is a Make Array. `kPrimes[I]` and `kPrimes.Num()` each make the array. | Yes |
+| <a id="inline-class-variables.static-inline-const-tmap-int32"></a>`static inline const TMap<int32, float> kRates = {{1, 0.5f}, {3, 1.5f}};` | Each use is a Make Map; a TSet is a Make Set. | Yes |
+| <a id="inline-class-variables.kprimes-contains-n"></a>`kPrimes.Contains(N)` | Makes no array: `N` is evaluated once and compared with each element in turn. This holds for an inline TArray or TSet of constants whose `==` is exact: numbers, bools, enums, names, strings, objects, classes and soft references. | Yes |
+| <a id="inline-class-variables.for-int32-p-kprimes"></a>`for (int32 P : kPrimes)` | Makes no array when an inline TArray holds at most 16 constants and the loop variable has the element type: each pass picks its element by the loop index. Anything else (17 or more elements, a TSet or TMap, elements that are not all constants, a loop variable of another type) makes the container once, before the loop. | Yes |
+| <a id="inline-class-variables.khold"></a>`kHold`, `this->kHold` | Both name the constant. | Yes |
+| <a id="inline-class-variables.me-khold"></a>`Me()->kHold` | Refused (`kHold is static: name it without the object in front`): the object would never be evaluated. | Refused |
+| <a id="inline-class-variables.static-inline-float-loose-0"></a>`static inline float Loose = 0.25f;` | Refused wherever it is used (`a Blueprint class has no static storage`). Make it `static inline const` or `static constexpr`, or a plain member if it has to keep a value. | Refused |
+| <a id="inline-class-variables.khold-1-0f"></a>`kHold = 1.0f;` | Refused by clang: the member is `const`. | Refused |
 
 ```cpp
 static inline const float kHold = 0.75f;
@@ -934,30 +939,30 @@ constants, not a Blueprint type.
 
 | You write | What it does | Status |
 |---|---|---|
-| `EEndPlayReason LastReason;` | A variable of the game's enum: a Byte bound to its UEnum, as the editor makes a variable of an enum that is no `enum class` (here a namespaced one, which the game's C++ holds as `TEnumAsByte`). Its enumerators are byte constants. | Yes |
-| `EAttachmentRule Rule = EAttachmentRule::KeepWorld;` | A variable of a game `enum class`: an EnumProperty over a ByteProperty named UnderlyingType, as the editor makes it and as the game's own members and parameters of it are. The same goes for a parameter, a return value, a local, a container's element or key, a UE_STRUCT member, a delegate's parameter and a `UE_DEFAULTS` tag on a native member: an override or a delegate of a native signature then has the native's types. The value is the same byte, its enumerators byte constants, and a default is written as the enumerator's name in an EnumProperty tag. | Yes |
-| A game enum that no property uses | UeApi's `Types.json` gives each enum's form, which genueapi reads off how the Dumper-7 dump's properties of the enum (a native delegate's parameters among them), and the game's Blueprints' variables, locals and containers' elements, are reflected (`form`: `EnumClass` or `TEnumAsByte`). 240 of the SDK's 1445 enums have no such property, and a variable of one is a Byte bound to the enum. One the game uses, ESteamVRInputStringBits, is only the element of a native function's `TArray` parameter, whose inner property neither the dump nor Dumper-7's usmap tells apart and no game package holds. Their form is not read yet rather than unknown: the editor takes it from the enum itself (`UEnum::GetCppForm`), which the dump does not carry yet. | Yes |
-| `LastReason == EEndPlayReason::Quit`, `<` | Comparisons work. | Yes |
-| `switch (Reason)` | A switch works on any enum. | Yes |
-| `EEndPlayReason Last = EEndPlayReason::Quit;` as a default | The default is written as the enumerator's name. | Yes |
-| `ECreatureSize Size;` | Refused (`a uint8, int32 or int64 enum only`). 36 of the SDK's 1445 enums (35 uint32, 1 uint16) have an underlying type other than uint8, int32 or int64, and none of them can be a variable. | Refused |
+| <a id="game-enums.eendplayreason-lastreason"></a>`EEndPlayReason LastReason;` | A variable of the game's enum: a Byte bound to its UEnum, as the editor makes a variable of an enum that is no `enum class` (here a namespaced one, which the game's C++ holds as `TEnumAsByte`). Its enumerators are byte constants. | Yes |
+| <a id="game-enums.eattachmentrule-rule"></a>`EAttachmentRule Rule = EAttachmentRule::KeepWorld;` | A variable of a game `enum class`: an EnumProperty over a ByteProperty named UnderlyingType, as the editor makes it and as the game's own members and parameters of it are. The same goes for a parameter, a return value, a local, a container's element or key, a UE_STRUCT member, a delegate's parameter and a `UE_DEFAULTS` tag on a native member: an override or a delegate of a native signature then has the native's types. The value is the same byte, its enumerators byte constants, and a default is written as the enumerator's name in an EnumProperty tag. | Yes |
+| <a id="game-enums.a-game-enum-that-no"></a>A game enum that no property uses | UeApi's `Types.json` gives each enum's form, which genueapi reads off how the Dumper-7 dump's properties of the enum (a native delegate's parameters among them), and the game's Blueprints' variables, locals and containers' elements, are reflected (`form`: `EnumClass` or `TEnumAsByte`). 240 of the SDK's 1445 enums have no such property, and a variable of one is a Byte bound to the enum. One the game uses, ESteamVRInputStringBits, is only the element of a native function's `TArray` parameter, whose inner property neither the dump nor Dumper-7's usmap tells apart and no game package holds. Their form is not read yet rather than unknown: the editor takes it from the enum itself (`UEnum::GetCppForm`), which the dump does not carry yet. | Yes |
+| <a id="game-enums.lastreason-eendplayreason-quit"></a>`LastReason == EEndPlayReason::Quit`, `<` | Comparisons work. | Yes |
+| <a id="game-enums.switch-reason"></a>`switch (Reason)` | A switch works on any enum. | Yes |
+| <a id="game-enums.eendplayreason-last"></a>`EEndPlayReason Last = EEndPlayReason::Quit;` as a default | The default is written as the enumerator's name. | Yes |
+| <a id="game-enums.ecreaturesize-size"></a>`ECreatureSize Size;` | Refused (`a uint8, int32 or int64 enum only`). 36 of the SDK's 1445 enums (35 uint32, 1 uint16) have an underlying type other than uint8, int32 or int64, and none of them can be a variable. | Refused |
 
 ### Mod enums: UE_ENUM
 
 | You write | What it does | Status |
 |---|---|---|
-| `enum class EMood : uint8 { Calm, Angry = 5, Sleepy };` `UE_ENUM(EMood);` | Cooks EMood as a UserDefinedEnum asset in the mod's package, with the C++ names and values and a closing `EMood_MAX` one past the largest value. From then on it is an ordinary Blueprint enum for variables, parameters, constants and switch. | Yes |
-| `EMood Mood = EMood::Angry;` | A default is written as the enumerator's name. | Yes |
-| `enum class ESpan : int32 { Tiny = -3, Wide = 70000 };` `UE_ENUM(ESpan);` | An int32 or int64 enum is cooked the same way with its wide values. A variable of it holds the full width, as UHT reflects a native `enum class : int32`. | Yes |
-| `enum class EBad : int16 { A, B };` `UE_ENUM(EBad);` | Refused (`declare it : uint8 (a Blueprint enum), : int32 or : int64`), even if no variable uses it. An enum with no fixed type is refused too. | Refused |
-| `enum class EO : uint8 { A = 255 };` `UE_ENUM(EO);` | Refused (`A is out of range`): `_MAX` needs the next value, so a uint8 enum's largest value is 254. | Refused |
-| `enum class EGear : uint8 { Low, High, EGear_MAX };` | The UE C++ idiom: a declared `EGear_MAX` one past the largest value is the closing `_MAX` itself, not a second entry. Any other value for it is refused. | Yes |
-| `UE_ENUM(EMissing);` | Refused (`names no enum with enumerators`). | Refused |
-| `UE_ENUM(EDialogRestriction);` for a mod enum named like a game or engine enum, in any namespace | Refused (`/Script/FSD already has an enum EDialogRestriction`). The engine keeps every enumerator's name, `EDialogRestriction::None`, in one global table where the first enum loaded wins, so lookups by name would answer with the game's. Rename it. Two mods' enums of one name clash the same way, which the compiler cannot see; give each mod's enums names of their own. | Refused |
-| `UE_ENUM_IN(ESystems, "/Game/_MyMods/Shared");` | For an enum in a header several mods include. Only the source whose `UE_MOD_PACKAGE` is exactly that path cooks it; every other mod imports it from there. `UE_STRUCT_IN` does the same for structs: [Structs](#structs). | Yes |
-| `ELocal L;` with no `UE_ENUM` on `ELocal` | Refused (`unimplemented property L: ELocal`). The enum's constants still fold to numbers, `(int32)ELocal::B`, but it is not a Blueprint type. Add `UE_ENUM`. | Refused |
-| `enum { kCap = 1000, kFar = 5000000000 };` | Constants of an enum with no fixed type are int-sized, or int64 when a value needs it, as C++ makes them. They fold to their values. | Yes |
-| `EMood Mood;` of a `uint8` UE_ENUM | A Byte bound to the enum, which is what the editor makes of a UserDefinedEnum: its form is namespaced, never `enum class`, whatever the C++ says. | Yes |
+| <a id="mod-enums-ue.enum-class-emood-uint8-calm"></a>`enum class EMood : uint8 { Calm, Angry = 5, Sleepy };` `UE_ENUM(EMood);` | Cooks EMood as a UserDefinedEnum asset in the mod's package, with the C++ names and values and a closing `EMood_MAX` one past the largest value. From then on it is an ordinary Blueprint enum for variables, parameters, constants and switch. | Yes |
+| <a id="mod-enums-ue.emood-mood-emood-angry"></a>`EMood Mood = EMood::Angry;` | A default is written as the enumerator's name. | Yes |
+| <a id="mod-enums-ue.enum-class-espan-int32-tiny"></a>`enum class ESpan : int32 { Tiny = -3, Wide = 70000 };` `UE_ENUM(ESpan);` | An int32 or int64 enum is cooked the same way with its wide values. A variable of it holds the full width, as UHT reflects a native `enum class : int32`. | Yes |
+| <a id="mod-enums-ue.enum-class-ebad-int16-a"></a>`enum class EBad : int16 { A, B };` `UE_ENUM(EBad);` | Refused (`declare it : uint8 (a Blueprint enum), : int32 or : int64`), even if no variable uses it. An enum with no fixed type is refused too. | Refused |
+| <a id="mod-enums-ue.enum-class-eo-uint8-a"></a>`enum class EO : uint8 { A = 255 };` `UE_ENUM(EO);` | Refused (`A is out of range`): `_MAX` needs the next value, so a uint8 enum's largest value is 254. | Refused |
+| <a id="mod-enums-ue.enum-class-egear-uint8-low"></a>`enum class EGear : uint8 { Low, High, EGear_MAX };` | The UE C++ idiom: a declared `EGear_MAX` one past the largest value is the closing `_MAX` itself, not a second entry. Any other value for it is refused. | Yes |
+| <a id="mod-enums-ue.ue-enum-emissing"></a>`UE_ENUM(EMissing);` | Refused (`names no enum with enumerators`). | Refused |
+| <a id="mod-enums-ue.ue-enum-edialogrestriction"></a>`UE_ENUM(EDialogRestriction);` for a mod enum named like a game or engine enum, in any namespace | Refused (`/Script/FSD already has an enum EDialogRestriction`). The engine keeps every enumerator's name, `EDialogRestriction::None`, in one global table where the first enum loaded wins, so lookups by name would answer with the game's. Rename it. Two mods' enums of one name clash the same way, which the compiler cannot see; give each mod's enums names of their own. | Refused |
+| <a id="mod-enums-ue.ue-enum-in-esystems-game"></a>`UE_ENUM_IN(ESystems, "/Game/_MyMods/Shared");` | For an enum in a header several mods include. Only the source whose `UE_MOD_PACKAGE` is exactly that path cooks it; every other mod imports it from there. `UE_STRUCT_IN` does the same for structs: [Structs](#structs). | Yes |
+| <a id="mod-enums-ue.elocal-l"></a>`ELocal L;` with no `UE_ENUM` on `ELocal` | Refused (`unimplemented property L: ELocal`). The enum's constants still fold to numbers, `(int32)ELocal::B`, but it is not a Blueprint type. Add `UE_ENUM`. | Refused |
+| <a id="mod-enums-ue.enum-kcap-1000-kfar-5000000000"></a>`enum { kCap = 1000, kFar = 5000000000 };` | Constants of an enum with no fixed type are int-sized, or int64 when a value needs it, as C++ makes them. They fold to their values. | Yes |
+| <a id="mod-enums-ue.emood-mood"></a>`EMood Mood;` of a `uint8` UE_ENUM | A Byte bound to the enum, which is what the editor makes of a UserDefinedEnum: its form is namespaced, never `enum class`, whatever the C++ says. | Yes |
 
 ```cpp
 enum class EMood : uint8 { Calm, Angry = 5, Sleepy };
@@ -994,24 +999,24 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `(int32)M` | Byte to Int. | Yes |
-| `(EMood)X` | Int to Byte. It wraps modulo 256 and does not check that the value is an enumerator, as the C++ cast does not. | Yes |
-| `(bool)M` | True when the value is nonzero. (`if (M)` on an `enum class` is a clang error, as in C++.) | Yes |
-| `switch (M)` with `using enum EMood;` | Works, `using enum` included. A value that matches no case falls through past the switch, as in C++. How a switch runs: [Statements and control flow](#statements-and-control-flow). | Yes |
+| <a id="enum-conversions-and.int32-m"></a>`(int32)M` | Byte to Int. | Yes |
+| <a id="enum-conversions-and.emood-x"></a>`(EMood)X` | Int to Byte. It wraps modulo 256 and does not check that the value is an enumerator, as the C++ cast does not. | Yes |
+| <a id="enum-conversions-and.bool-m"></a>`(bool)M` | True when the value is nonzero. (`if (M)` on an `enum class` is a clang error, as in C++.) | Yes |
+| <a id="enum-conversions-and.switch-m"></a>`switch (M)` with `using enum EMood;` | Works, `using enum` included. A value that matches no case falls through past the switch, as in C++. How a switch runs: [Statements and control flow](#statements-and-control-flow). | Yes |
 
 ### UE_ENUM_MAP
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_ENUM_MAP(EMood, FName, MoodNames);` | Declares the member `TMap<EMood, FName> MoodNames` with a default the compiler fills in when the mod is built: one pair per enumerator in declaration order, with the C++ name as the text. The closing `_MAX` is left out. | Yes |
-| `UE_ENUM_MAP(FString, EMood, MoodsByName);` | The enum can be on either side, with FName or FString on the other. | Yes |
-| `UE_ENUM_MAP(EEndPlayReason, FName, Reasons);` | Any enum the source can see works, the game's included. | Yes |
-| `TMap<EMood, FName> MoodNames = UE_ENUM_MAP(EMood);` | The default alone, for a member you declare yourself: the same table. | Yes |
-| `UE_ENUM_MAP(int32, FName, M);`, `UE_ENUM_MAP(EMood, EMood, M);`, `UE_ENUM_MAP(EMood, int32, M);` | Refused by clang, naming both types: "static assertion failed due to requirement '__EnumMapPair__<int, FName>': UE_ENUM_MAP(Key, Value, Name): one of Key and Value is an enum and the other FName or FString". | Refused |
-| `UE_ENUM_MAP(TEnum<EMood>, FName, M);` | Refused the same way: write the enum itself, `UE_ENUM_MAP(EMood, FName, M);`. | Refused |
-| `TMap<int32, FName> M = UE_ENUM_MAP(EMood);` | Refused by clang, "no viable conversion from '__EnumMapInit__<EMood>' to 'TMap<int32, FName>'": the one-argument form is the default of a TMap between that enum and FName or FString. | Refused |
-| `UE_ENUM_MAP(FName, EMood);`, `UE_ENUM_MAP(FName, EMood, A, B);` | Refused by clang: "UE_ENUM_MAP takes (Enum), or (Key, Value, Name) to declare the member". Written as an initializer, `= UE_ENUM_MAP(FName, EMood)`, clang says only "expected expression". | Refused |
-| `TMap<EMood, FName> Names = UE_ENUM_MAP(EMood);` in a function body | The same table, made where it is written as the braced map `{ { EMood::Calm, "Calm" }, ... }` would be: the enum on either side, FName or FString on the other. It is made each time the line runs, so a table read often is cheaper as a member. | Yes |
+| <a id="ue-enum-map.ue-enum-map-emood-fname"></a>`UE_ENUM_MAP(EMood, FName, MoodNames);` | Declares the member `TMap<EMood, FName> MoodNames` with a default the compiler fills in when the mod is built: one pair per enumerator in declaration order, with the C++ name as the text. The closing `_MAX` is left out. | Yes |
+| <a id="ue-enum-map.ue-enum-map-fstring-emood"></a>`UE_ENUM_MAP(FString, EMood, MoodsByName);` | The enum can be on either side, with FName or FString on the other. | Yes |
+| <a id="ue-enum-map.ue-enum-map-eendplayreason-fname"></a>`UE_ENUM_MAP(EEndPlayReason, FName, Reasons);` | Any enum the source can see works, the game's included. | Yes |
+| <a id="ue-enum-map.tmap-emood-fname-moodnames-ue"></a>`TMap<EMood, FName> MoodNames = UE_ENUM_MAP(EMood);` | The default alone, for a member you declare yourself: the same table. | Yes |
+| <a id="ue-enum-map.ue-enum-map-int32-fname"></a>`UE_ENUM_MAP(int32, FName, M);`, `UE_ENUM_MAP(EMood, EMood, M);`, `UE_ENUM_MAP(EMood, int32, M);` | Refused by clang, naming both types: "static assertion failed due to requirement '__EnumMapPair__<int, FName>': UE_ENUM_MAP(Key, Value, Name): one of Key and Value is an enum and the other FName or FString". | Refused |
+| <a id="ue-enum-map.ue-enum-map-tenum-emood"></a>`UE_ENUM_MAP(TEnum<EMood>, FName, M);` | Refused the same way: write the enum itself, `UE_ENUM_MAP(EMood, FName, M);`. | Refused |
+| <a id="ue-enum-map.tmap-int32-fname-m-ue"></a>`TMap<int32, FName> M = UE_ENUM_MAP(EMood);` | Refused by clang, "no viable conversion from '__EnumMapInit__<EMood>' to 'TMap<int32, FName>'": the one-argument form is the default of a TMap between that enum and FName or FString. | Refused |
+| <a id="ue-enum-map.ue-enum-map-fname-emood"></a>`UE_ENUM_MAP(FName, EMood);`, `UE_ENUM_MAP(FName, EMood, A, B);` | Refused by clang: "UE_ENUM_MAP takes (Enum), or (Key, Value, Name) to declare the member". Written as an initializer, `= UE_ENUM_MAP(FName, EMood)`, clang says only "expected expression". | Refused |
+| <a id="ue-enum-map.tmap-emood-fname-names-ue"></a>`TMap<EMood, FName> Names = UE_ENUM_MAP(EMood);` in a function body | The same table, made where it is written as the braced map `{ { EMood::Calm, "Calm" }, ... }` would be: the enum on either side, FName or FString on the other. It is made each time the line runs, so a table read often is cheaper as a member. | Yes |
 
 ```cpp
 UE_ENUM_MAP(EMood, FName, MoodNames);      // Calm, Angry, Sleepy
@@ -1032,13 +1037,13 @@ stays `E`, because an `E` variable cannot bind to a `TEnum<E>&`.
 
 | You write | What it does | Status |
 |---|---|---|
-| `TEnum<EMood> Mood = EMood::Calm;` | An EMood variable, member, parameter or local. It switches, compares and assigns like a plain EMood. | Yes |
-| `Mood = {};`, `TEnum<EMood>()`, `K2_DetachFromActor({}, {}, {})` | The zero enumerator, as for a plain EMood: assigned, passed (to a game function too), returned, as a struct literal's member or an array element. | Yes |
-| `Mood.Name()` | The enumerator's name as an FName, from `KismetNodeHelperLibrary::GetEnumeratorName` on EMood's UEnum. | Yes |
-| `Mood.String()` | Its display name as an FString, from `GetEnumeratorUserFriendlyName`: the label typed in the editor for a Blueprint enum. | Yes |
-| `.Name()` / `.String()` on an `int32` or `int64` enum | Refused ("a uint8 enum only"): the engine's two lookups take a uint8. | Refused |
-| `TMap<TEnum<EMood>, TSubclassOf<AActor>> Spawns;` | A map keyed by EMood, its value any type a map takes, a template too. | Yes |
-| `Moods.Num()` on a `TArray<TEnum<EMood>>`; `UE_DISPATCHER(OnMood, TEnum<EMood> M)` | A container of EMood with a container's methods, and a dispatcher whose Add and Broadcast are a dispatcher's. Only `TEnum<E>` itself has `.Name()` / `.String()`. | Yes |
+| <a id="tenum.tenum-emood-mood-emood-calm"></a>`TEnum<EMood> Mood = EMood::Calm;` | An EMood variable, member, parameter or local. It switches, compares and assigns like a plain EMood. | Yes |
+| <a id="tenum.mood"></a>`Mood = {};`, `TEnum<EMood>()`, `K2_DetachFromActor({}, {}, {})` | The zero enumerator, as for a plain EMood: assigned, passed (to a game function too), returned, as a struct literal's member or an array element. | Yes |
+| <a id="tenum.mood-name"></a>`Mood.Name()` | The enumerator's name as an FName, from `KismetNodeHelperLibrary::GetEnumeratorName` on EMood's UEnum. | Yes |
+| <a id="tenum.mood-string"></a>`Mood.String()` | Its display name as an FString, from `GetEnumeratorUserFriendlyName`: the label typed in the editor for a Blueprint enum. | Yes |
+| <a id="tenum.name"></a>`.Name()` / `.String()` on an `int32` or `int64` enum | Refused ("a uint8 enum only"): the engine's two lookups take a uint8. | Refused |
+| <a id="tenum.tmap-tenum-emood-tsubclassof"></a>`TMap<TEnum<EMood>, TSubclassOf<AActor>> Spawns;` | A map keyed by EMood, its value any type a map takes, a template too. | Yes |
+| <a id="tenum.moods-num"></a>`Moods.Num()` on a `TArray<TEnum<EMood>>`; `UE_DISPATCHER(OnMood, TEnum<EMood> M)` | A container of EMood with a container's methods, and a dispatcher whose Add and Broadcast are a dispatcher's. Only `TEnum<E>` itself has `.Name()` / `.String()`. | Yes |
 
 ```cpp
 TEnum<EMood> Mood = EMood::Angry;
@@ -1057,13 +1062,13 @@ metadata is written, because a cooked package carries none.
 
 | You write | What it does | Status |
 |---|---|---|
-| `TEnumMask<EMood> Moods = 0x21;` | An int32 variable, member, parameter or local. A member's default is the number. | Yes |
-| `Moods.Has(EMood::Angry)` | Whether the enumerator's bit is set: `BitIsMarked`. The engine tests `> 0`, so bit 31 never reads as set. | Yes |
-| `Moods.Add(M)`, `Moods.Remove(M)` | Set or clear the enumerator's bit: `MarkBit`, `ClearBit`. An enumerator past 31 does nothing. | Yes |
-| `Moods.Clear()` | Clear every bit: `ClearAllBits`. | Yes |
-| `int32(Moods)`, `Moods = Other \| 4;`, `if (Moods)` | Plain int32 reads and writes. | Yes |
-| `Map[K].Add(M)`, `GetMask().Clear()` on a `TEnumMask` | Refused ("writes the mask"): the three writers take the mask by reference, and Blueprint has no reference to a map element or a returned value. Copy it to a local, then store it back. | Refused |
-| A native enum whose values are already flags (1, 2, 4, ...) | Not what `TEnumMask` counts: bit N is value N. Test such an enum with `&` on an int32. | No |
+| <a id="tenummask.tenummask-emood-moods-0x21"></a>`TEnumMask<EMood> Moods = 0x21;` | An int32 variable, member, parameter or local. A member's default is the number. | Yes |
+| <a id="tenummask.moods-has-emood-angry"></a>`Moods.Has(EMood::Angry)` | Whether the enumerator's bit is set: `BitIsMarked`. The engine tests `> 0`, so bit 31 never reads as set. | Yes |
+| <a id="tenummask.moods-add-m"></a>`Moods.Add(M)`, `Moods.Remove(M)` | Set or clear the enumerator's bit: `MarkBit`, `ClearBit`. An enumerator past 31 does nothing. | Yes |
+| <a id="tenummask.moods-clear"></a>`Moods.Clear()` | Clear every bit: `ClearAllBits`. | Yes |
+| <a id="tenummask.int32-moods"></a>`int32(Moods)`, `Moods = Other \| 4;`, `if (Moods)` | Plain int32 reads and writes. | Yes |
+| <a id="tenummask.map-k-add-m"></a>`Map[K].Add(M)`, `GetMask().Clear()` on a `TEnumMask` | Refused ("writes the mask"): the three writers take the mask by reference, and Blueprint has no reference to a map element or a returned value. Copy it to a local, then store it back. | Refused |
+| <a id="tenummask.a-native-enum-whose-values"></a>A native enum whose values are already flags (1, 2, 4, ...) | Not what `TEnumMask` counts: bit N is value N. Test such an enum with `&` on an int32. | No |
 
 ```cpp
 TEnumMask<EMood> Allowed = 0x21;                          // Calm (bit 0) and Angry (bit 5)
@@ -1082,28 +1087,28 @@ copies it, as in C++.
 
 | You write | What it does | Status |
 |---|---|---|
-| `FVector Home;`, `FHitResult Hit;`, `FTransform Placed;` | A struct variable. All 2983 reflected structs in the DRG SDK can be one. | Yes |
-| `Home.Z = Twice.X + 1;` | Reads and writes a member in place (Break Struct, Set Members in Struct). | Yes |
-| `Nested.Inner.Kills += 1;` | Nested members work to any depth, in place. | Yes |
-| `K2_GetActorLocation().X` | A member of a struct a call returns. The value is stored in a temporary and read from there. | Yes |
-| `&S.Kills` with a member `S` | The address of S, found at run time through the ReadProperty helper as `&Member` is, plus Kills' offset in the struct. Without the helper the build stops ("include ReadProperty.h"). See [Pointers and memory](#pointers-and-memory). | Yes |
-| `&S.Kills` with a local or parameter `S` | Refused: a Blueprint variable has no address ("a Blueprint variable has none the VM hands out"). | Refused |
+| <a id="struct-variables-and.fvector-home"></a>`FVector Home;`, `FHitResult Hit;`, `FTransform Placed;` | A struct variable. All 2983 reflected structs in the DRG SDK can be one. | Yes |
+| <a id="struct-variables-and.home-z-twice-x-1"></a>`Home.Z = Twice.X + 1;` | Reads and writes a member in place (Break Struct, Set Members in Struct). | Yes |
+| <a id="struct-variables-and.nested-inner-kills-1"></a>`Nested.Inner.Kills += 1;` | Nested members work to any depth, in place. | Yes |
+| <a id="struct-variables-and.k2-getactorlocation-x"></a>`K2_GetActorLocation().X` | A member of a struct a call returns. The value is stored in a temporary and read from there. | Yes |
+| <a id="struct-variables-and.s-kills"></a>`&S.Kills` with a member `S` | The address of S, found at run time through the ReadProperty helper as `&Member` is, plus Kills' offset in the struct. Without the helper the build stops ("include ReadProperty.h"). See [Pointers and memory](#pointers-and-memory). | Yes |
+| <a id="struct-variables-and.s-kills-2"></a>`&S.Kills` with a local or parameter `S` | Refused: a Blueprint variable has no address ("a Blueprint variable has none the VM hands out"). | Refused |
 
 ### Making struct values
 
 | You write | What it does | Status |
 |---|---|---|
-| `FVector(1, 2, 3)`, `FLinearColor(1, 0.5f, 0, 1)` | A whole-struct constructor: one struct value built from the arguments. Constants, locals and the object's own variables make one literal value, as the editor's literal pin does. | Yes |
-| `FVector2D(1.0f, M == 0 ? 2.0f : 3.0f)`, `{Twice(M), 1}`, `V = {V.Y, V.X}` | A member that computes anything else (a call, `?:`, `&&`, a member of a struct) makes the editor's Make Struct instead: a fresh value, then one store per member, left to right as C++ runs a braced list. The variable assigned is written after all of them, so `V = {V.Y, V.X}` swaps. | Yes |
-| `FColor(255, 128, 0)` | R, G, B and A, with A 255 when left out, like the engine's constructor. Each argument lands on the member its parameter is named after, although FColor stores B, G, R, A. | Yes |
-| `FLightmassDirectionalLightSettings(1.5f, 2.5f, true, 4.5f)` | A struct with a parent struct: the arguments come in C++ order, the parent's members first, and each lands on its member (the engine lists the struct's own members first). | Yes |
-| `FMaterialAttributesInput(3, "In", "Ex", 0)`, `Handle = FTimerHandle();` | A struct with a member the engine marks Transient (PropertyConnectedBitmask here, FTimerHandle's one member Handle) is the Make Struct above, never a literal: the engine's literal skips that member and leaves it as the variable assigned held it, which a variable assigned again, or a local in a loop, still holds. The Make Struct sets it, to the value given or zero, so `Handle = FTimerHandle();` resets a live handle, as in C++. | Yes |
-| `FVector()`, `FVector4()`, `FTransform()`, `FTransform T{};` | What the engine's constructor makes. `FVector`, `FVector2D`, `FRotator`, `FLinearColor`, `FColor` and the `FVector_NetQuantize` types, whose constructor sets nothing, are their zeros, a literal. `FVector4()` is the literal (0, 0, 0, 1), its constructor's W; so is an FVector4 declared with no initializer, each time a loop comes round, since the engine makes a fresh FVector4 variable as zeros. Any other engine struct, `FTransform()` (the identity) or `FQuat()` among them, is the editor's Make Struct with nothing set: a temporary the function's frame constructs as the engine does. So `SpawnActor<T>(Class, FTransform())` spawns at the origin at scale 1. | Yes |
-| `FHitResult()`, `FStats{}` | Make Struct with nothing set, for a struct without a whole-struct constructor: the struct keeps its own defaults (`FHitResult::Time` is 1). | Yes |
-| `FStats S = {.Kills = K, .Alive = true};` | Make Struct: a fresh value, then one store for each member given. Members left out keep the struct's defaults. | Yes |
-| `KillsOf({.Kills = K})` | A braced value as an argument. | Yes |
-| `FStats S = {K, 2.0f};` | Positional braces go by member declaration order. | Yes |
-| `FStats S = {{}, 2.0f};` | A `{}` for a member is a fresh value of its type, as in C++, not the member's default: zero, an empty container, None, an engine struct's zeros, or a `UE_STRUCT`'s own defaults. | Yes |
+| <a id="making-struct-values.fvector-1-2-3"></a>`FVector(1, 2, 3)`, `FLinearColor(1, 0.5f, 0, 1)` | A whole-struct constructor: one struct value built from the arguments. Constants, locals and the object's own variables make one literal value, as the editor's literal pin does. | Yes |
+| <a id="making-struct-values.fvector2d-1-0f-m-0"></a>`FVector2D(1.0f, M == 0 ? 2.0f : 3.0f)`, `{Twice(M), 1}`, `V = {V.Y, V.X}` | A member that computes anything else (a call, `?:`, `&&`, a member of a struct) makes the editor's Make Struct instead: a fresh value, then one store per member, left to right as C++ runs a braced list. The variable assigned is written after all of them, so `V = {V.Y, V.X}` swaps. | Yes |
+| <a id="making-struct-values.fcolor-255-128-0"></a>`FColor(255, 128, 0)` | R, G, B and A, with A 255 when left out, like the engine's constructor. Each argument lands on the member its parameter is named after, although FColor stores B, G, R, A. | Yes |
+| <a id="making-struct-values.flightmassdirectionallightsettings"></a>`FLightmassDirectionalLightSettings(1.5f, 2.5f, true, 4.5f)` | A struct with a parent struct: the arguments come in C++ order, the parent's members first, and each lands on its member (the engine lists the struct's own members first). | Yes |
+| <a id="making-struct-values.fmaterialattributesinput-3-in-ex"></a>`FMaterialAttributesInput(3, "In", "Ex", 0)`, `Handle = FTimerHandle();` | A struct with a member the engine marks Transient (PropertyConnectedBitmask here, FTimerHandle's one member Handle) is the Make Struct above, never a literal: the engine's literal skips that member and leaves it as the variable assigned held it, which a variable assigned again, or a local in a loop, still holds. The Make Struct sets it, to the value given or zero, so `Handle = FTimerHandle();` resets a live handle, as in C++. | Yes |
+| <a id="making-struct-values.fvector"></a>`FVector()`, `FVector4()`, `FTransform()`, `FTransform T{};` | What the engine's constructor makes. `FVector`, `FVector2D`, `FRotator`, `FLinearColor`, `FColor` and the `FVector_NetQuantize` types, whose constructor sets nothing, are their zeros, a literal. `FVector4()` is the literal (0, 0, 0, 1), its constructor's W; so is an FVector4 declared with no initializer, each time a loop comes round, since the engine makes a fresh FVector4 variable as zeros. Any other engine struct, `FTransform()` (the identity) or `FQuat()` among them, is the editor's Make Struct with nothing set: a temporary the function's frame constructs as the engine does. So `SpawnActor<T>(Class, FTransform())` spawns at the origin at scale 1. | Yes |
+| <a id="making-struct-values.fhitresult"></a>`FHitResult()`, `FStats{}` | Make Struct with nothing set, for a struct without a whole-struct constructor: the struct keeps its own defaults (`FHitResult::Time` is 1). | Yes |
+| <a id="making-struct-values.fstats-s-kills-k-alive"></a>`FStats S = {.Kills = K, .Alive = true};` | Make Struct: a fresh value, then one store for each member given. Members left out keep the struct's defaults. | Yes |
+| <a id="making-struct-values.killsof-kills-k"></a>`KillsOf({.Kills = K})` | A braced value as an argument. | Yes |
+| <a id="making-struct-values.fstats-s-k-2-0f"></a>`FStats S = {K, 2.0f};` | Positional braces go by member declaration order. | Yes |
+| <a id="making-struct-values.fstats-s-2-0f"></a>`FStats S = {{}, 2.0f};` | A `{}` for a member is a fresh value of its type, as in C++, not the member's default: zero, an empty container, None, an engine struct's zeros, or a `UE_STRUCT`'s own defaults. | Yes |
 
 ```cpp
 FVector Home;
@@ -1133,16 +1138,16 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Home + Home * 2.0f`, `(A + B) / 2`, `Tint * 0.5f` | The Kismet math node for that pair of types (Add_VectorVector, Multiply_VectorFloat, Divide_VectorInt...). Only the pairs Kismet has exist. | Yes |
-| `2.0f * V` | The float converts to a vector first, which gives the same result. | Yes |
-| `Home == Twice`, `Home != Twice` | For FVector, FVector2D, FVector4 and FMatrix this is Kismet's Equal (Not Equal) node with an error tolerance of 0, so it compares every component exactly, as UE C++'s `==` does. The editor's node defaults to 1e-4; for that, call `UKismetMathLibrary::EqualEqual_VectorVector(A, B, 1e-4f)`. | Yes |
-| `Facing == Aim` with two FRotators or two FQuats | The Equal node with a tolerance of 0, with a warning: it compares rotations, so angles 360 degrees apart (a quaternion and its negation) are equal, where UE C++ compares the components. | Warns |
-| `Home == 0`, `Home != 0.5f` | The number fills all three components first (Conv_FloatToVector), so `Home == 0` is true for the zero vector. UE C++ has no such operator: its FVector constructor from a float is explicit. | Yes |
-| `Tint == Other` | FLinearColor, FTransform and other structs use their own Kismet Equal node. FLinearColor's has no tolerance. | Yes |
-| `Home += W;` | Refused by clang (`no viable overloaded '+='`): structs have no compound assignment. Write `Home = Home + W;`. | Refused |
-| `-V` | Refused by clang (`invalid argument type 'FVector' to unary expression`). Call `UKismetMathLibrary::NegateVector(V)`. | Refused |
-| `A + B` with two FRotators | Kismet has no such node. Stored in or returned as an FRotator it is a clang error. Call `UKismetMathLibrary::ComposeRotators(A, B)`. | Refused |
-| `A == B` with two `UE_STRUCT`s | Refused by clang (`invalid operands to binary expression`). The editor has no Equal node for them either. Compare the members that matter. | Refused |
+| <a id="struct-operators.home-home-2-0f"></a>`Home + Home * 2.0f`, `(A + B) / 2`, `Tint * 0.5f` | The Kismet math node for that pair of types (Add_VectorVector, Multiply_VectorFloat, Divide_VectorInt...). Only the pairs Kismet has exist. | Yes |
+| <a id="struct-operators.2-0f-v"></a>`2.0f * V` | The float converts to a vector first, which gives the same result. | Yes |
+| <a id="struct-operators.home-twice"></a>`Home == Twice`, `Home != Twice` | For FVector, FVector2D, FVector4 and FMatrix this is Kismet's Equal (Not Equal) node with an error tolerance of 0, so it compares every component exactly, as UE C++'s `==` does. The editor's node defaults to 1e-4; for that, call `UKismetMathLibrary::EqualEqual_VectorVector(A, B, 1e-4f)`. | Yes |
+| <a id="struct-operators.facing-aim"></a>`Facing == Aim` with two FRotators or two FQuats | The Equal node with a tolerance of 0, with a warning: it compares rotations, so angles 360 degrees apart (a quaternion and its negation) are equal, where UE C++ compares the components. | Warns |
+| <a id="struct-operators.home-0"></a>`Home == 0`, `Home != 0.5f` | The number fills all three components first (Conv_FloatToVector), so `Home == 0` is true for the zero vector. UE C++ has no such operator: its FVector constructor from a float is explicit. | Yes |
+| <a id="struct-operators.tint-other"></a>`Tint == Other` | FLinearColor, FTransform and other structs use their own Kismet Equal node. FLinearColor's has no tolerance. | Yes |
+| <a id="struct-operators.home-w"></a>`Home += W;` | Refused by clang (`no viable overloaded '+='`): structs have no compound assignment. Write `Home = Home + W;`. | Refused |
+| <a id="struct-operators.v"></a>`-V` | Refused by clang (`invalid argument type 'FVector' to unary expression`). Call `UKismetMathLibrary::NegateVector(V)`. | Refused |
+| <a id="struct-operators.a-b"></a>`A + B` with two FRotators | Kismet has no such node. Stored in or returned as an FRotator it is a clang error. Call `UKismetMathLibrary::ComposeRotators(A, B)`. | Refused |
+| <a id="struct-operators.a-b-2"></a>`A == B` with two `UE_STRUCT`s | Refused by clang (`invalid operands to binary expression`). The editor has no Equal node for them either. Compare the members that matter. | Refused |
 
 ```cpp
 FVector Mid(FVector A, FVector B) { return (A + B) / 2; }
@@ -1160,15 +1165,15 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Facing = Twice;` (FVector to FRotator) | The rotation of the direction, not a copy of X, Y and Z. | Yes |
-| `FTransform Placed = Home;` | A translation. | Yes |
-| `FTransform(Facing, Home, Size)`, `FTransform(Facing, Home)` | UE's constructor order, Rotation (an FRotator), Translation, Scale: the Make Transform node, `MakeTransform(Home, Facing, Size)`. Left out, the scale is 1. | Yes |
-| `FTransform(Home, Facing, Size)` | Make Transform's own order, Location, Rotation, Scale, with the same result. UE C++ has no such constructor; UeApi declares it so the node's order reads as written. | Yes |
-| `FTransform(A, B, C)` with three FVectors | Refused by clang ("call to constructor of 'FTransform' is ambiguous"): a vector converts to a rotator, so both orders, and the FQuat constructor, would take it. Write the rotator as one: `FTransform(FRotator(A), B, C)`. | Refused |
-| `FVector V = 2.0f;`, `FVector V = 2;` | A float fills all three components; an int converts to float first. | Yes |
-| `FLinearColor L = FColor(255, 0, 0);` | FColor and FLinearColor convert both ways through sRGB. | Yes |
-| `FVector V = Flat;` (FVector2D) | Z is 0. | Yes |
-| `FVector V = Facing;` (FRotator) | Refused by clang: left out on purpose, because a rotator is not a direction. Call `UKismetMathLibrary::GetForwardVector(Facing)`. | Refused |
+| <a id="struct-conversions.facing-twice"></a>`Facing = Twice;` (FVector to FRotator) | The rotation of the direction, not a copy of X, Y and Z. | Yes |
+| <a id="struct-conversions.ftransform-placed-home"></a>`FTransform Placed = Home;` | A translation. | Yes |
+| <a id="struct-conversions.ftransform-facing-home-size"></a>`FTransform(Facing, Home, Size)`, `FTransform(Facing, Home)` | UE's constructor order, Rotation (an FRotator), Translation, Scale: the Make Transform node, `MakeTransform(Home, Facing, Size)`. Left out, the scale is 1. | Yes |
+| <a id="struct-conversions.ftransform-home-facing-size"></a>`FTransform(Home, Facing, Size)` | Make Transform's own order, Location, Rotation, Scale, with the same result. UE C++ has no such constructor; UeApi declares it so the node's order reads as written. | Yes |
+| <a id="struct-conversions.ftransform-a-b-c"></a>`FTransform(A, B, C)` with three FVectors | Refused by clang ("call to constructor of 'FTransform' is ambiguous"): a vector converts to a rotator, so both orders, and the FQuat constructor, would take it. Write the rotator as one: `FTransform(FRotator(A), B, C)`. | Refused |
+| <a id="struct-conversions.fvector-v-2-0f"></a>`FVector V = 2.0f;`, `FVector V = 2;` | A float fills all three components; an int converts to float first. | Yes |
+| <a id="struct-conversions.flinearcolor-l-fcolor-255-0"></a>`FLinearColor L = FColor(255, 0, 0);` | FColor and FLinearColor convert both ways through sRGB. | Yes |
+| <a id="struct-conversions.fvector-v-flat"></a>`FVector V = Flat;` (FVector2D) | Z is 0. | Yes |
+| <a id="struct-conversions.fvector-v-facing"></a>`FVector V = Facing;` (FRotator) | Refused by clang: left out on purpose, because a rotator is not a direction. Call `UKismetMathLibrary::GetForwardVector(Facing)`. | Refused |
 
 Notes:
 - A struct converts implicitly wherever Kismet has a conversion node, and the conversion means what that node means.
@@ -1177,10 +1182,10 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `FStats T = Stats;` | A copy. Changing `T` leaves `Stats` alone. | Yes |
-| `SetKills(K, T)` with `void SetKills(int32 K, FStats &S)` | Writes through the reference into `T`, the copy. | Yes |
-| `for (FStats S : Many)` | `S` is a copy; `for (FStats &S : Many)` writes the element. See [Loops](#loops). | Yes |
-| `Weights.Find(Key, Out)` | `Out` receives a copy; writing it leaves the map alone. | Yes |
+| <a id="struct-copies.fstats-t-stats"></a>`FStats T = Stats;` | A copy. Changing `T` leaves `Stats` alone. | Yes |
+| <a id="struct-copies.setkills-k-t"></a>`SetKills(K, T)` with `void SetKills(int32 K, FStats &S)` | Writes through the reference into `T`, the copy. | Yes |
+| <a id="struct-copies.for-fstats-s-many"></a>`for (FStats S : Many)` | `S` is a copy; `for (FStats &S : Many)` writes the element. See [Loops](#loops). | Yes |
+| <a id="struct-copies.weights-find-key-out"></a>`Weights.Find(Key, Out)` | `Out` receives a copy; writing it leaves the map alone. | Yes |
 
 ```cpp
 // in a class; FStats is the UE_STRUCT under Mod structs: UE_STRUCT
@@ -1202,18 +1207,18 @@ void ZeroAll() {
 
 | You write | What it does | Status |
 |---|---|---|
-| `FFloatInterval Delay = FFloatInterval(1, 5);` | A constructor call as a member default. It is written into Class Defaults. | Yes |
-| `FTerrainPlacementBox(Min, Max, ETerrainPlacementBoxType::Terrain, UE_KEEP)` | `UE_KEEP` for a constructor argument leaves that member unwritten, so it holds what the engine's constructor sets, as braces leave out a member of a struct with no constructor. Only where the value starts fresh: a container's element, a class's own default. bpdecomp writes it for a member the cooked value leaves out. | Yes |
-| `GameplayTags = FGameplayTagContainer({FGameplayTag("Enemy.Type.Regular")}, {});` | Written in the container's own form, its tags' FNames (FGameplayTagContainer::Serialize); ParentTags is rebuilt by the engine at load. | Yes |
-| `Fx->OverrideParameters.SortedParameterOffsets = {FNiagaraVariableWithOffset("User.Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), 0)};` | A Niagara component's parameter store, as the cook writes it: each FNiagaraVariable / FNiagaraVariableWithOffset in its own form (the Name, the type definition, then VarData or the Offset), and `UserParameterRedirects` a TMap of them. A handle is given as the FNiagaraTypeDefinition it names; `StaticStructOf<T>()` is the struct of its values. | Yes |
-| `.ClassStructOrEnum = StaticStructOf<FNiagaraFloat>()`, `UObject *S = StaticStructOf<FLinearColor>();` | A struct's UScriptStruct as an object: the engine struct's `/Script` one, or a UE_STRUCT's asset. | Yes |
-| `FVector Offset = {0, 0, 50};` | Positional braces as a default. | Yes |
-| `FNested Deep = {.Inner = {.Time = 1.5f}, .Stamp = 7};` | Designated braces, nested. Members left out are zero, or take their own default initializer. | Yes |
-| `FHitResult Mine = {.Distance = 5.0f};` | Designated (or positional) braces of an engine struct whose header has no constructor: the members given are written, the ones left out are not, so they hold what the engine's constructor sets (`FHitResult::Time` is 1), as the editor's Make Struct leaves them. | Yes |
-| `FHeld H = {.Hit = {.Distance = 5.0f, .Time = 1.0f}};` where FHeld declares `FHitResult Hit = {.Time = 0.5f};` | New braces for a struct member with an initializer of its own. The value starts as the struct's default instance, which holds that initializer, so a member both braces leave out (FaceIndex) is the engine's in either and stays unwritten. A member the initializer gives and the new braces leave out would load the initializer's value instead of the engine's: `H = {.Hit = {.Distance = 5.0f}}` is refused, naming `H.Hit.Time`. The same holds for a `UE_STRUCT` or another mod's `UE_STRUCT_IN` struct, in a struct's member initializer and in a container's element. | Yes |
-| `FColor Lamp = FColor(255, 128, 0);` | FColor's argument order holds in defaults too. | Yes |
-| `FStats Fresh = FStats();`, `FStats Cleared = {{}, {}};` | A `UE_STRUCT`'s `T()` is its defaults, and writes nothing. A `{}` for a member is a fresh value of its type (zero, empty, None, a `UE_STRUCT`'s own defaults), written even where the member's default differs. In a function, `Code(FStats())` and `FStats S = FStats();` are the Make Struct of its defaults, as `FStats S{}` is. | Yes |
-| `FHitResult Hit = {};`, `FHeld H = {FHitResult(), 5};`, `FTransform T = FTransform();` | An engine struct by `{}` or `T()`: none of its members is written, so it holds what the engine's constructor sets (`FHitResult::Time` is 1, `FTransform()` is the identity, `FFindFloorResult()`'s HitResult has Time 1), however deep it sits in a struct value. The UeApi header's `T() = default;` says nothing of those values. Only `FVector`, `FVector2D`, `FRotator`, `FLinearColor`, `FColor` and the `FVector_NetQuantize` types, whose constructor sets nothing, are written as zeros. `FVector4` is written as (0, 0, 0, 1), its constructor's W, by `{}`, `T()` or no initializer at all, a `UE_STRUCT`'s member too: the engine makes a fresh one as zeros. A `UE_STRUCT` member with an initializer of its own, given `T()` in braces (`{FHitResult(), 5}` where the member is `FHitResult Hit = {.Time = 0.5f};`), is refused as in `UE_DEFAULTS`: see [Class defaults](#class-defaults). | Yes |
+| <a id="struct-defaults.ffloatinterval-delay"></a>`FFloatInterval Delay = FFloatInterval(1, 5);` | A constructor call as a member default. It is written into Class Defaults. | Yes |
+| <a id="struct-defaults.fterrainplacementbox-min-max"></a>`FTerrainPlacementBox(Min, Max, ETerrainPlacementBoxType::Terrain, UE_KEEP)` | `UE_KEEP` for a constructor argument leaves that member unwritten, so it holds what the engine's constructor sets, as braces leave out a member of a struct with no constructor. Only where the value starts fresh: a container's element, a class's own default. bpdecomp writes it for a member the cooked value leaves out. | Yes |
+| <a id="struct-defaults.gameplaytags"></a>`GameplayTags = FGameplayTagContainer({FGameplayTag("Enemy.Type.Regular")}, {});` | Written in the container's own form, its tags' FNames (FGameplayTagContainer::Serialize); ParentTags is rebuilt by the engine at load. | Yes |
+| <a id="struct-defaults.fx-overrideparameters"></a>`Fx->OverrideParameters.SortedParameterOffsets = {FNiagaraVariableWithOffset("User.Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), 0)};` | A Niagara component's parameter store, as the cook writes it: each FNiagaraVariable / FNiagaraVariableWithOffset in its own form (the Name, the type definition, then VarData or the Offset), and `UserParameterRedirects` a TMap of them. A handle is given as the FNiagaraTypeDefinition it names; `StaticStructOf<T>()` is the struct of its values. | Yes |
+| <a id="struct-defaults.classstructorenum-staticstructof"></a>`.ClassStructOrEnum = StaticStructOf<FNiagaraFloat>()`, `UObject *S = StaticStructOf<FLinearColor>();` | A struct's UScriptStruct as an object: the engine struct's `/Script` one, or a UE_STRUCT's asset. | Yes |
+| <a id="struct-defaults.fvector-offset-0-0-50"></a>`FVector Offset = {0, 0, 50};` | Positional braces as a default. | Yes |
+| <a id="struct-defaults.fnested-deep-inner-time-1"></a>`FNested Deep = {.Inner = {.Time = 1.5f}, .Stamp = 7};` | Designated braces, nested. Members left out are zero, or take their own default initializer. | Yes |
+| <a id="struct-defaults.fhitresult-mine-distance-5-0f"></a>`FHitResult Mine = {.Distance = 5.0f};` | Designated (or positional) braces of an engine struct whose header has no constructor: the members given are written, the ones left out are not, so they hold what the engine's constructor sets (`FHitResult::Time` is 1), as the editor's Make Struct leaves them. | Yes |
+| <a id="struct-defaults.fheld-h-hit-distance-5"></a>`FHeld H = {.Hit = {.Distance = 5.0f, .Time = 1.0f}};` where FHeld declares `FHitResult Hit = {.Time = 0.5f};` | New braces for a struct member with an initializer of its own. The value starts as the struct's default instance, which holds that initializer, so a member both braces leave out (FaceIndex) is the engine's in either and stays unwritten. A member the initializer gives and the new braces leave out would load the initializer's value instead of the engine's: `H = {.Hit = {.Distance = 5.0f}}` is refused, naming `H.Hit.Time`. The same holds for a `UE_STRUCT` or another mod's `UE_STRUCT_IN` struct, in a struct's member initializer and in a container's element. | Yes |
+| <a id="struct-defaults.fcolor-lamp-fcolor-255-128"></a>`FColor Lamp = FColor(255, 128, 0);` | FColor's argument order holds in defaults too. | Yes |
+| <a id="struct-defaults.fstats-fresh-fstats"></a>`FStats Fresh = FStats();`, `FStats Cleared = {{}, {}};` | A `UE_STRUCT`'s `T()` is its defaults, and writes nothing. A `{}` for a member is a fresh value of its type (zero, empty, None, a `UE_STRUCT`'s own defaults), written even where the member's default differs. In a function, `Code(FStats())` and `FStats S = FStats();` are the Make Struct of its defaults, as `FStats S{}` is. | Yes |
+| <a id="struct-defaults.fhitresult-hit"></a>`FHitResult Hit = {};`, `FHeld H = {FHitResult(), 5};`, `FTransform T = FTransform();` | An engine struct by `{}` or `T()`: none of its members is written, so it holds what the engine's constructor sets (`FHitResult::Time` is 1, `FTransform()` is the identity, `FFindFloorResult()`'s HitResult has Time 1), however deep it sits in a struct value. The UeApi header's `T() = default;` says nothing of those values. Only `FVector`, `FVector2D`, `FRotator`, `FLinearColor`, `FColor` and the `FVector_NetQuantize` types, whose constructor sets nothing, are written as zeros. `FVector4` is written as (0, 0, 0, 1), its constructor's W, by `{}`, `T()` or no initializer at all, a `UE_STRUCT`'s member too: the engine makes a fresh one as zeros. A `UE_STRUCT` member with an initializer of its own, given `T()` in braces (`{FHitResult(), 5}` where the member is `FHitResult Hit = {.Time = 0.5f};`), is refused as in `UE_DEFAULTS`: see [Class defaults](#class-defaults). | Yes |
 
 Notes:
 - Every value in a default must be known when the mod is built: [Classes and variables](#classes-and-variables).
@@ -1222,11 +1227,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `struct FStats { UE_STRUCT; int32 Kills; ... };` | Cooks the struct as a UserDefinedStruct asset in the mod's package, the editor's Structure asset. It can then be a member, parameter, local, container element or member of another struct. | Yes |
-| `float Time = 1.0f;` inside the struct | A member initializer is the struct's default value for that member. | Yes |
-| `TArray<int32> Hits;` inside the struct | A member can have any Blueprint type, containers and enums included. | Yes |
-| `UE_STRUCT_IN("/Game/_MyMods/Shared");` | For a struct in a header several mods include. Only the source whose `UE_MOD_PACKAGE` is exactly that path cooks it; every other mod imports it from there. | Yes |
-| `TArray<FEnemySpawnWave> Waves = {{.MinAmount = 2, .MaxAmount = 5}};`, `#include "UeApi/Game/FEnemySpawnWave.h"` | A game Blueprint's struct (a UserDefinedStruct the game cooks). genueapi writes it under `UeApi/Game/` with `UE_GAME_STRUCT(Package, Name)`, its members under their engine names (`MinAmount_13_06D0...`, off the object dump) and its default instance's values as initializers (off `--game`). It is imported, never cooked, and works like another mod's `UE_STRUCT_IN` struct: braces write each member they leave out with its initializer. A game Blueprint class that holds one includes its header. genueapi leaves a game struct out when it has no package in the `--game` content, when one of its members has no UeApi type, or when its default instance holds a value other than a number or bool that is not zero (a struct, text, soft path, enum or array), and then also every struct that holds it. | Yes |
+| <a id="mod-structs-ue.struct-fstats-ue-struct-int32"></a>`struct FStats { UE_STRUCT; int32 Kills; ... };` | Cooks the struct as a UserDefinedStruct asset in the mod's package, the editor's Structure asset. It can then be a member, parameter, local, container element or member of another struct. | Yes |
+| <a id="mod-structs-ue.float-time-1-0f"></a>`float Time = 1.0f;` inside the struct | A member initializer is the struct's default value for that member. | Yes |
+| <a id="mod-structs-ue.tarray-int32-hits"></a>`TArray<int32> Hits;` inside the struct | A member can have any Blueprint type, containers and enums included. | Yes |
+| <a id="mod-structs-ue.ue-struct-in-game-mymods"></a>`UE_STRUCT_IN("/Game/_MyMods/Shared");` | For a struct in a header several mods include. Only the source whose `UE_MOD_PACKAGE` is exactly that path cooks it; every other mod imports it from there. | Yes |
+| <a id="mod-structs-ue.tarray-fenemyspawnwave-waves"></a>`TArray<FEnemySpawnWave> Waves = {{.MinAmount = 2, .MaxAmount = 5}};`, `#include "UeApi/Game/FEnemySpawnWave.h"` | A game Blueprint's struct (a UserDefinedStruct the game cooks). genueapi writes it under `UeApi/Game/` with `UE_GAME_STRUCT(Package, Name)`, its members under their engine names (`MinAmount_13_06D0...`, off the object dump) and its default instance's values as initializers (off `--game`). It is imported, never cooked, and works like another mod's `UE_STRUCT_IN` struct: braces write each member they leave out with its initializer. A game Blueprint class that holds one includes its header. genueapi leaves a game struct out when it has no package in the `--game` content, when one of its members has no UeApi type, or when its default instance holds a value other than a number or bool that is not zero (a struct, text, soft path, enum or array), and then also every struct that holds it. | Yes |
 
 ```cpp
 struct FStats {
@@ -1287,34 +1292,34 @@ needs a container variable, not one a call returns (a range-for makes its own).
 
 | You write | What it does | Status |
 |---|---|---|
-| `TArray<int32> Scores;`, `TArray<FVector> Points;` | An Array variable, as a member, parameter or local. | Yes |
-| `TSet<int32> Seen;` | A Set variable. | Yes |
-| `TMap<FName, float> Weights;` | A Map variable. | Yes |
-| `TMap<APlayerCharacter *, int32> Kills;`, `TMap<AFSDPlayerState *, float> Damage;` | A Map keyed by an object reference, such as one entry per player: `Kills[Player] += 1`, `Kills.Remove(Player)` and `for (auto &[P, N] : Kills)` work as with any key. The game replaces a player's character (see [examples/WaitForPlayer.cpp](examples/WaitForPlayer.cpp)), so an entry keyed by the old character stops matching. Key by the player state, or by its `GetPlayerName()` as an `FString`, to keep one entry per player. | Yes |
-| `TArray<TSoftClassPtr<AActor>> Kinds;` | The element type can be any Blueprint type: numbers, strings, enums, structs, objects, class and soft references, interfaces. | Yes |
-| `TMap<FName, TArray<FName>> Groups;` | A container of containers, through a generated wrapper struct. See below. | Yes |
-| `UE_REPLICATED(TSet<int32>, Seen);` | Refused (`a TMap or TSet does not replicate`): [Replication](#replication). | Refused |
+| <a id="container-variables.tarray-int32-scores"></a>`TArray<int32> Scores;`, `TArray<FVector> Points;` | An Array variable, as a member, parameter or local. | Yes |
+| <a id="container-variables.tset-int32-seen"></a>`TSet<int32> Seen;` | A Set variable. | Yes |
+| <a id="container-variables.tmap-fname-float-weights"></a>`TMap<FName, float> Weights;` | A Map variable. | Yes |
+| <a id="container-variables.tmap-aplayercharacter-int32"></a>`TMap<APlayerCharacter *, int32> Kills;`, `TMap<AFSDPlayerState *, float> Damage;` | A Map keyed by an object reference, such as one entry per player: `Kills[Player] += 1`, `Kills.Remove(Player)` and `for (auto &[P, N] : Kills)` work as with any key. The game replaces a player's character (see [examples/WaitForPlayer.cpp](examples/WaitForPlayer.cpp)), so an entry keyed by the old character stops matching. Key by the player state, or by its `GetPlayerName()` as an `FString`, to keep one entry per player. | Yes |
+| <a id="container-variables.tarray-tsoftclassptr-aactor"></a>`TArray<TSoftClassPtr<AActor>> Kinds;` | The element type can be any Blueprint type: numbers, strings, enums, structs, objects, class and soft references, interfaces. | Yes |
+| <a id="container-variables.tmap-fname-tarray-fname-groups"></a>`TMap<FName, TArray<FName>> Groups;` | A container of containers, through a generated wrapper struct. See below. | Yes |
+| <a id="container-variables.ue-replicated-tset-int32-seen"></a>`UE_REPLICATED(TSet<int32>, Seen);` | Refused (`a TMap or TSet does not replicate`): [Replication](#replication). | Refused |
 
 ### Container methods
 
 | You write | What it does | Status |
 |---|---|---|
-| `Scores.Add(7)` | A method is the Blueprint node, with the container as its target. The methods are listed under the table. `Add` returns the new index. | Yes |
-| `Scores.Num()` | The same as `Length()`. | Yes |
-| `Weights.Find("alpha", W)` | Results come back through reference parameters: `Find(Key, Out)` on a map, `Get(Index, Out)`, `Keys(OutArray)`, `Random(OutItem, OutIndex)`, `Seen.Union(Other, Result)`. | Yes |
-| `Seen.ToArray(List)`, `Weights.Keys(Names)`, `GetAllActorsOfClass(C, Found)` | An array an engine function only fills is emptied just before the call, as the editor does, so afterwards it holds exactly what the call put there: `ToArray` itself would add to what `List` held. An array the function also reads (`UPARAM(ref)`, such as RunAssetsThroughFilter's) is passed as it is. | Yes |
-| `Items.Remove(2)` | Removes the element at index 2 (the Remove Index node). UE C++'s `Remove(Item)` removes by value; this does not. | Yes |
-| `Items.RemoveItem(2)` | Removes the elements equal to 2 (the Remove node). | Yes |
-| `Items.Find(5)` | The index of 5, or -1. | Yes |
-| `Items.Insert(9, 0)` | The item, then the index. | Yes |
-| `Items.Set(0, 9, true)` | The index, the item, then `bSizeToFit`. | Yes |
-| `A.Identical(B)` | Whether two arrays hold the same elements. `A == B` is refused by clang: containers have no `==`. | Yes |
-| `Items.Empty()`, `Items.Sort()`, `Items.Pop()` | Refused by clang. `Empty`, `Emplace`, `FindOrAdd`, `IsEmpty`, `Last`, `Pop`, `Sort` and the like are UE C++, not Blueprint nodes, and the SDK does not declare them. | Refused |
-| `Off = Active - Wanted;`, `A + B`, `A & B` on TSets | Set_Difference, Set_Union and Set_Intersection, the result in a temp that is the value. Both sides must be set variables or another of these (`(A + B) - C`). | Yes |
-| `Seen[0]` on a TSet | Refused by clang: a set has no `[]`. | Refused |
-| `GetItems().Num()`, `GetItems().Contains(3)` | A method that only reads (`Num`, `Contains`, `Find`, `Get`, `IsValidIndex` and the like) puts the result in a local and reads it there. | Yes |
-| `GetItems().Add(3)` | Refused (`a container operation needs a variable, not a computed value`). A change would go into a copy. Store the result in a local first. | Refused |
-| `TArray<int32> R = GetItems(); return R.Num();` | The local stays a variable, read once or not: a container function reads its container where it lies, so the call is never folded into its place. The same for a parameter of an `inline` function. | Yes |
+| <a id="container-methods.scores-add-7"></a>`Scores.Add(7)` | A method is the Blueprint node, with the container as its target. The methods are listed under the table. `Add` returns the new index. | Yes |
+| <a id="container-methods.scores-num"></a>`Scores.Num()` | The same as `Length()`. | Yes |
+| <a id="container-methods.weights-find-alpha-w"></a>`Weights.Find("alpha", W)` | Results come back through reference parameters: `Find(Key, Out)` on a map, `Get(Index, Out)`, `Keys(OutArray)`, `Random(OutItem, OutIndex)`, `Seen.Union(Other, Result)`. | Yes |
+| <a id="container-methods.seen-toarray-list"></a>`Seen.ToArray(List)`, `Weights.Keys(Names)`, `GetAllActorsOfClass(C, Found)` | An array an engine function only fills is emptied just before the call, as the editor does, so afterwards it holds exactly what the call put there: `ToArray` itself would add to what `List` held. An array the function also reads (`UPARAM(ref)`, such as RunAssetsThroughFilter's) is passed as it is. | Yes |
+| <a id="container-methods.items-remove-2"></a>`Items.Remove(2)` | Removes the element at index 2 (the Remove Index node). UE C++'s `Remove(Item)` removes by value; this does not. | Yes |
+| <a id="container-methods.items-removeitem-2"></a>`Items.RemoveItem(2)` | Removes the elements equal to 2 (the Remove node). | Yes |
+| <a id="container-methods.items-find-5"></a>`Items.Find(5)` | The index of 5, or -1. | Yes |
+| <a id="container-methods.items-insert-9-0"></a>`Items.Insert(9, 0)` | The item, then the index. | Yes |
+| <a id="container-methods.items-set-0-9-true"></a>`Items.Set(0, 9, true)` | The index, the item, then `bSizeToFit`. | Yes |
+| <a id="container-methods.a-identical-b"></a>`A.Identical(B)` | Whether two arrays hold the same elements. `A == B` is refused by clang: containers have no `==`. | Yes |
+| <a id="container-methods.items-empty"></a>`Items.Empty()`, `Items.Sort()`, `Items.Pop()` | Refused by clang. `Empty`, `Emplace`, `FindOrAdd`, `IsEmpty`, `Last`, `Pop`, `Sort` and the like are UE C++, not Blueprint nodes, and the SDK does not declare them. | Refused |
+| <a id="container-methods.off-active-wanted"></a>`Off = Active - Wanted;`, `A + B`, `A & B` on TSets | Set_Difference, Set_Union and Set_Intersection, the result in a temp that is the value. Both sides must be set variables or another of these (`(A + B) - C`). | Yes |
+| <a id="container-methods.seen-0"></a>`Seen[0]` on a TSet | Refused by clang: a set has no `[]`. | Refused |
+| <a id="container-methods.getitems-num"></a>`GetItems().Num()`, `GetItems().Contains(3)` | A method that only reads (`Num`, `Contains`, `Find`, `Get`, `IsValidIndex` and the like) puts the result in a local and reads it there. | Yes |
+| <a id="container-methods.getitems-add-3"></a>`GetItems().Add(3)` | Refused (`a container operation needs a variable, not a computed value`). A change would go into a copy. Store the result in a local first. | Refused |
+| <a id="container-methods.tarray-int32-r-getitems-return"></a>`TArray<int32> R = GetItems(); return R.Num();` | The local stays a variable, read once or not: a container function reads its container where it lies, so the call is never folded into its place. The same for a parameter of an `inline` function. | Yes |
 
 ```cpp
 TArray<int32> Scores;
@@ -1351,14 +1356,14 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Scores[0] = Scores[0] + 1;` | `A[i]` is the Get (a ref) node: it reads or writes the element in place. | Yes |
-| `Points[0].Z = 5;`, `Grid[0][0] = 7;` | A member or a nested array of an element changes in place. | Yes |
-| `float W = Weights["alpha"];` | A map read is the Find node into a temporary: a copy of the value, or the value type's default (0, empty, None, null) for a missing key. It never adds the key. | Yes |
-| `Counts[Key] = Seed;` | A map store is the Add node: insert or replace. | Yes |
-| `Counts[Key] += 2;`, `Local[7]++` | Reads with Find, then stores with Add. On an empty map, `Local[7]++` leaves 7 -> 1. | Yes |
-| `Table[NextKey()].Inner.Kills = K;` | Blueprint has no reference to a map element, so this becomes: copy the element, set the member, store it back. The value is evaluated first, as C++17 does, and the key only once. A missing key is added. | Yes |
-| `Lists[K].Add(X);` | A container method on a map element runs on a copy of the element. A method that writes stores the copy back; a read such as `Num` or `Contains` stores nothing. | Yes |
-| `AddTo(Table[1].Inner.Kills, 10)` with `void AddTo(int32 &V, int32 By)` | Warns: `V` gets a copy of the map element's member, stored back after the call. See [Functions](#functions). | Warns |
+| <a id="indexing.scores-0-scores-0-1"></a>`Scores[0] = Scores[0] + 1;` | `A[i]` is the Get (a ref) node: it reads or writes the element in place. | Yes |
+| <a id="indexing.points-0-z-5"></a>`Points[0].Z = 5;`, `Grid[0][0] = 7;` | A member or a nested array of an element changes in place. | Yes |
+| <a id="indexing.float-w-weights-alpha"></a>`float W = Weights["alpha"];` | A map read is the Find node into a temporary: a copy of the value, or the value type's default (0, empty, None, null) for a missing key. It never adds the key. | Yes |
+| <a id="indexing.counts-key-seed"></a>`Counts[Key] = Seed;` | A map store is the Add node: insert or replace. | Yes |
+| <a id="indexing.counts-key-2"></a>`Counts[Key] += 2;`, `Local[7]++` | Reads with Find, then stores with Add. On an empty map, `Local[7]++` leaves 7 -> 1. | Yes |
+| <a id="indexing.table-nextkey-inner-kills-k"></a>`Table[NextKey()].Inner.Kills = K;` | Blueprint has no reference to a map element, so this becomes: copy the element, set the member, store it back. The value is evaluated first, as C++17 does, and the key only once. A missing key is added. | Yes |
+| <a id="indexing.lists-k-add-x"></a>`Lists[K].Add(X);` | A container method on a map element runs on a copy of the element. A method that writes stores the copy back; a read such as `Num` or `Contains` stores nothing. | Yes |
+| <a id="indexing.addto-table-1-inner-kills"></a>`AddTo(Table[1].Inner.Kills, 10)` with `void AddTo(int32 &V, int32 By)` | Warns: `V` gets a copy of the map element's member, stored back after the call. See [Functions](#functions). | Warns |
 
 ```cpp
 TMap<FName, int32> Counts;
@@ -1379,17 +1384,17 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `TArray<int32> T = Items; T.Add(K);` | Assigning a container copies it. `Items` is unchanged. | Yes |
-| `Items.Append(Twice());` | A container that a call returns, passed to `Append` or `Union`, is stored in a local first. | Yes |
-| `TArray<int32> Primes = {2, 3, 5};` | A braced member default, written into Class Defaults element by element. | Yes |
-| `TMap<FName, int32> Cost = {{"Gold", 5}};` | A map's elements are `{key, value}` pairs. | Yes |
-| `TMap<FString, int32> M = {{"a", 5}, {"A", 1}};`, `TSet<int32> S = {3, 3};` in a default | A key given twice is written once, where it first appears, holding the last element given, as C++'s value holds it. An FString key compares without case, as an FName does, so this M is `{"A": 1}`. | Yes |
-| `TArray<FVector> Points = {{1, 2, 3}, FVector(4, 5, 6)};` | Struct elements can be braces or constructor calls. | Yes |
-| `TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};` | Refused: every element of a default must be known when the mod is built. See [Classes and variables](#classes-and-variables). | Refused |
-| `TArray<int32> L = {4, 5, 6};` in a function | The Make Array node: a temporary filled at once, made afresh each time the code runs. | Yes |
-| `TSet<int32> S = {1, 2};`, `TMap<int32, float> M = {{1, 0.5f}};` in a function | Make Set and Make Map. | Yes |
-| `Items = {};`, `Count({})`, `TArray<int32>()`, `return {};` in a function | An empty container: a Make Array (Set, Map) with no element. | Yes |
-| `Size(TArray<int32>{1, 2, M})`, `TSet<int32>{1, M}`, `TArray<int32>({1, 2})` in a function | The typed list, braced or in parentheses: the same Make Array (Set, Map) as the untyped braces. | Yes |
+| <a id="copies-and-braced.tarray-int32-t-items-t"></a>`TArray<int32> T = Items; T.Add(K);` | Assigning a container copies it. `Items` is unchanged. | Yes |
+| <a id="copies-and-braced.items-append-twice"></a>`Items.Append(Twice());` | A container that a call returns, passed to `Append` or `Union`, is stored in a local first. | Yes |
+| <a id="copies-and-braced.tarray-int32-primes-2-3"></a>`TArray<int32> Primes = {2, 3, 5};` | A braced member default, written into Class Defaults element by element. | Yes |
+| <a id="copies-and-braced.tmap-fname-int32-cost-gold"></a>`TMap<FName, int32> Cost = {{"Gold", 5}};` | A map's elements are `{key, value}` pairs. | Yes |
+| <a id="copies-and-braced.tmap-fstring-int32-m-a"></a>`TMap<FString, int32> M = {{"a", 5}, {"A", 1}};`, `TSet<int32> S = {3, 3};` in a default | A key given twice is written once, where it first appears, holding the last element given, as C++'s value holds it. An FString key compares without case, as an FName does, so this M is `{"A": 1}`. | Yes |
+| <a id="copies-and-braced.tarray-fvector-points-1-2"></a>`TArray<FVector> Points = {{1, 2, 3}, FVector(4, 5, 6)};` | Struct elements can be braces or constructor calls. | Yes |
+| <a id="copies-and-braced.tarray-int32-rolls"></a>`TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};` | Refused: every element of a default must be known when the mod is built. See [Classes and variables](#classes-and-variables). | Refused |
+| <a id="copies-and-braced.tarray-int32-l-4-5"></a>`TArray<int32> L = {4, 5, 6};` in a function | The Make Array node: a temporary filled at once, made afresh each time the code runs. | Yes |
+| <a id="copies-and-braced.tset-int32-s-1-2"></a>`TSet<int32> S = {1, 2};`, `TMap<int32, float> M = {{1, 0.5f}};` in a function | Make Set and Make Map. | Yes |
+| <a id="copies-and-braced.items"></a>`Items = {};`, `Count({})`, `TArray<int32>()`, `return {};` in a function | An empty container: a Make Array (Set, Map) with no element. | Yes |
+| <a id="copies-and-braced.size-tarray-int32-1-2"></a>`Size(TArray<int32>{1, 2, M})`, `TSet<int32>{1, M}`, `TArray<int32>({1, 2})` in a function | The typed list, braced or in parentheses: the same Make Array (Set, Map) as the untyped braces. | Yes |
 
 ```cpp
 TArray<int32> Primes = {2, 3, 5};
@@ -1404,18 +1409,18 @@ int32 LocalList(int32 I) {
 ```
 
 Notes:
-- A set or map list is written exactly as listed, duplicates included. What the engine makes of a duplicate has not
-  been checked, so keep such lists free of them.
+- In a default, a repeated key is written once (above). In a function, a Make Set or Make Map list is written as listed,
+  duplicates included; what the engine makes of those has not been checked, so keep such lists free of them.
 
 ### Containers of containers
 
 | You write | What it does | Status |
 |---|---|---|
-| `TArray<TArray<int32>> Grid;`, `TMap<FName, TArray<FName>> Groups;` | Blueprint has no container of containers, so the inner container becomes the `Value` member of a generated wrapper struct, such as `FNC_TArray_FName`. The C++ reads as usual. | Yes |
-| `Grid[0].Add(5);`, `Grid[0][0] = 7;` | An array's inner container changes in place. | Yes |
-| `TArray<FName> Again = Groups["first"];` | A map's value is read as a copy, like any map read. | Yes |
-| `Groups.Find(Key, Out)` with a container `Out` | Goes through a wrapper temporary; `Out` gets the inner container. | Yes |
-| `UE_REPLICATED(TArray<TSet<int32>>, Sets);` | Refused: a container that holds a TMap or TSet does not replicate. See [Replication](#replication). | Refused |
+| <a id="containers-of-containers.tarray-tarray-int32-grid"></a>`TArray<TArray<int32>> Grid;`, `TMap<FName, TArray<FName>> Groups;` | Blueprint has no container of containers, so the inner container becomes the `Value` member of a generated wrapper struct, such as `FNC_TArray_FName`. The C++ reads as usual. | Yes |
+| <a id="containers-of-containers.grid-0-add-5"></a>`Grid[0].Add(5);`, `Grid[0][0] = 7;` | An array's inner container changes in place. | Yes |
+| <a id="containers-of-containers.tarray-fname-again-groups-first"></a>`TArray<FName> Again = Groups["first"];` | A map's value is read as a copy, like any map read. | Yes |
+| <a id="containers-of-containers.groups-find-key-out"></a>`Groups.Find(Key, Out)` with a container `Out` | Goes through a wrapper temporary; `Out` gets the inner container. | Yes |
+| <a id="containers-of-containers.ue-replicated-tarray-tset-int32"></a>`UE_REPLICATED(TArray<TSet<int32>>, Sets);` | Refused: a container that holds a TMap or TSet does not replicate. See [Replication](#replication). | Refused |
 
 ```cpp
 TMap<FName, TArray<FName>> Groups;
@@ -1441,7 +1446,7 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `for (int32 P : Scores)`, `for (auto &[K, V] : Counts)` | Range-for over a TArray, TSet or TMap: [Loops](#loops). | Yes |
+| <a id="walking-a-container.for-int32-p-scores"></a>`for (int32 P : Scores)`, `for (auto &[K, V] : Counts)` | Range-for over a TArray, TSet or TMap: [Loops](#loops). | Yes |
 
 ## Operators
 
@@ -1454,13 +1459,13 @@ Blueprint math never traps. Integer overflow wraps, and a division by zero gives
 
 | You write | What it does | Status |
 |---|---|---|
-| `Kills * 3 + Assists - 1` | The editor's +, - and x nodes for the operand type (Add_IntInt, Subtract_Int64Int64, Multiply_FloatFloat). C++'s promotions pick the type: a uint8 or bool operand becomes int, int32 mixed with int64 is int64, and anything mixed with float is float. | Yes |
-| `X + 1` with X at the int32 maximum | Wraps around (two's complement), for int32 and int64 alike. C++ leaves signed overflow undefined. | Yes |
-| `Players / Squads`, `Players % Squads` | The / and % nodes (Divide_IntInt, Divide_Int64Int64, Divide_FloatFloat, Percent_IntInt). Integer division truncates toward zero and the sign of % follows the dividend, as in C++: -7 / 3 is -2 and -7 % 3 is -1. | Yes |
-| `Hits / Shots` with Shots at 0 | Gives 0 and logs a script warning ("Divide by zero", or "Modulo by zero" for %). The mod does not crash, but it quietly gets 0 where C++ would trap or give inf or NaN. | Yes |
-| `Id % Count` on int64 | Refused ("unimplemented binary operator % on Int64Int64"): UE 4.27 has no int64 % node. `%=` on an int64 is refused the same way. Write `Id - (Id / Count) * Count`. | Refused |
-| `-X`, `-F` | An integer is `0 - X`. A float is `-0.0 - F`, so the sign of zero flips as C++'s `-F` does. A literal such as `-5` is the constant itself. | Yes |
-| `+X` | Compiles to X. | Yes |
+| <a id="arithmetic.kills-3-assists-1"></a>`Kills * 3 + Assists - 1` | The editor's +, - and x nodes for the operand type (Add_IntInt, Subtract_Int64Int64, Multiply_FloatFloat). C++'s promotions pick the type: a uint8 or bool operand becomes int, int32 mixed with int64 is int64, and anything mixed with float is float. | Yes |
+| <a id="arithmetic.x-1"></a>`X + 1` with X at the int32 maximum | Wraps around (two's complement), for int32 and int64 alike. C++ leaves signed overflow undefined. | Yes |
+| <a id="arithmetic.players-squads"></a>`Players / Squads`, `Players % Squads` | The / and % nodes (Divide_IntInt, Divide_Int64Int64, Divide_FloatFloat, Percent_IntInt). Integer division truncates toward zero and the sign of % follows the dividend, as in C++: -7 / 3 is -2 and -7 % 3 is -1. | Yes |
+| <a id="arithmetic.hits-shots"></a>`Hits / Shots` with Shots at 0 | Gives 0 and logs a script warning ("Divide by zero", or "Modulo by zero" for %). The mod does not crash, but it quietly gets 0 where C++ would trap or give inf or NaN. | Yes |
+| <a id="arithmetic.id-count"></a>`Id % Count` on int64 | Refused ("unimplemented binary operator % on Int64Int64"): UE 4.27 has no int64 % node. `%=` on an int64 is refused the same way. Write `Id - (Id / Count) * Count`. | Refused |
+| <a id="arithmetic.x"></a>`-X`, `-F` | An integer is `0 - X`. A float is `-0.0 - F`, so the sign of zero flips as C++'s `-F` does. A literal such as `-5` is the constant itself. | Yes |
+| <a id="arithmetic.x-2"></a>`+X` | Compiles to X. | Yes |
 
 Notes:
 
@@ -1472,17 +1477,17 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `(A & 0xFF) \| (B ^ 1)` | The Bitwise AND, OR and XOR nodes (And_IntInt, Or_IntInt, Xor_IntInt, or the Int64Int64 versions). | Yes |
-| `Any \|= Hit`, `A & B`, `A ^ B` on bools | The OR, AND and XOR Boolean nodes (BooleanOR, BooleanAND, BooleanXOR). Both sides run, as in C++. A constant side decides the value or drops out, but a side that calls something still runs. Under UE_NO_OPTIMIZE the bools are promoted to int as in C++ (Conv_BoolToInt) and the result converted back (Conv_IntToBool). | Yes |
-| `bDone == true`, `A != B` on bools | The Equal and Not Equal Boolean nodes (EqualEqual_BoolBool, NotEqual_BoolBool), not an int compare of two promoted bools. | Yes |
-| `~B & 0xFF` | `~` is the Bitwise NOT node (Not_Int, Not_Int64). | Yes |
-| `Hi << 16` | Kismet has no shift node. `X << N` is a multiply by 2^N, which wraps as a shift does. | Yes |
-| `X >> 1` | Clears the low N bits and then divides, so it floors as C++ does: -3 >> 1 is -2 and -7 >> 1 is -4. A uint8 is promoted to int first, so 255 >> 1 is 127. | Yes |
-| `X << 3LL`, `X << SHIFT` | The amount may be any integer literal, with any suffix, or a macro that expands to one. The width comes from the left side alone, so `int32 >> 1LL` is int32 math. | Yes |
-| `X << kShift`, `X >> (2)` | The amount may be any constant C++ knows when it compiles: a constexpr or const variable, a const local, an enumerator, a cast such as `(int32)3`, `sizeof(...)`, a template's value parameter, and an inline function's parameter when the caller passes a constant. | Yes |
-| `1 << kShift` | When both sides are constants the whole shift folds to a constant. | Yes |
-| `X << 32` | Refused ("bit shift amount out of range"). The amount must be 0..31 for an int32 and 0..63 for an int64 left side. | Refused |
-| `X << N`, `X <<= N` with a variable N | Refused ("bit shift with a non-constant amount"): Kismet has no shift node, and a run-time amount cannot become a constant multiplier. Multiply or divide by a power of two instead. | Refused |
+| <a id="bitwise-operators-and.a-0xff-b-1"></a>`(A & 0xFF) \| (B ^ 1)` | The Bitwise AND, OR and XOR nodes (And_IntInt, Or_IntInt, Xor_IntInt, or the Int64Int64 versions). | Yes |
+| <a id="bitwise-operators-and.any-hit"></a>`Any \|= Hit`, `A & B`, `A ^ B` on bools | The OR, AND and XOR Boolean nodes (BooleanOR, BooleanAND, BooleanXOR). Both sides run, as in C++. A constant side decides the value or drops out, but a side that calls something still runs. Under UE_NO_OPTIMIZE the bools are promoted to int as in C++ (Conv_BoolToInt) and the result converted back (Conv_IntToBool). | Yes |
+| <a id="bitwise-operators-and.bdone-true"></a>`bDone == true`, `A != B` on bools | The Equal and Not Equal Boolean nodes (EqualEqual_BoolBool, NotEqual_BoolBool), not an int compare of two promoted bools. | Yes |
+| <a id="bitwise-operators-and.b-0xff"></a>`~B & 0xFF` | `~` is the Bitwise NOT node (Not_Int, Not_Int64). | Yes |
+| <a id="bitwise-operators-and.hi-16"></a>`Hi << 16` | Kismet has no shift node. `X << N` is a multiply by 2^N, which wraps as a shift does. | Yes |
+| <a id="bitwise-operators-and.x-1"></a>`X >> 1` | Clears the low N bits and then divides, so it floors as C++ does: -3 >> 1 is -2 and -7 >> 1 is -4. A uint8 is promoted to int first, so 255 >> 1 is 127. | Yes |
+| <a id="bitwise-operators-and.x-3ll"></a>`X << 3LL`, `X << SHIFT` | The amount may be any integer literal, with any suffix, or a macro that expands to one. The width comes from the left side alone, so `int32 >> 1LL` is int32 math. | Yes |
+| <a id="bitwise-operators-and.x-kshift"></a>`X << kShift`, `X >> (2)` | The amount may be any constant C++ knows when it compiles: a constexpr or const variable, a const local, an enumerator, a cast such as `(int32)3`, `sizeof(...)`, a template's value parameter, and an inline function's parameter when the caller passes a constant. | Yes |
+| <a id="bitwise-operators-and.1-kshift"></a>`1 << kShift` | When both sides are constants the whole shift folds to a constant. | Yes |
+| <a id="bitwise-operators-and.x-32"></a>`X << 32` | Refused ("bit shift amount out of range"). The amount must be 0..31 for an int32 and 0..63 for an int64 left side. | Refused |
+| <a id="bitwise-operators-and.x-n"></a>`X << N`, `X <<= N` with a variable N | Refused ("bit shift with a non-constant amount"): Kismet has no shift node, and a run-time amount cannot become a constant multiplier. Multiply or divide by a power of two instead. | Refused |
 
 ```cpp
 static constexpr int32 kShift = 3;
@@ -1494,39 +1499,39 @@ int32 Eight(int32 X) { return (X << kShift) | (1 << kShift); } // 1 << kShift fo
 Notes:
 
 - There is no unsigned (logical) shift, because uint32 is not a Blueprint type.
-- `X << -1` gets the non-constant message, not the out-of-range one. Clang adds its own warnings for both
-  (-Wshift-count-negative, -Wshift-count-overflow).
+- `X << -1` is out of range too ("bit shift amount out of range: -1"). Clang adds its own warning for a negative or
+  too-large amount (-Wshift-count-negative, -Wshift-count-overflow).
 
 ### Comparisons
 
 | You write | What it does | Status |
 |---|---|---|
-| `Health < 25.f`, `A >= B`, `A == B` | The comparison node for the operand type: Less_IntInt, GreaterEqual_FloatFloat, EqualEqual_Int64Int64 and so on. This covers numbers and bools. | Yes |
-| `M < EMood::Calm` | An enum compares through its underlying type. A uint8 enum uses the Byte nodes (Less_ByteByte), and an int64-backed enum compares all 64 bits. | Yes |
-| `A == this`, `P == nullptr` | Object identity, the Equal and Not Equal (Object) nodes. How `P != nullptr` differs from `if (P)` is in [Working with other objects](#working-with-other-objects). | Yes |
-| `A < B` on object pointers | Refused ("unimplemented binary operator < on ObjectObject"): Kismet has only == and != for objects. | Refused |
-| `A == B` on FString or FName | Compares case-insensitively, so "abc" == "ABC" is true for both. See [Strings and text](#strings-and-text). | Yes |
+| <a id="comparisons.health-25-f"></a>`Health < 25.f`, `A >= B`, `A == B` | The comparison node for the operand type: Less_IntInt, GreaterEqual_FloatFloat, EqualEqual_Int64Int64 and so on. This covers numbers and bools. | Yes |
+| <a id="comparisons.m-emood-calm"></a>`M < EMood::Calm` | An enum compares through its underlying type. A uint8 enum uses the Byte nodes (Less_ByteByte), and an int64-backed enum compares all 64 bits. | Yes |
+| <a id="comparisons.a-this"></a>`A == this`, `P == nullptr` | Object identity, the Equal and Not Equal (Object) nodes. How `P != nullptr` differs from `if (P)` is in [Working with other objects](#working-with-other-objects). | Yes |
+| <a id="comparisons.a-b"></a>`A < B` on object pointers | Refused ("unimplemented binary operator < on ObjectObject"): Kismet has only == and != for objects. | Refused |
+| <a id="comparisons.a-b-2"></a>`A == B` on FString or FName | Compares case-insensitively, so "abc" == "ABC" is true for both. See [Strings and text](#strings-and-text). | Yes |
 
 ### Logical operators and ?:
 
 | You write | What it does | Status |
 |---|---|---|
-| `!bFiring` | The NOT Boolean node. Many negations cost nothing instead; see [The optimizer](#the-optimizer). | Yes |
-| `X != 0 && 10 / X > 2` | C++ short-circuiting is kept: the right side's calls, reads and divisions run only when C++ would run them, so this never divides by zero. `\|\|` runs its right side only when the left is false. | Yes |
-| `X > 0 ? X * 2 : X < -5 ? -1 : 7` | Only the chosen arm runs. The operator compiles to an if/else that stores into a temp, or straight into the variable being assigned, and `return C ? A : B;` becomes two returns. Nested ternaries work. | Yes |
-| `FString(C ? "On" : "Off")`, `FString("x") + (C ? "+" : "-")` | A select of two strings: the temp is an FString, whether the two literals have one length (a `const char[2]` in C++) or not. | Yes |
-| `C ? 'y' : 'n'` | Blueprint has no char: the select is an int32, the code of the char picked, which is what C++ promotes a char to. | Yes |
-| `(C ? Left : Right) = 5` | Refused ("assignment to ConditionalOperator"): Blueprint has no reference to whichever variable the condition picks. Write `if (C) Left = 5; else Right = 5;`. | Refused |
-| `Add5(C ? A : B)` into a `T&` parameter | The callee gets a copy, stored back into the picked variable after the call, with a warning. See [Functions](#functions). | Warns |
-| `A = 1, B = 2;`, `++I, --J` | The comma operator as a statement: each side runs in turn, as two statements. A side that does nothing (`I, J++`) is dropped. A declaration of several variables, `int32 I = 0, J = N;`, is not the comma operator and works too. | Yes |
-| `if (bool bOk; Get(Out, bOk), !bOk)`, `switch (N += 10, N)` | An if or switch condition with a comma: the left side runs once, before the test, as an init-statement does, and the right side is the condition. This is how an out-parameter call is tested in one line. | Yes |
-| `int32 N{(Bump(), M)};`, `F((Bump(), M))`, `return (N += 1, N * 2);`, `switch (Bump(), T)` over a `TEnum<E>`, `S = {(Bump(), M), 2}` | A comma inside a statement's expression: the left side runs first, as a statement of its own, and the comma is worth its right side, read where C++ reads it. This holds wherever nothing in the statement runs before the comma: an initialiser, a return value, an assignment's right side, an argument, a braced list's first member. Beside another argument that is no constant (C++ leaves their order open, a parenthesised constructor's `FVector(Get(), (Bump(), M), 0.f)` included; braces fix theirs) the whole argument holding the comma runs first, into a temporary. A left-out argument whose default is a constant counts as that constant. Passed to a reference parameter, `const T&` included, the comma is its right side's variable itself, which the callee reads when it runs, after every argument: only the left side runs first, and the right side must be a variable (see the refusal below). | Yes |
-| `while (Next(X), X > 0)`, `while ((Bump(), N) < 5)`, `A && (Bump(), B)`, `C ? (Bump(), X) : Y`, `Obj->F((Bump(), M))` | Where no statement before the one holding the comma fits, the comma runs in place: its left side, then a copy of its right side, read right after it. That is a loop condition, which runs it again on every trip; the right side of `&&` / `\|\|` and an arm of `?:`, which run it only when C++ does; and an argument of a call on another object, whose object C++ evaluates first. Passed to a reference parameter there, `while (IncRef(0, (Bump(), N)) < 20)`, it is the right side's variable itself, which must then be a plain variable. | Yes |
-| `{G(), (Bump(), M)}`, `L[(Bump(), I)] = G()` | Refused ("the comma operator after something its statement runs first ..."). C++ runs G first: braces evaluate their members in order, and an assignment's right side runs before its left. The comma's left side would run before G. Write the left side as a statement of its own. | Refused |
-| `while ((Bump(), S).X < 3)` | Refused ("the comma operator used as a place, not a value ..."): a member taken of the comma, or the comma bound to an operator's or a constructor's reference, needs the place itself, and a loop condition has no statement before it to hold the left side. Write the left side as a statement of its own. A comma assigned to or updated there works, and so does a member or an element of one, `while (((Bump(), S).X += 1) < 3)`: see [Assignment and updates](#assignment-and-updates). | Refused |
-| `F(G(), (Bump(), L[I]))` where F takes `int32&` or `const int32&`, `Get() + (Bump(), L[0])` over FString | Refused: a comma bound to a reference beside an argument that may run first must end in a variable. That covers a call's reference parameter and an operator's reference operand (FString's `+` takes `const FString&`; the message names the operator). A temporary would not be the place the callee writes or reads, and `L[I]` located again after G would not be the one C++ binds. In a loop condition, the right of `&&` / `\|\|` / `?:` or a call on another object, a comma passed to a reference parameter must end in a variable even alone. | Refused |
-| `(Bump(), M) * (G() + 0.5)` | Refused for the double math (`no Kismet conversion from float to double`), as `M * (G() + 0.5)` is. The comma runs first into a temporary, and the conversion to double stays outside it. A comma whose own value is a type no Blueprint variable holds is refused naming that type. | Refused |
-| `int32 D = (1, 4);` as a class default | The right side, when the left side does nothing. A left side that does something would run when the game builds the object, which a default cannot: refused as any computed default. | Yes |
+| <a id="logical-operators-and.bfiring"></a>`!bFiring` | The NOT Boolean node. Many negations cost nothing instead; see [The optimizer](#the-optimizer). | Yes |
+| <a id="logical-operators-and.x-0-10-x-2"></a>`X != 0 && 10 / X > 2` | C++ short-circuiting is kept: the right side's calls, reads and divisions run only when C++ would run them, so this never divides by zero. `\|\|` runs its right side only when the left is false. | Yes |
+| <a id="logical-operators-and.x-0-x-2-x"></a>`X > 0 ? X * 2 : X < -5 ? -1 : 7` | Only the chosen arm runs. The operator compiles to an if/else that stores into a temp, or straight into the variable being assigned, and `return C ? A : B;` becomes two returns. Nested ternaries work. | Yes |
+| <a id="logical-operators-and.fstring-c-on-off"></a>`FString(C ? "On" : "Off")`, `FString("x") + (C ? "+" : "-")` | A select of two strings: the temp is an FString, whether the two literals have one length (a `const char[2]` in C++) or not. | Yes |
+| <a id="logical-operators-and.c-y-n"></a>`C ? 'y' : 'n'` | Blueprint has no char: the select is an int32, the code of the char picked, which is what C++ promotes a char to. | Yes |
+| <a id="logical-operators-and.c-left-right-5"></a>`(C ? Left : Right) = 5` | Refused ("assignment to ConditionalOperator"): Blueprint has no reference to whichever variable the condition picks. Write `if (C) Left = 5; else Right = 5;`. | Refused |
+| <a id="logical-operators-and.add5-c-a-b"></a>`Add5(C ? A : B)` into a `T&` parameter | The callee gets a copy, stored back into the picked variable after the call, with a warning. See [Functions](#functions). | Warns |
+| <a id="logical-operators-and.a-1-b-2"></a>`A = 1, B = 2;`, `++I, --J` | The comma operator as a statement: each side runs in turn, as two statements. A side that does nothing (`I, J++`) is dropped. A declaration of several variables, `int32 I = 0, J = N;`, is not the comma operator and works too. | Yes |
+| <a id="logical-operators-and.if-bool-bok-get-out"></a>`if (bool bOk; Get(Out, bOk), !bOk)`, `switch (N += 10, N)` | An if or switch condition with a comma: the left side runs once, before the test, as an init-statement does, and the right side is the condition. This is how an out-parameter call is tested in one line. | Yes |
+| <a id="logical-operators-and.int32-n-bump-m"></a>`int32 N{(Bump(), M)};`, `F((Bump(), M))`, `return (N += 1, N * 2);`, `switch (Bump(), T)` over a `TEnum<E>`, `S = {(Bump(), M), 2}` | A comma inside a statement's expression: the left side runs first, as a statement of its own, and the comma is worth its right side, read where C++ reads it. This holds wherever nothing in the statement runs before the comma: an initialiser, a return value, an assignment's right side, an argument, a braced list's first member. Beside another argument that is no constant (C++ leaves their order open, a parenthesised constructor's `FVector(Get(), (Bump(), M), 0.f)` included; braces fix theirs) the whole argument holding the comma runs first, into a temporary. A left-out argument whose default is a constant counts as that constant. Passed to a reference parameter, `const T&` included, the comma is its right side's variable itself, which the callee reads when it runs, after every argument: only the left side runs first, and the right side must be a variable (see the refusal below). | Yes |
+| <a id="logical-operators-and.while-next-x-x-0"></a>`while (Next(X), X > 0)`, `while ((Bump(), N) < 5)`, `A && (Bump(), B)`, `C ? (Bump(), X) : Y`, `Obj->F((Bump(), M))` | Where no statement before the one holding the comma fits, the comma runs in place: its left side, then a copy of its right side, read right after it. That is a loop condition, which runs it again on every trip; the right side of `&&` / `\|\|` and an arm of `?:`, which run it only when C++ does; and an argument of a call on another object, whose object C++ evaluates first. Passed to a reference parameter there, `while (IncRef(0, (Bump(), N)) < 20)`, it is the right side's variable itself, which must then be a plain variable. | Yes |
+| <a id="logical-operators-and.g-bump-m"></a>`{G(), (Bump(), M)}`, `L[(Bump(), I)] = G()` | Refused ("the comma operator after something its statement runs first ..."). C++ runs G first: braces evaluate their members in order, and an assignment's right side runs before its left. The comma's left side would run before G. Write the left side as a statement of its own. | Refused |
+| <a id="logical-operators-and.while-bump-s-x-3"></a>`while ((Bump(), S).X < 3)` | Refused ("the comma operator used as a place, not a value ..."): a member taken of the comma, or the comma bound to an operator's or a constructor's reference, needs the place itself, and a loop condition has no statement before it to hold the left side. Write the left side as a statement of its own. A comma assigned to or updated there works, and so does a member or an element of one, `while (((Bump(), S).X += 1) < 3)`: see [Assignment and updates](#assignment-and-updates). | Refused |
+| <a id="logical-operators-and.f-g-bump-l-i"></a>`F(G(), (Bump(), L[I]))` where F takes `int32&` or `const int32&`, `Get() + (Bump(), L[0])` over FString | Refused: a comma bound to a reference beside an argument that may run first must end in a variable. That covers a call's reference parameter and an operator's reference operand (FString's `+` takes `const FString&`; the message names the operator). A temporary would not be the place the callee writes or reads, and `L[I]` located again after G would not be the one C++ binds. In a loop condition, the right of `&&` / `\|\|` / `?:` or a call on another object, a comma passed to a reference parameter must end in a variable even alone. | Refused |
+| <a id="logical-operators-and.bump-m-g-0-5"></a>`(Bump(), M) * (G() + 0.5)` | Refused for the double math (`no Kismet conversion from float to double`), as `M * (G() + 0.5)` is. The comma runs first into a temporary, and the conversion to double stays outside it. A comma whose own value is a type no Blueprint variable holds is refused naming that type. | Refused |
+| <a id="logical-operators-and.int32-d-1-4"></a>`int32 D = (1, 4);` as a class default | The right side, when the left side does nothing. A left side that does something would run when the game builds the object, which a default cannot: refused as any computed default. | Yes |
 
 Notes:
 
@@ -1541,25 +1546,25 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Total = Kills * 3;`, `Other->Score = 10;` | The Set node, on a local, a member or another object's field. A replicated property also gets the editor's FlushNetDormancy and RepNotify around the write; see [Replication](#replication). | Yes |
-| `Slots[I] = Value;` | Set Array Elem. | Yes |
-| `Scores[Name] = 5;` | The map Add node, which replaces an existing value. See [Containers](#containers). | Yes |
-| `Spots[Name].X = 1;` | A store into a map value's member is copied out, changed and stored back, as `T E = Map[K]; E.X = 1; Map[K] = E;`, with the key evaluated once. | Yes |
-| `Acc += I;`, and `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | `X = X op Y`: a math node and a Set. X is located once, so `Slots[NextSlot()] += By` calls NextSlot a single time, and Y is evaluated first. It works on everything plain `=` works on, map values and their members included. `<<=`, `>>=` and int64 `%=` follow the rules of the plain operators. | Yes |
-| `int32 Z = (Y += X) * 10;` | A compound assignment used as a value is X after the store. | Yes |
-| `IncRef(1, B += 1)`, `Peek(SetB(), ++B)`, where the parameter is `int32&` or `const int32&` | Passed to a reference parameter, a compound assignment or a prefix `++` / `--` is the variable itself, as a plain `=` is: the update runs first, as a statement, and the callee reads, and for `T&` writes, B after every argument. Its left side must be a plain variable (`IncRef(1, L[Idx()] += 1)` is refused). The same holds in a loop condition (`while (IncRef(0, B += 1) < 20)`), on the right of `&&` / `\|\|` or in `?:`, and in a call on another object (`P->IncRef(1, B += 1)`). There the call runs as one block each time C++ runs it: the object first, then the update, then the call on B. Behind something its statement runs first, `{G(), IncRef(0, B += 1)}`, it is refused, since the update would run before G. | Yes |
-| `X++`, `++X`, `X--`, `--X` | The Increment Int and Decrement Int macros, with X located once. Postfix gives the value before the store, prefix the value after. Works on int32, int64, float and uint8 (a uint8 wraps at 255). On a raw pointer it steps by the element size; see [Pointers and memory](#pointers-and-memory). | Yes |
-| `A = B = 0;`, `S1 = S2 = Name;`, `if ((X = Next()) > 3)`, `return A = N;` | A plain `=` used as a value: the assignment runs first, as a statement, and the value is the variable it wrote, read after it. Numbers, strings and structs alike. It works wherever the comma operator does, and like it, passed to a reference parameter (`const T&` included) it is that variable itself, with no copy. In a loop condition (`while ((V = Next()) > 0)`, `while (UsePair(T = S) < 100)` with a struct passed by value), on the right of `&&` / `\|\|` / `?:` or in an argument of a call on another object it runs in place, as the comma does there; a member taken of it in those places, `while ((T = S).X < 9)`, is refused ("an assignment used as a place, not a value ..."). Behind something its statement runs first, `{G(), (A = M)}`, it is refused ("an assignment used as a value after something its statement runs first ..."). The left side must be a plain variable (`A = L[0] = 1` is refused): it is read again. A comma there names one, so `int32 X = ((Bump(), N) = G());` is `(Bump(), N) = G();` then `X = N`, and `((Bump(), T).A = G())` reads T.A. | Yes |
-| `(Bump(), N) += 1`, `while (++(Bump(), N) < 5)`, `(Bump(), N) = G();`, `(N = Next()) += G()` | A comma or a plain `=` assigned to or updated writes the variable it names: the comma's right side, or the `=`'s left side after the assignment. The outer assignment's right side runs first, as C++17 orders it, then the comma's left side (or the inner assignment), then the store: `(Bump(), N) = G()` gives N what G returned before Bump ran; a struct's or FString's `=` reads an element on its right through its reference, so `(Bump(), T) = L[Count]` locates L[Count] before Bump and reads it after. In a loop condition, on the right of `&&` / `\|\|` and as a statement alike. A member or an element of one is the same member or element of the variable, its index run after the comma: `while (((Bump(), T).A += 1) < 5)`, `((Bump(), L)[0] += 1)`, `(Bump(), L)[Idx()] = G();` (G, then Bump, then Idx). The inner `=`'s left side must be a plain variable, or a comma that names one (`((Bump(), N) = G()) += 1`); `(L[Idx()] = M) += 1` is refused: it is named twice. An update or a struct's `=` there is the same: `while (((N += G()) += 1) < 20)` is `N += G(); N += 1` on every trip, `++(N += 1)` steps N twice, `(N += G()) = N + 5;` reads N + 5 first, and `while (((T = S).A += 1) < 5)` copies S, then updates T.A. `(L[Idx()] += M) += 1` is refused the same way. | Yes |
+| <a id="assignment-and-updates.total-kills-3"></a>`Total = Kills * 3;`, `Other->Score = 10;` | The Set node, on a local, a member or another object's field. A replicated property also gets the editor's FlushNetDormancy and RepNotify around the write; see [Replication](#replication). | Yes |
+| <a id="assignment-and-updates.slots-i-value"></a>`Slots[I] = Value;` | Set Array Elem. | Yes |
+| <a id="assignment-and-updates.scores-name-5"></a>`Scores[Name] = 5;` | The map Add node, which replaces an existing value. See [Containers](#containers). | Yes |
+| <a id="assignment-and-updates.spots-name-x-1"></a>`Spots[Name].X = 1;` | A store into a map value's member is copied out, changed and stored back, as `T E = Map[K]; E.X = 1; Map[K] = E;`, with the key evaluated once. | Yes |
+| <a id="assignment-and-updates.acc-i"></a>`Acc += I;`, and `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | `X = X op Y`: a math node and a Set. X is located once, so `Slots[NextSlot()] += By` calls NextSlot a single time, and Y is evaluated first. It works on everything plain `=` works on, map values and their members included. `<<=`, `>>=` and int64 `%=` follow the rules of the plain operators. | Yes |
+| <a id="assignment-and-updates.int32-z-y-x-10"></a>`int32 Z = (Y += X) * 10;` | A compound assignment used as a value is X after the store. | Yes |
+| <a id="assignment-and-updates.incref-1-b-1"></a>`IncRef(1, B += 1)`, `Peek(SetB(), ++B)`, where the parameter is `int32&` or `const int32&` | Passed to a reference parameter, a compound assignment or a prefix `++` / `--` is the variable itself, as a plain `=` is: the update runs first, as a statement, and the callee reads, and for `T&` writes, B after every argument. Its left side must be a plain variable (`IncRef(1, L[Idx()] += 1)` is refused). The same holds in a loop condition (`while (IncRef(0, B += 1) < 20)`), on the right of `&&` / `\|\|` or in `?:`, and in a call on another object (`P->IncRef(1, B += 1)`). There the call runs as one block each time C++ runs it: the object first, then the update, then the call on B. Behind something its statement runs first, `{G(), IncRef(0, B += 1)}`, it is refused, since the update would run before G. | Yes |
+| <a id="assignment-and-updates.x"></a>`X++`, `++X`, `X--`, `--X` | The Increment Int and Decrement Int macros, with X located once. Postfix gives the value before the store, prefix the value after. Works on int32, int64, float and uint8 (a uint8 wraps at 255). On a raw pointer it steps by the element size; see [Pointers and memory](#pointers-and-memory). | Yes |
+| <a id="assignment-and-updates.a-b-0"></a>`A = B = 0;`, `S1 = S2 = Name;`, `if ((X = Next()) > 3)`, `return A = N;` | A plain `=` used as a value: the assignment runs first, as a statement, and the value is the variable it wrote, read after it. Numbers, strings and structs alike. It works wherever the comma operator does, and like it, passed to a reference parameter (`const T&` included) it is that variable itself, with no copy. In a loop condition (`while ((V = Next()) > 0)`, `while (UsePair(T = S) < 100)` with a struct passed by value), on the right of `&&` / `\|\|` / `?:` or in an argument of a call on another object it runs in place, as the comma does there; a member taken of it in those places, `while ((T = S).X < 9)`, is refused ("an assignment used as a place, not a value ..."). Behind something its statement runs first, `{G(), (A = M)}`, it is refused ("an assignment used as a value after something its statement runs first ..."). The left side must be a plain variable (`A = L[0] = 1` is refused): it is read again. A comma there names one, so `int32 X = ((Bump(), N) = G());` is `(Bump(), N) = G();` then `X = N`, and `((Bump(), T).A = G())` reads T.A. | Yes |
+| <a id="assignment-and-updates.bump-n-1"></a>`(Bump(), N) += 1`, `while (++(Bump(), N) < 5)`, `(Bump(), N) = G();`, `(N = Next()) += G()` | A comma or a plain `=` assigned to or updated writes the variable it names: the comma's right side, or the `=`'s left side after the assignment. The outer assignment's right side runs first, as C++17 orders it, then the comma's left side (or the inner assignment), then the store: `(Bump(), N) = G()` gives N what G returned before Bump ran; a struct's or FString's `=` reads an element on its right through its reference, so `(Bump(), T) = L[Count]` locates L[Count] before Bump and reads it after. In a loop condition, on the right of `&&` / `\|\|` and as a statement alike. A member or an element of one is the same member or element of the variable, its index run after the comma: `while (((Bump(), T).A += 1) < 5)`, `((Bump(), L)[0] += 1)`, `(Bump(), L)[Idx()] = G();` (G, then Bump, then Idx). The inner `=`'s left side must be a plain variable, or a comma that names one (`((Bump(), N) = G()) += 1`); `(L[Idx()] = M) += 1` is refused: it is named twice. An update or a struct's `=` there is the same: `while (((N += G()) += 1) < 20)` is `N += G(); N += 1` on every trip, `++(N += 1)` steps N twice, `(N += G()) = N + 5;` reads N + 5 first, and `while (((T = S).A += 1) < 5)` copies S, then updates T.A. `(L[Idx()] += M) += 1` is refused the same way. | Yes |
 
 ### Evaluation order
 
 | You write | What it does | Status |
 |---|---|---|
-| `Slots[Cursor] = NextSlot();` | The right side of `=` or `op=` runs first, then the destination (object, array, index, map key) is located, as C++17 requires. This stores at the new Cursor. | Yes |
-| `GetPeer()->SetCursor(SwapPeerInline());` | The object a call runs on is evaluated before its arguments. When an argument needs statements of its own that could change the object, the object is saved into a local first. The same holds for `E1[E2]`, a container method's container and a dispatcher's Broadcast. | Yes |
-| `Bump() * 100 + BumpInline()`, `Pair(Bump(), BumpInline())` | An operand or argument that needs statements (an inline call, `&&`, `\|\|`, `?:`, a `++` or `op=` value, a pointer read) runs before the whole expression or call. C++ leaves this order unspecified. | Yes |
-| `FIntPoint P = {Bump(), M ? N : 0};` | A struct literal's members run left to right, each once, as C++ requires of braces: each computed member is its own statement. | Yes |
+| <a id="evaluation-order.slots-cursor-nextslot"></a>`Slots[Cursor] = NextSlot();` | The right side of `=` or `op=` runs first, then the destination (object, array, index, map key) is located, as C++17 requires. This stores at the new Cursor. | Yes |
+| <a id="evaluation-order.getpeer-setcursor-swappeerinline"></a>`GetPeer()->SetCursor(SwapPeerInline());` | The object a call runs on is evaluated before its arguments. When an argument needs statements of its own that could change the object, the object is saved into a local first. The same holds for `E1[E2]`, a container method's container and a dispatcher's Broadcast. | Yes |
+| <a id="evaluation-order.bump-100-bumpinline"></a>`Bump() * 100 + BumpInline()`, `Pair(Bump(), BumpInline())` | An operand or argument that needs statements (an inline call, `&&`, `\|\|`, `?:`, a `++` or `op=` value, a pointer read) runs before the whole expression or call. C++ leaves this order unspecified. | Yes |
+| <a id="evaluation-order.fintpoint-p-bump-m-n"></a>`FIntPoint P = {Bump(), M ? N : 0};` | A struct literal's members run left to right, each once, as C++ requires of braces: each computed member is its own statement. | Yes |
 
 ```cpp
 TArray<int32> Slots;
@@ -1594,12 +1599,12 @@ The rule to remember: a statement is a declaration, a call, an assignment or upd
 
 | You write | What it does | Status |
 |---|---|---|
-| `if (Target)` | An object pointer is the Is Valid node, so an object that is pending kill counts as false. `Target != nullptr` can still be true for it; see [Working with other objects](#working-with-other-objects). | Yes |
-| `if (Count)` | An int32 goes through Conv_IntToBool. | Yes |
-| `if (F)` on a float, an int64, a byte or an enum | Compared with zero by a Not Equal node, so a NaN counts as true. | Yes |
-| `(bool)F + X`, `bool IsSet(int32 V) { return V; }` | A number converts to bool the same way outside a condition: true when nonzero, as in C++. `(bool)F + X` adds 0 or 1. | Yes |
-| `if (Tag)` | An FName is `Tag != None` (NotEqual_NameName). `!Tag` and `static_cast<bool>(Tag)` work too. | Yes |
-| `Target && Target->CustomTimeDilation > 0` | Works as a guard: the Is Valid test decides, through the short-circuit, whether the read runs. | Yes |
+| <a id="conditions.if-target"></a>`if (Target)` | An object pointer is the Is Valid node, so an object that is pending kill counts as false. `Target != nullptr` can still be true for it; see [Working with other objects](#working-with-other-objects). | Yes |
+| <a id="conditions.if-count"></a>`if (Count)` | An int32 goes through Conv_IntToBool. | Yes |
+| <a id="conditions.if-f"></a>`if (F)` on a float, an int64, a byte or an enum | Compared with zero by a Not Equal node, so a NaN counts as true. | Yes |
+| <a id="conditions.bool-f-x"></a>`(bool)F + X`, `bool IsSet(int32 V) { return V; }` | A number converts to bool the same way outside a condition: true when nonzero, as in C++. `(bool)F + X` adds 0 or 1. | Yes |
+| <a id="conditions.if-tag"></a>`if (Tag)` | An FName is `Tag != None` (NotEqual_NameName). `!Tag` and `static_cast<bool>(Tag)` work too. | Yes |
+| <a id="conditions.target-target-customtimedilation"></a>`Target && Target->CustomTimeDilation > 0` | Works as a guard: the Is Valid test decides, through the short-circuit, whether the read runs. | Yes |
 
 An interface value is true when an object is behind it, a plain null test in which a pending-kill object still counts
 ([Interfaces](#interfaces)). A raw pointer is true when its address is nonzero
@@ -1609,10 +1614,10 @@ An interface value is true when an object is behind it, a plain null test in whi
 
 | You write | What it does | Status |
 |---|---|---|
-| `if (Health <= 0) Die(); else Heal();` | The Branch node, compiled to a conditional jump. `else if` chains work. The condition converts to bool as described under Conditions. | Yes |
-| `if (int32 Twice = V * 2; Twice > 10)` | The init-statement runs once, before the test. An expression works as well: `if (N++; N > 3)`. | Yes |
-| `if (APawn *P = Cast<APawn>(Obj))` | A declaring condition: P is made once and tested. | Yes |
-| `if constexpr (sizeof(T) == 8)` | Only the branch clang kept is compiled, and no jump is left behind, in a UE_NO_OPTIMIZE function too. | Yes |
+| <a id="if.if-health-0-die-else"></a>`if (Health <= 0) Die(); else Heal();` | The Branch node, compiled to a conditional jump. `else if` chains work. The condition converts to bool as described under Conditions. | Yes |
+| <a id="if.if-int32-twice-v-2"></a>`if (int32 Twice = V * 2; Twice > 10)` | The init-statement runs once, before the test. An expression works as well: `if (N++; N > 3)`. | Yes |
+| <a id="if.if-apawn-p-cast-apawn"></a>`if (APawn *P = Cast<APawn>(Obj))` | A declaring condition: P is made once and tested. | Yes |
+| <a id="if.if-constexpr-sizeof-t-8"></a>`if constexpr (sizeof(T) == 8)` | Only the branch clang kept is compiled, and no jump is left behind, in a UE_NO_OPTIMIZE function too. | Yes |
 
 Notes:
 
@@ -1625,13 +1630,13 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `switch (Code)` on an int32, uint8, bool or enum | The editor's Switch on Int, Byte or Enum. The value is evaluated once, and the case bodies are compiled in source order, so fallthrough, `[[fallthrough]]`, `default` in any position, `break` and `continue` behave as in C++. | Yes |
-| `switch (Id)` on an int64 | A chain of full 64-bit compares. | Yes |
-| `switch (int32 K = V + 1; K)` | An init-statement or a declaring condition runs once, then the plain switch. | Yes |
-| `switch (UE_NAME_SWITCH(Kind))` | The editor's Switch on Name, shown below. | Yes |
-| `case 1 ... 3:` | GNU case ranges are refused ("unimplemented statement IntegerLiteral"). List the cases. | Refused |
-| `switch (X) case 1: return 1;` | Refused ("`switch` needs a braced body"). | Refused |
-| `case 0: { R = 1; case 1: R += 2; }` | A case label inside a nested block is refused ("unimplemented statement CaseStmt"). Every case label must sit directly in the switch body. | Refused |
+| <a id="switch.switch-code"></a>`switch (Code)` on an int32, uint8, bool or enum | The editor's Switch on Int, Byte or Enum. The value is evaluated once, and the case bodies are compiled in source order, so fallthrough, `[[fallthrough]]`, `default` in any position, `break` and `continue` behave as in C++. | Yes |
+| <a id="switch.switch-id"></a>`switch (Id)` on an int64 | A chain of full 64-bit compares. | Yes |
+| <a id="switch.switch-int32-k-v-1"></a>`switch (int32 K = V + 1; K)` | An init-statement or a declaring condition runs once, then the plain switch. | Yes |
+| <a id="switch.switch-ue-name-switch-kind"></a>`switch (UE_NAME_SWITCH(Kind))` | The editor's Switch on Name, shown below. | Yes |
+| <a id="switch.case-1-3"></a>`case 1 ... 3:` | GNU case ranges are refused ("unimplemented statement IntegerLiteral"). List the cases. | Refused |
+| <a id="switch.switch-x-case-1-return"></a>`switch (X) case 1: return 1;` | Refused ("`switch` needs a braced body"). | Refused |
+| <a id="switch.case-0-r-1-case"></a>`case 0: { R = 1; case 1: R += 2; }` | A case label inside a nested block is refused ("unimplemented statement CaseStmt"). Every case label must sit directly in the switch body. | Refused |
 
 ```cpp
 int32 Score;
@@ -1672,11 +1677,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `break;`, `continue;` | Plain jumps. `break` leaves the innermost loop or switch. `continue` goes to a for loop's increment, a do-while's test, or the loop around a switch. Inside an inline function's body they belong to that body's own loops. | Yes |
-| `goto done;` | A jump, backward or forward, which can leave any number of loops at once. The editor's nearest equivalent is a wire looping back. Each expansion of an inline function gets its own labels. A declaration that a goto reaches again is made again, as one in a loop is. | Yes |
-| `return Found;`, `return;` | The Return Node. `return C ? A : B;` becomes two returns. In an inline function, return jumps to the end of the expanded body. Inside a TMap loop that writes values back, the values are stored first. | Yes |
-| `return Log(Errors, "bad");` in a void function | A void call, then a plain return, as C++ runs it. `return (void)X;` with an X that does nothing is a plain return. | Yes |
-| `goto` inside a TMap loop that writes values back | Refused; see [Loops](#loops). | Refused |
+| <a id="jumps.break"></a>`break;`, `continue;` | Plain jumps. `break` leaves the innermost loop or switch. `continue` goes to a for loop's increment, a do-while's test, or the loop around a switch. Inside an inline function's body they belong to that body's own loops. | Yes |
+| <a id="jumps.goto-done"></a>`goto done;` | A jump, backward or forward, which can leave any number of loops at once. The editor's nearest equivalent is a wire looping back. Each expansion of an inline function gets its own labels. A declaration that a goto reaches again is made again, as one in a loop is. | Yes |
+| <a id="jumps.return-found"></a>`return Found;`, `return;` | The Return Node. `return C ? A : B;` becomes two returns. In an inline function, return jumps to the end of the expanded body. Inside a TMap loop that writes values back, the values are stored first. | Yes |
+| <a id="jumps.return-log-errors-bad"></a>`return Log(Errors, "bad");` in a void function | A void call, then a plain return, as C++ runs it. `return (void)X;` with an X that does nothing is a plain return. | Yes |
+| <a id="jumps.goto"></a>`goto` inside a TMap loop that writes values back | Refused; see [Loops](#loops). | Refused |
 
 ```cpp
 int32 SumBelow(int32 N) {
@@ -1702,14 +1707,14 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `{ int32 Tmp = A; A = B; B = Tmp; }` | A bare block. Its statements join the enclosing list, and nothing is destroyed at the closing brace. | Yes |
-| `;`, `Done: ;`, `[[fallthrough]];` | Compile to nothing. | Yes |
-| `case Angry: [[likely]] return N;` | `[[likely]]` and `[[unlikely]]` are hints for another compiler. Only the statement they mark is compiled. | Yes |
-| `static_assert`, `using`, `typedef` in a body | Compile-time only. A local cannot yet use a type alias declared in the function; see [Locals](#locals). | Yes |
-| `(void)Compute();` | The call. | Yes |
-| `C ? Open() : Close();`, `bReady && Launch();`, `X + 1;` | Refused ("unimplemented statement ConditionalOperator", or BinaryOperator): an expression statement must be a call, an assignment or an update. Write the if out. | Refused |
-| `(void)Unused;` | Refused ("unimplemented statement DeclRefExpr"). To silence an unused-parameter warning, leave the parameter unnamed. | Refused |
-| `try { Risky(); } catch (...) { Recover(); }` | Refused ("unimplemented statement CXXTryStmt"): Blueprint has no exceptions. | Refused |
+| <a id="statements-and-blocks.int32-tmp-a-a-b"></a>`{ int32 Tmp = A; A = B; B = Tmp; }` | A bare block. Its statements join the enclosing list, and nothing is destroyed at the closing brace. | Yes |
+| <a id="statements-and-blocks.row"></a>`;`, `Done: ;`, `[[fallthrough]];` | Compile to nothing. | Yes |
+| <a id="statements-and-blocks.case-angry-likely-return-n"></a>`case Angry: [[likely]] return N;` | `[[likely]]` and `[[unlikely]]` are hints for another compiler. Only the statement they mark is compiled. | Yes |
+| <a id="statements-and-blocks.static-assert"></a>`static_assert`, `using`, `typedef` in a body | Compile-time only. A local cannot yet use a type alias declared in the function; see [Locals](#locals). | Yes |
+| <a id="statements-and-blocks.void-compute"></a>`(void)Compute();` | The call. | Yes |
+| <a id="statements-and-blocks.c-open-close"></a>`C ? Open() : Close();`, `bReady && Launch();`, `X + 1;` | Refused ("unimplemented statement ConditionalOperator", or BinaryOperator): an expression statement must be a call, an assignment or an update. Write the if out. | Refused |
+| <a id="statements-and-blocks.void-unused"></a>`(void)Unused;` | Refused ("unimplemented statement DeclRefExpr"). To silence an unused-parameter warning, leave the parameter unnamed. | Refused |
+| <a id="statements-and-blocks.try-risky-catch-recover"></a>`try { Risky(); } catch (...) { Recover(); }` | Refused ("unimplemented statement CXXTryStmt"): Blueprint has no exceptions. | Refused |
 
 Note: `if (C);` on one line makes clang warn -Wempty-body. The build still succeeds, and putting the `;` on its own
 line silences it.
@@ -1725,11 +1730,11 @@ loop over it.
 
 | You write | What it does | Status |
 |---|---|---|
-| `while (I < Limit && 100 / (Limit - I) > 1)` | The editor's WhileLoop without the flow stack: a test at the top and a jump back. The condition runs on every trip, with any statements it needs (an inline call, `&&`, `?:`, a pointer read). An inline function called in the condition gets fresh locals each trip. | Yes |
-| `while (true)` | No test at all. Leave with `break` or `return`. | Yes |
-| `while (int32 Left = Start - Steps)` | Left is made again and tested on every trip. | Yes |
-| `do { I += 1; } while (I < Limit);` | The body runs once before the first test, and `continue` jumps to the test. | Yes |
-| `do { R = 1; if (X > 0) break; R = 2; } while (false);` | Runs once with no test. `break` leaves it. | Yes |
+| <a id="while-and-do.while-i-limit-100-limit"></a>`while (I < Limit && 100 / (Limit - I) > 1)` | The editor's WhileLoop without the flow stack: a test at the top and a jump back. The condition runs on every trip, with any statements it needs (an inline call, `&&`, `?:`, a pointer read). An inline function called in the condition gets fresh locals each trip. | Yes |
+| <a id="while-and-do.while-true"></a>`while (true)` | No test at all. Leave with `break` or `return`. | Yes |
+| <a id="while-and-do.while-int32-left-start-steps"></a>`while (int32 Left = Start - Steps)` | Left is made again and tested on every trip. | Yes |
+| <a id="while-and-do.do-i-1-while-i"></a>`do { I += 1; } while (I < Limit);` | The body runs once before the first test, and `continue` jumps to the test. | Yes |
+| <a id="while-and-do.do-r-1-if-x"></a>`do { R = 1; if (X > 0) break; R = 2; } while (false);` | Runs once with no test. `break` leaves it. | Yes |
 
 Note: UE 4.27 compiles Blueprint's runaway-loop guard (1,000,000 iterations) out of Shipping and Test builds. In such
 a build a loop that never ends hangs the game instead of being stopped.
@@ -1738,18 +1743,18 @@ a build a loop that never ends hangs the game instead of being stopped.
 
 | You write | What it does | Status |
 |---|---|---|
-| `for (int32 I = 0; I < Count; ++I)` | `Init; while (Cond) { Body; Inc; }`: the editor's ForLoop, with any condition and increment. `continue` reaches the increment. Loops nest freely. | Yes |
-| `for (;;)`, `for (; I < N; I++)` | A missing condition is `true`, and a missing init or increment is left out. | Yes |
-| `for (int32 I = 0; int32 L = N - I; ++I)` | A declaring condition: L is made again and tested on every trip, and `continue` still reaches the increment. | Yes |
-| `for (int32 I = 0, J = N; I < J; ++I, --J)` | Two variables, both updated in the increment. See [Operators](#operators) for the comma. | Yes |
+| <a id="for.for-int32-i-0-i"></a>`for (int32 I = 0; I < Count; ++I)` | `Init; while (Cond) { Body; Inc; }`: the editor's ForLoop, with any condition and increment. `continue` reaches the increment. Loops nest freely. | Yes |
+| <a id="for.for"></a>`for (;;)`, `for (; I < N; I++)` | A missing condition is `true`, and a missing init or increment is left out. | Yes |
+| <a id="for.for-int32-i-0-int32"></a>`for (int32 I = 0; int32 L = N - I; ++I)` | A declaring condition: L is made again and tested on every trip, and `continue` still reaches the increment. | Yes |
+| <a id="for.for-int32-i-0-j"></a>`for (int32 I = 0, J = N; I < J; ++I, --J)` | Two variables, both updated in the increment. See [Operators](#operators) for the comma. | Yes |
 
 ### Range-for over a TArray
 
 | You write | What it does | Status |
 |---|---|---|
-| `for (int32 X : Items)` | The editor's ForEachLoop: the array is walked by index, and X is a fresh copy on each pass, so assigning to X never changes the array. | Yes |
-| `for (int32 &X : Items)` | X is another name for `Items[Index]`, so writes land in the array. `const T&` and `auto&&` work the same way. ForEachLoop's element is a copy, so it has no equivalent. | Yes |
-| `for (auto [X, Y] : Points)` | A structured binding over TArray or TSet elements is refused ("a structured binding over a TArray"). Bind the element, `for (const FIntPoint &P : Points)`, and read `P.X`. | Refused |
+| <a id="range-for-over.for-int32-x-items"></a>`for (int32 X : Items)` | The editor's ForEachLoop: the array is walked by index, and X is a fresh copy on each pass, so assigning to X never changes the array. | Yes |
+| <a id="range-for-over.for-int32-x-items-2"></a>`for (int32 &X : Items)` | X is another name for `Items[Index]`, so writes land in the array. `const T&` and `auto&&` work the same way. ForEachLoop's element is a copy, so it has no equivalent. | Yes |
+| <a id="range-for-over.for-auto-x-y-points"></a>`for (auto [X, Y] : Points)` | A structured binding over TArray or TSet elements is refused ("a structured binding over a TArray"). Bind the element, `for (const FIntPoint &P : Points)`, and read `P.X`. | Refused |
 
 ```cpp
 TArray<int32> Items;
@@ -1769,18 +1774,18 @@ and after a removal the walk runs past the new end. Do not change the array's le
 
 | You write | What it does | Status |
 |---|---|---|
-| `for (int32 X : Seen)`, `for (const int32 &X : Seen)` | The set is copied into an array (To Array) and the loop walks the copy. The loop variable is a value or a const reference: `int32 &` is a clang error, because the SDK's TSet is read-only in a loop. Since the walk is over the copy, adding to or removing from the set in the body does not disturb it. | Yes |
-| `for (const FName &Tag : Tags)` without the copy | A TSet loop always walks a copy today. The loop works either way; only the cost of the copy differs. | Not yet |
+| <a id="range-for-over.for-int32-x-seen"></a>`for (int32 X : Seen)`, `for (const int32 &X : Seen)` | The set is copied into an array (To Array) and the loop walks the copy. The loop variable is a value or a const reference: `int32 &` is a clang error, because the SDK's TSet is read-only in a loop. Since the walk is over the copy, adding to or removing from the set in the body does not disturb it. | Yes |
+| <a id="range-for-over.for-const-fname-tag-tags"></a>`for (const FName &Tag : Tags)` without the copy | A TSet loop always walks a copy today. The loop works either way; only the cost of the copy differs. | Not yet |
 
 ### Range-for over a TMap
 
 | You write | What it does | Status |
 |---|---|---|
-| `for (auto &[Key, Value] : Scores)` | Walks the map where it lives. Value is the value in the map: a write through it is what `Scores[Key]` reads next, a `T&` binds it with no copy, and a container value changes in place. Key is a copy. `const auto &[Key, Value]` reads the same way. The 4.27 editor has no map ForEach; this replaces Keys, ForEachLoop and Find. | Yes |
-| `for (auto [Key, Value] : Scores)` | By value: the keys are copied (Keys) and each value is fetched into a local (Find). Value is a copy and nothing is written back, as in C++. | Yes |
-| `Scores.Remove(Key)` in the body | A body that adds to or removes from the map walks a copy of the keys instead, so removing the current key is safe. Each read of Value is then a Find and each store an Add. A container value is copied, and stored back at the end of each pass and before a `break` or `return`. | Yes |
-| `for (auto &Pair : Scores)` | Refused ("a TMap range-for binds `auto [Key, Value]`"): a map loop binds exactly two names. | Refused |
-| `goto` inside a TMap loop that writes values back | Refused ("a goto inside a TMap range-for that writes its value back would skip the write"), even when the label is inside the loop. A loop writes values back when it walks a copy of the keys and the body changes a container value through `auto &[Key, Value]`. Leave with `break`, or bind `const auto&`. | Refused |
+| <a id="range-for-over.for-auto-key-value-scores"></a>`for (auto &[Key, Value] : Scores)` | Walks the map where it lives. Value is the value in the map: a write through it is what `Scores[Key]` reads next, a `T&` binds it with no copy, and a container value changes in place. Key is a copy. `const auto &[Key, Value]` reads the same way. The 4.27 editor has no map ForEach; this replaces Keys, ForEachLoop and Find. | Yes |
+| <a id="range-for-over.for-auto-key-value-scores-2"></a>`for (auto [Key, Value] : Scores)` | By value: the keys are copied (Keys) and each value is fetched into a local (Find). Value is a copy and nothing is written back, as in C++. | Yes |
+| <a id="range-for-over.scores-remove-key"></a>`Scores.Remove(Key)` in the body | A body that adds to or removes from the map walks a copy of the keys instead, so removing the current key is safe. Each read of Value is then a Find and each store an Add. A container value is copied, and stored back at the end of each pass and before a `break` or `return`. | Yes |
+| <a id="range-for-over.for-auto-pair-scores"></a>`for (auto &Pair : Scores)` | Refused ("a TMap range-for binds `auto [Key, Value]`"): a map loop binds exactly two names. | Refused |
+| <a id="range-for-over.goto"></a>`goto` inside a TMap loop that writes values back | Refused ("a goto inside a TMap range-for that writes its value back would skip the write"), even when the label is inside the loop. A loop writes values back when it walks a copy of the keys and the body changes a container value through `auto &[Key, Value]`. Leave with `break`, or bind `const auto&`. | Refused |
 
 ```cpp
 TMap<FName, int32> Scores;
@@ -1812,11 +1817,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `for (int32 X : PickPeer()->Items)` | The range expression is evaluated once, into a local, as C++ binds its range once. PickPeer runs once, and reseating a pointer in the body does not move the walk. | Yes |
-| `for (int32 X : GetItems())`, `for (auto *C : A->GetComponentsByClass<UStaticMeshComponent>())` | The value is computed once, into a local, before the loop: the temporary C++ binds the range to. GetItems runs once, and an `int32 &X` loop writes that copy, not the container GetItems read. | Yes |
-| `for (int32 X : {1, 2, 3})` | Refused: the range is a std::initializer_list, not a Blueprint container. A `TArray<int32>{1, 2, 3}` written in the range is refused as well. Declare `TArray<int32> L = {1, 2, 3};` and walk L, or walk a `static inline const` array. | Refused |
-| `for (int32 P : kPrimes)` | A `static inline const` array of constants; see [Constants](#constants). | Yes |
-| `for (int32 Scale = 3; int32 X : Items)` | The C++20 init-statement runs once, before the loop. | Yes |
+| <a id="what-a-range.for-int32-x-pickpeer-items"></a>`for (int32 X : PickPeer()->Items)` | The range expression is evaluated once, into a local, as C++ binds its range once. PickPeer runs once, and reseating a pointer in the body does not move the walk. | Yes |
+| <a id="what-a-range.for-int32-x-getitems"></a>`for (int32 X : GetItems())`, `for (auto *C : A->GetComponentsByClass<UStaticMeshComponent>())` | The value is computed once, into a local, before the loop: the temporary C++ binds the range to. GetItems runs once, and an `int32 &X` loop writes that copy, not the container GetItems read. | Yes |
+| <a id="what-a-range.for-int32-x-1-2"></a>`for (int32 X : {1, 2, 3})` | Refused: the range is a std::initializer_list, not a Blueprint container. A `TArray<int32>{1, 2, 3}` written in the range is refused as well. Declare `TArray<int32> L = {1, 2, 3};` and walk L, or walk a `static inline const` array. | Refused |
+| <a id="what-a-range.for-int32-p-kprimes"></a>`for (int32 P : kPrimes)` | A `static inline const` array of constants; see [Constants](#constants). | Yes |
+| <a id="what-a-range.for-int32-scale-3-int32"></a>`for (int32 Scale = 3; int32 X : Items)` | The C++20 init-statement runs once, before the loop. | Yes |
 
 ```cpp
 TArray<int32> Items;
@@ -1839,11 +1844,11 @@ A function that makes a latent call is the one exception, described under Declar
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 Sum = 0;` | A Local Variable. The initializer runs each time the declaration is reached. | Yes |
-| `FIntPoint Info;` | With no initializer the local starts as zero, empty, None or the struct's defaults. It never holds garbage, unlike in C++. | Yes |
-| `TArray<int32> Acc;` inside a loop | Reset to its starting value every time a loop, a goto or a repeated inline expansion reaches the declaration. That includes the locals of an inline function called in a loop or in a loop's condition. | Yes |
-| `int32 I = 0, Hits = 0;` | Several variables in one declaration. | Yes |
-| `const int32 Three = 3;` | A local holding a constant that nothing writes is no variable at all; see [The optimizer](#the-optimizer). | Yes |
+| <a id="declaring-locals.int32-sum-0"></a>`int32 Sum = 0;` | A Local Variable. The initializer runs each time the declaration is reached. | Yes |
+| <a id="declaring-locals.fintpoint-info"></a>`FIntPoint Info;` | With no initializer the local starts as zero, empty, None or the struct's defaults. It never holds garbage, unlike in C++. | Yes |
+| <a id="declaring-locals.tarray-int32-acc"></a>`TArray<int32> Acc;` inside a loop | Reset to its starting value every time a loop, a goto or a repeated inline expansion reaches the declaration. That includes the locals of an inline function called in a loop or in a loop's condition. | Yes |
+| <a id="declaring-locals.int32-i-0-hits-0"></a>`int32 I = 0, Hits = 0;` | Several variables in one declaration. | Yes |
+| <a id="declaring-locals.const-int32-three-3"></a>`const int32 Three = 3;` | A local holding a constant that nothing writes is no variable at all; see [The optimizer](#the-optimizer). | Yes |
 
 ```cpp
 int32 CountPasses(int32 N) {
@@ -1868,9 +1873,9 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `for (int32 I = 0; I < 2; ++I)` after another loop over I | Locals of the same name and type in different blocks or loops are one variable. Correct C++ cannot observe this. | Yes |
-| `int32 Total = 0;` with a member Total | The local shadows the member, and the member is left alone. | Yes |
-| `if (int32 Rest = V % 3)` | A variable declared in a condition or an init-statement stays a function-wide local afterwards. | Yes |
+| <a id="names-and-scope.for-int32-i-0-i"></a>`for (int32 I = 0; I < 2; ++I)` after another loop over I | Locals of the same name and type in different blocks or loops are one variable. Correct C++ cannot observe this. | Yes |
+| <a id="names-and-scope.int32-total-0"></a>`int32 Total = 0;` with a member Total | The local shadows the member, and the member is left alone. | Yes |
+| <a id="names-and-scope.if-int32-rest-v-3"></a>`if (int32 Rest = V % 3)` | A variable declared in a condition or an init-statement stays a function-wide local afterwards. | Yes |
 
 ```cpp
 int32 Total;
@@ -1891,11 +1896,11 @@ function then has two properties both named X.
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 &Alias = Count;` | Another name for a local, a parameter or a member of this (`Score` or `this->Score`), or for a member of one of their structs (`float &Z = Spawn.Z;`). Reads and writes are that variable's own Get and Set. | Yes |
-| `int32 &Slot = Slots[I];` | A TArray element (of this object or another), `*P` or `P[I]`: the reference keeps the place's address in a hidden int64 local, and reads and writes go straight to that memory. | Yes |
-| `const FVector &Home = K2_GetActorLocation();` | A `const T&` bound to a temporary is a copy, which lives as long as the reference. | Yes |
-| `int32 &R = Other->Score;` | Another object's field has no Blueprint reference, so R keeps the field's address, found by name at run time as `&Other->Score` is. That needs the ReadProperty class you supply (see [Pointers and memory](#pointers-and-memory)); without one the build stops ("include ReadProperty.h"). The `const` and `auto &` forms, and `O->Score` through a local pointer, are the same. Without the helper, write to the field directly, or pass it to an inline function's `T&` parameter, which binds the field itself. | Yes |
-| `float &X = Other->Loc.X;` | X keeps the address of Loc, found by name at run time as `&Other->Loc` is, plus X's offset. That needs the ReadProperty class, as the row above does. | Yes |
+| <a id="reference-locals.int32-alias-count"></a>`int32 &Alias = Count;` | Another name for a local, a parameter or a member of this (`Score` or `this->Score`), or for a member of one of their structs (`float &Z = Spawn.Z;`). Reads and writes are that variable's own Get and Set. | Yes |
+| <a id="reference-locals.int32-slot-slots-i"></a>`int32 &Slot = Slots[I];` | A TArray element (of this object or another), `*P` or `P[I]`: the reference keeps the place's address in a hidden int64 local, and reads and writes go straight to that memory. | Yes |
+| <a id="reference-locals.const-fvector-home-k2"></a>`const FVector &Home = K2_GetActorLocation();` | A `const T&` bound to a temporary is a copy, which lives as long as the reference. | Yes |
+| <a id="reference-locals.int32-r-other-score"></a>`int32 &R = Other->Score;` | Another object's field has no Blueprint reference, so R keeps the field's address, found by name at run time as `&Other->Score` is. That needs the ReadProperty class you supply (see [Pointers and memory](#pointers-and-memory)); without one the build stops ("include ReadProperty.h"). The `const` and `auto &` forms, and `O->Score` through a local pointer, are the same. Without the helper, write to the field directly, or pass it to an inline function's `T&` parameter, which binds the field itself. | Yes |
+| <a id="reference-locals.float-x-other-loc-x"></a>`float &X = Other->Loc.X;` | X keeps the address of Loc, found by name at run time as `&Other->Loc` is, plus X's offset. That needs the ReadProperty class, as the row above does. | Yes |
 
 ```cpp
 int32 Count;
@@ -1930,9 +1935,9 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `using T = int32; T A = X;`, `typedef TArray<T> FList;` | An alias declared inside a function means its type from the declaration to the end of the block holding it, as in C++. The alias itself compiles to nothing. | Yes |
-| `auto [A, B] = Point;` | Refused outside a TMap range-for ("a declaration statement declares nothing usable"). Read the members: `int32 A = Point.X;`. | Refused |
-| `auto Inc = [](int32 V) { return V + 1; };` | A lambda is refused; see [Functions](#functions). | Refused |
+| <a id="other-declarations.using-t-int32-t-a"></a>`using T = int32; T A = X;`, `typedef TArray<T> FList;` | An alias declared inside a function means its type from the declaration to the end of the block holding it, as in C++. The alias itself compiles to nothing. | Yes |
+| <a id="other-declarations.auto-a-b-point"></a>`auto [A, B] = Point;` | Refused outside a TMap range-for ("a declaration statement declares nothing usable"). Read the members: `int32 A = Point.X;`. | Refused |
+| <a id="other-declarations.auto-inc-int32-v-return"></a>`auto Inc = [](int32 V) { return V + 1; };` | A lambda is refused; see [Functions](#functions). | Refused |
 
 ## The optimizer
 
@@ -1946,11 +1951,11 @@ pure call whose result is unused is dropped.
 
 | You write | What it does | Status |
 |---|---|---|
-| `N * kStep + kSlots * 2 + (1 << 4 \| kStep)` | Every operator expression over constants compiles to its value; here one multiply and two additions remain. Each step is rounded to its C++ type, so `1 / 2.f` is 0.5f and `1 << 31` wraps. This covers arithmetic, bitwise operators, shifts, comparisons, `&&`, `\|\|` and `?:`. | Yes |
-| `false && X`, `true \|\| X` | X is not compiled. A float constant is true when it is nonzero. | Yes |
-| `N * 3 + 8 + 19` | Only constant subexpressions fold. C++ groups `+` from the left, so both additions stay; `N * 3 + (8 + 19)` has one. | Yes |
-| `X + 0`, `X - 0`, `X * 1`, `X / 1`, `X \| 0`, `X ^ 0` | Compile to X with no node. A float keeps its + and -, because -0.0f + 0 is +0.0f. | Yes |
-| `X / 0` | A division or modulo by a constant zero is not folded. It runs and gives 0, and clang warns -Wdivision-by-zero. | Yes |
+| <a id="constant-folding.n-kstep-kslots-2-1"></a>`N * kStep + kSlots * 2 + (1 << 4 \| kStep)` | Every operator expression over constants compiles to its value; here one multiply and two additions remain. Each step is rounded to its C++ type, so `1 / 2.f` is 0.5f and `1 << 31` wraps. This covers arithmetic, bitwise operators, shifts, comparisons, `&&`, `\|\|` and `?:`. | Yes |
+| <a id="constant-folding.false-x"></a>`false && X`, `true \|\| X` | X is not compiled. A float constant is true when it is nonzero. | Yes |
+| <a id="constant-folding.n-3-8-19"></a>`N * 3 + 8 + 19` | Only constant subexpressions fold. C++ groups `+` from the left, so both additions stay; `N * 3 + (8 + 19)` has one. | Yes |
+| <a id="constant-folding.x-0"></a>`X + 0`, `X - 0`, `X * 1`, `X / 1`, `X \| 0`, `X ^ 0` | Compile to X with no node. A float keeps its + and -, because -0.0f + 0 is +0.0f. | Yes |
+| <a id="constant-folding.x-0-2"></a>`X / 0` | A division or modulo by a constant zero is not folded. It runs and gives 0, and clang warns -Wdivision-by-zero. | Yes |
 
 ```cpp
 static constexpr int32 kStep = 3;
@@ -1966,17 +1971,17 @@ declare them.
 
 | You write | What it does | Status |
 |---|---|---|
-| `const int32 Three = 3;` | A local initialised to a constant that nothing writes is no variable: each read is the constant itself. A local the body also writes keeps its variable. Strings and containers are never folded this way, since they would be rebuilt at every use. | Yes |
-| `if (Lim > 3) break;` with a constant Lim | An if whose condition folds compiles only the branch it takes. | Yes |
-| `while (false)`, `while (true)`, `do { } while (false)` | `while (false)` compiles to nothing, and the other two get no test. Code that a label or a case makes reachable is kept. | Yes |
+| <a id="constant-locals-and.const-int32-three-3"></a>`const int32 Three = 3;` | A local initialised to a constant that nothing writes is no variable: each read is the constant itself. A local the body also writes keeps its variable. Strings and containers are never folded this way, since they would be rebuilt at every use. | Yes |
+| <a id="constant-locals-and.if-lim-3-break"></a>`if (Lim > 3) break;` with a constant Lim | An if whose condition folds compiles only the branch it takes. | Yes |
+| <a id="constant-locals-and.while-false"></a>`while (false)`, `while (true)`, `do { } while (false)` | `while (false)` compiles to nothing, and the other two get no test. Code that a label or a case makes reachable is kept. | Yes |
 
 ### Negations
 
 | You write | What it does | Status |
 |---|---|---|
-| `!(Ammo > 0)` | Becomes `Ammo <= 0`: an ordered comparison of integers or enums flips for free. | Yes |
-| `!(A == B)` | Becomes `A != B` for the built-in comparisons (numbers, enums, bools, object pointers). FString and FName `==` is an operator call, so `!(S == T)` keeps its NOT node. | Yes |
-| `!!X`, `if (!X) A(); else B();` | `!!X` is X, and an if on `!X` swaps its branches instead. | Yes |
+| <a id="negations.ammo-0"></a>`!(Ammo > 0)` | Becomes `Ammo <= 0`: an ordered comparison of integers or enums flips for free. | Yes |
+| <a id="negations.a-b"></a>`!(A == B)` | Becomes `A != B` for the built-in comparisons (numbers, enums, bools, object pointers). FString and FName `==` is an operator call, so `!(S == T)` keeps its NOT node. | Yes |
+| <a id="negations.x"></a>`!!X`, `if (!X) A(); else B();` | `!!X` is X, and an if on `!X` swaps its branches instead. | Yes |
 
 Note: an ordered comparison of floats is never flipped, because a NaN is neither `A < B` nor `A >= B`. The result
 stays what C++ says.
@@ -1985,13 +1990,13 @@ stays what C++ says.
 
 | You write | What it does | Status |
 |---|---|---|
-| `UKismetMathLibrary::Abs_Int(A);` | A pure call whose result is unused is dropped. Clang also warns -Wunused-value. | Yes |
-| `int32 Unused = A * 3;` | A local that nothing reads is removed, with its stores. | Yes |
-| `int32 Rolled = UKismetMathLibrary::RandomInteger(A);` | The unread local goes, but an impure initializer still runs as a call. | Yes |
-| `return X + A * B;` after `int32 X = A * B;` | A repeated pure call is not reused: it is evaluated each time it appears. To compute it once, keep the result in a local and read the local. | Not yet |
-| `if (IsReady(Item))` over an inline bool function whose returns are all constants | Each `return true` and `return false` jumps straight to the branch it picks: no bool is stored and then tested. | Yes |
-| `Scale(Value, Tick())` into `inline int32 Scale(int32 V, int32 By)` | A parameter the body only reads is the caller's local variable itself, not a copy, while nothing can change that variable during the call. Another argument that writes it, or a reference parameter bound to it, keeps the copy. | Yes |
-| `Bump(V)` in a `final` class or to a `final` method, `Base::Bump(V)`, or a static of a class this source cooks | The call: the body is copied in, as an inline function's is. See [Calling your own functions](#calling-your-own-functions). | Yes |
+| <a id="what-the-optimizer.ukismetmathlibrary-abs-int-a"></a>`UKismetMathLibrary::Abs_Int(A);` | A pure call whose result is unused is dropped. Clang also warns -Wunused-value. | Yes |
+| <a id="what-the-optimizer.int32-unused-a-3"></a>`int32 Unused = A * 3;` | A local that nothing reads is removed, with its stores. | Yes |
+| <a id="what-the-optimizer.int32-rolled-ukismetmathlibrary"></a>`int32 Rolled = UKismetMathLibrary::RandomInteger(A);` | The unread local goes, but an impure initializer still runs as a call. | Yes |
+| <a id="what-the-optimizer.return-x-a-b"></a>`return X + A * B;` after `int32 X = A * B;` | A repeated pure call is not reused: it is evaluated each time it appears. To compute it once, keep the result in a local and read the local. | Not yet |
+| <a id="what-the-optimizer.if-isready-item"></a>`if (IsReady(Item))` over an inline bool function whose returns are all constants | Each `return true` and `return false` jumps straight to the branch it picks: no bool is stored and then tested. | Yes |
+| <a id="what-the-optimizer.scale-value-tick"></a>`Scale(Value, Tick())` into `inline int32 Scale(int32 V, int32 By)` | A parameter the body only reads is the caller's local variable itself, not a copy, while nothing can change that variable during the call. Another argument that writes it, or a reference parameter bound to it, keeps the copy. | Yes |
+| <a id="what-the-optimizer.bump-v"></a>`Bump(V)` in a `final` class or to a `final` method, `Base::Bump(V)`, or a static of a class this source cooks | The call: the body is copied in, as an inline function's is. See [Calling your own functions](#calling-your-own-functions). | Yes |
 
 ```cpp
 int32 Drops(int32 A) {
@@ -2018,8 +2023,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_NO_OPTIMIZE int32 Raw(int32 X, int32 Y)` | `[[clang::optnone]]`: the function is compiled as written. Unused pure calls, unread locals and constant branches stay, a harmless `&&` or `\|\|` keeps its branch, and no folding or negation rewrite happens. | Yes |
-| `#pragma clang optimize off` ... `#pragma clang optimize on` | The same for every function between the two lines. | Yes |
+| <a id="ue-no-optimize.ue-no-optimize-int32-raw"></a>`UE_NO_OPTIMIZE int32 Raw(int32 X, int32 Y)` | `[[clang::optnone]]`: the function is compiled as written. Unused pure calls, unread locals and constant branches stay, a harmless `&&` or `\|\|` keeps its branch, and no folding or negation rewrite happens. | Yes |
+| <a id="ue-no-optimize.pragma-clang-optimize-off"></a>`#pragma clang optimize off` ... `#pragma clang optimize on` | The same for every function between the two lines. | Yes |
 
 ```cpp
 UE_NO_OPTIMIZE int32 Raw(int32 X, int32 Y) {
@@ -2050,23 +2055,23 @@ written inside the class does not make a method inline. Only the `inline` keywor
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 AddCharges(int32 By) { ... }` | A Blueprint function, Public and BlueprintCallable. An editor Blueprint can call it, and an editor subclass can override it. | Yes |
-| `void Refill(int32 Amount);` and `void AMyActor::Refill(...) { ... }` | The same function, defined outside the class or in a `.cpp` beside the header. The definition gives the body and parameters; the declaration gives `static` and the access. | Yes |
-| `int32 Pick(int32, int32 B)` | A parameter left unnamed is cooked as `P<its index>` (`P0` here; `_` is added while another parameter or a local of the body has that name, so `void Fill(int32&, int32 B) { int32 P0 = B * 2; ... }` names it `P0_`), as the editor names every pin. Callers pass it in its place. | Yes |
-| `int32 GetCharges() const` | A const Blueprint function, as a UFUNCTION declared const would be. | Yes |
-| `UE_PURE int32 Doubled() const` | A pure function: the editor draws it as a node without exec pins. Each C++ call runs once, where it is written. An editor pure node, by contrast, runs again for each use. | Yes |
-| `UE_PURE static int32 Clamp01(int32 V)` | A pure static function. | Yes |
-| `virtual int32 Priority()` | `virtual` is accepted and changes nothing. Every mod method is already called by name, and the most derived version runs. | Yes |
-| `virtual int32 Step() final` | No subclass has a Step of its own: the function is cooked Final, and calls to it are direct, as in a `final` class. A subclass method named Step is refused. C++ allows `final` only on a virtual method. | Yes |
-| `virtual int32 Score() = 0;` | An empty function that returns the default: 0, false, None or empty. A subclass's Score overrides it and names it as its super. A class that declares one, or inherits one with no version of its own, is cooked Abstract, which SpawnActor and CreateWidget refuse, as they refuse a class the editor marks Generate Abstract Class. `NewObject` and `AddComponentByClass` do not check the flag in a game, so a call to Score on such an object gets the default. A `SpawnActor` that names such a class warns, and a `NewObject` that names it is refused ([Objects and widgets](#objects-and-widgets)). | Yes |
-| `public:` / `protected:` / `private:` | Become the function's Public, Protected or Private flag, which the editor honours; see [Classes and variables](#classes-and-variables). | Yes |
-| `UE_CATEGORY("Turret\|Setup");` | The category of the members that follow, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
-| `UE_TOOLTIP("...") UE_KEYWORDS("...")` | The function's tooltip and search keywords, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
-| `UE_AUTHORITY_ONLY` / `UE_COSMETIC` | The editor's Authority Only and Cosmetic function flags; see [RPCs](#rpcs). | Yes |
-| `generate_api: true` in `mods.yaml` | Writes an editor stub of the class, so a Blueprint made in the editor can place call nodes for its functions; see [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
-| `int32 Undef(int32 X);` with no body anywhere | No function is cooked, and a call to it is refused ("... declares and never defines"), as C++ would not link it. Give every method a body, or make it `virtual ... = 0` for an empty one. | Refused |
-| `AMyActor() { Charges = 5; }` | No function: a default constructor is read as the class's defaults, and one that takes parameters is refused. A destructor that does something is refused too, as the engine never runs it. See [Constructors](#constructors); do run-time setup in ReceiveBeginPlay. | Yes |
-| `int32 Sum() const { ... }` inside a UE_STRUCT | Refused: "a UE_STRUCT holds no functions". A Blueprint struct has none, so a call to it could not run; it used to compile into one. An inline method is refused where it is called (`called on another object`), and an inline static one works. Write a free inline function that takes the struct: `inline int32 SumOf(const FPair &P)`. | Refused |
+| <a id="methods-as-blueprint.int32-addcharges-int32-by"></a>`int32 AddCharges(int32 By) { ... }` | A Blueprint function, Public and BlueprintCallable. An editor Blueprint can call it, and an editor subclass can override it. | Yes |
+| <a id="methods-as-blueprint.void-refill-int32-amount"></a>`void Refill(int32 Amount);` and `void AMyActor::Refill(...) { ... }` | The same function, defined outside the class or in a `.cpp` beside the header. The definition gives the body and parameters; the declaration gives `static` and the access. | Yes |
+| <a id="methods-as-blueprint.int32-pick-int32-int32-b"></a>`int32 Pick(int32, int32 B)` | A parameter left unnamed is cooked as `P<its index>` (`P0` here; `_` is added while another parameter or a local of the body has that name, so `void Fill(int32&, int32 B) { int32 P0 = B * 2; ... }` names it `P0_`), as the editor names every pin. Callers pass it in its place. | Yes |
+| <a id="methods-as-blueprint.int32-getcharges-const"></a>`int32 GetCharges() const` | A const Blueprint function, as a UFUNCTION declared const would be. | Yes |
+| <a id="methods-as-blueprint.ue-pure-int32-doubled-const"></a>`UE_PURE int32 Doubled() const` | A pure function: the editor draws it as a node without exec pins. Each C++ call runs once, where it is written. An editor pure node, by contrast, runs again for each use. | Yes |
+| <a id="methods-as-blueprint.ue-pure-static-int32-clamp01"></a>`UE_PURE static int32 Clamp01(int32 V)` | A pure static function. | Yes |
+| <a id="methods-as-blueprint.virtual-int32-priority"></a>`virtual int32 Priority()` | `virtual` is accepted and changes nothing. Every mod method is already called by name, and the most derived version runs. | Yes |
+| <a id="methods-as-blueprint.virtual-int32-step-final"></a>`virtual int32 Step() final` | No subclass has a Step of its own: the function is cooked Final, and calls to it are direct, as in a `final` class. A subclass method named Step is refused. C++ allows `final` only on a virtual method. | Yes |
+| <a id="methods-as-blueprint.virtual-int32-score-0"></a>`virtual int32 Score() = 0;` | An empty function that returns the default: 0, false, None or empty. A subclass's Score overrides it and names it as its super. A class that declares one, or inherits one with no version of its own, is cooked Abstract, which SpawnActor and CreateWidget refuse, as they refuse a class the editor marks Generate Abstract Class. `NewObject` and `AddComponentByClass` do not check the flag in a game, so a call to Score on such an object gets the default. A `SpawnActor` that names such a class warns, and a `NewObject` that names it is refused ([Objects and widgets](#objects-and-widgets)). | Yes |
+| <a id="methods-as-blueprint.public"></a>`public:` / `protected:` / `private:` | Become the function's Public, Protected or Private flag, which the editor honours; see [Classes and variables](#classes-and-variables). | Yes |
+| <a id="methods-as-blueprint.ue-category-turret-setup"></a>`UE_CATEGORY("Turret\|Setup");` | The category of the members that follow, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
+| <a id="methods-as-blueprint.ue-tooltip-ue-keywords"></a>`UE_TOOLTIP("...") UE_KEYWORDS("...")` | The function's tooltip and search keywords, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
+| <a id="methods-as-blueprint.ue-authority-only"></a>`UE_AUTHORITY_ONLY` / `UE_COSMETIC` | The editor's Authority Only and Cosmetic function flags; see [RPCs](#rpcs). | Yes |
+| <a id="methods-as-blueprint.generate-api-true"></a>`generate_api: true` in `mods.yaml` | Writes an editor stub of the class, so a Blueprint made in the editor can place call nodes for its functions; see [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
+| <a id="methods-as-blueprint.int32-undef-int32-x"></a>`int32 Undef(int32 X);` with no body anywhere | No function is cooked, and a call to it is refused ("... declares and never defines"), as C++ would not link it. Give every method a body, or make it `virtual ... = 0` for an empty one. | Refused |
+| <a id="methods-as-blueprint.amyactor-charges-5"></a>`AMyActor() { Charges = 5; }` | No function: a default constructor is read as the class's defaults, and one that takes parameters is refused. A destructor that does something is refused too, as the engine never runs it. See [Constructors](#constructors); do run-time setup in ReceiveBeginPlay. | Yes |
+| <a id="methods-as-blueprint.int32-sum-const"></a>`int32 Sum() const { ... }` inside a UE_STRUCT | Refused: "a UE_STRUCT holds no functions". A Blueprint struct has none, so a call to it could not run; it used to compile into one. An inline method is refused where it is called (`called on another object`), and an inline static one works. Write a free inline function that takes the struct: `inline int32 SumOf(const FPair &P)`. | Refused |
 
 ```cpp
 class AMyActor : public AActor {
@@ -2097,14 +2102,14 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Bump(By)` or `this->Bump(By)` | A call by name, as the editor's call to a function of the same Blueprint. The VM runs the most derived version on the object, so a subclass's override runs even when the parent's code makes the call. | Yes |
-| `Peer->Bump(1)` | Runs on that object and reaches the most derived version for its class. | Yes |
-| `Fact(V - 1)` inside `Fact` | Recursion. Each call gets its own frame, as a recursive Blueprint function does. Mutual recursion works the same way. | Yes |
-| `Other->Twice(3)` where `Twice` is inline | Refused; see the inline table below. | Not yet |
-| `Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. A function the final class inherits, overrides, or implements for an interface it lists is not cooked Final (an override takes its parent's flags, an implementation keeps the interface function's BlueprintEvent), so a call to one whose body is not copied in (authority-only, an RPC, `noinline`) stays a call by name, as the editor's is; with no subclass, the name finds that one function. | Yes |
-| `Twice(V)`, a static of a class this source cooks | Its body is copied in the same way. | Yes |
-| `Peer->Bump(1)` in a `final` class | Direct, but not copied in: the body would need Peer as its `this`. | Yes |
-| `[[gnu::noinline]] int32 Kept(int32 V)` | Calls to Kept stay calls, wherever they could be copied in. | Yes |
+| <a id="calling-your-own.bump-by"></a>`Bump(By)` or `this->Bump(By)` | A call by name, as the editor's call to a function of the same Blueprint. The VM runs the most derived version on the object, so a subclass's override runs even when the parent's code makes the call. | Yes |
+| <a id="calling-your-own.peer-bump-1"></a>`Peer->Bump(1)` | Runs on that object and reaches the most derived version for its class. | Yes |
+| <a id="calling-your-own.fact-v-1"></a>`Fact(V - 1)` inside `Fact` | Recursion. Each call gets its own frame, as a recursive Blueprint function does. Mutual recursion works the same way. | Yes |
+| <a id="calling-your-own.other-twice-3"></a>`Other->Twice(3)` where `Twice` is inline | Refused; see the inline table below. | Not yet |
+| <a id="calling-your-own.bump-by-2"></a>`Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. A function the final class inherits, overrides, or implements for an interface it lists is not cooked Final (an override takes its parent's flags, an implementation keeps the interface function's BlueprintEvent), so a call to one whose body is not copied in (authority-only, an RPC, `noinline`) stays a call by name, as the editor's is; with no subclass, the name finds that one function. | Yes |
+| <a id="calling-your-own.twice-v"></a>`Twice(V)`, a static of a class this source cooks | Its body is copied in the same way. | Yes |
+| <a id="calling-your-own.peer-bump-1-2"></a>`Peer->Bump(1)` in a `final` class | Direct, but not copied in: the body would need Peer as its `this`. | Yes |
+| <a id="calling-your-own.gnu-noinline-int32-kept-int32"></a>`[[gnu::noinline]] int32 Kept(int32 V)` | Calls to Kept stay calls, wherever they could be copied in. | Yes |
 
 ```cpp
 int32 N;
@@ -2161,16 +2166,16 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `FVector Offset(float Up) { return ...; }` | The return type becomes the function's ReturnValue output. Any type a variable can have may be returned, and a caller can read a member of a returned struct directly: `GetTransform().Translation.Y`. | Yes |
-| `auto Half(int32 V) { return V / 2; }` | A deduced return type becomes the Blueprint function's return type. | Yes |
-| `int32 &Slot(int32 I) { return Slots[I]; }` | Returns the address of what it returns, and each call is the memory there, as `*P` is: `Slot(2) = 7` writes the element, `Slot(2) += 1` calls Slot once, `int32 &R = Slot(2);` keeps the address, `Slot(2).X` reaches a member. The returned thing needs an address: a TArray element, memory through a pointer, a member of either, another object's member (through ReadProperty). A Blueprint caller, such as the editor, sees an int64: the address. | Yes |
-| `int32 &Bad() { int32 L = 3; return L; }` | Refused: "returns a reference to L, a local: a Blueprint variable has no address to return". A by-value parameter and a `T&` parameter are refused the same way. Return a value or a pointer. | Refused |
-| `const FString &Name() { return Names[0]; }` | Returns a copy: the function's ReturnValue is an FString. The build warns ("returns const FString&: a Blueprint function returns a copy"): a caller that keeps the reference does not see the original change later. | Warns |
-| `int32 ByVal(TArray<int32> A)` | An input pin. The callee gets its own copy, containers and structs included, and its writes stay in the callee. | Yes |
-| `void Around(int32 A, int32 &Lo, int32 &Hi)` | A pass-by-reference pin: writes reach the caller's variable, member or array element. This is how a function returns several values. | Yes |
-| `int32 Plus1(const int32 &A)` | Passed by reference, with no copy. A literal or computed argument is first stored in a hidden local, as the editor's compiler does, because the VM needs an address. The parameter is marked const (`CPF_ConstParm`), as the editor marks a const reference pin; `AActor *const &A` is the same. | Yes |
-| `int32 Times(int32 X, int32 By = 3)` | A call that leaves the argument out passes the default expression, evaluated at that call each time, as in C++. This holds for Blueprint functions and inline ones. | Yes |
-| A function that calls Delay or UE_AWAIT and returns a value or takes a non-const `T&` | Refused: `a function that resumes later returns nothing and takes no non-const reference parameters`. Store the result in a member; see [Latent calls](#latent-calls). | Refused |
+| <a id="parameters-and-return.fvector-offset-float-up-return"></a>`FVector Offset(float Up) { return ...; }` | The return type becomes the function's ReturnValue output. Any type a variable can have may be returned, and a caller can read a member of a returned struct directly: `GetTransform().Translation.Y`. | Yes |
+| <a id="parameters-and-return.auto-half-int32-v-return"></a>`auto Half(int32 V) { return V / 2; }` | A deduced return type becomes the Blueprint function's return type. | Yes |
+| <a id="parameters-and-return.int32-slot-int32-i-return"></a>`int32 &Slot(int32 I) { return Slots[I]; }` | Returns the address of what it returns, and each call is the memory there, as `*P` is: `Slot(2) = 7` writes the element, `Slot(2) += 1` calls Slot once, `int32 &R = Slot(2);` keeps the address, `Slot(2).X` reaches a member. The returned thing needs an address: a TArray element, memory through a pointer, a member of either, another object's member (through ReadProperty). A Blueprint caller, such as the editor, sees an int64: the address. | Yes |
+| <a id="parameters-and-return.int32-bad-int32-l-3"></a>`int32 &Bad() { int32 L = 3; return L; }` | Refused: "returns a reference to L, a local: a Blueprint variable has no address to return". A by-value parameter and a `T&` parameter are refused the same way. Return a value or a pointer. | Refused |
+| <a id="parameters-and-return.const-fstring-name-return-names"></a>`const FString &Name() { return Names[0]; }` | Returns a copy: the function's ReturnValue is an FString. The build warns ("returns const FString&: a Blueprint function returns a copy"): a caller that keeps the reference does not see the original change later. | Warns |
+| <a id="parameters-and-return.int32-byval-tarray-int32-a"></a>`int32 ByVal(TArray<int32> A)` | An input pin. The callee gets its own copy, containers and structs included, and its writes stay in the callee. | Yes |
+| <a id="parameters-and-return.void-around-int32-a-int32"></a>`void Around(int32 A, int32 &Lo, int32 &Hi)` | A pass-by-reference pin: writes reach the caller's variable, member or array element. This is how a function returns several values. | Yes |
+| <a id="parameters-and-return.int32-plus1-const-int32-a"></a>`int32 Plus1(const int32 &A)` | Passed by reference, with no copy. A literal or computed argument is first stored in a hidden local, as the editor's compiler does, because the VM needs an address. The parameter is marked const (`CPF_ConstParm`), as the editor marks a const reference pin; `AActor *const &A` is the same. | Yes |
+| <a id="parameters-and-return.int32-times-int32-x-int32"></a>`int32 Times(int32 X, int32 By = 3)` | A call that leaves the argument out passes the default expression, evaluated at that call each time, as in C++. This holds for Blueprint functions and inline ones. | Yes |
+| <a id="parameters-and-return.t"></a>A function that calls Delay or UE_AWAIT and returns a value or takes a non-const `T&` | Refused: `a function that resumes later returns nothing and takes no non-const reference parameters`. Store the result in a member; see [Latent calls](#latent-calls). | Refused |
 
 ```cpp
 int32 N;
@@ -2206,11 +2211,11 @@ after the call, with a warning.
 
 | You write | What it does | Status |
 |---|---|---|
-| `Bump(X, 3)`, `Bump(Arr[NextIdx()], By)`, `Bump(O->Calls, By)` | The parameter names that place, fixed at the call: the object and the index are evaluated once. An inline body sees its own writes; a Blueprint function gets the place by reference. Either way the writes reach the caller. | Yes |
-| `Add5(Counts[K])` with a TMap `Counts` | Blueprint has no reference to a map element (Find copies it out), so the call gets a hidden copy that is stored back into `Counts[K]` after the call. The warning says `bound to a map element`. | Warns |
-| `Add5(C ? X : Y)` | The call gets a hidden copy, stored back after the call into whichever variable the condition picked. The condition is evaluated once, before the call. | Warns |
-| `Add5(C ? M[K()] : X)` | Refused (`where X or Y is found by a call`): both sides would have to be located before the call, but C++ runs only the picked side's call. Pick into a local, pass the local, then store it back. | Not yet |
-| `Bump(*P)` with a raw pointer `P` | Passes the memory itself, so the callee's write lands there; see [Pointers and memory](#pointers-and-memory). | Yes |
+| <a id="reference-parameters-and.bump-x-3"></a>`Bump(X, 3)`, `Bump(Arr[NextIdx()], By)`, `Bump(O->Calls, By)` | The parameter names that place, fixed at the call: the object and the index are evaluated once. An inline body sees its own writes; a Blueprint function gets the place by reference. Either way the writes reach the caller. | Yes |
+| <a id="reference-parameters-and.add5-counts-k"></a>`Add5(Counts[K])` with a TMap `Counts` | Blueprint has no reference to a map element (Find copies it out), so the call gets a hidden copy that is stored back into `Counts[K]` after the call. The warning says `bound to a map element`. | Warns |
+| <a id="reference-parameters-and.add5-c-x-y"></a>`Add5(C ? X : Y)` | The call gets a hidden copy, stored back after the call into whichever variable the condition picked. The condition is evaluated once, before the call. | Warns |
+| <a id="reference-parameters-and.add5-c-m-k-x"></a>`Add5(C ? M[K()] : X)` | Refused (`where X or Y is found by a call`): both sides would have to be located before the call, but C++ runs only the picked side's call. Pick into a local, pass the local, then store it back. | Not yet |
+| <a id="reference-parameters-and.bump-p"></a>`Bump(*P)` with a raw pointer `P` | Passes the memory itself, so the callee's write lands there; see [Pointers and memory](#pointers-and-memory). | Yes |
 
 ```cpp
 TMap<int32, int32> Counts;
@@ -2237,15 +2242,15 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `static int32 Twice(int32 V)` | A static Blueprint function (Static, Final, Public, BlueprintCallable). `Twice(X)` and `AMyActor::Twice(1)` both run it on the class default object, so inside it `this` is that default object, which has no world. | Yes |
-| `static APawn *FirstPawn(UObject *WorldContextObject = nullptr)` | The first parameter whose name starts with `WorldContext` is what every engine call inside the static receives as its world context, as the editor wires the hidden pin. A caller that leaves it out passes its own `this`, or its own world context when the caller is itself such a static. | Yes |
-| `class MyLib : public UBlueprintFunctionLibrary` holding statics | The editor's Blueprint Function Library. Another mod that includes its header calls the statics like an engine library's: a final call on the library's default object, with a world context left out filled with the caller's `this`. | Yes |
-| `LIB_F_Log_C::AddLogEntry(Main, Severity, Prefix, Entry, this)`, a game Blueprint library's static taking one of the game's Blueprint enums | UeApi declares the enum parameter `uint8`, the byte the call passes. The game's Blueprint enums have no C++ type yet, so a method, field or delegate of one is left out of UeApi. | Yes |
-| A static that calls Delay or UE_AWAIT | Refused: `a static function has no object whose ubergraph frame could keep its locals`; see [Latent calls](#latent-calls). | Refused |
-| `static int32 Tell(int32 V)` in a class whose mod parent has a static `Tell` too | Hides the parent's, as in C++, with a warning: "... hides Parent::Tell, a static: compiled as C++ name hiding ...". Every call to a static is bound to the one it names, so `Tell(V)` runs this one and `Parent::Tell(V)` the parent's. It is cooked with the parent's static as its super, as the editor links any function named like a parent's; the editor itself would refuse the name ("cannot be overridden"). | Warns |
-| `static float Tell(float V)` over a mod parent's `static int32 Tell(int32)` | Refused: "... is static and hides Parent::Tell, a static of another signature, ...". Its super would be the parent's static, a function of other parameters, which no editor links. Rename this one. | Refused |
-| A method that is not static named like a mod parent's static, or a static named like a parent's method | Refused: "... is static, and the editor takes a function of that name in a subclass for an override of it ..." or "... is static, and the Parent::Tell it hides is not ...". The editor makes a function named like a parent's an override of it, and an override must agree with it on Static. The parent may be another mod's class, from the header it shares. Rename one of them. | Refused |
-| A static or a method named like one a mod parent of this source declares and never defines (no body, not `= 0`) | The parent compiles no function of that name, so this one hides nothing a Blueprint has: no warning, no refusal, no super, and its parameters may differ from the declaration's (`float Scale(float)` over a declared-only `int32 Scale(int32)`): a call to the declared-only one is refused, as C++ would not link it, so none lays out the parent's parameters. A function above the parent of that name, a native one too, is found as if the parent did not declare it. | Yes |
+| <a id="static-functions-and.static-int32-twice-int32-v"></a>`static int32 Twice(int32 V)` | A static Blueprint function (Static, Final, Public, BlueprintCallable). `Twice(X)` and `AMyActor::Twice(1)` both run it on the class default object, so inside it `this` is that default object, which has no world. | Yes |
+| <a id="static-functions-and.static-apawn-firstpawn-uobject"></a>`static APawn *FirstPawn(UObject *WorldContextObject = nullptr)` | The first parameter whose name starts with `WorldContext` is what every engine call inside the static receives as its world context, as the editor wires the hidden pin. A caller that leaves it out passes its own `this`, or its own world context when the caller is itself such a static. | Yes |
+| <a id="static-functions-and.class-mylib-public"></a>`class MyLib : public UBlueprintFunctionLibrary` holding statics | The editor's Blueprint Function Library. Another mod that includes its header calls the statics like an engine library's: a final call on the library's default object, with a world context left out filled with the caller's `this`. | Yes |
+| <a id="static-functions-and.lib-f-log-c-addlogentry"></a>`LIB_F_Log_C::AddLogEntry(Main, Severity, Prefix, Entry, this)`, a game Blueprint library's static taking one of the game's Blueprint enums | UeApi declares the enum parameter `uint8`, the byte the call passes. The game's Blueprint enums have no C++ type yet, so a method, field or delegate of one is left out of UeApi. | Yes |
+| <a id="static-functions-and.a-static-that-calls-delay"></a>A static that calls Delay or UE_AWAIT | Refused: `a static function has no object whose ubergraph frame could keep its locals`; see [Latent calls](#latent-calls). | Refused |
+| <a id="static-functions-and.static-int32-tell-int32-v"></a>`static int32 Tell(int32 V)` in a class whose mod parent has a static `Tell` too | Hides the parent's, as in C++, with a warning: "... hides Parent::Tell, a static: compiled as C++ name hiding ...". Every call to a static is bound to the one it names, so `Tell(V)` runs this one and `Parent::Tell(V)` the parent's. It is cooked with the parent's static as its super, as the editor links any function named like a parent's; the editor itself would refuse the name ("cannot be overridden"). | Warns |
+| <a id="static-functions-and.static-float-tell-float-v"></a>`static float Tell(float V)` over a mod parent's `static int32 Tell(int32)` | Refused: "... is static and hides Parent::Tell, a static of another signature, ...". Its super would be the parent's static, a function of other parameters, which no editor links. Rename this one. | Refused |
+| <a id="static-functions-and.a-method-that-is-not"></a>A method that is not static named like a mod parent's static, or a static named like a parent's method | Refused: "... is static, and the editor takes a function of that name in a subclass for an override of it ..." or "... is static, and the Parent::Tell it hides is not ...". The editor makes a function named like a parent's an override of it, and an override must agree with it on Static. The parent may be another mod's class, from the header it shares. Rename one of them. | Refused |
+| <a id="static-functions-and.0"></a>A static or a method named like one a mod parent of this source declares and never defines (no body, not `= 0`) | The parent compiles no function of that name, so this one hides nothing a Blueprint has: no warning, no refusal, no super, and its parameters may differ from the declaration's (`float Scale(float)` over a declared-only `int32 Scale(int32)`): a call to the declared-only one is refused, as C++ would not link it, so none lays out the parent's parameters. A function above the parent of that name, a native one too, is found as if the parent did not declare it. | Yes |
 
 ```cpp
 static int32 Twice(int32 V) { return V * 2; }
@@ -2302,12 +2307,12 @@ overload is the one with the most parameters.
 
 | You write | What it does | Status |
 |---|---|---|
-| `inline int32 Pick(int32 V)` beside `inline int32 Pick(bool B)` | Each call expands the overload C++ picked, and one overload may call another. None of them is a Blueprint function. | Yes |
-| `int32 Get(int32 A, int32 B)` beside `inline int32 Get(int32 A)` | The overload with the most parameters is the Blueprint function named `Get`; the inline ones beside it expand normally. | Yes |
-| `inline int32 Get(int32 A, int32 B)` beside a non-inline `int32 Get(int32 A)`, then `Get(V)` | Refused: `an overload set may not mix inline and non-inline functions`. Make the non-inline overload the one with the most parameters, or rename it. | Not yet |
-| `int32 Ov(int32 A)` beside `int32 Ov(int32 A, int32 B)`, neither inline | Refused: "a second function of that name". A Blueprint class has one function per name. Give them different names, or make the extra overloads `inline`. | Refused |
-| `int32 Get()` beside `int32 get()` | Refused: "differs from Get only in case". An FName ignores case, so both would be one function. The same holds for two variables, a variable and a function, and a name an ancestor already has: `int32 get()` in a class whose parent has `Get()` is refused, while `Get()` itself overrides it. | Refused |
-| `int32 None;`, `int32 none();`, a `UE_STRUCT` member `int32 NONE;` | Refused: "None is UE's empty name". The name None is UE's empty name in any case, which the Blueprint editor refuses for a variable or a function. A saved value's members end at one of that name, so a `UE_STRUCT` member called None would cut the struct's value short in a class default. The same for a component and an interface's member. | Refused |
+| <a id="overloading.inline-int32-pick-int32-v"></a>`inline int32 Pick(int32 V)` beside `inline int32 Pick(bool B)` | Each call expands the overload C++ picked, and one overload may call another. None of them is a Blueprint function. | Yes |
+| <a id="overloading.int32-get-int32-a-int32"></a>`int32 Get(int32 A, int32 B)` beside `inline int32 Get(int32 A)` | The overload with the most parameters is the Blueprint function named `Get`; the inline ones beside it expand normally. | Yes |
+| <a id="overloading.inline-int32-get-int32-a"></a>`inline int32 Get(int32 A, int32 B)` beside a non-inline `int32 Get(int32 A)`, then `Get(V)` | Refused: `an overload set may not mix inline and non-inline functions`. Make the non-inline overload the one with the most parameters, or rename it. | Not yet |
+| <a id="overloading.int32-ov-int32-a"></a>`int32 Ov(int32 A)` beside `int32 Ov(int32 A, int32 B)`, neither inline | Refused: "a second function of that name". A Blueprint class has one function per name. Give them different names, or make the extra overloads `inline`. | Refused |
+| <a id="overloading.int32-get"></a>`int32 Get()` beside `int32 get()` | Refused: "differs from Get only in case". An FName ignores case, so both would be one function. The same holds for two variables, a variable and a function, and a name an ancestor already has: `int32 get()` in a class whose parent has `Get()` is refused, while `Get()` itself overrides it. | Refused |
+| <a id="overloading.int32-none"></a>`int32 None;`, `int32 none();`, a `UE_STRUCT` member `int32 NONE;` | Refused: "None is UE's empty name". The name None is UE's empty name in any case, which the Blueprint editor refuses for a variable or a function. A saved value's members end at one of that name, so a `UE_STRUCT` member called None would cut the struct's value short in a class default. The same for a component and an interface's member. | Refused |
 
 ```cpp
 inline int32 Pick(int32 V) { return V + 1; }
@@ -2321,9 +2326,9 @@ int32 Use(int32 V) { return Pick(V) + Pick(true) + Get(V) + Get(V, 2); }
 
 | You write | What it does | Status |
 |---|---|---|
-| `auto L = [X](int32 Y) { return X + Y; };` | Refused, as are an immediately invoked lambda and a lambda passed to an inline template, each with its own `unimplemented` message. Write an inline method or a free inline function. | Refused |
-| `auto *P = &Inc1; return P(X);` | Refused (`unimplemented local`): a Blueprint has no function pointers. To call a function later, bind it to a dispatcher or pass it as a delegate (`{this, &AMine::Handle}`); see [Event dispatchers](#event-dispatchers). | Refused |
-| `inline FPairX operator+(FPairX L, FPairX R)` | Refused where it is used (`unimplemented operator overload`). Only the engine's operators that UeApi lists, and string `+`, are lowered. Write a named inline function. | Refused |
+| <a id="lambdas-function.auto-l-x-int32-y"></a>`auto L = [X](int32 Y) { return X + Y; };` | Refused, as are an immediately invoked lambda and a lambda passed to an inline template, each with its own `unimplemented` message. Write an inline method or a free inline function. | Refused |
+| <a id="lambdas-function.auto-p-inc1-return-p"></a>`auto *P = &Inc1; return P(X);` | Refused (`unimplemented local`): a Blueprint has no function pointers. To call a function later, bind it to a dispatcher or pass it as a delegate (`{this, &AMine::Handle}`); see [Event dispatchers](#event-dispatchers). | Refused |
+| <a id="lambdas-function.inline-fpairx-operator-fpairx-l"></a>`inline FPairX operator+(FPairX L, FPairX R)` | Refused where it is used (`unimplemented operator overload`). Only the engine's operators that UeApi lists, and string `+`, are lowered. Write a named inline function. | Refused |
 
 ## Calling engine and game functions
 
@@ -2335,19 +2340,19 @@ latent call's `FLatentActionInfo`, because the compiler fills them in.
 
 | You write | What it does | Status |
 |---|---|---|
-| `K2_SetActorLocation(Home, false, Hit, false);` | Calls the engine's function on this actor, as the editor's call node does. | Yes |
-| `Char->Server_SetRunning(false);` | The same on another object. The engine applies its own authority, cosmetic and RPC routing to the call. | Yes |
-| `FHitResult Hit;` passed to a `T&` parameter | A `T&` parameter of an engine function is an output and needs a variable, as in C++. | Yes |
-| `UKismetMathLibrary::RandomInteger(10)` | A native static is a direct library call. | Yes |
-| `UGameplayStatics::ApplyDamage(...)`, `PlaySound2D(...)` | An authority-only or cosmetic static is called on the library's default object, so the engine checks where it may run, as for the editor's node. | Yes |
-| `UGameplayStatics::GetPlayerPawn(0)` in a class that is no actor, component, widget, GameInstance or subsystem | Warns: "passes self as GetPlayerPawn's world context, and an object of this class finds its world only through its Outer". The editor wires self to the pin only in a class with a world. Make the object with an actor or component as its Outer, or pass a world context. | Warns |
-| A static of a game Blueprint library, or of another mod's library | A final call on that class's default object. | Yes |
-| `Json->GetPath(...)` on a game Blueprint, `T->Fire(2)` on another mod's class | A call by name, as the editor calls a Blueprint function that is not final: on an object of a subclass that overrides it, the override runs. A function the header marks `final`, a static, and a parent call (`Turret::Fire(N)` in an override) are bound to that class's function. | Yes |
-| A call or an expression passed to an engine function's `const T&` parameter | Stored in a hidden local first, because the VM needs an address. | Yes |
-| `Target->K2_DestroyActor();` with `Target` null | The call is skipped (the engine logs "Accessed None"), and a returned value reads as zero. C++ would crash here; a Blueprint does not. The same holds for a mod function called on a null object. | Yes |
-| `MakeCarveRequests(Owner->GetTransform());`, `FVector S = Key->GetActorScale3D(); Scale / S` with the object null | A struct a call on a null object returns reads as zero where it is passed on, as it does through the editor's local: the call names its own ReturnValue for the engine to clear. Without that, a native's parameter would keep its default-constructed value (an FVector's garbage, an FTransform's identity) and a mod function's its struct's defaults. | Yes |
-| `Seen->GetPriority()` on a `TScriptInterface<ITagged>` | A call by name to the object behind the interface; see [Interfaces](#interfaces). | Yes |
-| `Other->GetClass()`, `GetName()`, `GetOuter()`, `GetTypedOuter<T>(Obj)` | UObject's C++ helpers and their Objects.h relatives, which are not reflected functions. The compiler maps them; see [Working with other objects](#working-with-other-objects). | Yes |
+| <a id="engine-and-game.k2-setactorlocation-home-false"></a>`K2_SetActorLocation(Home, false, Hit, false);` | Calls the engine's function on this actor, as the editor's call node does. | Yes |
+| <a id="engine-and-game.char-server-setrunning-false"></a>`Char->Server_SetRunning(false);` | The same on another object. The engine applies its own authority, cosmetic and RPC routing to the call. | Yes |
+| <a id="engine-and-game.fhitresult-hit"></a>`FHitResult Hit;` passed to a `T&` parameter | A `T&` parameter of an engine function is an output and needs a variable, as in C++. | Yes |
+| <a id="engine-and-game.ukismetmathlibrary-randominteger"></a>`UKismetMathLibrary::RandomInteger(10)` | A native static is a direct library call. | Yes |
+| <a id="engine-and-game.ugameplaystatics-applydamage"></a>`UGameplayStatics::ApplyDamage(...)`, `PlaySound2D(...)` | An authority-only or cosmetic static is called on the library's default object, so the engine checks where it may run, as for the editor's node. | Yes |
+| <a id="engine-and-game.ugameplaystatics-getplayerpawn-0"></a>`UGameplayStatics::GetPlayerPawn(0)` in a class that is no actor, component, widget, GameInstance or subsystem | Warns: "passes self as GetPlayerPawn's world context, and an object of this class finds its world only through its Outer". The editor wires self to the pin only in a class with a world. Make the object with an actor or component as its Outer, or pass a world context. | Warns |
+| <a id="engine-and-game.a-static-of-a-game"></a>A static of a game Blueprint library, or of another mod's library | A final call on that class's default object. | Yes |
+| <a id="engine-and-game.json-getpath"></a>`Json->GetPath(...)` on a game Blueprint, `T->Fire(2)` on another mod's class | A call by name, as the editor calls a Blueprint function that is not final: on an object of a subclass that overrides it, the override runs. A function the header marks `final`, a static, and a parent call (`Turret::Fire(N)` in an override) are bound to that class's function. | Yes |
+| <a id="engine-and-game.const-t"></a>A call or an expression passed to an engine function's `const T&` parameter | Stored in a hidden local first, because the VM needs an address. | Yes |
+| <a id="engine-and-game.target-k2-destroyactor"></a>`Target->K2_DestroyActor();` with `Target` null | The call is skipped (the engine logs "Accessed None"), and a returned value reads as zero. C++ would crash here; a Blueprint does not. The same holds for a mod function called on a null object. | Yes |
+| <a id="engine-and-game.makecarverequests-owner"></a>`MakeCarveRequests(Owner->GetTransform());`, `FVector S = Key->GetActorScale3D(); Scale / S` with the object null | A struct a call on a null object returns reads as zero where it is passed on, as it does through the editor's local: the call names its own ReturnValue for the engine to clear. Without that, a native's parameter would keep its default-constructed value (an FVector's garbage, an FTransform's identity) and a mod function's its struct's defaults. | Yes |
+| <a id="engine-and-game.seen-getpriority"></a>`Seen->GetPriority()` on a `TScriptInterface<ITagged>` | A call by name to the object behind the interface; see [Interfaces](#interfaces). | Yes |
+| <a id="engine-and-game.other-getclass"></a>`Other->GetClass()`, `GetName()`, `GetOuter()`, `GetTypedOuter<T>(Obj)` | UObject's C++ helpers and their Objects.h relatives, which are not reflected functions. The compiler maps them; see [Working with other objects](#working-with-other-objects). | Yes |
 
 ```cpp
 FVector Home;
@@ -2372,11 +2377,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UGameplayStatics::GetPlayerPawn(0)` | UeApi declares every reflected function with a `UObject*` parameter named `WorldContext...` twice, with and without it. Leaving it out passes `this`, which is what the editor wires to the hidden pin. | Yes |
-| The same call inside a static that has a `WorldContextObject` parameter | Passes the static's own parameter. | Yes |
-| `UGameplayStatics::GetPlayerPawn(nullptr, 0)` | An explicit argument, `nullptr` included, is kept. | Yes |
-| `UKismetSystemLibrary::Delay(0.5f)` | A latent function's `FLatentActionInfo` is left out as well, and the compiler fills it in. Never pass it yourself: with the world context written too it is refused (`leave the FLatentActionInfo argument out`); see [Latent calls](#latent-calls). | Yes |
-| `UKismetSystemLibrary::Delay(0.5f, Info)`, the latent info passed without the world context | Refused: `leave the FLatentActionInfo argument out`, as with the world context written. See [Latent calls](#latent-calls). | Refused |
+| <a id="the-world-context.ugameplaystatics-getplayerpawn-0"></a>`UGameplayStatics::GetPlayerPawn(0)` | UeApi declares every reflected function with a `UObject*` parameter named `WorldContext...` twice, with and without it. Leaving it out passes `this`, which is what the editor wires to the hidden pin. | Yes |
+| <a id="the-world-context.worldcontextobject"></a>The same call inside a static that has a `WorldContextObject` parameter | Passes the static's own parameter. | Yes |
+| <a id="the-world-context.ugameplaystatics-getplayerpawn"></a>`UGameplayStatics::GetPlayerPawn(nullptr, 0)` | An explicit argument, `nullptr` included, is kept. | Yes |
+| <a id="the-world-context.ukismetsystemlibrary-delay-0-5f"></a>`UKismetSystemLibrary::Delay(0.5f)` | A latent function's `FLatentActionInfo` is left out as well, and the compiler fills it in. Never pass it yourself: with the world context written too it is refused (`leave the FLatentActionInfo argument out`); see [Latent calls](#latent-calls). | Yes |
+| <a id="the-world-context.ukismetsystemlibrary-delay-0-5f-2"></a>`UKismetSystemLibrary::Delay(0.5f, Info)`, the latent info passed without the world context | Refused: `leave the FLatentActionInfo argument out`, as with the world context written. See [Latent calls](#latent-calls). | Refused |
 
 ```cpp
 APawn *Mine() { return UGameplayStatics::GetPlayerPawn(0); }            // this
@@ -2397,8 +2402,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Bump(1);` | A call made for its effects runs even when its value is unused. | Yes |
-| `Doubled();` where `Doubled` is UE_PURE, or an engine BlueprintPure function without outputs | Removed when its arguments do nothing either. AssetGen prints nothing about it; clang warns `ignoring return value of function declared with pure attribute`. | Yes |
+| <a id="results-you-ignore.bump-1"></a>`Bump(1);` | A call made for its effects runs even when its value is unused. | Yes |
+| <a id="results-you-ignore.doubled"></a>`Doubled();` where `Doubled` is UE_PURE, or an engine BlueprintPure function without outputs | Removed when its arguments do nothing either. AssetGen prints nothing about it; clang warns `ignoring return value of function declared with pure attribute`. | Yes |
 
 ```cpp
 int32 N;
@@ -2417,14 +2422,14 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UKismetMathLibrary::Clamp(V, 0, 10)` | Math is the engine's Blueprint math library, the functions behind the editor's math nodes: Clamp, FClamp, Min, FMin, FMax, Abs, Sqrt, Sin, Cos, Lerp, FInterpTo, RandomInteger, RandomFloatInRange and the rest of `UKismetMathLibrary` in `UeApi/Engine.h`. Each call is a direct library call. | Yes |
-| `A + B`, `A < B`, `Dir * 2.0f` | Operators on numbers and vectors need no written call: they become the math library's operator functions; see [Operators](#operators). | Yes |
-| `S == "x"` on an FString | Ignores case, as FString's `==` does in UE C++; see [Strings and text](#strings-and-text). | Yes |
-| `FMath::Clamp(V, 0, 10)` | clang error `use of undeclared identifier 'FMath'`: FMath is not part of the reflected API, so UeApi does not declare it. Use UKismetMathLibrary. | Refused |
-| `std::min(A, B)`, `std::sqrt(X)`, `__builtin_sqrtf(X)` | Refused, even with `#include <algorithm>` or `<cmath>` (`call to an unknown function`): a mod has no C++ standard library to call into. Use UKismetMathLibrary, or write the helper as an inline function. | Refused |
-| `if constexpr (__is_same(T, int32))`, `static_assert(__is_same(int32, int))` | clang's type-trait builtins work in place of `<type_traits>` where clang decides them at build time. | Yes |
-| `bool B = __is_same(A, B);`, `if (__is_same(A, B))`, `return __is_same(A, B) ? 1 : 0;` | The constant true or false, compared through aliases and typedefs as clang compares types: `__is_same(int32, int)` is true. | Yes |
-| `bool B = __is_base_of(AActor, T);` and the other traits | Refused as a value ("unimplemented argument TypeTraitExpr"). Put the test in `if constexpr` or a `requires` clause. | Refused |
+| <a id="math-and-utility.ukismetmathlibrary-clamp-v-0-10"></a>`UKismetMathLibrary::Clamp(V, 0, 10)` | Math is the engine's Blueprint math library, the functions behind the editor's math nodes: Clamp, FClamp, Min, FMin, FMax, Abs, Sqrt, Sin, Cos, Lerp, FInterpTo, RandomInteger, RandomFloatInRange and the rest of `UKismetMathLibrary` in `UeApi/Engine.h`. Each call is a direct library call. | Yes |
+| <a id="math-and-utility.a-b"></a>`A + B`, `A < B`, `Dir * 2.0f` | Operators on numbers and vectors need no written call: they become the math library's operator functions; see [Operators](#operators). | Yes |
+| <a id="math-and-utility.s-x"></a>`S == "x"` on an FString | Ignores case, as FString's `==` does in UE C++; see [Strings and text](#strings-and-text). | Yes |
+| <a id="math-and-utility.fmath-clamp-v-0-10"></a>`FMath::Clamp(V, 0, 10)` | clang error `use of undeclared identifier 'FMath'`: FMath is not part of the reflected API, so UeApi does not declare it. Use UKismetMathLibrary. | Refused |
+| <a id="math-and-utility.std-min-a-b"></a>`std::min(A, B)`, `std::sqrt(X)`, `__builtin_sqrtf(X)` | Refused, even with `#include <algorithm>` or `<cmath>` (`call to an unknown function`): a mod has no C++ standard library to call into. Use UKismetMathLibrary, or write the helper as an inline function. | Refused |
+| <a id="math-and-utility.if-constexpr-is-same-t"></a>`if constexpr (__is_same(T, int32))`, `static_assert(__is_same(int32, int))` | clang's type-trait builtins work in place of `<type_traits>` where clang decides them at build time. | Yes |
+| <a id="math-and-utility.bool-b-is-same-a"></a>`bool B = __is_same(A, B);`, `if (__is_same(A, B))`, `return __is_same(A, B) ? 1 : 0;` | The constant true or false, compared through aliases and typedefs as clang compares types: `__is_same(int32, int)` is true. | Yes |
+| <a id="math-and-utility.bool-b-is-base-of"></a>`bool B = __is_base_of(AActor, T);` and the other traits | Refused as a value ("unimplemented argument TypeTraitExpr"). Put the test in `if constexpr` or a `requires` clause. | Refused |
 
 ```cpp
 int32 Clamped(int32 V) { return UKismetMathLibrary::Clamp(V, 0, 10); }
@@ -2450,8 +2455,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UGameFunctionLibrary::GetFSDGameState(this)->PostGameMessage(Msg)` | Posts `Msg` as a game message, through the game state. This is what to use instead of the Print String node. | Yes |
-| `UGameFunctionLibrary::GetFSDGameState()->PostGameMessage(Msg)` in a static with a `WorldContextObject` parameter | The game state of that parameter's world. | Yes |
+| <a id="messages-on-screen.ugamefunctionlibrary"></a>`UGameFunctionLibrary::GetFSDGameState(this)->PostGameMessage(Msg)` | Posts `Msg` as a game message, through the game state. This is what to use instead of the Print String node. | Yes |
+| <a id="messages-on-screen.ugamefunctionlibrary-2"></a>`UGameFunctionLibrary::GetFSDGameState()->PostGameMessage(Msg)` in a static with a `WorldContextObject` parameter | The game state of that parameter's world. | Yes |
 
 ```cpp
 int32 Count = 3;
@@ -2485,15 +2490,15 @@ the function it replaces is refused.
 
 | You write | What it does | Status |
 |---|---|---|
-| `void ReceiveBeginPlay() { ... }` | Overrides the parent's event, like adding the event node in the editor. The engine calls it. | Yes |
-| `void ReceiveTick(float DeltaSeconds)` | Also turns ticking on: it sets `PrimaryActorTick.bCanEverTick` on an actor's class default object, `PrimaryComponentTick.bCanEverTick` on a component's, as the editor's compiler does. AActor and UActorComponent leave ticking off by default. | Yes |
-| `void Tick(FGeometry MyGeometry, float InDeltaTime)`, `void OnPaint(FPaintContext &Context) const` in a widget class | Also turns that event on, for this class alone: a subclass runs it only through an override of its own. See [Parent classes](#parent-classes). | Yes |
-| `void OnJumped() { ACharacter::OnJumped(); ... }` | Overrides a BlueprintNativeEvent (an event with a C++ default). The Blueprint version replaces the default, and the parent call runs it. | Yes |
-| `bool CanJumpInternal() const` | An override copies its parent's access, event, net, authority, cosmetic, const and pure flags, whatever section it is written in. It drops Native, because the Blueprint version is script. | Yes |
-| A class in `namespace Game::...` deriving a game Blueprint, redefining one of its functions | An override the game's code reaches by name, with the parent function's flags; see [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp). | Yes |
-| `class ATurret : public AActor, public ITargetable` with its functions defined | Implements an interface; see [Interfaces](#interfaces). | Yes |
-| `void ReceiveTick(float DeltaSeconds) override` | clang error `only virtual member functions can be marked 'override'`: UeApi declares engine functions non-virtual. Leave it off; the name alone makes the override. | Refused |
-| `UE_SERVER`, `UE_CLIENT` or `UE_MULTICAST` on an override | Refused: `an override takes its parent's replication; drop the RPC marker`; see [RPCs](#rpcs). | Refused |
+| <a id="overriding-engine-and.void-receivebeginplay"></a>`void ReceiveBeginPlay() { ... }` | Overrides the parent's event, like adding the event node in the editor. The engine calls it. | Yes |
+| <a id="overriding-engine-and.void-receivetick-float"></a>`void ReceiveTick(float DeltaSeconds)` | Also turns ticking on: it sets `PrimaryActorTick.bCanEverTick` on an actor's class default object, `PrimaryComponentTick.bCanEverTick` on a component's, as the editor's compiler does. AActor and UActorComponent leave ticking off by default. | Yes |
+| <a id="overriding-engine-and.void-tick-fgeometry-mygeometry"></a>`void Tick(FGeometry MyGeometry, float InDeltaTime)`, `void OnPaint(FPaintContext &Context) const` in a widget class | Also turns that event on, for this class alone: a subclass runs it only through an override of its own. See [Parent classes](#parent-classes). | Yes |
+| <a id="overriding-engine-and.void-onjumped-acharacter"></a>`void OnJumped() { ACharacter::OnJumped(); ... }` | Overrides a BlueprintNativeEvent (an event with a C++ default). The Blueprint version replaces the default, and the parent call runs it. | Yes |
+| <a id="overriding-engine-and.bool-canjumpinternal-const"></a>`bool CanJumpInternal() const` | An override copies its parent's access, event, net, authority, cosmetic, const and pure flags, whatever section it is written in. It drops Native, because the Blueprint version is script. | Yes |
+| <a id="overriding-engine-and.namespace-game"></a>A class in `namespace Game::...` deriving a game Blueprint, redefining one of its functions | An override the game's code reaches by name, with the parent function's flags; see [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp). | Yes |
+| <a id="overriding-engine-and.class-aturret-public-aactor"></a>`class ATurret : public AActor, public ITargetable` with its functions defined | Implements an interface; see [Interfaces](#interfaces). | Yes |
+| <a id="overriding-engine-and.void-receivetick-float-2"></a>`void ReceiveTick(float DeltaSeconds) override` | clang error `only virtual member functions can be marked 'override'`: UeApi declares engine functions non-virtual. Leave it off; the name alone makes the override. | Refused |
+| <a id="overriding-engine-and.ue-server"></a>`UE_SERVER`, `UE_CLIENT` or `UE_MULTICAST` on an override | Refused: `an override takes its parent's replication; drop the RPC marker`; see [RPCs](#rpcs). | Refused |
 
 ```cpp
 class AMyActor : public AActor {
@@ -2535,8 +2540,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 Bump(int32 By)` in a subclass of a mod class that declares `Bump` | The nearest ancestor that declares the method is its super, and the override inherits that function's access, net, pure and const flags. Calls by name anywhere, the parent's code included, reach the most derived version. | Yes |
-| `Twice(By)` where `Twice` is inherited, not redeclared | An ordinary call by name. A subclass's override is what runs, including one compiled later in another mod. | Yes |
+| <a id="overriding-your-own.int32-bump-int32-by"></a>`int32 Bump(int32 By)` in a subclass of a mod class that declares `Bump` | The nearest ancestor that declares the method is its super, and the override inherits that function's access, net, pure and const flags. Calls by name anywhere, the parent's code included, reach the most derived version. | Yes |
+| <a id="overriding-your-own.twice-by"></a>`Twice(By)` where `Twice` is inherited, not redeclared | An ordinary call by name. A subclass's override is what runs, including one compiled later in another mod. | Yes |
 
 Notes:
 
@@ -2547,14 +2552,14 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `SuperBase::ReceiveBeginPlay();` inside an override | Runs the parent's own implementation once and comes back: the editor's "Add call to parent function". Write the class you derive from; C++ has no `Super`. | Yes |
-| `AActor::ReceiveBeginPlay();` | Calls the engine's function. For a BlueprintImplementableEvent it does nothing, because there is no parent body. For a BlueprintNativeEvent it runs the C++ default. | Yes |
-| `SuperBase::Twice(1)` in a class that does not declare Twice | SuperBase's Twice, its body copied in: C++ runs that function without dispatch, so an object of a subclass that overrides Twice does not reach its own. `this->SuperBase::Twice(1)` is the same call. | Yes |
-| The same call to a function whose body cannot be copied in: authority-only, cosmetic, a server or client RPC, `noinline`, one that waits, one whose body makes such a call itself, or any from a `UE_NO_OPTIMIZE` caller | SuperBase's function, without dispatch. Blueprint calls a parent's function that way only from a class that has its own function of that name, so AssetGen adds one to your class: an override of the method that only calls the nearest parent's version with the same arguments, compiled like one you write, with an override's flags and super. The call is then bound to SuperBase's function, and a subclass's override of the method overrides the added one. A call by name runs what it ran before: the added override passes it on, and the engine routes both calls the same way. | Yes |
-| The same call to a multicast RPC | A call by name, with a warning: an object of a subclass that overrides the function runs its override. On a server a multicast runs locally and is also sent, so an added override would send it once, then again when it calls the parent's. An override you declare yourself does that too, as an editor override that calls its parent does. | Warns |
-| `SuperTest::Thrice(1)` in SuperTest's own code | SuperTest's own Thrice, its body copied in: C++ runs that one without dispatch, also on an object of a subclass that overrides Thrice. | Yes |
-| The same call to one of the class's own functions whose body cannot be copied in | A call by name, with a warning: on an object of a subclass that overrides the function, the override runs. A Blueprint calls its own class's function without dispatch only when that function is `final`, and then the call is bound to it. | Warns |
-| `Other->SuperBase::Bump(1)` | Refused: "runs SuperBase's Bump on another object without dispatch". C++ runs SuperBase's own Bump there; a Blueprint calls a function that way only as self's parent call, and by name the call would reach Other's override. The same however the object is written: a variable, `this->Other`, a call, `GetOther()->SuperBase::Bump(1)`, or a cast, `Cast<SuperBase>(A)->SuperBase::Bump(1)`. Call it by name, or put the code in a function of another name. Only a qualifier that a macro takes as an argument, `#define ON(O, Q) O->Q::Bump(1)`, is not read: that call goes by name with no message. | Refused |
+| <a id="calling-the-parent.superbase-receivebeginplay"></a>`SuperBase::ReceiveBeginPlay();` inside an override | Runs the parent's own implementation once and comes back: the editor's "Add call to parent function". Write the class you derive from; C++ has no `Super`. | Yes |
+| <a id="calling-the-parent.aactor-receivebeginplay"></a>`AActor::ReceiveBeginPlay();` | Calls the engine's function. For a BlueprintImplementableEvent it does nothing, because there is no parent body. For a BlueprintNativeEvent it runs the C++ default. | Yes |
+| <a id="calling-the-parent.superbase-twice-1"></a>`SuperBase::Twice(1)` in a class that does not declare Twice | SuperBase's Twice, its body copied in: C++ runs that function without dispatch, so an object of a subclass that overrides Twice does not reach its own. `this->SuperBase::Twice(1)` is the same call. | Yes |
+| <a id="calling-the-parent.noinline"></a>The same call to a function whose body cannot be copied in: authority-only, cosmetic, a server or client RPC, `noinline`, one that waits, one whose body makes such a call itself, or any from a `UE_NO_OPTIMIZE` caller | SuperBase's function, without dispatch. Blueprint calls a parent's function that way only from a class that has its own function of that name, so AssetGen adds one to your class: an override of the method that only calls the nearest parent's version with the same arguments, compiled like one you write, with an override's flags and super. The call is then bound to SuperBase's function, and a subclass's override of the method overrides the added one. A call by name runs what it ran before: the added override passes it on, and the engine routes both calls the same way. | Yes |
+| <a id="calling-the-parent.the-same-call-to-a"></a>The same call to a multicast RPC | A call by name, with a warning: an object of a subclass that overrides the function runs its override. On a server a multicast runs locally and is also sent, so an added override would send it once, then again when it calls the parent's. An override you declare yourself does that too, as an editor override that calls its parent does. | Warns |
+| <a id="calling-the-parent.supertest-thrice-1"></a>`SuperTest::Thrice(1)` in SuperTest's own code | SuperTest's own Thrice, its body copied in: C++ runs that one without dispatch, also on an object of a subclass that overrides Thrice. | Yes |
+| <a id="calling-the-parent.the-same-call-to-one"></a>The same call to one of the class's own functions whose body cannot be copied in | A call by name, with a warning: on an object of a subclass that overrides the function, the override runs. A Blueprint calls its own class's function without dispatch only when that function is `final`, and then the call is bound to it. | Warns |
+| <a id="calling-the-parent.other-superbase-bump-1"></a>`Other->SuperBase::Bump(1)` | Refused: "runs SuperBase's Bump on another object without dispatch". C++ runs SuperBase's own Bump there; a Blueprint calls a function that way only as self's parent call, and by name the call would reach Other's override. The same however the object is written: a variable, `this->Other`, a call, `GetOther()->SuperBase::Bump(1)`, or a cast, `Cast<SuperBase>(A)->SuperBase::Bump(1)`. Call it by name, or put the code in a function of another name. Only a qualifier that a macro takes as an argument, `#define ON(O, Q) O->Q::Bump(1)`, is not read: that call goes by name with no message. | Refused |
 
 ```cpp
 class SuperBase : public AActor {
@@ -2600,18 +2605,18 @@ object, write a free inline function.
 
 | You write | What it does | Status |
 |---|---|---|
-| `inline int32 Clamp(int32 V, int32 Lo, int32 Hi) { ... }` | Never a Blueprint function. Each call copies the body into the caller, like an editor macro, with its own locals, and `return` jumps to the end of the copy. Loops, switch, goto, nested inline calls and early returns all work. | Yes |
-| `inline` on the declaration, or only on the out-of-line definition | Either one makes the method inline. | Yes |
-| `Late(Counter)` | Each argument is evaluated once, before the body runs. A by-value parameter keeps the argument's value at the call, even if the body changes what it was read from. A constant or read-only argument is used in place, without a copy. | Yes |
-| `inline bool AttachTo(USceneComponent *Child, USceneComponent *Parent)` at namespace scope | A free inline function, expanded at every call. A free function can act on any object; an inline method expands only on `this`. | Yes |
-| `int32 Helper(int32 X) { ... }` at namespace scope, without `inline` | Refused at the call: `call to an unknown function: Helper`. A Blueprint has no free functions. Add `inline`, or make it a static of a function library class. | Refused |
-| `static inline int32 AddOne(int32 V)` in a library class | Expanded at the call, from its own class or from any class that includes the header, in any mod. The library does not export it. | Yes |
-| `Bump(By)` inside an inline body or a member template that a subclass expands | A call on `this` goes by name, so the object's most derived method runs, including an override compiled later or one in a class between. | Yes |
-| `Other->Twice(3)` where `Twice` is an inline method | Refused: `called on another object (only this)`, because `this` in the body stays the caller's self. Make the method non-inline, or write a free inline function that takes the object. | Not yet |
-| An inline function that calls itself, directly or through another inline | Refused (`calls itself`): the expansion would never end. Make it non-inline; a Blueprint function may recurse. One overload calling another is fine. | Refused |
-| `inline int32 Nope(int32 X);` with no body | Refused at the call (`has no body`). clang also warns with `-Wundefined-inline`. | Refused |
-| `OnHit.Add(this, &AMine::Handle)` where `Handle` is inline | Refused: a delegate binds a function by name, and an inline function is none. Drop `inline`; see [Event dispatchers](#event-dispatchers). | Refused |
-| `static int32 Count = 0;` inside an inline function | Refused: each expansion would keep its own. Use a member variable; see [Latent calls](#latent-calls). | Refused |
+| <a id="inline-functions.inline-int32-clamp-int32-v"></a>`inline int32 Clamp(int32 V, int32 Lo, int32 Hi) { ... }` | Never a Blueprint function. Each call copies the body into the caller, like an editor macro, with its own locals, and `return` jumps to the end of the copy. Loops, switch, goto, nested inline calls and early returns all work. | Yes |
+| <a id="inline-functions.inline"></a>`inline` on the declaration, or only on the out-of-line definition | Either one makes the method inline. | Yes |
+| <a id="inline-functions.late-counter"></a>`Late(Counter)` | Each argument is evaluated once, before the body runs. A by-value parameter keeps the argument's value at the call, even if the body changes what it was read from. A constant or read-only argument is used in place, without a copy. | Yes |
+| <a id="inline-functions.inline-bool-attachto"></a>`inline bool AttachTo(USceneComponent *Child, USceneComponent *Parent)` at namespace scope | A free inline function, expanded at every call. A free function can act on any object; an inline method expands only on `this`. | Yes |
+| <a id="inline-functions.int32-helper-int32-x"></a>`int32 Helper(int32 X) { ... }` at namespace scope, without `inline` | Refused at the call: `call to an unknown function: Helper`. A Blueprint has no free functions. Add `inline`, or make it a static of a function library class. | Refused |
+| <a id="inline-functions.static-inline-int32-addone-int32"></a>`static inline int32 AddOne(int32 V)` in a library class | Expanded at the call, from its own class or from any class that includes the header, in any mod. The library does not export it. | Yes |
+| <a id="inline-functions.bump-by"></a>`Bump(By)` inside an inline body or a member template that a subclass expands | A call on `this` goes by name, so the object's most derived method runs, including an override compiled later or one in a class between. | Yes |
+| <a id="inline-functions.other-twice-3"></a>`Other->Twice(3)` where `Twice` is an inline method | Refused: `called on another object (only this)`, because `this` in the body stays the caller's self. Make the method non-inline, or write a free inline function that takes the object. | Not yet |
+| <a id="inline-functions.an-inline-function-that-calls"></a>An inline function that calls itself, directly or through another inline | Refused (`calls itself`): the expansion would never end. Make it non-inline; a Blueprint function may recurse. One overload calling another is fine. | Refused |
+| <a id="inline-functions.inline-int32-nope-int32-x"></a>`inline int32 Nope(int32 X);` with no body | Refused at the call (`has no body`). clang also warns with `-Wundefined-inline`. | Refused |
+| <a id="inline-functions.onhit-add-this-amine-handle"></a>`OnHit.Add(this, &AMine::Handle)` where `Handle` is inline | Refused: a delegate binds a function by name, and an inline function is none. Drop `inline`; see [Event dispatchers](#event-dispatchers). | Refused |
+| <a id="inline-functions.static-int32-count-0"></a>`static int32 Count = 0;` inside an inline function | Refused: each expansion would keep its own. Use a member variable; see [Latent calls](#latent-calls). | Refused |
 
 ```cpp
 int32 Counter;
@@ -2641,9 +2646,9 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `FirstPawn()` where `FirstPawn(UObject *WorldContextObject = nullptr)` is inline | A parameter whose name starts with `WorldContext`, left at its default, becomes the caller's `this`. Inside a static with its own WorldContext parameter it becomes that parameter. A Blueprint function or an engine function gets the same value in the same place. | Yes |
-| `FirstPawn(Other)`, `FirstPawn(nullptr)` | An explicit argument, `nullptr` included, is kept. | Yes |
-| An engine call inside the inline body that leaves out its own world context | Gets the caller's context, not the inline's WorldContextObject parameter. Pass the parameter on explicitly, as below. | Yes |
+| <a id="world-context-in.firstpawn"></a>`FirstPawn()` where `FirstPawn(UObject *WorldContextObject = nullptr)` is inline | A parameter whose name starts with `WorldContext`, left at its default, becomes the caller's `this`. Inside a static with its own WorldContext parameter it becomes that parameter. A Blueprint function or an engine function gets the same value in the same place. | Yes |
+| <a id="world-context-in.firstpawn-other"></a>`FirstPawn(Other)`, `FirstPawn(nullptr)` | An explicit argument, `nullptr` included, is kept. | Yes |
+| <a id="world-context-in.an-engine-call-inside-the"></a>An engine call inside the inline body that leaves out its own world context | Gets the caller's context, not the inline's WorldContextObject parameter. Pass the parameter on explicitly, as below. | Yes |
 
 ```cpp
 inline APawn *FirstPawn(UObject *WorldContextObject = nullptr) {
@@ -2671,16 +2676,16 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `SpawnActor<AActor>(AActor::StaticClass(), Where)` from `Objects.h` | Each instantiation clang makes is expanded at its call like any inline function. No function exists per instantiation; see [Creating objects](#creating-objects). | Yes |
-| `template <class T> inline T Max2(T A, T B)` | A free function template needs `inline`. | Yes |
-| `template <class T> T Max2(T A, T B)` without `inline` | Refused at the call: `call to an unknown function: Max2`. Add `inline`. | Refused |
-| `template <class T> int32 WidthOf()` in a class | A member template is expanded at its call, with or without `inline`. No Blueprint function is made, and only calls on `this` expand. Its body is its own class's code, as an inline method's is: a call in it is read there, wherever it is copied. | Yes |
-| `inline auto TwiceN(Number auto V)`, or `int32 AutoP(auto V)` in a class | An `auto` parameter makes the function a template, expanded at each call. A free one needs `inline`. | Yes |
-| `template <class T> concept Number = requires(T A) { A + A; };` | Concepts and requires-clauses are checked by clang and cost nothing at run time. A wrong type is a "constraints not satisfied" error on the calling line. | Yes |
-| `template <class... T> inline int32 Fwd(T... V) { return Sum2(V...); }` | Pack expansion into a call works. | Yes |
-| `sizeof...(V)`, `sizeof...(T)` | The number of arguments in the pack, of a parameter pack or of a template's type pack, as a constant; 0 for an empty pack. | Yes |
-| `template <int32 N> inline int32 Times(int32 X) { return X * N; }` | A template's value parameter is the constant the call gave it. | Yes |
-| `if constexpr (sizeof(T) == 8)` | Only the branch clang kept is compiled; no test or jump is left in the bytecode. | Yes |
+| <a id="templates.spawnactor-aactor-aactor"></a>`SpawnActor<AActor>(AActor::StaticClass(), Where)` from `Objects.h` | Each instantiation clang makes is expanded at its call like any inline function. No function exists per instantiation; see [Creating objects](#creating-objects). | Yes |
+| <a id="templates.template-class-t-inline-t"></a>`template <class T> inline T Max2(T A, T B)` | A free function template needs `inline`. | Yes |
+| <a id="templates.template-class-t-t-max2"></a>`template <class T> T Max2(T A, T B)` without `inline` | Refused at the call: `call to an unknown function: Max2`. Add `inline`. | Refused |
+| <a id="templates.template-class-t-int32-widthof"></a>`template <class T> int32 WidthOf()` in a class | A member template is expanded at its call, with or without `inline`. No Blueprint function is made, and only calls on `this` expand. Its body is its own class's code, as an inline method's is: a call in it is read there, wherever it is copied. | Yes |
+| <a id="templates.inline-auto-twicen-number-auto"></a>`inline auto TwiceN(Number auto V)`, or `int32 AutoP(auto V)` in a class | An `auto` parameter makes the function a template, expanded at each call. A free one needs `inline`. | Yes |
+| <a id="templates.template-class-t-concept-number"></a>`template <class T> concept Number = requires(T A) { A + A; };` | Concepts and requires-clauses are checked by clang and cost nothing at run time. A wrong type is a "constraints not satisfied" error on the calling line. | Yes |
+| <a id="templates.template-class-t-inline-int32"></a>`template <class... T> inline int32 Fwd(T... V) { return Sum2(V...); }` | Pack expansion into a call works. | Yes |
+| <a id="templates.sizeof-v"></a>`sizeof...(V)`, `sizeof...(T)` | The number of arguments in the pack, of a parameter pack or of a template's type pack, as a constant; 0 for an empty pack. | Yes |
+| <a id="templates.template-int32-n-inline-int32"></a>`template <int32 N> inline int32 Times(int32 X) { return X * N; }` | A template's value parameter is the constant the call gave it. | Yes |
+| <a id="templates.if-constexpr-sizeof-t-8"></a>`if constexpr (sizeof(T) == 8)` | Only the branch clang kept is compiled; no test or jump is left in the bytecode. | Yes |
 
 ```cpp
 template <class T> concept Number = requires(T A) { A + A; };
@@ -2709,11 +2714,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `constexpr int32 SqM(int32 X) const` in a class | An ordinary Blueprint function that runs in the game; `constexpr` changes nothing. Mark it `inline` to expand it at calls, or `consteval` to run it at build time. | Yes |
-| `inline constexpr int32 Sq(int32 X)` at namespace scope | Expanded like any inline function and computed in the game. | Yes |
-| `constexpr int32 Sq(int32 X)` at namespace scope, without `inline` | Refused at the call: `call to an unknown function: Sq`. AssetGen does not run a plain constexpr call at build time. Add `inline`, or use `consteval`. | Refused |
-| `consteval int32 Fnv(const char *S)` | clang runs the call while compiling, and only the answer reaches the Blueprint; see [Constants](#constants). | Yes |
-| `int32 K = Sq(3);` as a member initializer, with a plain constexpr `Sq` | Refused (`a default is a value known when the mod is built`), and so is a consteval `Sq` called there directly. A default reaches a function call only through a constant: `static constexpr int32 kSq = Sq(3);` with `Sq` a consteval function at namespace scope, then `int32 K = kSq;`. See [Constants](#constants). | Refused |
+| <a id="constexpr-and-consteval.constexpr-int32-sqm-int32-x"></a>`constexpr int32 SqM(int32 X) const` in a class | An ordinary Blueprint function that runs in the game; `constexpr` changes nothing. Mark it `inline` to expand it at calls, or `consteval` to run it at build time. | Yes |
+| <a id="constexpr-and-consteval.inline-constexpr-int32-sq-int32"></a>`inline constexpr int32 Sq(int32 X)` at namespace scope | Expanded like any inline function and computed in the game. | Yes |
+| <a id="constexpr-and-consteval.constexpr-int32-sq-int32-x"></a>`constexpr int32 Sq(int32 X)` at namespace scope, without `inline` | Refused at the call: `call to an unknown function: Sq`. AssetGen does not run a plain constexpr call at build time. Add `inline`, or use `consteval`. | Refused |
+| <a id="constexpr-and-consteval.consteval-int32-fnv-const-char"></a>`consteval int32 Fnv(const char *S)` | clang runs the call while compiling, and only the answer reaches the Blueprint; see [Constants](#constants). | Yes |
+| <a id="constexpr-and-consteval.int32-k-sq-3"></a>`int32 K = Sq(3);` as a member initializer, with a plain constexpr `Sq` | Refused (`a default is a value known when the mod is built`), and so is a consteval `Sq` called there directly. A default reaches a function call only through a constant: `static constexpr int32 kSq = Sq(3);` with `Sq` a consteval function at namespace scope, then `int32 K = kSq;`. See [Constants](#constants). | Refused |
 
 ```cpp
 inline constexpr int32 Sq(int32 X) { return X * X; }   // expanded, computed in the game
@@ -2736,15 +2741,15 @@ component class, and the first scene component declared is the actor's root.
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_COMPONENT(UStaticMeshComponent, Mesh);` | Adds a component, as Add Component in the Components panel does. `Mesh` is an ordinary object variable. A construction-script node builds the component from a template (`Mesh_GEN_VARIABLE`) each time the actor spawns and stores it in `Mesh`. | Yes |
-| `Mesh->SetHiddenInGame(true, false);` in a function | By the time the construction script and `ReceiveBeginPlay` run, the variable holds this actor's own instance. Use it like any object pointer; a change affects only this actor. | Yes |
-| `UE_COMPONENT(UHealthComponent, Health);` | One of DRG's own component classes works like an engine one. | Yes |
-| `UE_COMPONENT(UInstancedStaticMeshComponent, Pile);` | Static mesh, instanced static mesh, hierarchical instanced static mesh, SkyAtmosphere and AtmosphericFog components write native data after their properties. AssetGen writes exactly the bytes a cooked template of that class carries, and a class derived from one of them gets the same bytes. Other component classes need nothing extra. | Yes |
-| `UE_COMPONENT(UModelComponent, Bsp);` | Refused: a model component "belongs to a level's BSP" and cannot be a template. | Refused |
-| `UE_COMPONENT(UCharges, Ammo);`, with a component class the mod declares | A component of the mod's own class, as the editor adds a component Blueprint in the Components panel: a construction-script node whose template is made from that class's default object. `UE_DEFAULTS` sets its defaults as for an engine component (`Ammo->Count = 3;`). An abstract class (a method `= 0`) is refused as "abstract": the engine never instances an abstract class. | Yes |
-| `UE_COMPONENT(UTexture2D, Icon);` | Refused: "is not a UActorComponent". | Refused |
-| `UE_COMPONENT` in a class that is not an actor | Refused: "only an actor has a construction script". | Refused |
-| `UE_COMPONENT` in a `UE_INTERFACE` | Refused: "an interface cannot declare a UE_COMPONENT". Declare the component on each class that implements the interface. | Refused |
+| <a id="declaring-components.ue-component"></a>`UE_COMPONENT(UStaticMeshComponent, Mesh);` | Adds a component, as Add Component in the Components panel does. `Mesh` is an ordinary object variable. A construction-script node builds the component from a template (`Mesh_GEN_VARIABLE`) each time the actor spawns and stores it in `Mesh`. | Yes |
+| <a id="declaring-components.mesh-sethiddeningame-true-false"></a>`Mesh->SetHiddenInGame(true, false);` in a function | By the time the construction script and `ReceiveBeginPlay` run, the variable holds this actor's own instance. Use it like any object pointer; a change affects only this actor. | Yes |
+| <a id="declaring-components.ue-component-uhealthcomponent"></a>`UE_COMPONENT(UHealthComponent, Health);` | One of DRG's own component classes works like an engine one. | Yes |
+| <a id="declaring-components.ue-component-2"></a>`UE_COMPONENT(UInstancedStaticMeshComponent, Pile);` | Static mesh, instanced static mesh, hierarchical instanced static mesh, SkyAtmosphere and AtmosphericFog components write native data after their properties. AssetGen writes exactly the bytes a cooked template of that class carries, and a class derived from one of them gets the same bytes. Other component classes need nothing extra. | Yes |
+| <a id="declaring-components.ue-component-umodelcomponent-bsp"></a>`UE_COMPONENT(UModelComponent, Bsp);` | Refused: a model component "belongs to a level's BSP" and cannot be a template. | Refused |
+| <a id="declaring-components.ue-component-ucharges-ammo"></a>`UE_COMPONENT(UCharges, Ammo);`, with a component class the mod declares | A component of the mod's own class, as the editor adds a component Blueprint in the Components panel: a construction-script node whose template is made from that class's default object. `UE_DEFAULTS` sets its defaults as for an engine component (`Ammo->Count = 3;`). An abstract class (a method `= 0`) is refused as "abstract": the engine never instances an abstract class. | Yes |
+| <a id="declaring-components.ue-component-utexture2d-icon"></a>`UE_COMPONENT(UTexture2D, Icon);` | Refused: "is not a UActorComponent". | Refused |
+| <a id="declaring-components.ue-component-3"></a>`UE_COMPONENT` in a class that is not an actor | Refused: "only an actor has a construction script". | Refused |
+| <a id="declaring-components.ue-component-4"></a>`UE_COMPONENT` in a `UE_INTERFACE` | Refused: "an interface cannot declare a UE_COMPONENT". Declare the component on each class that implements the interface. | Refused |
 
 ```cpp
 class Lantern : public AActor {
@@ -2792,20 +2797,20 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_COMPONENT(USceneComponent, Root);` as the first scene component | Becomes the actor's root. | Yes |
-| a later scene component | Attaches directly to the root, unless `SetupAttachment` places it. | Yes |
-| a component that is not a scene component, such as `UProjectileMovementComponent` | Is created with no attachment, wherever it is declared. | Yes |
-| no `UE_COMPONENT` at all | The actor gets the default scene root, as in the editor: a `USceneComponent` named DefaultSceneRoot, made by the class's construction script, which a reference can name across the network, and held in the class's variable `DefaultSceneRoot`. Below a parent that gives the actor a root already, it gets none. | Yes |
-| a member named `DefaultSceneRoot` in an actor class | Refused: the construction script stores the default scene root in the variable of that name, a second one or the one a subclass declares. | Refused |
-| only components that are not scene components | The actor gets the engine's default scene root too, as in the editor, so a movement component has a root to move. Below a parent that gives the actor a root already, a Blueprint parent or a native one such as ACharacter (its capsule), it gets none, as in the editor. | Yes |
-| `UE_DEFAULTS { Tip->SetupAttachment(Glow); }`, Glow another `UE_COMPONENT` of the class | Tip attaches to Glow, as in a C++ constructor: in the construction script it is one of Glow's child nodes. It keeps its own location, rotation and scale, relative to Glow. | Yes |
-| `Tip->SetupAttachment(Glow, FName("Muzzle"));` | The same at a socket or bone of Glow (the node's AttachToName). The socket is a literal name or none; a variable or a call there is refused, since it would be dropped. | Yes |
-| `Glow->SetupAttachment(Lamp);`, Lamp a component of a mod or game Blueprint parent | Glow attaches to the inherited Lamp. Its node names Lamp and the parent class whose construction script makes it (ParentComponentOrVariableName, ParentComponentOwnerClassName), as the editor saves a component dropped on an inherited one. A game Blueprint's component needs the UeApi header to mark it as a construction-script node (`Scene__UeScsNode`); one without it is refused with what to regenerate. | Yes |
-| `Glow->SetupAttachment(Mesh);` in an `ACharacter` child | Glow attaches to a native default subobject. The node names the subobject by its object name, `CharacterMesh0` for `Mesh` (bIsParentComponentNative), which UeApi records. It stays `CharacterMesh0` further down, in an `APlayerCharacter` child, though `FPMesh` is a skeletal mesh too: a subclass cannot rename a subobject its parent makes. A native member that is no default subobject is refused: attach to it at run time. | Yes |
-| `Glow->SetupAttachment(RootComponent);` | Glow attaches to the actor's root, whichever component that is, as a constructor's call does. Below a parent that gives the actor a root, such as `ACharacter`'s capsule or a Blueprint parent's root, its node is a root node naming no parent, which the construction script attaches to that root. With no root to inherit, Glow is never the root itself: it hangs from the first scene component `SetupAttachment` leaves alone, or, with none, from the default scene root, which stays, as the editor keeps a component added under it. It keeps its own location, rotation and scale, relative to the root. `SetupAttachment(RootComponent, FName("Sock"))` attaches at that socket of the root, the node's AttachToName. | Yes |
-| `Lamp->SetupAttachment(Own);` for an inherited Lamp, `A->SetupAttachment(B); B->SetupAttachment(A);`, or one component attached twice | Refused. An inherited component stays where its own class puts it. A cycle has no node the construction script starts from, so none of its components would be made. | Refused |
-| `Trigger->OnComponentBeginOverlap.Add(this, &AMine::OnTouch);` in the constructor or `UE_DEFAULTS` | Binds a component's event, as the editor's component-bound event node does ("On Component Begin Overlap (Trigger)"): each actor of the class made calls OnTouch on itself when its Trigger fires. The component is any this class has a property for, its own `UE_COMPONENT`, a Blueprint parent's or a native parent's (`MovementComponent->OnProjectileStop` in an `AProjectile` child), found by that name as the actor is made. A dispatcher the editor can bind, to a function of this class whose parameters match it. | Yes |
-| `Pivot->SetupAttachment(Lamp);` in a function | Attaches at once, keeping the relative transform: `K2_AttachToComponent` with KeepRelative for location, rotation and scale, and no welding. That is what the engine's own `SetupAttachment` leads to when the component registers; called on a component already registered, as any of a constructed actor is, the engine's own does nothing, so the compiler warns, naming the function. Call `AttachToComponent` to pick the rules yourself. | Warns |
+| <a id="the-root-and.ue-component-uscenecomponent"></a>`UE_COMPONENT(USceneComponent, Root);` as the first scene component | Becomes the actor's root. | Yes |
+| <a id="the-root-and.a-later-scene-component"></a>a later scene component | Attaches directly to the root, unless `SetupAttachment` places it. | Yes |
+| <a id="the-root-and.uprojectilemovementcomponent"></a>a component that is not a scene component, such as `UProjectileMovementComponent` | Is created with no attachment, wherever it is declared. | Yes |
+| <a id="the-root-and.ue-component"></a>no `UE_COMPONENT` at all | The actor gets the default scene root, as in the editor: a `USceneComponent` named DefaultSceneRoot, made by the class's construction script, which a reference can name across the network, and held in the class's variable `DefaultSceneRoot`. Below a parent that gives the actor a root already, it gets none. | Yes |
+| <a id="the-root-and.defaultsceneroot"></a>a member named `DefaultSceneRoot` in an actor class | Refused: the construction script stores the default scene root in the variable of that name, a second one or the one a subclass declares. | Refused |
+| <a id="the-root-and.only-components-that-are-not"></a>only components that are not scene components | The actor gets the engine's default scene root too, as in the editor, so a movement component has a root to move. Below a parent that gives the actor a root already, a Blueprint parent or a native one such as ACharacter (its capsule), it gets none, as in the editor. | Yes |
+| <a id="the-root-and.ue-defaults-tip-setupattachment"></a>`UE_DEFAULTS { Tip->SetupAttachment(Glow); }`, Glow another `UE_COMPONENT` of the class | Tip attaches to Glow, as in a C++ constructor: in the construction script it is one of Glow's child nodes. It keeps its own location, rotation and scale, relative to Glow. | Yes |
+| <a id="the-root-and.tip-setupattachment-glow-fname"></a>`Tip->SetupAttachment(Glow, FName("Muzzle"));` | The same at a socket or bone of Glow (the node's AttachToName). The socket is a literal name or none; a variable or a call there is refused, since it would be dropped. | Yes |
+| <a id="the-root-and.glow-setupattachment-lamp"></a>`Glow->SetupAttachment(Lamp);`, Lamp a component of a mod or game Blueprint parent | Glow attaches to the inherited Lamp. Its node names Lamp and the parent class whose construction script makes it (ParentComponentOrVariableName, ParentComponentOwnerClassName), as the editor saves a component dropped on an inherited one. A game Blueprint's component needs the UeApi header to mark it as a construction-script node (`Scene__UeScsNode`); one without it is refused with what to regenerate. | Yes |
+| <a id="the-root-and.glow-setupattachment-mesh"></a>`Glow->SetupAttachment(Mesh);` in an `ACharacter` child | Glow attaches to a native default subobject. The node names the subobject by its object name, `CharacterMesh0` for `Mesh` (bIsParentComponentNative), which UeApi records. It stays `CharacterMesh0` further down, in an `APlayerCharacter` child, though `FPMesh` is a skeletal mesh too: a subclass cannot rename a subobject its parent makes. A native member that is no default subobject is refused: attach to it at run time. | Yes |
+| <a id="the-root-and.glow-setupattachment"></a>`Glow->SetupAttachment(RootComponent);` | Glow attaches to the actor's root, whichever component that is, as a constructor's call does. Below a parent that gives the actor a root, such as `ACharacter`'s capsule or a Blueprint parent's root, its node is a root node naming no parent, which the construction script attaches to that root. With no root to inherit, Glow is never the root itself: it hangs from the first scene component `SetupAttachment` leaves alone, or, with none, from the default scene root, which stays, as the editor keeps a component added under it. It keeps its own location, rotation and scale, relative to the root. `SetupAttachment(RootComponent, FName("Sock"))` attaches at that socket of the root, the node's AttachToName. | Yes |
+| <a id="the-root-and.lamp-setupattachment-own"></a>`Lamp->SetupAttachment(Own);` for an inherited Lamp, `A->SetupAttachment(B); B->SetupAttachment(A);`, or one component attached twice | Refused. An inherited component stays where its own class puts it. A cycle has no node the construction script starts from, so none of its components would be made. | Refused |
+| <a id="the-root-and.trigger-oncomponentbeginoverlap"></a>`Trigger->OnComponentBeginOverlap.Add(this, &AMine::OnTouch);` in the constructor or `UE_DEFAULTS` | Binds a component's event, as the editor's component-bound event node does ("On Component Begin Overlap (Trigger)"): each actor of the class made calls OnTouch on itself when its Trigger fires. The component is any this class has a property for, its own `UE_COMPONENT`, a Blueprint parent's or a native parent's (`MovementComponent->OnProjectileStop` in an `AProjectile` child), found by that name as the actor is made. A dispatcher the editor can bind, to a function of this class whose parameters match it. | Yes |
+| <a id="the-root-and.pivot-setupattachment-lamp"></a>`Pivot->SetupAttachment(Lamp);` in a function | Attaches at once, keeping the relative transform: `K2_AttachToComponent` with KeepRelative for location, rotation and scale, and no welding. That is what the engine's own `SetupAttachment` leads to when the component registers; called on a component already registered, as any of a constructed actor is, the engine's own does nothing, so the compiler warns, naming the function. Call `AttachToComponent` to pick the rules yourself. | Warns |
 
 Notes:
 
@@ -2819,12 +2824,12 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `AddComponentByType<USceneComponent>(this)` | The Add Component by Class node (`AActor::AddComponentByClass`), returning the component as a `T*`. It is created at the owner's origin, and a scene component attaches to the owner's root. | Yes |
-| `AddComponentByType<UCharges>(this, ChargesClass, true)` | The class can be picked at run time as a `TSubclassOf<T>`; it is `T` by default. The third argument is bManualAttachment: with `true`, a scene component is not attached. A component class the mod declares itself works here. | Yes |
-| `AddComponentByType<UAbstractComp>(this)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Refused: "is an abstract class ... which the engine may not construct". AddComponentByClass constructs it with NewObject, which asserts on an abstract class in a Development game. Add a subclass that defines every `= 0` method, or the UE_FINAL_AS leaf, which the message names. Only a class the call names is checked. | Refused |
-| `AddComponentDeferred<UCharges>(this)`, then `FinishComponent(this, C)` | The Add Component node with exposed pins. Registration, and with it the component's BeginPlay, waits for `FinishComponent` (`AActor::FinishAddComponent`), so the values you set in between are the first ones it sees. | Yes |
-| `AttachToComponent(Muzzle, Barrel)` | `K2_AttachToComponent` with one attachment rule for location, rotation and scale (SnapToTarget unless you pass another) and welding on. Returns whether it attached. | Yes |
-| `AttachToComponent(Gun, Hand, FName("hand_r"), EAttachmentRule::KeepRelative, false)` | The same at a socket, with another rule and without welding. For a different rule per channel, call `Gun->K2_AttachToComponent(...)` yourself. | Yes |
+| <a id="adding-components-at.addcomponentbytype"></a>`AddComponentByType<USceneComponent>(this)` | The Add Component by Class node (`AActor::AddComponentByClass`), returning the component as a `T*`. It is created at the owner's origin, and a scene component attaches to the owner's root. | Yes |
+| <a id="adding-components-at.addcomponentbytype-ucharges-this"></a>`AddComponentByType<UCharges>(this, ChargesClass, true)` | The class can be picked at run time as a `TSubclassOf<T>`; it is `T` by default. The third argument is bManualAttachment: with `true`, a scene component is not attached. A component class the mod declares itself works here. | Yes |
+| <a id="adding-components-at.addcomponentbytype-uabstractcomp"></a>`AddComponentByType<UAbstractComp>(this)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Refused: "is an abstract class ... which the engine may not construct". AddComponentByClass constructs it with NewObject, which asserts on an abstract class in a Development game. Add a subclass that defines every `= 0` method, or the UE_FINAL_AS leaf, which the message names. Only a class the call names is checked. | Refused |
+| <a id="adding-components-at.addcomponentdeferred-ucharges"></a>`AddComponentDeferred<UCharges>(this)`, then `FinishComponent(this, C)` | The Add Component node with exposed pins. Registration, and with it the component's BeginPlay, waits for `FinishComponent` (`AActor::FinishAddComponent`), so the values you set in between are the first ones it sees. | Yes |
+| <a id="adding-components-at.attachtocomponent-muzzle-barrel"></a>`AttachToComponent(Muzzle, Barrel)` | `K2_AttachToComponent` with one attachment rule for location, rotation and scale (SnapToTarget unless you pass another) and welding on. Returns whether it attached. | Yes |
+| <a id="adding-components-at.attachtocomponent-gun-hand-fname"></a>`AttachToComponent(Gun, Hand, FName("hand_r"), EAttachmentRule::KeepRelative, false)` | The same at a socket, with another rule and without welding. For a different rule per channel, call `Gun->K2_AttachToComponent(...)` yourself. | Yes |
 
 ```cpp
 #include "../include/Objects.h" // AssetGen's include/ folder, by its path from your source
@@ -2871,29 +2876,29 @@ panel.
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_WIDGET(UCanvasPanel, Root);` in a `UUserWidget` class | Adds a widget to the class's tree, as dropping one in the designer does, and makes `Root` a variable of the class (the designer's Is Variable). When a widget of the class is made, `Root` holds its own copy. The first `UE_WIDGET` is the tree's root. The class is cooked as a widget Blueprint's class (WidgetBlueprintGeneratedClass). | Yes |
-| `Root->AddChildToCanvas(Title);` in the constructor | Puts Title in the canvas, as dragging it there in the designer does: a slot of the panel's slot class (`UCanvasPanelSlot`) holds it. `AddChildToVerticalBox`, `AddChildToOverlay` and the other panels' adders work the same way. | Yes |
-| `Root->AddChild(Box);`, `Play->SetContent(Label);` | The same through the untyped adders. The slot is the panel's own kind, `<Panel>Slot` (`ButtonSlot` for a button), as the panel makes it. Take it as its class with `Cast<UButtonSlot>(Play->SetContent(Label))`; a cast to another slot class is refused, since it would be null. | Yes |
-| `Root->AddChildToCanvas(Title)->SetPosition(FVector2D(20, 10));` | Sets the slot's layout: `SetPosition` and `SetSize` are the canvas slot's offsets (left and top, width and height), `SetOffsets`, `SetAnchors`, `SetMinimum`, `SetMaximum`, `SetAlignment` and `SetLayout` the rest of its LayoutData. The parts no setter gives keep the slot's default. | Yes |
-| `UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);` then `At->SetSize(FVector2D(200, 40));` | Several setters on one slot, through a local. | Yes |
-| `UOverlaySlot* At = Box->AddChildToOverlay(Mark);` then `At->Padding.Top = 6.0f;`, `At->HorizontalAlignment = ...;` | A slot member assigned through the local, whole or a part of a struct, as a widget's own members are. A part is written as the cook writes it, the struct holding only that part; the rest keeps the slot class's default (a `UBorderSlot`'s Padding is 4, 2, 4, 2). | Yes |
-| `Cast<UVerticalBoxSlot>(Box->AddChild(Hint))->SetPadding(FMargin(4, 4, 4, 4));`, `->SetHorizontalAlignment(...)` | Any other slot setter, `SetPadding`, `SetHorizontalAlignment`, `SetVerticalAlignment`, `SetSize(FSlateChildSize)`, `SetZOrder`, `SetAutoSize`: read as the property it sets, `Foo` or `bFoo` of the slot's class, of the argument's type. | Yes |
-| `Title->SetText(FText("Score"));`, `Title->Text = FText("Score");` | A widget's own defaults, set by a setter (read the same way, on the widget's class) or assigned as a member, as `UE_DEFAULTS` sets a component's. | Yes |
-| `UE_WIDGET(UWtCard, Card);`, a widget class of the mod or the game | A user widget inside this one. It is made from its own class, its own tree included. | Yes |
-| a class below a mod widget class with `UE_WIDGET`s, declaring none | Shows its parent's tree, as a widget Blueprint below another does: it is cooked as a widget Blueprint's class too, and its parent's variables hold its widgets. | Yes |
-| a `UE_WIDGET` no `AddChild` call puts in a panel, or a ring of panels holding one another | Refused: "no panel holds it". The engine walks the tree from its root, and would never reach it. | Refused |
-| a widget added twice, the root added, a second child of a content widget (`UButton`, `USizeBox`, `UBorder`) | Refused: a widget has one parent, the root none, and a content widget holds one child. | Refused |
-| `Title->SetOpacity(0.5f);`, a setter with no property of its name and type | Refused: "AssetGen reads a setter as the property it sets, and ... has no Opacity of its argument's type". Assign the member instead. | Refused |
-| an adder's other arguments, `Grid->AddChildToGrid(Cell, 1, 2)` | Refused: set them with the slot's setters. | Refused |
-| `UE_WIDGET` in a class that is not a `UUserWidget` | Refused: "a UE_WIDGET is a widget of a UUserWidget's tree". | Refused |
-| `Play->OnClicked.Add(this, &UScoreCard::OnPlay);` in the constructor | Binds a widget's event, as the designer's "On Clicked (Play)" node does: each widget of the class made calls OnPlay when its own Play is clicked. Any widget dispatcher the editor can bind (`OnHovered`, a mod widget's `UE_DISPATCHER`), to a function of this class. A class below inherits it. | Yes |
-| `UE_WIDGET(UNamedSlot, Body);` | A named slot: a place in this widget's layout that a widget nesting this one fills. The class lists it in its named slots. | Yes |
-| `UE_SLOT(Frame->Body, Inner);` in the constructor | Fills the named slot Body of the nested user widget Frame with Inner, a `UE_WIDGET` of this class that sits in no panel, as dropping a widget on a named slot in the designer does. Inner is still this class's variable. Body is a named slot of Frame's class: a `UE_WIDGET(UNamedSlot, ...)` of a mod class, a named slot variable of a game one. | Yes |
-| `UE_BIND(Title, Text, &UScoreCard::GetScore);` in the constructor | Binds Title's Text to GetScore, as the designer's Bind button does: the widget reads it from GetScore each time it is drawn. GetScore returns the property's type (`FText` here) and takes nothing; the widget must have a binding for it (`TextDelegate`), which clang checks. | Yes |
-| a `UE_SLOT` content in a panel too, a slot no `UE_WIDGET` of the mod class it is on, an event bound to another object's function, a `UE_BIND` to a function of a class this one is not | Refused: a widget has one parent; a mod class's slot that is not in its tree is null where the engine looks for it; the engine finds the bound function on this widget, by name. | Refused |
-| `UE_ANIMATION(Pop);`, `UE_ANIMATION(Fade, 1.5f);` in the class | A widget animation, as the designer's Animations panel adds one: a `UWidgetAnimation*` variable of the class that holds it once a widget is made, for `PlayAnimation(Pop, ...)`. It lasts until its last key, or the length given in seconds. | Yes |
-| `UE_KEYS(Pop, Mark->RenderTransform.Scale.X, (0, 0.5, Cubic, 1.159), (0.25, 0.7, Cubic));` in the constructor | Keys one channel of a `UE_WIDGET`'s render transform in the animation: `Translation.X`, `Translation.Y`, `Angle`, `Scale.X`, `Scale.Y`, `Shear.X` or `Shear.Y`. Each key is `(time in seconds, value)`, Linear unless it says `Constant` or `Cubic`; a slope in value per second after `Cubic` is its tangent (the curve editor's User), and without one the tangent is Auto, as the editor computes it. The animation binds the widget by name, as Sequencer does. | Yes |
-| an animation with no keys and no length, two `UE_KEYS` on one channel, a slope after a key that is not `Cubic`, a channel outside the render transform, `UE_ANIMATION` in a class with no `UE_WIDGET` | Refused: an animation runs as long as its keys; a channel's keys are one curve; only a cubic key has a tangent; AssetGen keys the 2D transform track alone; the animation binds widgets of the class's tree. | Refused |
+| <a id="widget-layouts.ue-widget-ucanvaspanel-root"></a>`UE_WIDGET(UCanvasPanel, Root);` in a `UUserWidget` class | Adds a widget to the class's tree, as dropping one in the designer does, and makes `Root` a variable of the class (the designer's Is Variable). When a widget of the class is made, `Root` holds its own copy. The first `UE_WIDGET` is the tree's root. The class is cooked as a widget Blueprint's class (WidgetBlueprintGeneratedClass). | Yes |
+| <a id="widget-layouts.root-addchildtocanvas-title"></a>`Root->AddChildToCanvas(Title);` in the constructor | Puts Title in the canvas, as dragging it there in the designer does: a slot of the panel's slot class (`UCanvasPanelSlot`) holds it. `AddChildToVerticalBox`, `AddChildToOverlay` and the other panels' adders work the same way. | Yes |
+| <a id="widget-layouts.root-addchild-box"></a>`Root->AddChild(Box);`, `Play->SetContent(Label);` | The same through the untyped adders. The slot is the panel's own kind, `<Panel>Slot` (`ButtonSlot` for a button), as the panel makes it. Take it as its class with `Cast<UButtonSlot>(Play->SetContent(Label))`; a cast to another slot class is refused, since it would be null. | Yes |
+| <a id="widget-layouts.root-addchildtocanvas-title-2"></a>`Root->AddChildToCanvas(Title)->SetPosition(FVector2D(20, 10));` | Sets the slot's layout: `SetPosition` and `SetSize` are the canvas slot's offsets (left and top, width and height), `SetOffsets`, `SetAnchors`, `SetMinimum`, `SetMaximum`, `SetAlignment` and `SetLayout` the rest of its LayoutData. The parts no setter gives keep the slot's default. | Yes |
+| <a id="widget-layouts.ucanvaspanelslot-at-root"></a>`UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);` then `At->SetSize(FVector2D(200, 40));` | Several setters on one slot, through a local. | Yes |
+| <a id="widget-layouts.uoverlayslot-at-box"></a>`UOverlaySlot* At = Box->AddChildToOverlay(Mark);` then `At->Padding.Top = 6.0f;`, `At->HorizontalAlignment = ...;` | A slot member assigned through the local, whole or a part of a struct, as a widget's own members are. A part is written as the cook writes it, the struct holding only that part; the rest keeps the slot class's default (a `UBorderSlot`'s Padding is 4, 2, 4, 2). | Yes |
+| <a id="widget-layouts.cast-uverticalboxslot-box"></a>`Cast<UVerticalBoxSlot>(Box->AddChild(Hint))->SetPadding(FMargin(4, 4, 4, 4));`, `->SetHorizontalAlignment(...)` | Any other slot setter, `SetPadding`, `SetHorizontalAlignment`, `SetVerticalAlignment`, `SetSize(FSlateChildSize)`, `SetZOrder`, `SetAutoSize`: read as the property it sets, `Foo` or `bFoo` of the slot's class, of the argument's type. | Yes |
+| <a id="widget-layouts.title-settext-ftext-score"></a>`Title->SetText(FText("Score"));`, `Title->Text = FText("Score");` | A widget's own defaults, set by a setter (read the same way, on the widget's class) or assigned as a member, as `UE_DEFAULTS` sets a component's. | Yes |
+| <a id="widget-layouts.ue-widget-uwtcard-card"></a>`UE_WIDGET(UWtCard, Card);`, a widget class of the mod or the game | A user widget inside this one. It is made from its own class, its own tree included. | Yes |
+| <a id="widget-layouts.ue-widget"></a>a class below a mod widget class with `UE_WIDGET`s, declaring none | Shows its parent's tree, as a widget Blueprint below another does: it is cooked as a widget Blueprint's class too, and its parent's variables hold its widgets. | Yes |
+| <a id="widget-layouts.ue-widget-2"></a>a `UE_WIDGET` no `AddChild` call puts in a panel, or a ring of panels holding one another | Refused: "no panel holds it". The engine walks the tree from its root, and would never reach it. | Refused |
+| <a id="widget-layouts.ubutton"></a>a widget added twice, the root added, a second child of a content widget (`UButton`, `USizeBox`, `UBorder`) | Refused: a widget has one parent, the root none, and a content widget holds one child. | Refused |
+| <a id="widget-layouts.title-setopacity-0-5f"></a>`Title->SetOpacity(0.5f);`, a setter with no property of its name and type | Refused: "AssetGen reads a setter as the property it sets, and ... has no Opacity of its argument's type". Assign the member instead. | Refused |
+| <a id="widget-layouts.grid-addchildtogrid-cell-1-2"></a>an adder's other arguments, `Grid->AddChildToGrid(Cell, 1, 2)` | Refused: set them with the slot's setters. | Refused |
+| <a id="widget-layouts.ue-widget-3"></a>`UE_WIDGET` in a class that is not a `UUserWidget` | Refused: "a UE_WIDGET is a widget of a UUserWidget's tree". | Refused |
+| <a id="widget-layouts.play-onclicked-add-this"></a>`Play->OnClicked.Add(this, &UScoreCard::OnPlay);` in the constructor | Binds a widget's event, as the designer's "On Clicked (Play)" node does: each widget of the class made calls OnPlay when its own Play is clicked. Any widget dispatcher the editor can bind (`OnHovered`, a mod widget's `UE_DISPATCHER`), to a function of this class. A class below inherits it. | Yes |
+| <a id="widget-layouts.ue-widget-unamedslot-body"></a>`UE_WIDGET(UNamedSlot, Body);` | A named slot: a place in this widget's layout that a widget nesting this one fills. The class lists it in its named slots. | Yes |
+| <a id="widget-layouts.ue-slot-frame-body-inner"></a>`UE_SLOT(Frame->Body, Inner);` in the constructor | Fills the named slot Body of the nested user widget Frame with Inner, a `UE_WIDGET` of this class that sits in no panel, as dropping a widget on a named slot in the designer does. Inner is still this class's variable. Body is a named slot of Frame's class: a `UE_WIDGET(UNamedSlot, ...)` of a mod class, a named slot variable of a game one. | Yes |
+| <a id="widget-layouts.ue-bind-title-text-uscorecard"></a>`UE_BIND(Title, Text, &UScoreCard::GetScore);` in the constructor | Binds Title's Text to GetScore, as the designer's Bind button does: the widget reads it from GetScore each time it is drawn. GetScore returns the property's type (`FText` here) and takes nothing; the widget must have a binding for it (`TextDelegate`), which clang checks. | Yes |
+| <a id="widget-layouts.ue-slot"></a>a `UE_SLOT` content in a panel too, a slot no `UE_WIDGET` of the mod class it is on, an event bound to another object's function, a `UE_BIND` to a function of a class this one is not | Refused: a widget has one parent; a mod class's slot that is not in its tree is null where the engine looks for it; the engine finds the bound function on this widget, by name. | Refused |
+| <a id="widget-layouts.ue-animation-pop"></a>`UE_ANIMATION(Pop);`, `UE_ANIMATION(Fade, 1.5f);` in the class | A widget animation, as the designer's Animations panel adds one: a `UWidgetAnimation*` variable of the class that holds it once a widget is made, for `PlayAnimation(Pop, ...)`. It lasts until its last key, or the length given in seconds. | Yes |
+| <a id="widget-layouts.ue-keys-pop-mark-rendertransform"></a>`UE_KEYS(Pop, Mark->RenderTransform.Scale.X, (0, 0.5, Cubic, 1.159), (0.25, 0.7, Cubic));` in the constructor | Keys one channel of a `UE_WIDGET`'s render transform in the animation: `Translation.X`, `Translation.Y`, `Angle`, `Scale.X`, `Scale.Y`, `Shear.X` or `Shear.Y`. Each key is `(time in seconds, value)`, Linear unless it says `Constant` or `Cubic`; a slope in value per second after `Cubic` is its tangent (the curve editor's User), and without one the tangent is Auto, as the editor computes it. The animation binds the widget by name, as Sequencer does. | Yes |
+| <a id="widget-layouts.ue-keys"></a>an animation with no keys and no length, two `UE_KEYS` on one channel, a slope after a key that is not `Cubic`, a channel outside the render transform, `UE_ANIMATION` in a class with no `UE_WIDGET` | Refused: an animation runs as long as its keys; a channel's keys are one curve; only a cubic key has a tangent; AssetGen keys the 2D transform track alone; the animation binds widgets of the class's tree. | Refused |
 
 ```cpp
 class UFrame : public UUserWidget {                  // a box with a named slot that whoever nests it fills
@@ -2964,31 +2969,31 @@ default constructor is read the same way, as C++ would leave the object: see [Co
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_DEFAULTS { InitialLifeSpan = 3.0f; }` | This class's default for a property a parent declares (an engine, game or mod class), written on its default object as Class Defaults would. No `Super::` is needed. It works in any class, not only an actor. | Yes |
-| `UE_DEFAULTS { Reach.Min = 4.0f; Hit.Distance = 6.0f; Part->Range.Steps = 7; }` | One member of a struct the class inherits, a mod's or an engine struct written as tags, on the class or on a component: the rest stays as the parent has it. The struct is written holding only the members set, as the editor saves a struct that differs in one field, and the loader reads them over the parent's value. A later statement on the same member wins. A path into a struct with a native serializer (FVector, FRotator, ...) is refused: "is a Vector, which is written whole: assign all of it". | Yes |
-| `Lamp->Intensity = 1500.0f;` | A default on the template of a component this class declares, as editing the component in the details panel writes it. A zero or `false` is still written, because a template is compared with the component class's own defaults, where `bVisible` is true. | Yes |
-| `Lamp->LightColor = FColor(255, 128, 0);`, `Lamp->LightColor = {255, 128, 0};` | A struct value, by constructor or by braces. Each argument goes to the member its parameter is named after, so `FColor` takes R, G, B, A as in C++, although it stores B, G, R, A. Braces on an SDK struct that has a constructor call that constructor. Only a struct with no constructor is filled by member position. | Yes |
-| `Ids = {2, 3};`, `Score = {{"a", 5}, {"b", 2}};` on a TSet or TMap a parent declares | This class's whole value, as Class Defaults would set it. The default object loads a set or map over its parent's value, so the compiler writes what differs, as the editor saves it: the parent's elements (a map's keys) this value lacks, as removed, then the elements the parent lacks or maps to another value. The parent's value is known where a header gives it: an initializer, a `UE_DEFAULTS` or a `UE_STRUCT` member's default instance, in a class of this mod or of another mod's shared header (`UE_CLASS_IN`, or `UE_CLASS` where the header gives the member a value). Below an engine or game class, whose value no header says, the elements are added to that class's own, with a warning naming the member, and so below a class whose `UE_DEFAULTS` sets the member over one (its default object holds that class's elements too; the statement's own are still removed). The same holds for a TSet or TMap inside a UE_STRUCT a parent declares, when you assign the struct whole (`Held = {{2, 3}, 3};`). A key given twice holds the last value given, as in C++, and an FString key compares without case: `{{"a", 5}, {"A", 1}}` is `{"A": 1}`. | Yes |
-| `Mesh->StaticMesh = &SM_Crate_B;` | Points an object property at an asset: a `UE_ASSET_AT`, a UeAssets name or an asset the mod cooks. The same as picking the asset in the details panel. | Yes |
-| `Index_0 = 7;`, for a member the SDK spells `Index_0` | Written under the engine's real name, `Index`. See [Classes and variables](#classes-and-variables). | Yes |
-| `Button->WidgetStyle.Normal.DrawAs = ESlateBrushDrawType::Box;`, `PrimaryActorTick.bStartWithTickEnabled = false;` | A part of a struct member, at any depth, written as the cook writes a struct that differs from its default in a few members: the tag holds only the parts set, and the rest keeps the archetype's value (the parent's, the component class's, the widget class's). Several statements on one member make one tag, a later one over an earlier. | Yes |
-| `Lamp->RelativeLocation.Z = 50.0f;` | Refused: "RelativeLocation is a Vector, which is written whole: assign all of it". A struct with a native serializer (Vector, Vector2D, Rotator, LinearColor, Color, Guid) is read as one value, never in parts. Assign the whole struct: `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`. | Refused |
-| `Home.Z = 5.0f;` on a member this class declares | Refused: "is declared here - give it an initializer instead", as for a whole member. | Refused |
-| `GetOwner()->InitialLifeSpan = 5.0f;` | Refused: "every statement is ...". A member of another object is no default of this class's. It used to compile as this class's own `InitialLifeSpan`. | Refused |
-| `int32 Charges;` with `UE_DEFAULTS { Charges = 3; }` | Refused: "is declared here - give it an initializer instead". Write `int32 Charges = 3;`. | Refused |
-| `UE_DEFAULTS;` in the class, `void UTurret::UeDefaults__() { Charges = 3; }` outside it | Refused: "UE_DEFAULTS has no body in the class". The statements are read where the macro is written, which is also all a mod that includes the class's header sees. Write `UE_DEFAULTS { Charges = 3; }` in the class. | Refused |
-| `UE_DEFAULTS { ... }` in a `UE_STRUCT` or a `UE_INTERFACE` | Refused: "has no UE_DEFAULTS". Neither cooks a default object of its own, and the block used to be dropped. Give each variable its initializer; set an interface's inherited variable in the `UE_DEFAULTS` of a class that implements it. | Refused |
-| `Extra->bVisible = false;`, where `Extra` is a plain pointer member | Refused: "is not a UE_COMPONENT". Only a `UE_COMPONENT`, this class's or a parent's, has a template to hold defaults. | Refused |
-| `Lamp->Intensity += 100.0f;`, an `if`, a call such as `K2_DestroyActor();` | Refused: "every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`". The block never runs, so logic in it could do nothing. | Refused |
-| `Lamp->Intensity = UKismetMathLibrary::RandomFloat();`, `InitialLifeSpan = sizeof(FVector);` | Refused: "a default is a value known when the mod is built". A value here follows the rules for a member's initializer: see [Classes and variables](#classes-and-variables). Compute anything else in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
-| `Instigator = nullptr;`, `Mesh->StaticMesh = nullptr;`, `Count = {};`, `Rule = EAttachmentRule();`, `Offset = FVector();` | The type's zero, written over the parent's value: null, 0, `false`, the zero enumerator, None, an empty string or container, and the zeros of `FVector`, `FVector2D`, `FRotator`, `FLinearColor`, `FColor` and the `FVector_NetQuantize` types, whose engine constructor sets nothing. A `UE_STRUCT`'s `{}` or `T()` is its own defaults, and so is another mod's (`UE_STRUCT_IN`): its header says each member's initializer, written. The same as `Count = 0;`. | Yes |
-| `Hit = FHitResult();`, `Hit = {};`, `Floor = FFindFloorResult();`, `Xf = FTransform();`, a `UE_STRUCT`'s `{}` that holds an FHitResult | Refused: "holds what the engine's FHitResult constructor sets". Any other engine struct than those above holds what the engine's constructor sets (`FHitResult::Time` is 1, `FTransform()` is the identity), which no header says, so it cannot be written over the parent's value. Leave the statement out, or give the members in braces: `Hit = {.Time = 1.0f};`. `V4 = FVector4();` is written, (0, 0, 0, 1). | Refused |
-| `Hit = {.Distance = 6.0f};` | The members given are written. One the braces leave out holds what the engine's constructor sets, which no header says: it is left unwritten where the parent's value is a fresh one (declared in a mod parent with no initializer, `{}` or `T()`, or with braces that leave it out, followed down, and set by no `UE_DEFAULTS` on the way), and refused over any other value: "Hit.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets". Give every member, or leave the statement out. A `UE_STRUCT` value's braces, `H = {.N = 5};`, refuse a member of such a struct they leave out the same way. Braces nested for a `UE_STRUCT`'s member, `H = {.Hit = {.Distance = 5.0f}};`, are over a fresh value where that member has no initializer of its own, or one whose braces, followed down, leave it out: with `FInner In = {.K = 4};`, `O = {.In = {.Hit = {.Distance = 3.0f}}};` leaves the rest of Hit unwritten, and where the initializer gives Hit `{.Time = 0.5f}`, the Time the new braces leave out is refused. Another mod's struct (`UE_STRUCT_IN`) is no engine struct: a member its braces leave out takes the initializer its header gives it, written. | Yes |
-| `Hit = {.Time = 3.0f};` then `Hit = {.Distance = 6.0f};` | The last statement on a member is its value, as the last assignment is in C++: the earlier one writes nothing, so `Hit` is Distance 6 with Time the engine's 1, not 3. | Yes |
-| `Handle = FTimerHandle();` | Writes nothing, with a warning: FTimerHandle's one member is Transient, which the engine never loads from a default, so the value stays the parent's. | Warns |
-| `bHasScriptImplementedTick = true;` in a widget class that overrides `Tick`, `bHasScriptImplementedPaint = false;` in one that does not override `OnPaint` | Changes nothing, with a warning: "so this line changes nothing". AssetGen sets both flags from the class's own `Tick` and `OnPaint`, as the editor's widget compiler does on every compile. Drop the line. | Warns |
-| `bHasScriptImplementedTick = true;` in a widget class that does not override `Tick`, `bHasScriptImplementedPaint = false;` in one that overrides `OnPaint` | Refused: "follows whether the class overrides Tick itself", since the compile sets the flag back. Override the event for it to run, or drop the override to turn it off: see [Parent classes](#parent-classes). | Refused |
-| `Lantern() { InitialLifeSpan = 5.0f; }` | A `UE_DEFAULTS` statement, written in the constructor: see [Constructors](#constructors). | Yes |
+| <a id="ue-defaults.ue-defaults-initiallifespan-3-0f"></a>`UE_DEFAULTS { InitialLifeSpan = 3.0f; }` | This class's default for a property a parent declares (an engine, game or mod class), written on its default object as Class Defaults would. No `Super::` is needed. It works in any class, not only an actor. | Yes |
+| <a id="ue-defaults.ue-defaults-reach-min-4"></a>`UE_DEFAULTS { Reach.Min = 4.0f; Hit.Distance = 6.0f; Part->Range.Steps = 7; }` | One member of a struct the class inherits, a mod's or an engine struct written as tags, on the class or on a component: the rest stays as the parent has it. The struct is written holding only the members set, as the editor saves a struct that differs in one field, and the loader reads them over the parent's value. A later statement on the same member wins. A path into a struct with a native serializer (FVector, FRotator, ...) is refused: "is a Vector, which is written whole: assign all of it". | Yes |
+| <a id="ue-defaults.lamp-intensity-1500-0f"></a>`Lamp->Intensity = 1500.0f;` | A default on the template of a component this class declares, as editing the component in the details panel writes it. A zero or `false` is still written, because a template is compared with the component class's own defaults, where `bVisible` is true. | Yes |
+| <a id="ue-defaults.lamp-lightcolor-fcolor-255-128"></a>`Lamp->LightColor = FColor(255, 128, 0);`, `Lamp->LightColor = {255, 128, 0};` | A struct value, by constructor or by braces. Each argument goes to the member its parameter is named after, so `FColor` takes R, G, B, A as in C++, although it stores B, G, R, A. Braces on an SDK struct that has a constructor call that constructor. Only a struct with no constructor is filled by member position. | Yes |
+| <a id="ue-defaults.ids-2-3"></a>`Ids = {2, 3};`, `Score = {{"a", 5}, {"b", 2}};` on a TSet or TMap a parent declares | This class's whole value, as Class Defaults would set it. The default object loads a set or map over its parent's value, so the compiler writes what differs, as the editor saves it: the parent's elements (a map's keys) this value lacks, as removed, then the elements the parent lacks or maps to another value. The parent's value is known where a header gives it: an initializer, a `UE_DEFAULTS` or a `UE_STRUCT` member's default instance, in a class of this mod or of another mod's shared header (`UE_CLASS_IN`, or `UE_CLASS` where the header gives the member a value). Below an engine or game class, whose value no header says, the elements are added to that class's own, with a warning naming the member, and so below a class whose `UE_DEFAULTS` sets the member over one (its default object holds that class's elements too; the statement's own are still removed). The same holds for a TSet or TMap inside a UE_STRUCT a parent declares, when you assign the struct whole (`Held = {{2, 3}, 3};`). A key given twice holds the last value given, as in C++, and an FString key compares without case: `{{"a", 5}, {"A", 1}}` is `{"A": 1}`. | Yes |
+| <a id="ue-defaults.mesh-staticmesh-sm-crate-b"></a>`Mesh->StaticMesh = &SM_Crate_B;` | Points an object property at an asset: a `UE_ASSET_AT`, a UeAssets name or an asset the mod cooks. The same as picking the asset in the details panel. | Yes |
+| <a id="ue-defaults.index-0-7"></a>`Index_0 = 7;`, for a member the SDK spells `Index_0` | Written under the engine's real name, `Index`. See [Classes and variables](#classes-and-variables). | Yes |
+| <a id="ue-defaults.button-widgetstyle-normal-drawas"></a>`Button->WidgetStyle.Normal.DrawAs = ESlateBrushDrawType::Box;`, `PrimaryActorTick.bStartWithTickEnabled = false;` | A part of a struct member, at any depth, written as the cook writes a struct that differs from its default in a few members: the tag holds only the parts set, and the rest keeps the archetype's value (the parent's, the component class's, the widget class's). Several statements on one member make one tag, a later one over an earlier. | Yes |
+| <a id="ue-defaults.lamp-relativelocation-z-50-0f"></a>`Lamp->RelativeLocation.Z = 50.0f;` | Refused: "RelativeLocation is a Vector, which is written whole: assign all of it". A struct with a native serializer (Vector, Vector2D, Rotator, LinearColor, Color, Guid) is read as one value, never in parts. Assign the whole struct: `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`. | Refused |
+| <a id="ue-defaults.home-z-5-0f"></a>`Home.Z = 5.0f;` on a member this class declares | Refused: "is declared here - give it an initializer instead", as for a whole member. | Refused |
+| <a id="ue-defaults.getowner-initiallifespan-5-0f"></a>`GetOwner()->InitialLifeSpan = 5.0f;` | Refused: "every statement is ...". A member of another object is no default of this class's. It used to compile as this class's own `InitialLifeSpan`. | Refused |
+| <a id="ue-defaults.int32-charges"></a>`int32 Charges;` with `UE_DEFAULTS { Charges = 3; }` | Refused: "is declared here - give it an initializer instead". Write `int32 Charges = 3;`. | Refused |
+| <a id="ue-defaults.ue-defaults"></a>`UE_DEFAULTS;` in the class, `void UTurret::UeDefaults__() { Charges = 3; }` outside it | Refused: "UE_DEFAULTS has no body in the class". The statements are read where the macro is written, which is also all a mod that includes the class's header sees. Write `UE_DEFAULTS { Charges = 3; }` in the class. | Refused |
+| <a id="ue-defaults.ue-defaults-2"></a>`UE_DEFAULTS { ... }` in a `UE_STRUCT` or a `UE_INTERFACE` | Refused: "has no UE_DEFAULTS". Neither cooks a default object of its own, and the block used to be dropped. Give each variable its initializer; set an interface's inherited variable in the `UE_DEFAULTS` of a class that implements it. | Refused |
+| <a id="ue-defaults.extra-bvisible-false"></a>`Extra->bVisible = false;`, where `Extra` is a plain pointer member | Refused: "is not a UE_COMPONENT". Only a `UE_COMPONENT`, this class's or a parent's, has a template to hold defaults. | Refused |
+| <a id="ue-defaults.lamp-intensity-100-0f"></a>`Lamp->Intensity += 100.0f;`, an `if`, a call such as `K2_DestroyActor();` | Refused: "every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`". The block never runs, so logic in it could do nothing. | Refused |
+| <a id="ue-defaults.lamp-intensity"></a>`Lamp->Intensity = UKismetMathLibrary::RandomFloat();`, `InitialLifeSpan = sizeof(FVector);` | Refused: "a default is a value known when the mod is built". A value here follows the rules for a member's initializer: see [Classes and variables](#classes-and-variables). Compute anything else in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
+| <a id="ue-defaults.instigator-nullptr"></a>`Instigator = nullptr;`, `Mesh->StaticMesh = nullptr;`, `Count = {};`, `Rule = EAttachmentRule();`, `Offset = FVector();` | The type's zero, written over the parent's value: null, 0, `false`, the zero enumerator, None, an empty string or container, and the zeros of `FVector`, `FVector2D`, `FRotator`, `FLinearColor`, `FColor` and the `FVector_NetQuantize` types, whose engine constructor sets nothing. A `UE_STRUCT`'s `{}` or `T()` is its own defaults, and so is another mod's (`UE_STRUCT_IN`): its header says each member's initializer, written. The same as `Count = 0;`. | Yes |
+| <a id="ue-defaults.hit-fhitresult"></a>`Hit = FHitResult();`, `Hit = {};`, `Floor = FFindFloorResult();`, `Xf = FTransform();`, a `UE_STRUCT`'s `{}` that holds an FHitResult | Refused: "holds what the engine's FHitResult constructor sets". Any other engine struct than those above holds what the engine's constructor sets (`FHitResult::Time` is 1, `FTransform()` is the identity), which no header says, so it cannot be written over the parent's value. Leave the statement out, or give the members in braces: `Hit = {.Time = 1.0f};`. `V4 = FVector4();` is written, (0, 0, 0, 1). | Refused |
+| <a id="ue-defaults.hit-distance-6-0f"></a>`Hit = {.Distance = 6.0f};` | The members given are written. One the braces leave out holds what the engine's constructor sets, which no header says: it is left unwritten where the parent's value is a fresh one (declared in a mod parent with no initializer, `{}` or `T()`, or with braces that leave it out, followed down, and set by no `UE_DEFAULTS` on the way), and refused over any other value: "Hit.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets". Give every member, or leave the statement out. A `UE_STRUCT` value's braces, `H = {.N = 5};`, refuse a member of such a struct they leave out the same way. Braces nested for a `UE_STRUCT`'s member, `H = {.Hit = {.Distance = 5.0f}};`, are over a fresh value where that member has no initializer of its own, or one whose braces, followed down, leave it out: with `FInner In = {.K = 4};`, `O = {.In = {.Hit = {.Distance = 3.0f}}};` leaves the rest of Hit unwritten, and where the initializer gives Hit `{.Time = 0.5f}`, the Time the new braces leave out is refused. Another mod's struct (`UE_STRUCT_IN`) is no engine struct: a member its braces leave out takes the initializer its header gives it, written. | Yes |
+| <a id="ue-defaults.hit-time-3-0f"></a>`Hit = {.Time = 3.0f};` then `Hit = {.Distance = 6.0f};` | The last statement on a member is its value, as the last assignment is in C++: the earlier one writes nothing, so `Hit` is Distance 6 with Time the engine's 1, not 3. | Yes |
+| <a id="ue-defaults.handle-ftimerhandle"></a>`Handle = FTimerHandle();` | Writes nothing, with a warning: FTimerHandle's one member is Transient, which the engine never loads from a default, so the value stays the parent's. | Warns |
+| <a id="ue-defaults.bhasscriptimplementedtick-true"></a>`bHasScriptImplementedTick = true;` in a widget class that overrides `Tick`, `bHasScriptImplementedPaint = false;` in one that does not override `OnPaint` | Changes nothing, with a warning: "so this line changes nothing". AssetGen sets both flags from the class's own `Tick` and `OnPaint`, as the editor's widget compiler does on every compile. Drop the line. | Warns |
+| <a id="ue-defaults.bhasscriptimplementedtick-true-2"></a>`bHasScriptImplementedTick = true;` in a widget class that does not override `Tick`, `bHasScriptImplementedPaint = false;` in one that overrides `OnPaint` | Refused: "follows whether the class overrides Tick itself", since the compile sets the flag back. Override the event for it to run, or drop the override to turn it off: see [Parent classes](#parent-classes). | Refused |
+| <a id="ue-defaults.lantern-initiallifespan-5-0f"></a>`Lantern() { InitialLifeSpan = 5.0f; }` | A `UE_DEFAULTS` statement, written in the constructor: see [Constructors](#constructors). | Yes |
 
 ```cpp
 UE_ASSET_AT(UStaticMesh, SM_Crate_B, "/Game/Art/Environments/SpaceRig/SM_Crate_B");
@@ -3037,16 +3042,16 @@ statement, under the same rules, read after the class's own `UE_DEFAULTS` block.
 
 | You write | What it does | Status |
 |---|---|---|
-| `Lantern() : Charges(5) { Range = 10.0f; Range = 20.0f; }` | The same as `int32 Charges = 5;` and `float Range = 20.0f;`: each replaces the variable's in-class initializer, and the last one written wins, as in C++. | Yes |
-| `Lantern() { InitialLifeSpan = 2.0f; Lamp->Intensity = 250.0f; Lamp->SetupAttachment(Root); }` | The same as these statements in `UE_DEFAULTS`. A class that also has a `UE_DEFAULTS` block reads the constructor's after it, so on the same member the constructor's value wins. | Yes |
-| `FStats() : Speed(2.5f) { HP = 50; }` in a `UE_STRUCT` | The struct's default instance, as `int32 HP = 50;` and `float Speed = 2.5f;` would make it. A `UE_STRUCT`'s constructor with parameters still places a value's arguments: see [Structs](#structs). | Yes |
-| `Lantern() = default;`, `virtual ~Lantern() {}` | Nothing to read. | Yes |
-| `Lantern(int32 InCharges) : Charges(InCharges) {}` | Refused: "the engine makes a Blueprint class's objects with no arguments". Nothing would ever call it. | Refused |
-| `Lantern();` in the class, `Lantern::Lantern() { ... }` outside it | Refused: "has no body in the class". As with `UE_DEFAULTS`, a mod that includes the class's header sees only the class. | Refused |
-| `Lantern() { K2_DestroyActor(); }`, a local, an `if` | Refused: "a constructor never runs in the game". Each statement must be one `UE_DEFAULTS` takes. Do run-time setup in `ReceiveBeginPlay`. | Refused |
-| `Lantern() { Charges = Max + 1; }` | Refused: "a default is a value known when the mod is built". A value follows the rules for an initializer, so it cannot read a member, even one the constructor set before it. | Refused |
-| `~Lantern() { ... }` | Refused: "a destructor never runs in the game". The engine frees the object without it. Do teardown in `ReceiveEndPlay`. | Refused |
-| A `UE_INTERFACE`'s constructor setting a variable of the interface it extends | Refused: "a UE_INTERFACE's constructor sets its own members". An interface has no `UE_DEFAULTS`. | Refused |
+| <a id="constructors.lantern-charges-5-range-10"></a>`Lantern() : Charges(5) { Range = 10.0f; Range = 20.0f; }` | The same as `int32 Charges = 5;` and `float Range = 20.0f;`: each replaces the variable's in-class initializer, and the last one written wins, as in C++. | Yes |
+| <a id="constructors.lantern-initiallifespan-2-0f"></a>`Lantern() { InitialLifeSpan = 2.0f; Lamp->Intensity = 250.0f; Lamp->SetupAttachment(Root); }` | The same as these statements in `UE_DEFAULTS`. A class that also has a `UE_DEFAULTS` block reads the constructor's after it, so on the same member the constructor's value wins. | Yes |
+| <a id="constructors.fstats-speed-2-5f-hp"></a>`FStats() : Speed(2.5f) { HP = 50; }` in a `UE_STRUCT` | The struct's default instance, as `int32 HP = 50;` and `float Speed = 2.5f;` would make it. A `UE_STRUCT`'s constructor with parameters still places a value's arguments: see [Structs](#structs). | Yes |
+| <a id="constructors.lantern-default"></a>`Lantern() = default;`, `virtual ~Lantern() {}` | Nothing to read. | Yes |
+| <a id="constructors.lantern-int32-incharges-charges"></a>`Lantern(int32 InCharges) : Charges(InCharges) {}` | Refused: "the engine makes a Blueprint class's objects with no arguments". Nothing would ever call it. | Refused |
+| <a id="constructors.lantern"></a>`Lantern();` in the class, `Lantern::Lantern() { ... }` outside it | Refused: "has no body in the class". As with `UE_DEFAULTS`, a mod that includes the class's header sees only the class. | Refused |
+| <a id="constructors.lantern-k2-destroyactor"></a>`Lantern() { K2_DestroyActor(); }`, a local, an `if` | Refused: "a constructor never runs in the game". Each statement must be one `UE_DEFAULTS` takes. Do run-time setup in `ReceiveBeginPlay`. | Refused |
+| <a id="constructors.lantern-charges-max-1"></a>`Lantern() { Charges = Max + 1; }` | Refused: "a default is a value known when the mod is built". A value follows the rules for an initializer, so it cannot read a member, even one the constructor set before it. | Refused |
+| <a id="constructors.lantern-2"></a>`~Lantern() { ... }` | Refused: "a destructor never runs in the game". The engine frees the object without it. Do teardown in `ReceiveEndPlay`. | Refused |
+| <a id="constructors.ue-interface"></a>A `UE_INTERFACE`'s constructor setting a variable of the interface it extends | Refused: "a UE_INTERFACE's constructor sets its own members". An interface has no `UE_DEFAULTS`. | Refused |
 
 ### The root's transform
 
@@ -3057,8 +3062,8 @@ its own location, rotation and scale like any other.
 
 | You write | What it does | Status |
 |---|---|---|
-| `Root->RelativeRotation = FRotator(0.0f, 90.0f, 0.0f);` on a plain `USceneComponent` root | AssetGen moves the root's location, rotation and scale onto every component attached to it, composed the way UE composes a child with its parent, and removes them from the root. The children end up where the editor's viewport would show them, however the actor is spawned. The root itself stays at the spawn transform. | Yes |
-| `Body->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f);` on a root that is a mesh, a light or any class but `USceneComponent` | Warns: "is the actor's root, which the engine puts at the spawn transform". Such a root cannot pass its transform on without losing its own, so the value stays on the template, where the engine does not apply it. Declare a `USceneComponent` first and let the mesh attach to it. | Warns |
+| <a id="the-root-s.root-relativerotation-frotator-0"></a>`Root->RelativeRotation = FRotator(0.0f, 90.0f, 0.0f);` on a plain `USceneComponent` root | AssetGen moves the root's location, rotation and scale onto every component attached to it, composed the way UE composes a child with its parent, and removes them from the root. The children end up where the editor's viewport would show them, however the actor is spawned. The root itself stays at the spawn transform. | Yes |
+| <a id="the-root-s.body-relativescale3d-fvector-2"></a>`Body->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f);` on a root that is a mesh, a light or any class but `USceneComponent` | Warns: "is the actor's root, which the engine puts at the spawn transform". Such a root cannot pass its transform on without losing its own, so the value stays on the template, where the engine does not apply it. Declare a `USceneComponent` first and let the mesh attach to it. | Warns |
 
 ```cpp
 class Turntable : public AActor {
@@ -3087,15 +3092,15 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Lamp->Intensity = 250.0f;`, where a mod parent declares `Lamp` | Overrides that component's defaults for this class only, as the editor does for an inherited component. No `Super::` is needed: the compiler finds the class that declares the member. A grandchild that sets `Lamp->bVisible = false;` keeps the 250 as well: defaults fold down the chain as C++ constructors do. | Yes |
-| `enemy->KillShout = nullptr;` in a child of `ENE_Spider_ExploderTank_C`, where `ENE_PF_SpiderBase_C` declares `enemy` | A game Blueprint between the class and the component's owner can have a template of the component of its own (a record of its InheritableComponentHandler, which the SDK lists as `UeIchRecords`). The override is then built on that one, as the engine finds it first, and keeps what that Blueprint sets: here `ENE_Spider_ExploderTank_C:Enemy_GEN_VARIABLE`, not the owner's node. A UeApi from a genueapi older than version 5 lists no records, so with a game Blueprint between this is refused, saying to regenerate it. | Yes |
-| `CapsuleComponent->CapsuleRadius = 55.0f;` in an `ACharacter` child | A C++ parent's component is a default subobject. AssetGen overrides it under the subobject's real name and class, which can differ from the member's: `ACharacter`'s `CapsuleComponent` is `CollisionCylinder`. The SDK records the name as `<Member>__UeSubobject`, for a subclass too: `Mesh` in an `APlayerCharacter` child is still `CharacterMesh0`. Where two of the class's subobjects fit the member and neither has its name, it records the one the game's Blueprints of the class name on their default objects: `ABomber`'s `GooSoundComponent` is `GooAudioComponent`, not `WingSound`. | Yes |
-| `CapsuleComponent->CapsuleRadius = 70.0f;` in a child of a mod class that sets the capsule too | Builds on the parent's override: the child keeps what the parent set, such as its half height, and changes only the radius. The parent is loaded first. A mod parent that leaves the capsule alone still carries one for its child to build on. | Yes |
-| `temperature->TemperatureChangeScale = 2.0f;` in a child of a game Blueprint (`ENE_Spider_Grunt_Normal_C`) | The C++ ancestor's component is a default subobject of the game Blueprint's default object, which its package exports: the override is built on that export, and the class loads after every default subobject the parent exports, restated or not, and every object nested in one, such as the bonus instanced in `WPN_Pickaxe_C`'s `Damage` (the SDK lists them as `UeDefaultSubobjects`). The SDK spells a name as the game's object dump does, which can differ in case from the parent's package (`temperature`, `Temperature`); names compare without case, so both are one object. | Yes |
-| `StaticMesh->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f);` in a child of a game Blueprint | A game Blueprint's component is a construction-script node, as a mod parent's is. The override is keyed on that node's GUID, which the SDK records as `<Component>__UeScsNode`. The node's real name is used, even when it contains spaces. | Yes |
-| `Controller->bAttachToPawn = true;` in an `APawn` child | Refused: "UeApi does not say which default subobject Controller is". Either the member is not a default subobject, and you set the value at run time, or the SDK predates the markers, and you regenerate it with genueapi. | Refused |
-| a component of a game Blueprint whose header has no `__UeScsNode` marker | Refused: "its header does not say which SCS node it is". Regenerate the SDK from a dump made with the Dumper-7 fork, which writes the markers. | Refused |
-| a component of a mod parent that another mod owns (pinned with `UE_CLASS`) | Not yet: refused with the same SCS node message, and its advice to re-dump the game does not apply. Set the value at run time, for example in `ReceiveBeginPlay`. | Not yet |
+| <a id="components-a-parent.lamp-intensity-250-0f"></a>`Lamp->Intensity = 250.0f;`, where a mod parent declares `Lamp` | Overrides that component's defaults for this class only, as the editor does for an inherited component. No `Super::` is needed: the compiler finds the class that declares the member. A grandchild that sets `Lamp->bVisible = false;` keeps the 250 as well: defaults fold down the chain as C++ constructors do. | Yes |
+| <a id="components-a-parent.enemy-killshout-nullptr"></a>`enemy->KillShout = nullptr;` in a child of `ENE_Spider_ExploderTank_C`, where `ENE_PF_SpiderBase_C` declares `enemy` | A game Blueprint between the class and the component's owner can have a template of the component of its own (a record of its InheritableComponentHandler, which the SDK lists as `UeIchRecords`). The override is then built on that one, as the engine finds it first, and keeps what that Blueprint sets: here `ENE_Spider_ExploderTank_C:Enemy_GEN_VARIABLE`, not the owner's node. A UeApi from a genueapi older than version 5 lists no records, so with a game Blueprint between this is refused, saying to regenerate it. | Yes |
+| <a id="components-a-parent.capsulecomponent-capsuleradius"></a>`CapsuleComponent->CapsuleRadius = 55.0f;` in an `ACharacter` child | A C++ parent's component is a default subobject. AssetGen overrides it under the subobject's real name and class, which can differ from the member's: `ACharacter`'s `CapsuleComponent` is `CollisionCylinder`. The SDK records the name as `<Member>__UeSubobject`, for a subclass too: `Mesh` in an `APlayerCharacter` child is still `CharacterMesh0`. Where two of the class's subobjects fit the member and neither has its name, it records the one the game's Blueprints of the class name on their default objects: `ABomber`'s `GooSoundComponent` is `GooAudioComponent`, not `WingSound`. | Yes |
+| <a id="components-a-parent.capsulecomponent-capsuleradius-2"></a>`CapsuleComponent->CapsuleRadius = 70.0f;` in a child of a mod class that sets the capsule too | Builds on the parent's override: the child keeps what the parent set, such as its half height, and changes only the radius. The parent is loaded first. A mod parent that leaves the capsule alone still carries one for its child to build on. | Yes |
+| <a id="components-a-parent.temperature"></a>`temperature->TemperatureChangeScale = 2.0f;` in a child of a game Blueprint (`ENE_Spider_Grunt_Normal_C`) | The C++ ancestor's component is a default subobject of the game Blueprint's default object, which its package exports: the override is built on that export, and the class loads after every default subobject the parent exports, restated or not, and every object nested in one, such as the bonus instanced in `WPN_Pickaxe_C`'s `Damage` (the SDK lists them as `UeDefaultSubobjects`). The SDK spells a name as the game's object dump does, which can differ in case from the parent's package (`temperature`, `Temperature`); names compare without case, so both are one object. | Yes |
+| <a id="components-a-parent.staticmesh-relativescale3d"></a>`StaticMesh->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f);` in a child of a game Blueprint | A game Blueprint's component is a construction-script node, as a mod parent's is. The override is keyed on that node's GUID, which the SDK records as `<Component>__UeScsNode`. The node's real name is used, even when it contains spaces. | Yes |
+| <a id="components-a-parent.controller-battachtopawn-true"></a>`Controller->bAttachToPawn = true;` in an `APawn` child | Refused: "UeApi does not say which default subobject Controller is". Either the member is not a default subobject, and you set the value at run time, or the SDK predates the markers, and you regenerate it with genueapi. | Refused |
+| <a id="components-a-parent.uescsnode"></a>a component of a game Blueprint whose header has no `__UeScsNode` marker | Refused: "its header does not say which SCS node it is". Regenerate the SDK from a dump made with the Dumper-7 fork, which writes the markers. | Refused |
+| <a id="components-a-parent.ue-class"></a>a component of a mod parent that another mod owns (pinned with `UE_CLASS`) | Not yet: refused with the same SCS node message, and its advice to re-dump the game does not apply. Set the value at run time, for example in `ReceiveBeginPlay`. | Not yet |
 
 ```cpp
 #include "UeApi/Game/BP_ExplosiveBarrel_C.h"
@@ -3144,19 +3149,19 @@ at it.
 
 | You write | What it does | Status |
 |---|---|---|
-| `StatusEffects = {UE_INSTANCED(UStatChangeStatusEffectItem, this, "Slow")};` | A new object of that class under the default object, which the property points at. It starts from its class's defaults. | Yes |
-| `UDotStatusEffectItem *Burn = UE_INSTANCED(UDotStatusEffectItem, this, "Burn");` then `Burn->damageAmount = FRandRange{2.0f, 3.0f};` and `StatusEffects = {Burn};` | A local holds the object so its own members can be set: each `Burn->Field = value;` is a default of that object, under the same rules as any `UE_DEFAULTS` statement. | Yes |
-| `Burn->DamageImpulseOverride = UE_INSTANCED(UDamageImpulse, Burn, "Impulse");` | An object under another instanced object, nested as deep as needed. | Yes |
-| `Attack->Projectiles = {UE_INSTANCED(UNormalProjectileAttack, Attack, "Shot")};` | An object under a component's template: the class's own `UE_COMPONENT`, a component a parent declares (mod or game Blueprint), or a C++ parent's default subobject. | Yes |
-| `UE_INSTANCED(UDotStatusEffectItem, this, "DotStatusEffectItem_0")` in a child of `STE_Spider_Shooter_Acid_C` | Named as an object the parent already holds there, it is this class's copy of that one: the engine finds it as its archetype, so a member the child leaves unset keeps the parent's value. This works for a mod parent and a game Blueprint, under the default object or under a component the parent sets up (the SDK lists a game Blueprint's objects as `UeDefaultSubobjects` and `UeTemplateSubobjects`). The parent's object must be of the same class. | Yes |
-| A name the parent holds, with another class | Refused: "DotStatusEffectItem_0 is a /Script/FSD.DotStatusEffectItem in STE_Spider_Shooter_Acid_C, which UStatChangeStatusEffectItem's DotStatusEffectItem_0 would be a copy of; make it that class, or name it otherwise for an object of its own". | Refused |
-| `UE_INSTANCED(UDotStatusEffectItem, this)`, or a name that is not a string literal | Refused: "UE_INSTANCED names its object". The name is the export's, and it is how a subclass reaches the object. The editor's own names are `<Class>_<N>`, such as `DotStatusEffectItem_0`. | Refused |
-| Two `UE_INSTANCED` of one name under one outer | Refused: "makes Burn twice; one object holds one name under its outer". | Refused |
-| `UE_INSTANCED(..., GetOwner(), ...)`, or a local that holds no `UE_INSTANCED` | Refused: "UE_INSTANCED's outer is `this`, one of the class's components, or a local holding another UE_INSTANCED". | Refused |
-| `UE_INSTANCED(...);` as a statement of its own | Refused: "UE_INSTANCED makes an object a default points at". An object nothing points at would be a default that does nothing. | Refused |
-| `UE_INSTANCED` in a member initializer | Refused: "UE_INSTANCED makes an object in a class's UE_DEFAULTS, pointed at by one of its defaults". | Refused |
-| `UE_INSTANCED` in a function | Refused: "call to an unknown function: UeInstanced__". At run time, make an object with `NewObject`: see [Creating objects](#creating-objects). | Refused |
-| An object under a game Blueprint's component, with an SDK from genueapi older than version 4 | Refused: "UeApi was written by a genueapi older than version 4". Regenerate the SDK. | Refused |
+| <a id="instanced-objects.statuseffects-ue-instanced"></a>`StatusEffects = {UE_INSTANCED(UStatChangeStatusEffectItem, this, "Slow")};` | A new object of that class under the default object, which the property points at. It starts from its class's defaults. | Yes |
+| <a id="instanced-objects.udotstatuseffectitem-burn-ue"></a>`UDotStatusEffectItem *Burn = UE_INSTANCED(UDotStatusEffectItem, this, "Burn");` then `Burn->damageAmount = FRandRange{2.0f, 3.0f};` and `StatusEffects = {Burn};` | A local holds the object so its own members can be set: each `Burn->Field = value;` is a default of that object, under the same rules as any `UE_DEFAULTS` statement. | Yes |
+| <a id="instanced-objects.burn-damageimpulseoverride-ue"></a>`Burn->DamageImpulseOverride = UE_INSTANCED(UDamageImpulse, Burn, "Impulse");` | An object under another instanced object, nested as deep as needed. | Yes |
+| <a id="instanced-objects.attack-projectiles-ue-instanced"></a>`Attack->Projectiles = {UE_INSTANCED(UNormalProjectileAttack, Attack, "Shot")};` | An object under a component's template: the class's own `UE_COMPONENT`, a component a parent declares (mod or game Blueprint), or a C++ parent's default subobject. | Yes |
+| <a id="instanced-objects.ue-instanced"></a>`UE_INSTANCED(UDotStatusEffectItem, this, "DotStatusEffectItem_0")` in a child of `STE_Spider_Shooter_Acid_C` | Named as an object the parent already holds there, it is this class's copy of that one: the engine finds it as its archetype, so a member the child leaves unset keeps the parent's value. This works for a mod parent and a game Blueprint, under the default object or under a component the parent sets up (the SDK lists a game Blueprint's objects as `UeDefaultSubobjects` and `UeTemplateSubobjects`). The parent's object must be of the same class. | Yes |
+| <a id="instanced-objects.a-name-the-parent-holds"></a>A name the parent holds, with another class | Refused: "DotStatusEffectItem_0 is a /Script/FSD.DotStatusEffectItem in STE_Spider_Shooter_Acid_C, which UStatChangeStatusEffectItem's DotStatusEffectItem_0 would be a copy of; make it that class, or name it otherwise for an object of its own". | Refused |
+| <a id="instanced-objects.ue-instanced-2"></a>`UE_INSTANCED(UDotStatusEffectItem, this)`, or a name that is not a string literal | Refused: "UE_INSTANCED names its object". The name is the export's, and it is how a subclass reaches the object. The editor's own names are `<Class>_<N>`, such as `DotStatusEffectItem_0`. | Refused |
+| <a id="instanced-objects.ue-instanced-3"></a>Two `UE_INSTANCED` of one name under one outer | Refused: "makes Burn twice; one object holds one name under its outer". | Refused |
+| <a id="instanced-objects.ue-instanced-getowner"></a>`UE_INSTANCED(..., GetOwner(), ...)`, or a local that holds no `UE_INSTANCED` | Refused: "UE_INSTANCED's outer is `this`, one of the class's components, or a local holding another UE_INSTANCED". | Refused |
+| <a id="instanced-objects.ue-instanced-4"></a>`UE_INSTANCED(...);` as a statement of its own | Refused: "UE_INSTANCED makes an object a default points at". An object nothing points at would be a default that does nothing. | Refused |
+| <a id="instanced-objects.ue-instanced-5"></a>`UE_INSTANCED` in a member initializer | Refused: "UE_INSTANCED makes an object in a class's UE_DEFAULTS, pointed at by one of its defaults". | Refused |
+| <a id="instanced-objects.ue-instanced-6"></a>`UE_INSTANCED` in a function | Refused: "call to an unknown function: UeInstanced__". At run time, make an object with `NewObject`: see [Creating objects](#creating-objects). | Refused |
+| <a id="instanced-objects.an-object-under-a-game"></a>An object under a game Blueprint's component, with an SDK from genueapi older than version 4 | Refused: "UeApi was written by a genueapi older than version 4". Regenerate the SDK. | Refused |
 
 ```cpp
 #include "UeApi/Game/ENE_ShootingPlant_C.h"
@@ -3205,9 +3210,9 @@ object.
 
 | You write | What it does | Status |
 |---|---|---|
-| `SpawnActor<AActor>(AActor::StaticClass(), Where, this)` | The Spawn Actor from Class node: `BeginDeferredActorSpawnFromClass`, then `FinishSpawningActor`. It returns the new actor as a `T*`. The arguments are the class, the transform, the owner (none by default) and the collision handling (`Undefined` by default). The new actor's construction script and BeginPlay run inside the call. | Yes |
-| `SpawnActorDeferred<Spawner>(Spawner::StaticClass(), Where)`, then `FinishSpawning(Twin, Where)` | The Spawn Actor node with Expose on Spawn pins. The actor is created but not finished. Set its variables, and `FinishSpawning` runs its construction script and BeginPlay with those values in place. Pass the same transform to both calls. | Yes |
-| `AttachToActor(Plain, Twin, FName(), EAttachmentRule::KeepWorld)` | `K2_AttachToActor` with one rule for location, rotation and scale (SnapToTarget unless you pass another) and welding on. | Yes |
+| <a id="spawning-actors.spawnactor-aactor-aactor"></a>`SpawnActor<AActor>(AActor::StaticClass(), Where, this)` | The Spawn Actor from Class node: `BeginDeferredActorSpawnFromClass`, then `FinishSpawningActor`. It returns the new actor as a `T*`. The arguments are the class, the transform, the owner (none by default) and the collision handling (`Undefined` by default). The new actor's construction script and BeginPlay run inside the call. | Yes |
+| <a id="spawning-actors.spawnactordeferred-spawner"></a>`SpawnActorDeferred<Spawner>(Spawner::StaticClass(), Where)`, then `FinishSpawning(Twin, Where)` | The Spawn Actor node with Expose on Spawn pins. The actor is created but not finished. Set its variables, and `FinishSpawning` runs its construction script and BeginPlay with those values in place. Pass the same transform to both calls. | Yes |
+| <a id="spawning-actors.attachtoactor-plain-twin-fname"></a>`AttachToActor(Plain, Twin, FName(), EAttachmentRule::KeepWorld)` | `K2_AttachToActor` with one rule for location, rotation and scale (SnapToTarget unless you pass another) and welding on. | Yes |
 
 ```cpp
 #include "../include/Objects.h"
@@ -3241,13 +3246,13 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `NewObject<UEnemyContext>(this)` | The Construct Object from Class node (`UGameplayStatics::SpawnObject`): a new object of `T`, with `this` as its Outer. `T` can be neither an actor nor a component, the same rule the editor's node applies. | Yes |
-| `NewObject<UObject>(this, Kind)` | The class picked at run time, as a `TSubclassOf<T>`. | Yes |
-| `CreateWidget<UUserWidget>(PlayerController, HudClass)` | The Create Widget node (`UWidgetBlueprintLibrary::Create`), with the calling object as world context. The owning player may be null. | Yes |
-| `NewObject<AActor>(this)`, `SpawnActor<UObject>(UObject::StaticClass(), Where)` | Refused by clang on the calling line: "no matching function", then a note naming the constraint `T` fails. `SpawnActor` and `SpawnActorDeferred` take an actor class, `AddComponentByType` and `AddComponentDeferred` a component class, `CreateWidget` a widget class, and `NewObject` any other class. | Refused |
-| `SpawnActor<AShape>(AShape::StaticClass(), Where)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Warns: "is an abstract class" (for a UE_FINAL_AS base, naming the leaf to spawn). SpawnActor makes no actor of an abstract class and returns None. Only a class the call names is checked (`X::StaticClass()`); one picked at run time is not. | Warns |
-| `NewObject<USpec>(this)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Refused: "is an abstract class ... which the engine may not construct". SpawnObject makes one in a Shipping game and asserts in a Development one; the editor's Construct Object node refuses the class too. Construct a subclass that defines every `= 0` method, or the UE_FINAL_AS leaf the message names. Only a class the call names is checked (`X::StaticClass()`, or `NewObject`'s default). | Refused |
-| `NewObject<UProbe>(nullptr)` | Warns: "SpawnObject with no Outer (None) makes nothing and returns None". Pass the object that owns it, such as `this`. | Warns |
+| <a id="objects-and-widgets.newobject-uenemycontext-this"></a>`NewObject<UEnemyContext>(this)` | The Construct Object from Class node (`UGameplayStatics::SpawnObject`): a new object of `T`, with `this` as its Outer. `T` can be neither an actor nor a component, the same rule the editor's node applies. | Yes |
+| <a id="objects-and-widgets.newobject-uobject-this-kind"></a>`NewObject<UObject>(this, Kind)` | The class picked at run time, as a `TSubclassOf<T>`. | Yes |
+| <a id="objects-and-widgets.createwidget-uuserwidget"></a>`CreateWidget<UUserWidget>(PlayerController, HudClass)` | The Create Widget node (`UWidgetBlueprintLibrary::Create`), with the calling object as world context. The owning player may be null. | Yes |
+| <a id="objects-and-widgets.newobject-aactor-this"></a>`NewObject<AActor>(this)`, `SpawnActor<UObject>(UObject::StaticClass(), Where)` | Refused by clang on the calling line: "no matching function", then a note naming the constraint `T` fails. `SpawnActor` and `SpawnActorDeferred` take an actor class, `AddComponentByType` and `AddComponentDeferred` a component class, `CreateWidget` a widget class, and `NewObject` any other class. | Refused |
+| <a id="objects-and-widgets.spawnactor-ashape-ashape"></a>`SpawnActor<AShape>(AShape::StaticClass(), Where)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Warns: "is an abstract class" (for a UE_FINAL_AS base, naming the leaf to spawn). SpawnActor makes no actor of an abstract class and returns None. Only a class the call names is checked (`X::StaticClass()`); one picked at run time is not. | Warns |
+| <a id="objects-and-widgets.newobject-uspec-this"></a>`NewObject<USpec>(this)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Refused: "is an abstract class ... which the engine may not construct". SpawnObject makes one in a Shipping game and asserts in a Development one; the editor's Construct Object node refuses the class too. Construct a subclass that defines every `= 0` method, or the UE_FINAL_AS leaf the message names. Only a class the call names is checked (`X::StaticClass()`, or `NewObject`'s default). | Refused |
+| <a id="objects-and-widgets.newobject-uprobe-nullptr"></a>`NewObject<UProbe>(nullptr)` | Warns: "SpawnObject with no Outer (None) makes nothing and returns None". Pass the object that owns it, such as `this`. | Warns |
 
 ```cpp
 #include "../include/Objects.h"
@@ -3290,11 +3295,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Spawner::StaticClass()`, on one of the mod's own classes | Names that class (`Spawner_C`), as the editor's class picker does, although C++ finds the `StaticClass` of the engine parent. It also works written through a macro in the mod's own source. | Yes |
-| `NewObject<UEnemyContext>(this)` | A helper's default `T::StaticClass()` argument names `T`. | Yes |
-| `UKismetSystemLibrary::DoesImplementInterface(Obj, IAimable::StaticClass())`, on one of the mod's own interfaces | Names the interface's class (`IAimable_C`), as `ITargetable::StaticClass()` names a game interface's. `UE_INTERFACE` declares the `StaticClass`; it is no function of the interface asset. | Yes |
-| `Weapons::Rifle::StaticClass()` | Names `Rifle_C`: the qualifier is read in as many parts as it is written with. So does an alias, `using RifleT = Weapons::Rifle;` then `RifleT::StaticClass()`, as [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp) does. | Yes |
-| `StaticClassOf<Egg>()`, with `class Egg;` declared before | `Egg::StaticClass()` where Egg is only declared so far, as a value and as a default. Two classes whose defaults name each other's class (`Hen` holds `TSubclassOf<AActor> EggClass`, `Egg` holds Hen's class) cannot both have the other complete, and clang needs a class complete for `X::StaticClass()`; a template argument need only be declared. | Yes |
+| <a id="staticclass-on-the.spawner-staticclass"></a>`Spawner::StaticClass()`, on one of the mod's own classes | Names that class (`Spawner_C`), as the editor's class picker does, although C++ finds the `StaticClass` of the engine parent. It also works written through a macro in the mod's own source. | Yes |
+| <a id="staticclass-on-the.newobject-uenemycontext-this"></a>`NewObject<UEnemyContext>(this)` | A helper's default `T::StaticClass()` argument names `T`. | Yes |
+| <a id="staticclass-on-the.ukismetsystemlibrary"></a>`UKismetSystemLibrary::DoesImplementInterface(Obj, IAimable::StaticClass())`, on one of the mod's own interfaces | Names the interface's class (`IAimable_C`), as `ITargetable::StaticClass()` names a game interface's. `UE_INTERFACE` declares the `StaticClass`; it is no function of the interface asset. | Yes |
+| <a id="staticclass-on-the.weapons-rifle-staticclass"></a>`Weapons::Rifle::StaticClass()` | Names `Rifle_C`: the qualifier is read in as many parts as it is written with. So does an alias, `using RifleT = Weapons::Rifle;` then `RifleT::StaticClass()`, as [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp) does. | Yes |
+| <a id="staticclass-on-the.staticclassof-egg"></a>`StaticClassOf<Egg>()`, with `class Egg;` declared before | `Egg::StaticClass()` where Egg is only declared so far, as a value and as a default. Two classes whose defaults name each other's class (`Hen` holds `TSubclassOf<AActor> EggClass`, `Egg` holds Hen's class) cannot both have the other complete, and clang needs a class complete for `X::StaticClass()`; a template argument need only be declared. | Yes |
 
 ```cpp
 #include "../include/Objects.h"
@@ -3325,7 +3330,7 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `template <Derives<AActor> T> inline T *SpawnAbove(...)` | Every `Objects.h` function is an inline template, and AssetGen splices its body into the caller. A helper costs exactly the engine calls inside it and adds no function of its own. Write more the same way in your source. | Yes |
+| <a id="helpers-of-your.template-derives-aactor-t-inline"></a>`template <Derives<AActor> T> inline T *SpawnAbove(...)` | Every `Objects.h` function is an inline template, and AssetGen splices its body into the caller. A helper costs exactly the engine calls inside it and adds no function of its own. Write more the same way in your source. | Yes |
 
 ```cpp
 #include "../include/Objects.h"
@@ -3361,11 +3366,11 @@ remember: unlike C++, a read through a null object does not crash; it gives zero
 
 | You write | What it does | Status |
 |---|---|---|
-| `Char->InventoryComponent->MiningItem` | The Get node with a Target pin: the property is read from that object, and a chain reads each object in turn. Properties of game classes, of the mod's other classes and of data assets read the same way. A read through a null object gives zero or empty, and the game logs "Accessed None". | Yes |
-| `Other->Hits += 1;`, `Other->Cursor = Next();` | The Set node with a Target pin. As in C++17, the right side is evaluated before the object is located, so if the right side changes what the pointer names, the write goes to the new object. | Yes |
-| `GetPeer()->Slots.Add(5);`, `GetPeer()->SlotMap[FName("a")] = 7;` | A container on another object is changed where it lives, as the editor's container nodes do with a Target. The object is located before the arguments are evaluated, which is C++ order. | Yes |
-| `UKismetSystemLibrary::SetStructurePropertyByName(Obj, "Home", Home);`, `UBlueprintMapLibrary::SetMapPropertyByName(Obj, "Spots", (TMap<int, int>&)Spots);`, `UKismetArrayLibrary::SetArrayPropertyByName(Obj, "Hits", (TArray<int>&)Hits);` | The engine's set-by-name nodes, whose value pin is a wildcard. UeApi spells the wildcard `FGenericStruct`, `TArray<int>`, `TSet<int>` or `TMap<int, int>`: a struct passes as it is, and a container through a reference cast to that type, which only lets clang pass it. The variable itself is passed, as the editor wires the pin to it, and the engine copies it with the named property's type, without checking that the two types match: make sure they do. | Yes |
-| `GetPeer()->OnPeerHit.Broadcast(3);` | Fires the dispatcher of another object of the same class. Another mod class's, a game Blueprint's and a BlueprintCallable native dispatcher can be broadcast too; see [Event dispatchers](#event-dispatchers). | Yes |
+| <a id="properties-of-other.char-inventorycomponent"></a>`Char->InventoryComponent->MiningItem` | The Get node with a Target pin: the property is read from that object, and a chain reads each object in turn. Properties of game classes, of the mod's other classes and of data assets read the same way. A read through a null object gives zero or empty, and the game logs "Accessed None". | Yes |
+| <a id="properties-of-other.other-hits-1"></a>`Other->Hits += 1;`, `Other->Cursor = Next();` | The Set node with a Target pin. As in C++17, the right side is evaluated before the object is located, so if the right side changes what the pointer names, the write goes to the new object. | Yes |
+| <a id="properties-of-other.getpeer-slots-add-5"></a>`GetPeer()->Slots.Add(5);`, `GetPeer()->SlotMap[FName("a")] = 7;` | A container on another object is changed where it lives, as the editor's container nodes do with a Target. The object is located before the arguments are evaluated, which is C++ order. | Yes |
+| <a id="properties-of-other.ukismetsystemlibrary"></a>`UKismetSystemLibrary::SetStructurePropertyByName(Obj, "Home", Home);`, `UBlueprintMapLibrary::SetMapPropertyByName(Obj, "Spots", (TMap<int, int>&)Spots);`, `UKismetArrayLibrary::SetArrayPropertyByName(Obj, "Hits", (TArray<int>&)Hits);` | The engine's set-by-name nodes, whose value pin is a wildcard. UeApi spells the wildcard `FGenericStruct`, `TArray<int>`, `TSet<int>` or `TMap<int, int>`: a struct passes as it is, and a container through a reference cast to that type, which only lets clang pass it. The variable itself is passed, as the editor wires the pin to it, and the engine copies it with the named property's type, without checking that the two types match: make sure they do. | Yes |
+| <a id="properties-of-other.getpeer-onpeerhit-broadcast-3"></a>`GetPeer()->OnPeerHit.Broadcast(3);` | Fires the dispatcher of another object of the same class. Another mod class's, a game Blueprint's and a BlueprintCallable native dispatcher can be broadcast too; see [Event dispatchers](#event-dispatchers). | Yes |
 
 ```cpp
 class Peer : public AActor {
@@ -3399,12 +3404,12 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `if (Obj)`, `!Obj`, `Obj ? A : B` | The Is Valid node: true only for an object that is not null and is not being destroyed (pending kill). This is stricter than C++'s null test. | Yes |
-| `if (Cls)`, `!Cls`, `Cls ? A : B` on a `TSubclassOf<T>` | The Is Valid Class node: true for a class that is set and not stale. A `UClass *` tests with Is Valid, as an object. | Yes |
-| `Obj != nullptr`, `Obj == nullptr` | The Equal and Not Equal (Object) nodes against None: a plain pointer comparison. An object that is being destroyed still compares `!= nullptr`. Use `if (Obj)` to treat it as gone. | Yes |
-| `Hit != this`, `Other->GetClass() == GetClass()` | `EqualEqual_ObjectObject` and `NotEqual_ObjectObject`: object identity. | Yes |
-| `Target && Target->InitialLifeSpan > 0.0f` | The right side is not read when `Target` is null, as in C++. Blueprint's AND node would evaluate both sides, so AssetGen keeps a branch here. | Yes |
-| `A < B` on object pointers | Refused: Blueprint compares objects only with `==` and `!=`. See [Operators](#operators). | Refused |
+| <a id="validity-and-comparison.if-obj"></a>`if (Obj)`, `!Obj`, `Obj ? A : B` | The Is Valid node: true only for an object that is not null and is not being destroyed (pending kill). This is stricter than C++'s null test. | Yes |
+| <a id="validity-and-comparison.if-cls"></a>`if (Cls)`, `!Cls`, `Cls ? A : B` on a `TSubclassOf<T>` | The Is Valid Class node: true for a class that is set and not stale. A `UClass *` tests with Is Valid, as an object. | Yes |
+| <a id="validity-and-comparison.obj-nullptr"></a>`Obj != nullptr`, `Obj == nullptr` | The Equal and Not Equal (Object) nodes against None: a plain pointer comparison. An object that is being destroyed still compares `!= nullptr`. Use `if (Obj)` to treat it as gone. | Yes |
+| <a id="validity-and-comparison.hit-this"></a>`Hit != this`, `Other->GetClass() == GetClass()` | `EqualEqual_ObjectObject` and `NotEqual_ObjectObject`: object identity. | Yes |
+| <a id="validity-and-comparison.target-target-initiallifespan-0"></a>`Target && Target->InitialLifeSpan > 0.0f` | The right side is not read when `Target` is null, as in C++. Blueprint's AND node would evaluate both sides, so AssetGen keeps a branch here. | Yes |
+| <a id="validity-and-comparison.a-b"></a>`A < B` on object pointers | Refused: Blueprint compares objects only with `==` and `!=`. See [Operators](#operators). | Refused |
 
 ```cpp
 class Others : public AActor {
@@ -3435,15 +3440,15 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Obj->GetClass()` | Get Class. The SDK forwards it to `UGameplayStatics::GetObjectClass(Obj)`. It works on `this` and on any other object. | Yes |
-| `Obj->GetName()` | Get Object Name (`UKismetSystemLibrary::GetObjectName`). A class with a `GetName` function of its own, such as `UFSDSaveGame`, calls that one instead. | Yes |
-| `Obj->GetOuter()` | Reads the object's outer pointer from memory, with no engine call. On a null object it crashes, as in C++. For a null-safe call, use `UKismetSystemLibrary::GetOuterObject(Obj)`. | Yes |
-| `GetTypedOuter<AActor>(Obj)` | From `Objects.h`: the nearest outer of `Obj` that is a `T`, or null. `Obj` itself is never a candidate, and a null `Obj` gives null. Each step is one outer read and one Cast. | Yes |
-| `GetOutermostTypedOuter<ULevel>(Obj)` | From `Objects.h`: the same walk, keeping the farthest outer that is a `T`. | Yes |
-| `GetOuter()` or `GetTypedOuter<T>()` in a function that waits (`Delay`, `UE_AWAIT`) | Reads the outer when the line runs, before the wait or after the function resumes. | Yes |
-| `Obj->IsA(AActor::StaticClass())` | Get Class, then Class Is Child Of: `UKismetMathLibrary::ClassIsChildOf(UGameplayStatics::GetObjectClass(Obj), Class)`. False on a null object. Needs `UeApi/Engine.h`. | Yes |
-| `Class->IsChildOf(AActor::StaticClass())` | Class Is Child Of (`UKismetMathLibrary::ClassIsChildOf`). False on a null class. | Yes |
-| `Obj->Class` | Refused by clang: "no member named 'Class' in 'UObject'". The SDK declares none of UObject's raw fields (`Class`, `Outer`, `Name`). Use the helpers above. | Refused |
+| <a id="uobject-helpers.obj-getclass"></a>`Obj->GetClass()` | Get Class. The SDK forwards it to `UGameplayStatics::GetObjectClass(Obj)`. It works on `this` and on any other object. | Yes |
+| <a id="uobject-helpers.obj-getname"></a>`Obj->GetName()` | Get Object Name (`UKismetSystemLibrary::GetObjectName`). A class with a `GetName` function of its own, such as `UFSDSaveGame`, calls that one instead. | Yes |
+| <a id="uobject-helpers.obj-getouter"></a>`Obj->GetOuter()` | Reads the object's outer pointer from memory, with no engine call. On a null object it crashes, as in C++. For a null-safe call, use `UKismetSystemLibrary::GetOuterObject(Obj)`. | Yes |
+| <a id="uobject-helpers.gettypedouter-aactor-obj"></a>`GetTypedOuter<AActor>(Obj)` | From `Objects.h`: the nearest outer of `Obj` that is a `T`, or null. `Obj` itself is never a candidate, and a null `Obj` gives null. Each step is one outer read and one Cast. | Yes |
+| <a id="uobject-helpers.getoutermosttypedouter-ulevel"></a>`GetOutermostTypedOuter<ULevel>(Obj)` | From `Objects.h`: the same walk, keeping the farthest outer that is a `T`. | Yes |
+| <a id="uobject-helpers.getouter"></a>`GetOuter()` or `GetTypedOuter<T>()` in a function that waits (`Delay`, `UE_AWAIT`) | Reads the outer when the line runs, before the wait or after the function resumes. | Yes |
+| <a id="uobject-helpers.obj-isa-aactor-staticclass"></a>`Obj->IsA(AActor::StaticClass())` | Get Class, then Class Is Child Of: `UKismetMathLibrary::ClassIsChildOf(UGameplayStatics::GetObjectClass(Obj), Class)`. False on a null object. Needs `UeApi/Engine.h`. | Yes |
+| <a id="uobject-helpers.class-ischildof-aactor"></a>`Class->IsChildOf(AActor::StaticClass())` | Class Is Child Of (`UKismetMathLibrary::ClassIsChildOf`). False on a null class. | Yes |
+| <a id="uobject-helpers.obj-class"></a>`Obj->Class` | Refused by clang: "no member named 'Class' in 'UObject'". The SDK declares none of UObject's raw fields (`Class`, `Outer`, `Name`). Use the helpers above. | Refused |
 
 ```cpp
 #include "../include/Objects.h"
@@ -3461,8 +3466,7 @@ public:
 Notes:
 
 - `GetOuter()` needs nothing declared. The compiler adds a small `FDeref` struct for the memory read and cooks it
-  into the mod; see [Pointers and memory](#pointers-and-memory). A header comment that says a mod declares `FDeref`
-  itself, or that the outer walk is a `GetOuterObject` call, is out of date.
+  into the mod; see [Pointers and memory](#pointers-and-memory).
 - The forwarders need the header that declares their target. Without it the compiler says "which is not declared
   here: include its UeApi header"; `UGameplayStatics` and `UKismetSystemLibrary` are in `UeApi/Engine.h`.
 
@@ -3474,10 +3478,10 @@ as a method of the struct, so calls chain the way the nodes do. FString, FName, 
 
 | You write | What it does | Status |
 |---|---|---|
-| `AssetData.GetExportTextName()` | `UAssetRegistryHelpers::GetExportTextName(AssetData)`: the value goes first, the arguments after it. | Yes |
-| `Path.ToSoftClassPtr()`, `V.ToString()` | A one-argument `Conv_XToY` is `To<Y>()`: `Conv_SoftClassPathToSoftClassRef`, `Conv_VectorToString`. | Yes |
-| `Soft.LoadClassAsset_Blocking()` | The same on a soft pointer, `UKismetSystemLibrary::LoadClassAsset_Blocking(Soft)`. | Yes |
-| A library function taking a world context, or a latent one, as a method | Not declared: call the static. | Not yet |
+| <a id="methods-on-structs.assetdata-getexporttextname"></a>`AssetData.GetExportTextName()` | `UAssetRegistryHelpers::GetExportTextName(AssetData)`: the value goes first, the arguments after it. | Yes |
+| <a id="methods-on-structs.path-tosoftclassptr"></a>`Path.ToSoftClassPtr()`, `V.ToString()` | A one-argument `Conv_XToY` is `To<Y>()`: `Conv_SoftClassPathToSoftClassRef`, `Conv_VectorToString`. | Yes |
+| <a id="methods-on-structs.soft-loadclassasset-blocking"></a>`Soft.LoadClassAsset_Blocking()` | The same on a soft pointer, `UKismetSystemLibrary::LoadClassAsset_Blocking(Soft)`. | Yes |
+| <a id="methods-on-structs.a-library-function-taking-a"></a>A library function taking a world context, or a latent one, as a method | Not declared: call the static. | Not yet |
 
 ```cpp
 UClass *ClassOf(const FAssetData &AssetData)
@@ -3497,10 +3501,10 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UGameFunctionLibrary::GetLocalPlayerCharacter(this)` | DRG's getter for the character this machine controls, already an `APlayerCharacter`, so no cast is needed. `this` can be left out. It returns null until the character exists, so a mod that starts in `ReceiveBeginPlay` waits for it in a `Delay` loop. | Yes |
-| `UGameplayStatics::GetPlayerController(0)`, `GetPlayerPawn(0)`, `GetPlayerCharacter(0)` | The Get Player Controller, Get Player Pawn and Get Player Character nodes. They return engine types, so `Cast<APlayerCharacter>` the result to reach DRG's members. The index counts the player controllers in this world. A client has only its own, so 0 is the local player. | Yes |
-| `UGameFunctionLibrary::GetFSDGameState()` | One of DRG's typed getters: `GetFSDGameState`, `GetFSDGameMode`, `GetFSDGameInstance`, `GetFSDSaveGame`, `GetCSGWorld`, `GetNumPlayers` and more. The world context is filled in. | Yes |
-| `for (APlayerCharacter *P : GS->ActivePlayerCharacters)` | The game state's list of every player's character, walked in place with no copy. | Yes |
+| <a id="the-player-and.ugamefunctionlibrary"></a>`UGameFunctionLibrary::GetLocalPlayerCharacter(this)` | DRG's getter for the character this machine controls, already an `APlayerCharacter`, so no cast is needed. `this` can be left out. It returns null until the character exists, so a mod that starts in `ReceiveBeginPlay` waits for it in a `Delay` loop. | Yes |
+| <a id="the-player-and.ugameplaystatics"></a>`UGameplayStatics::GetPlayerController(0)`, `GetPlayerPawn(0)`, `GetPlayerCharacter(0)` | The Get Player Controller, Get Player Pawn and Get Player Character nodes. They return engine types, so `Cast<APlayerCharacter>` the result to reach DRG's members. The index counts the player controllers in this world. A client has only its own, so 0 is the local player. | Yes |
+| <a id="the-player-and.ugamefunctionlibrary-2"></a>`UGameFunctionLibrary::GetFSDGameState()` | One of DRG's typed getters: `GetFSDGameState`, `GetFSDGameMode`, `GetFSDGameInstance`, `GetFSDSaveGame`, `GetCSGWorld`, `GetNumPlayers` and more. The world context is filled in. | Yes |
+| <a id="the-player-and.for-aplayercharacter-p-gs"></a>`for (APlayerCharacter *P : GS->ActivePlayerCharacters)` | The game state's list of every player's character, walked in place with no copy. | Yes |
 
 ```cpp
 class Census : public AActor {
@@ -3541,14 +3545,14 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UGameplayStatics::GetAllActorsOfClass(APlayerCharacter::StaticClass(), Found)` | Get All Actors Of Class. The result comes back through the `TArray<AActor *>&` parameter: the engine empties the array, then adds every actor of the class, subclasses included, from the calling object's world. Cast each element to reach the class's own members. | Yes |
-| `GetAllActorsOfClassWithTag(AActor::StaticClass(), FName("Loot"), Loot)`, `GetAllActorsWithTag(FName("Loot"), Loot)` | The With Tag nodes. They match an actor's `Tags` array. | Yes |
-| `GetAllActorsWithInterface(ITargetable::StaticClass(), Found)` | Get All Actors With Interface: every actor that implements the interface. | Yes |
-| `UGameplayStatics::GetActorOfClass(AMyManager::StaticClass())` | Get Actor Of Class: the first actor of the class (subclasses included) that the world's actor iterator reaches, or null. With several actors of the class, which one comes back depends on that order, so use it for a class the world holds one of. | Yes |
-| `A->GetComponentByClass(UHealthComponentBase::StaticClass())` | Get Component by Class: the actor's first component of that class, or null. It is typed `UActorComponent*`, so Cast it. `K2_GetComponentsByClass(Class)` returns all of them, and `GetComponentsByTag(Class, Tag)` also filters by component tag. | Yes |
-| `A->GetComponentsByClass<UStaticMeshComponent>()`, `GetComponentsByClass<UMyPart>()` | Get Components by Class: every component of that class, as a `TArray<UStaticMeshComponent *>` that needs no cast. It is `K2_GetComponentsByClass(UStaticMeshComponent::StaticClass())`, whose array of `UActorComponent *` holds only that class. | Yes |
-| `UActorFunctionLibrary::GetPlayersInRange(K2_GetActorLocation(), 1000.0f, true)` | DRG's getter for the player characters within a radius, as a `TArray<APlayerCharacter *>` that needs no cast. The last argument is MustBeAlive. DRG marks it authority-only: on a client the call is skipped and returns an empty array. | Yes |
-| an engine or game static marked `UE_AUTHORITY_ONLY` or `UE_COSMETIC` | Called on its class's default object, as the editor's node calls it, so the engine decides where it runs. For a static of a function library, an actor or a component class, which is nearly all of them, an authority-only one is skipped on a client and a cosmetic one on a dedicated server. A skipped call returns zero or None and leaves its output parameters as they were. | Yes |
+| <a id="finding-actors-and.ugameplaystatics"></a>`UGameplayStatics::GetAllActorsOfClass(APlayerCharacter::StaticClass(), Found)` | Get All Actors Of Class. The result comes back through the `TArray<AActor *>&` parameter: the engine empties the array, then adds every actor of the class, subclasses included, from the calling object's world. Cast each element to reach the class's own members. | Yes |
+| <a id="finding-actors-and.getallactorsofclasswithtag"></a>`GetAllActorsOfClassWithTag(AActor::StaticClass(), FName("Loot"), Loot)`, `GetAllActorsWithTag(FName("Loot"), Loot)` | The With Tag nodes. They match an actor's `Tags` array. | Yes |
+| <a id="finding-actors-and.getallactorswithinterface"></a>`GetAllActorsWithInterface(ITargetable::StaticClass(), Found)` | Get All Actors With Interface: every actor that implements the interface. | Yes |
+| <a id="finding-actors-and.ugameplaystatics-getactorofclass"></a>`UGameplayStatics::GetActorOfClass(AMyManager::StaticClass())` | Get Actor Of Class: the first actor of the class (subclasses included) that the world's actor iterator reaches, or null. With several actors of the class, which one comes back depends on that order, so use it for a class the world holds one of. | Yes |
+| <a id="finding-actors-and.a-getcomponentbyclass"></a>`A->GetComponentByClass(UHealthComponentBase::StaticClass())` | Get Component by Class: the actor's first component of that class, or null. It is typed `UActorComponent*`, so Cast it. `K2_GetComponentsByClass(Class)` returns all of them, and `GetComponentsByTag(Class, Tag)` also filters by component tag. | Yes |
+| <a id="finding-actors-and.a-getcomponentsbyclass"></a>`A->GetComponentsByClass<UStaticMeshComponent>()`, `GetComponentsByClass<UMyPart>()` | Get Components by Class: every component of that class, as a `TArray<UStaticMeshComponent *>` that needs no cast. It is `K2_GetComponentsByClass(UStaticMeshComponent::StaticClass())`, whose array of `UActorComponent *` holds only that class. | Yes |
+| <a id="finding-actors-and.uactorfunctionlibrary"></a>`UActorFunctionLibrary::GetPlayersInRange(K2_GetActorLocation(), 1000.0f, true)` | DRG's getter for the player characters within a radius, as a `TArray<APlayerCharacter *>` that needs no cast. The last argument is MustBeAlive. DRG marks it authority-only: on a client the call is skipped and returns an empty array. | Yes |
+| <a id="finding-actors-and.ue-authority-only"></a>an engine or game static marked `UE_AUTHORITY_ONLY` or `UE_COSMETIC` | Called on its class's default object, as the editor's node calls it, so the engine decides where it runs. For a static of a function library, an actor or a component class, which is nearly all of them, an authority-only one is skipped on a client and a cosmetic one on a dedicated server. A skipped call returns zero or None and leaves its output parameters as they were. | Yes |
 
 ```cpp
 #include "../include/Objects.h"
@@ -3617,11 +3621,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UDamageSubsystem::Get()`, `UUGCSubsystem::Get()` | The editor's Get <Subsystem> node. Every subsystem class in the SDK has a static `Get`, which calls `USubsystemBlueprintLibrary`'s getter for the class's kind (engine, game instance or world) and returns the subsystem already typed. | Yes |
-| `GetSubsystem<UTracerManager>()` | The same as `UTracerManager::Get()`. | Yes |
-| `UTracerManager::Get(Other)` | The world or game instance subsystem of `Other`'s world or game instance. Left out, the context is `this`, or a static function's own `WorldContext...` parameter. An engine subsystem's `Get` takes no argument, because there is one engine. | Yes |
-| `BP_TracerManager_C::Get()` | A subsystem the game implements as a Blueprint, for its Blueprint variables. DRG has two: `BP_TracerManager_C` (world) and `BP_FadeScreenSubSystem_C` (game instance), each in its `UeApi/Game` header. | Yes |
-| `(UTracerManager *)USubsystemBlueprintLibrary::GetWorldSubsystem(this, UTracerManager::StaticClass())` | What `Get` expands to, written by hand. The C-style cast compiles to nothing. | Yes |
+| <a id="subsystems.udamagesubsystem-get"></a>`UDamageSubsystem::Get()`, `UUGCSubsystem::Get()` | The editor's Get <Subsystem> node. Every subsystem class in the SDK has a static `Get`, which calls `USubsystemBlueprintLibrary`'s getter for the class's kind (engine, game instance or world) and returns the subsystem already typed. | Yes |
+| <a id="subsystems.getsubsystem-utracermanager"></a>`GetSubsystem<UTracerManager>()` | The same as `UTracerManager::Get()`. | Yes |
+| <a id="subsystems.utracermanager-get-other"></a>`UTracerManager::Get(Other)` | The world or game instance subsystem of `Other`'s world or game instance. Left out, the context is `this`, or a static function's own `WorldContext...` parameter. An engine subsystem's `Get` takes no argument, because there is one engine. | Yes |
+| <a id="subsystems.bp-tracermanager-c-get"></a>`BP_TracerManager_C::Get()` | A subsystem the game implements as a Blueprint, for its Blueprint variables. DRG has two: `BP_TracerManager_C` (world) and `BP_FadeScreenSubSystem_C` (game instance), each in its `UeApi/Game` header. | Yes |
+| <a id="subsystems.utracermanager"></a>`(UTracerManager *)USubsystemBlueprintLibrary::GetWorldSubsystem(this, UTracerManager::StaticClass())` | What `Get` expands to, written by hand. The C-style cast compiles to nothing. | Yes |
 
 ```cpp
 #include "UeApi/SimpleUGC.h"
@@ -3680,19 +3684,19 @@ not a C++ value, so point at it with `&`.
 
 | You write | What it does | Status |
 |---|---|---|
-| `UMoodDef MD_Big = {.Health = -500.5f, .Title = "Big"};` | An asset of the class, cooked as `<mod package>/MD_Big`. Only the members the braces name are written, and the rest keep the class defaults. A member named with a zero value is still written. | Yes |
-| `UMoodDef MD_Plain = {};` | An asset with the class defaults only. | Yes |
-| `UMoodDef MD_Zero = {.Health = {}};` | `{}` for a member is its zero, written as `.Health = 0` is. A struct, container or name member's `{}` is written too: zeros, an empty container, None, or a `UE_STRUCT`'s own defaults, not the class default. | Yes |
-| `UHitDef HD_Near = {.H = {.Hit = {.Distance = 5.0f}}};` | An asset starts as its class's default object, so braces for a struct member are written over the default object's value, as a `UE_DEFAULTS` statement's are over a parent's. A member they leave out that the engine's constructor sets (`FHitResult`'s FaceIndex) stays unwritten where the default object's value of it is the engine's too. Where the class's own braces or a `UE_DEFAULTS` gave it another value (`H = {.Hit = {.FaceIndex = 3}}`), or the class is a game or engine class, whose value no header says, it is refused, naming the member. | Yes |
-| `UEnemyDescriptor ED_Mine = {.SpawnSpread = 250.0f, .IdealSpawnSize = 4};` | An asset of a game or engine class. | Yes |
-| `namespace Moods { UMoodDef Angry = {.Health = 50}; }` | A namespace is a folder: the asset is cooked at `<mod package>/Moods/Angry`. See [Mod sources and packages](#mod-sources-and-packages). | Yes |
-| `.Delay = FFloatInterval(1.0f, 5.0f)`, `.Delay = {2.0f, 6.0f}` | A struct member, by constructor or by braces, one value per member, as in any default. | Yes |
-| `.Waves = {3, 5, 8}` | A container member takes a braced list. | Yes |
-| `.Ids = {3}`, `.Score = {{"a", 5}}` on a TSet or TMap whose class default is `{1, 2}`, `{{"a", 1}, {"c", 3}}` | The asset's whole value, as C++ means it. The asset loads a set or map over its class default's value, so the compiler writes what differs, as the cooker does: the class default's elements (a map's keys) this value lacks, as removed, then the elements the class default lacks or maps to another value. `.Ids = {}` empties it. The class default is known where a header gives it: an initializer, a `UE_DEFAULTS` on the way or a `UE_STRUCT` member's default instance, in a class of this mod or of another mod's shared header (`UE_CLASS_IN`, or `UE_CLASS` where the header gives the member a value). A game or engine class's value no header says: there the elements are added to that class's own, with a warning naming the member, and so over a class whose `UE_DEFAULTS` sets the member over one. The same holds for a TSet or TMap inside a struct member. A key given twice holds the last value given, as in C++, and an FString key compares without case: `{{"a", 5}, {"A", 1}}` is `{"A": 1}`. A TArray is replaced whole. | Yes |
-| `.Next = &MD_Calm` | One asset pointing at another. | Yes |
-| `.EnemyClass = "/Game/A/BP_A.BP_A_C"` | A soft object or soft class member takes the asset's path as a string, written the way the cooker writes it. The path rules are in [Types](#types). | Yes |
-| `UBigDef MD_Huge = {{.Health = 900}, false};` | Sets a member a mod base class declares: the base gets a brace list of its own as the first element. C++ cannot designate a base's member (`{.Health = 900}` is a clang error), and after a nested base list the class's own members go by position. | Yes |
-| `.SpawnClass = AMyEnemy::StaticClass()`, on a `TSubclassOf` member | The class, as picking it in the asset's details does. `UE_ASSET_EDIT` takes one the same way ([Editing game packages](#editing-game-packages)). See [Classes and variables](#classes-and-variables). | Yes |
+| <a id="declaring-data-assets.umooddef-md-big-health-500"></a>`UMoodDef MD_Big = {.Health = -500.5f, .Title = "Big"};` | An asset of the class, cooked as `<mod package>/MD_Big`. Only the members the braces name are written, and the rest keep the class defaults. A member named with a zero value is still written. | Yes |
+| <a id="declaring-data-assets.umooddef-md-plain"></a>`UMoodDef MD_Plain = {};` | An asset with the class defaults only. | Yes |
+| <a id="declaring-data-assets.umooddef-md-zero-health"></a>`UMoodDef MD_Zero = {.Health = {}};` | `{}` for a member is its zero, written as `.Health = 0` is. A struct, container or name member's `{}` is written too: zeros, an empty container, None, or a `UE_STRUCT`'s own defaults, not the class default. | Yes |
+| <a id="declaring-data-assets.uhitdef-hd-near-h-hit"></a>`UHitDef HD_Near = {.H = {.Hit = {.Distance = 5.0f}}};` | An asset starts as its class's default object, so braces for a struct member are written over the default object's value, as a `UE_DEFAULTS` statement's are over a parent's. A member they leave out that the engine's constructor sets (`FHitResult`'s FaceIndex) stays unwritten where the default object's value of it is the engine's too. Where the class's own braces or a `UE_DEFAULTS` gave it another value (`H = {.Hit = {.FaceIndex = 3}}`), or the class is a game or engine class, whose value no header says, it is refused, naming the member. | Yes |
+| <a id="declaring-data-assets.uenemydescriptor-ed-mine"></a>`UEnemyDescriptor ED_Mine = {.SpawnSpread = 250.0f, .IdealSpawnSize = 4};` | An asset of a game or engine class. | Yes |
+| <a id="declaring-data-assets.namespace-moods-umooddef-angry"></a>`namespace Moods { UMoodDef Angry = {.Health = 50}; }` | A namespace is a folder: the asset is cooked at `<mod package>/Moods/Angry`. See [Mod sources and packages](#mod-sources-and-packages). | Yes |
+| <a id="declaring-data-assets.delay-ffloatinterval-1-0f-5"></a>`.Delay = FFloatInterval(1.0f, 5.0f)`, `.Delay = {2.0f, 6.0f}` | A struct member, by constructor or by braces, one value per member, as in any default. | Yes |
+| <a id="declaring-data-assets.waves-3-5-8"></a>`.Waves = {3, 5, 8}` | A container member takes a braced list. | Yes |
+| <a id="declaring-data-assets.ids-3"></a>`.Ids = {3}`, `.Score = {{"a", 5}}` on a TSet or TMap whose class default is `{1, 2}`, `{{"a", 1}, {"c", 3}}` | The asset's whole value, as C++ means it. The asset loads a set or map over its class default's value, so the compiler writes what differs, as the cooker does: the class default's elements (a map's keys) this value lacks, as removed, then the elements the class default lacks or maps to another value. `.Ids = {}` empties it. The class default is known where a header gives it: an initializer, a `UE_DEFAULTS` on the way or a `UE_STRUCT` member's default instance, in a class of this mod or of another mod's shared header (`UE_CLASS_IN`, or `UE_CLASS` where the header gives the member a value). A game or engine class's value no header says: there the elements are added to that class's own, with a warning naming the member, and so over a class whose `UE_DEFAULTS` sets the member over one. The same holds for a TSet or TMap inside a struct member. A key given twice holds the last value given, as in C++, and an FString key compares without case: `{{"a", 5}, {"A", 1}}` is `{"A": 1}`. A TArray is replaced whole. | Yes |
+| <a id="declaring-data-assets.next-md-calm"></a>`.Next = &MD_Calm` | One asset pointing at another. | Yes |
+| <a id="declaring-data-assets.enemyclass-game-a-bp-a"></a>`.EnemyClass = "/Game/A/BP_A.BP_A_C"` | A soft object or soft class member takes the asset's path as a string, written the way the cooker writes it. The path rules are in [Types](#types). | Yes |
+| <a id="declaring-data-assets.ubigdef-md-huge-health-900"></a>`UBigDef MD_Huge = {{.Health = 900}, false};` | Sets a member a mod base class declares: the base gets a brace list of its own as the first element. C++ cannot designate a base's member (`{.Health = 900}` is a clang error), and after a nested base list the class's own members go by position. | Yes |
+| <a id="declaring-data-assets.spawnclass-amyenemy-staticclass"></a>`.SpawnClass = AMyEnemy::StaticClass()`, on a `TSubclassOf` member | The class, as picking it in the asset's details does. `UE_ASSET_EDIT` takes one the same way ([Editing game packages](#editing-game-packages)). See [Classes and variables](#classes-and-variables). | Yes |
 
 ```cpp
 class UMoodDef : public UPrimaryDataAsset {
@@ -3744,9 +3748,9 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UMoodDef *Picked = &MD_Big;` | `&Asset` is that asset wherever a default expects an object: a variable, or an element or value of a `TArray`, `TSet` or `TMap` default. It is what picking the asset in the details panel writes. | Yes |
-| `UMoodDef *Def = &MD_Calm;` in a function, `(&MD_Big)->Health` | In a function body, `&Asset` is an object constant, like an asset picked on a node's pin. Read and write its members through the pointer, as for any object. | Yes |
-| `float H = MD_Big.Health;` | Refused: "is an asset, not a value". Take its address: `(&MD_Big)->Health`. | Refused |
+| <a id="pointing-at-data.umooddef-picked-md-big"></a>`UMoodDef *Picked = &MD_Big;` | `&Asset` is that asset wherever a default expects an object: a variable, or an element or value of a `TArray`, `TSet` or `TMap` default. It is what picking the asset in the details panel writes. | Yes |
+| <a id="pointing-at-data.umooddef-def-md-calm"></a>`UMoodDef *Def = &MD_Calm;` in a function, `(&MD_Big)->Health` | In a function body, `&Asset` is an object constant, like an asset picked on a node's pin. Read and write its members through the pointer, as for any object. | Yes |
+| <a id="pointing-at-data.float-h-md-big-health"></a>`float H = MD_Big.Health;` | Refused: "is an asset, not a value". Take its address: `(&MD_Big)->Health`. | Refused |
 
 ```cpp
 UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");
@@ -3783,18 +3787,18 @@ path is not checked when the mod is built, so a wrong path compiles.
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");` | Names an asset in another package, so `&ED_Spider_Grunt` points at it in defaults and in function bodies. The object's name is the last segment of the path. Only an asset the source uses is imported. | Yes |
-| `"/Game/Dir/Package.Object"` | Names an object whose name is not its package's. In the game's content the difference is mostly letter case. | Yes |
-| `UE_ASSET_AT(UEnemyDescriptor, Spider, ...)` in two namespaces | Two different assets: an asset is keyed by its qualified name. | Yes |
-| `(&ED_Spider_Grunt)->SpawnAmountModifier` | Reads the game asset's value when the game runs. | Yes |
-| `ED_Spider_Grunt.SpawnSpread * 2`, `ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity` | A member read by value is the value the asset's package holds, read when the mod is built off the extracted game pak (`--game`; bpbuild: `game_content`), and a constant there: in code, and in a default. A number, a bool, an enum, a name or a string. A step is `.Member` or a `TArray`'s `[i]`, as in `UE_ASSET_EDITS`. A member the asset has no value of is its archetype's, its class's default object, followed through the game's packages; a Blueprint class's own variable that its default object leaves out is zero. The SDK carries no values, so none can go stale with it. The compile prints each value it reads, `value <- <package> (<path> = <value>, ...)`, and bpbuild rebuilds a mod when the game's copy of a package it read is newer, after a re-extract. | Yes |
-| `ED_Spider_Grunt.SpawnAmountModifier`, a member the asset leaves to a native class | Refused: "sets no value of its own, so it holds EnemyDescriptor's C++ default, which no package holds". That value is the C++ constructor's, in the game's code. Read it when the game runs, `(&ED_Spider_Grunt)->SpawnAmountModifier`. | Refused |
-| a member whose type UeApi gives otherwise than the package, an enumerator UeApi's enum lacks | Refused: "the game's package holds a FloatProperty there, where UeApi declares a IntProperty: regenerate UeApi from the same game build as the extracted pak". A stale SDK never compiles in a value it misreads. | Refused |
-| a reference, a text, a map's value, an element past the end of the game's array, an asset of a mod pak | Refused, each with its reason ("only a number, a bool, an enum, a name or a string is read when the mod is built", "the game's array has 0 elements", "is not in <game folder>"). Read it when the game runs, through the pointer. | Refused |
-| a value that this mod's own `UE_ASSET_EDIT` or `UE_ASSET_EDITS` changes | Refused: "this mod's edit changes the value read when the mod is built". The game loads the edited value. | Refused |
-| a value read without `--game` | Refused: "a game asset's value is read off its package when the mod is built: pass the folder /Game is in". | Refused |
-| `&OtherData`, another mod's asset of a class that a shared header declares without `UE_CLASS` | Refused: each mod that includes the header cooks its own copy of the class, so the reference "would load as null". The message prints the `UE_CLASS` line that pins the class to its owner; see [Mod sources and packages](#mod-sources-and-packages). | Refused |
-| changing a game data asset, or a game Blueprint's defaults or functions, in the pak | `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH`: see [Editing game packages](#editing-game-packages). | Yes |
+| <a id="ue-asset-at.ue-asset-at-uenemydescriptor-ed"></a>`UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");` | Names an asset in another package, so `&ED_Spider_Grunt` points at it in defaults and in function bodies. The object's name is the last segment of the path. Only an asset the source uses is imported. | Yes |
+| <a id="ue-asset-at.game-dir-package-object"></a>`"/Game/Dir/Package.Object"` | Names an object whose name is not its package's. In the game's content the difference is mostly letter case. | Yes |
+| <a id="ue-asset-at.ue-asset-at-uenemydescriptor"></a>`UE_ASSET_AT(UEnemyDescriptor, Spider, ...)` in two namespaces | Two different assets: an asset is keyed by its qualified name. | Yes |
+| <a id="ue-asset-at.ed-spider-grunt"></a>`(&ED_Spider_Grunt)->SpawnAmountModifier` | Reads the game asset's value when the game runs. | Yes |
+| <a id="ue-asset-at.ed-spider-grunt-spawnspread-2"></a>`ED_Spider_Grunt.SpawnSpread * 2`, `ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity` | A member read by value is the value the asset's package holds, read when the mod is built off the extracted game pak (`--game`; bpbuild: `game_content`), and a constant there: in code, and in a default. A number, a bool, an enum, a name or a string. A step is `.Member` or a `TArray`'s `[i]`, as in `UE_ASSET_EDITS`. A member the asset has no value of is its archetype's, its class's default object, followed through the game's packages; a Blueprint class's own variable that its default object leaves out is zero. The SDK carries no values, so none can go stale with it. The compile prints each value it reads, `value <- <package> (<path> = <value>, ...)`, and bpbuild rebuilds a mod when the game's copy of a package it read is newer, after a re-extract. | Yes |
+| <a id="ue-asset-at.ed-spider-grunt-2"></a>`ED_Spider_Grunt.SpawnAmountModifier`, a member the asset leaves to a native class | Refused: "sets no value of its own, so it holds EnemyDescriptor's C++ default, which no package holds". That value is the C++ constructor's, in the game's code. Read it when the game runs, `(&ED_Spider_Grunt)->SpawnAmountModifier`. | Refused |
+| <a id="ue-asset-at.a-member-whose-type-ueapi"></a>a member whose type UeApi gives otherwise than the package, an enumerator UeApi's enum lacks | Refused: "the game's package holds a FloatProperty there, where UeApi declares a IntProperty: regenerate UeApi from the same game build as the extracted pak". A stale SDK never compiles in a value it misreads. | Refused |
+| <a id="ue-asset-at.a-reference-a-text-a"></a>a reference, a text, a map's value, an element past the end of the game's array, an asset of a mod pak | Refused, each with its reason ("only a number, a bool, an enum, a name or a string is read when the mod is built", "the game's array has 0 elements", "is not in <game folder>"). Read it when the game runs, through the pointer. | Refused |
+| <a id="ue-asset-at.ue-asset-edit"></a>a value that this mod's own `UE_ASSET_EDIT` or `UE_ASSET_EDITS` changes | Refused: "this mod's edit changes the value read when the mod is built". The game loads the edited value. | Refused |
+| <a id="ue-asset-at.game"></a>a value read without `--game` | Refused: "a game asset's value is read off its package when the mod is built: pass the folder /Game is in". | Refused |
+| <a id="ue-asset-at.otherdata"></a>`&OtherData`, another mod's asset of a class that a shared header declares without `UE_CLASS` | Refused: each mod that includes the header cooks its own copy of the class, so the reference "would load as null". The message prints the `UE_CLASS` line that pins the class to its owner; see [Mod sources and packages](#mod-sources-and-packages). | Refused |
+| <a id="ue-asset-at.changing-a-game-data-asset"></a>changing a game data asset, or a game Blueprint's defaults or functions, in the pak | `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH`: see [Editing game packages](#editing-game-packages). | Yes |
 
 ```cpp
 UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");
@@ -3832,9 +3836,9 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `#include "UeAssets/UEnemyDescriptor.h"` | One header per asset class, generated from the game's AssetRegistry.bin by `tools/genueassets.py`. Each asset is a `UE_ASSET_AT` in a namespace that mirrors its folder. | Yes |
-| `&UeAssets::UEnemyDescriptor::Game::Enemies::Spider::Grunt::ED_Spider_Grunt` | Points at that game asset, by its path. | Yes |
-| `genueassets.py ... --pak <mod pak>` | Also names the assets of a mod pak, which has no registry, from the pak's own package headers. | Yes |
+| <a id="the-ueassets-headers.include-ueassets"></a>`#include "UeAssets/UEnemyDescriptor.h"` | One header per asset class, generated from the game's AssetRegistry.bin by `tools/genueassets.py`. Each asset is a `UE_ASSET_AT` in a namespace that mirrors its folder. | Yes |
+| <a id="the-ueassets-headers.ueassets-uenemydescriptor-game"></a>`&UeAssets::UEnemyDescriptor::Game::Enemies::Spider::Grunt::ED_Spider_Grunt` | Points at that game asset, by its path. | Yes |
+| <a id="the-ueassets-headers.genueassets-py-pak-mod-pak"></a>`genueassets.py ... --pak <mod pak>` | Also names the assets of a mod pak, which has no registry, from the pak's own package headers. | Yes |
 
 ```cpp
 #include "UeAssets/UEnemyDescriptor.h"
@@ -3863,8 +3867,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_ASSET_ALL(UEnemyDescriptor);` in a namespace | Declares `All`, a `TArray<TSoftObjectPtr<UEnemyDescriptor>>` filled when the mod is built. It holds every `UE_ASSET_AT` in that namespace and the namespaces inside it whose class is the class given or derives from it. They are soft pointers, so nothing loads until you load one. | Yes |
-| `UeAssets::USoundWave::All` | Each `UeAssets` header declares one: every game asset of that class. | Yes |
+| <a id="lists-of-assets.ue-asset-all-uenemydescriptor"></a>`UE_ASSET_ALL(UEnemyDescriptor);` in a namespace | Declares `All`, a `TArray<TSoftObjectPtr<UEnemyDescriptor>>` filled when the mod is built. It holds every `UE_ASSET_AT` in that namespace and the namespaces inside it whose class is the class given or derives from it. They are soft pointers, so nothing loads until you load one. | Yes |
+| <a id="lists-of-assets.ueassets-usoundwave-all"></a>`UeAssets::USoundWave::All` | Each `UeAssets` header declares one: every game asset of that class. | Yes |
 
 ```cpp
 namespace Picks {
@@ -3910,18 +3914,18 @@ the game's. The rule to remember: an edit starts from the game's own package, so
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_ASSET_EDIT(ED_Spider_Grunt) {.SpawnSpread = 800.0f, .IdealSpawnSize = 12};` at namespace scope | Edits a game asset that a `UE_ASSET_AT` names, every one in the `UeAssets` headers included. Each member the braces name replaces the asset's value, or is added where the asset had none. The members the braces leave out keep the asset's values, and every other byte of the package stays the game's. | Yes |
-| `.CanBeUsedForConstantPressure = false`, `.Count = 0` | A zero is written like any other value, since it replaces the asset's own. | Yes |
-| `.VeteranClasses = {&ED_Spider_Grunt, &ED_Spider_Exploder}`, `.SpawnClass = APlayerCharacter::StaticClass()` | A container member is replaced whole. An object or class the package did not reference before is added to its imports. | Yes |
-| `UE_ASSET_EDITS { ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity = 2.0f; }` | Assigns part of a member's value by path: the rest of the array, and of that element, keeps its bytes. A step is `.Member` or `[i]`, a `TArray` element whose index is a constant, to any depth. | Yes |
-| `UE_ASSET_EDITS { ED_Spider_Exploder.SpawnSpread = 100.0f; ED_Spider_Grunt.IdealSpawnSize = 12; }` | A block can assign whole members too, of several assets. Its statements apply in order, so a later one lands on what an earlier one wrote. | Yes |
-| `UE_ASSET_EDIT` and `UE_ASSET_EDITS` of one asset in one source | Both land in the one edited package. | Yes |
-| `PrimaryActorTick.bCanEverTick = true`, a path into a member the object has no value of | The object takes that member from its class (its archetype), so the new value holds only the path, and the engine fills in the rest. This works through members of structs written as tags. Through a native struct (FVector, FRotator, ...) or an array element, the value's other parts are unknown when the mod is built: refused with "is not set on". Assign the whole member. | Yes |
-| `Points[2].X = 1.0f` on an array of two | Refused: "Points has 2 elements". | Refused |
-| `UE_ASSET_EDITS { Def.Score["a"] = 1; Def.Ids.Add(7); Def.Score.Remove("b"); }` | One element of a `TMap` or `TSet` put, added or removed, as C++'s `operator[]`, `Add` and `Remove` leave the container: merged into the value the asset holds, so its other elements stay. The tag is a delta over the archetype's value, so a key removed is listed as removed, and an asset with no value of its own gets a tag of the one element. An FString key compares without case. A path through members of structs written as tags reaches one too (`Def.Held.Score["a"] = 1`), and so does a patch's `UE_DEFAULTS`. | Yes |
-| `Def.Arr[0].Score["a"] = 1`, `Def.Score["a"].X = 1` | Refused: a map inside an array's element or a native struct "cannot be changed on its own yet; assign the whole element"; a map's value "is assigned whole, `Map[Key] = value;`". | Refused |
-| `UE_ASSET_EDIT(MD_Big) {...}`, an asset the mod cooks itself | Refused: "the target is a UE_ASSET_AT ...; a mod's own asset takes its values where it is declared". Set the value in the asset's own braces. | Refused |
-| any edit without `--game` | Refused: "an edit starts from the game's own package: pass the folder /Game is in". | Refused |
+| <a id="editing-a-game.ue-asset-edit-ed-spider"></a>`UE_ASSET_EDIT(ED_Spider_Grunt) {.SpawnSpread = 800.0f, .IdealSpawnSize = 12};` at namespace scope | Edits a game asset that a `UE_ASSET_AT` names, every one in the `UeAssets` headers included. Each member the braces name replaces the asset's value, or is added where the asset had none. The members the braces leave out keep the asset's values, and every other byte of the package stays the game's. | Yes |
+| <a id="editing-a-game.canbeusedforconstantpressure"></a>`.CanBeUsedForConstantPressure = false`, `.Count = 0` | A zero is written like any other value, since it replaces the asset's own. | Yes |
+| <a id="editing-a-game.veteranclasses-ed-spider-grunt"></a>`.VeteranClasses = {&ED_Spider_Grunt, &ED_Spider_Exploder}`, `.SpawnClass = APlayerCharacter::StaticClass()` | A container member is replaced whole. An object or class the package did not reference before is added to its imports. | Yes |
+| <a id="editing-a-game.ue-asset-edits-ed-spider"></a>`UE_ASSET_EDITS { ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity = 2.0f; }` | Assigns part of a member's value by path: the rest of the array, and of that element, keeps its bytes. A step is `.Member` or `[i]`, a `TArray` element whose index is a constant, to any depth. | Yes |
+| <a id="editing-a-game.ue-asset-edits-ed-spider-2"></a>`UE_ASSET_EDITS { ED_Spider_Exploder.SpawnSpread = 100.0f; ED_Spider_Grunt.IdealSpawnSize = 12; }` | A block can assign whole members too, of several assets. Its statements apply in order, so a later one lands on what an earlier one wrote. | Yes |
+| <a id="editing-a-game.ue-asset-edit"></a>`UE_ASSET_EDIT` and `UE_ASSET_EDITS` of one asset in one source | Both land in the one edited package. | Yes |
+| <a id="editing-a-game.primaryactortick-bcanevertick"></a>`PrimaryActorTick.bCanEverTick = true`, a path into a member the object has no value of | The object takes that member from its class (its archetype), so the new value holds only the path, and the engine fills in the rest. This works through members of structs written as tags. Through a native struct (FVector, FRotator, ...) or an array element, the value's other parts are unknown when the mod is built: refused with "is not set on". Assign the whole member. | Yes |
+| <a id="editing-a-game.points-2-x-1-0f"></a>`Points[2].X = 1.0f` on an array of two | Refused: "Points has 2 elements". | Refused |
+| <a id="editing-a-game.ue-asset-edits-def-score"></a>`UE_ASSET_EDITS { Def.Score["a"] = 1; Def.Ids.Add(7); Def.Score.Remove("b"); }` | One element of a `TMap` or `TSet` put, added or removed, as C++'s `operator[]`, `Add` and `Remove` leave the container: merged into the value the asset holds, so its other elements stay. The tag is a delta over the archetype's value, so a key removed is listed as removed, and an asset with no value of its own gets a tag of the one element. An FString key compares without case. A path through members of structs written as tags reaches one too (`Def.Held.Score["a"] = 1`), and so does a patch's `UE_DEFAULTS`. | Yes |
+| <a id="editing-a-game.def-arr-0-score-a"></a>`Def.Arr[0].Score["a"] = 1`, `Def.Score["a"].X = 1` | Refused: a map inside an array's element or a native struct "cannot be changed on its own yet; assign the whole element"; a map's value "is assigned whole, `Map[Key] = value;`". | Refused |
+| <a id="editing-a-game.ue-asset-edit-md-big"></a>`UE_ASSET_EDIT(MD_Big) {...}`, an asset the mod cooks itself | Refused: "the target is a UE_ASSET_AT ...; a mod's own asset takes its values where it is declared". Set the value in the asset's own braces. | Refused |
+| <a id="editing-a-game.game"></a>any edit without `--game` | Refused: "an edit starts from the game's own package: pass the folder /Game is in". | Refused |
 
 ```cpp
 #include "UeAssets/UEnemyDescriptor.h"
@@ -3948,36 +3952,36 @@ its `UE_DEFAULTS` and methods are written into that Blueprint's own package.
 
 | You write | What it does | Status |
 |---|---|---|
-| `class SlowGrunt : public ENE_Spider_Grunt_Normal_C { UE_PATCH; UE_DEFAULTS { CustomTimeDilation = 0.5f; } };` | Edits the Blueprint's class defaults: the tags of its default object, `Default__<Name>_C`. A member of the Blueprint or of any class above it can be set, and a zero is written like any value. | Yes |
-| `HealthComponent->MaxHealth = 180.0f;`, a component a native class declares | Edits the default subobject the engine copies that component from. | Yes |
-| `MeleeAttack->CenterOnTarget = true;`, a component the Blueprint adds | Edits its template in the Blueprint's Components panel. | Yes |
-| `Comp->Field = value;`, a parent Blueprint's component that this Blueprint overrides | Edits this Blueprint's override of the component, as setting it in this Blueprint's Components panel does. | Yes |
-| a parent Blueprint's component that this Blueprint does not override | Not yet: the package has no template of it to edit. Refused with "the class does not override that inherited component". Patch the Blueprint that declares the component, which changes every child that does not override it too. | Not yet |
-| `Loose->bVisible = false;`, a member that is no component of the Blueprint | Refused: "Loose is not one of <Class>'s components (UeApi gives it no SCS node)". | Refused |
-| `PrimaryActorTick.bCanEverTick = true;`, `MeleeAttack->Montages[0] = &ANIM_Attack;` | Paths into a value, by the rules of `UE_ASSET_EDITS` above. | Yes |
-| `Score["a"] = 9;`, `Ids.Add(7);`, `Score.Remove("b");` | One element, merged into the default object's value as in `UE_ASSET_EDITS` above. | Yes |
-| `Ids = {7};`, `Score = {{"a", 9}};` on a `TSet` or `TMap` | The default object loads exactly that value: the elements the parent's value has and this one drops are written as removed, as the cook writes a set or map. `Ids = {}` empties it. The same holds for one inside a struct, by path or in a whole struct. A key given twice holds the last value, and an FString key compares without case. | Yes |
-| `class Tweaks : public AActor { UE_PATCH; ... };` | Refused: "a patch derives from the game Blueprint it edits (a class in a /Game package); a native class's defaults come from its C++ constructor, not from a package". | Refused |
-| `int32 Extra = 4;` in a patch | A variable added to the Blueprint, after its own: its methods and the patch's read and write it, and the initializer is a tag of its default object, which every instance and a game subclass start from. A `UE_DEFAULTS` value of it wins over the initializer, as the constructor's would. | Yes |
-| `class Tweaks : public BP_Turret_C, public IPoke { UE_PATCH; ... };` | The Blueprint implements the interface: listed in its Interfaces as the editor lists one, with the patch's methods for it, an empty one for each it leaves out, and the interface's variables as the class's own. Checked offline; not run in the game yet. | Yes |
-| `int32 count;` beside the Blueprint's `Count` | Refused: "already has a variable Count, and an FName ignores case; rename it". | Refused |
-| `UE_REPLICATED(int32, Extra);` in a patch | Refused: "a patch's own member does not replicate". It would renumber the class's replicated properties against a player without the mod. | Refused |
-| `UE_COMPONENT(...)`, `UE_WIDGET(...)` or `UE_DISPATCHER(...)` in a patch | Refused: "a patch adds no component or widget" / "no dispatcher". The construction script and widget tree stay the game's. Spawn one at run time, or declare a class of your own. | Refused |
-| an interface whose function the Blueprint already has, left out of the patch | Refused: "would replace with an empty one; write the method in the patch". `Parent::Fn()` in that method runs the game's. | Refused |
-| a patch with neither `UE_DEFAULTS`, methods nor members | Refused: "nothing to edit". | Refused |
+| <a id="patching-a-game.class-slowgrunt-public-ene"></a>`class SlowGrunt : public ENE_Spider_Grunt_Normal_C { UE_PATCH; UE_DEFAULTS { CustomTimeDilation = 0.5f; } };` | Edits the Blueprint's class defaults: the tags of its default object, `Default__<Name>_C`. A member of the Blueprint or of any class above it can be set, and a zero is written like any value. | Yes |
+| <a id="patching-a-game.healthcomponent-maxhealth-180-0f"></a>`HealthComponent->MaxHealth = 180.0f;`, a component a native class declares | Edits the default subobject the engine copies that component from. | Yes |
+| <a id="patching-a-game.meleeattack-centerontarget-true"></a>`MeleeAttack->CenterOnTarget = true;`, a component the Blueprint adds | Edits its template in the Blueprint's Components panel. | Yes |
+| <a id="patching-a-game.comp-field-value"></a>`Comp->Field = value;`, a parent Blueprint's component that this Blueprint overrides | Edits this Blueprint's override of the component, as setting it in this Blueprint's Components panel does. | Yes |
+| <a id="patching-a-game.a-parent-blueprint-s-component"></a>a parent Blueprint's component that this Blueprint does not override | Not yet: the package has no template of it to edit. Refused with "the class does not override that inherited component". Patch the Blueprint that declares the component, which changes every child that does not override it too. | Not yet |
+| <a id="patching-a-game.loose-bvisible-false"></a>`Loose->bVisible = false;`, a member that is no component of the Blueprint | Refused: "Loose is not one of <Class>'s components (UeApi gives it no SCS node)". | Refused |
+| <a id="patching-a-game.primaryactortick-bcanevertick"></a>`PrimaryActorTick.bCanEverTick = true;`, `MeleeAttack->Montages[0] = &ANIM_Attack;` | Paths into a value, by the rules of `UE_ASSET_EDITS` above. | Yes |
+| <a id="patching-a-game.score-a-9"></a>`Score["a"] = 9;`, `Ids.Add(7);`, `Score.Remove("b");` | One element, merged into the default object's value as in `UE_ASSET_EDITS` above. | Yes |
+| <a id="patching-a-game.ids-7"></a>`Ids = {7};`, `Score = {{"a", 9}};` on a `TSet` or `TMap` | The default object loads exactly that value: the elements the parent's value has and this one drops are written as removed, as the cook writes a set or map. `Ids = {}` empties it. The same holds for one inside a struct, by path or in a whole struct. A key given twice holds the last value, and an FString key compares without case. | Yes |
+| <a id="patching-a-game.class-tweaks-public-aactor-ue"></a>`class Tweaks : public AActor { UE_PATCH; ... };` | Refused: "a patch derives from the game Blueprint it edits (a class in a /Game package); a native class's defaults come from its C++ constructor, not from a package". | Refused |
+| <a id="patching-a-game.int32-extra-4"></a>`int32 Extra = 4;` in a patch | A variable added to the Blueprint, after its own: its methods and the patch's read and write it, and the initializer is a tag of its default object, which every instance and a game subclass start from. A `UE_DEFAULTS` value of it wins over the initializer, as the constructor's would. | Yes |
+| <a id="patching-a-game.class-tweaks-public-bp-turret"></a>`class Tweaks : public BP_Turret_C, public IPoke { UE_PATCH; ... };` | The Blueprint implements the interface: listed in its Interfaces as the editor lists one, with the patch's methods for it, an empty one for each it leaves out, and the interface's variables as the class's own. Checked offline; not run in the game yet. | Yes |
+| <a id="patching-a-game.int32-count"></a>`int32 count;` beside the Blueprint's `Count` | Refused: "already has a variable Count, and an FName ignores case; rename it". | Refused |
+| <a id="patching-a-game.ue-replicated-int32-extra"></a>`UE_REPLICATED(int32, Extra);` in a patch | Refused: "a patch's own member does not replicate". It would renumber the class's replicated properties against a player without the mod. | Refused |
+| <a id="patching-a-game.ue-component"></a>`UE_COMPONENT(...)`, `UE_WIDGET(...)` or `UE_DISPATCHER(...)` in a patch | Refused: "a patch adds no component or widget" / "no dispatcher". The construction script and widget tree stay the game's. Spawn one at run time, or declare a class of your own. | Refused |
+| <a id="patching-a-game.an-interface-whose-function-the"></a>an interface whose function the Blueprint already has, left out of the patch | Refused: "would replace with an empty one; write the method in the patch". `Parent::Fn()` in that method runs the game's. | Refused |
+| <a id="patching-a-game.ue-defaults"></a>a patch with neither `UE_DEFAULTS`, methods nor members | Refused: "nothing to edit". | Refused |
 
 ### Replacing a game Blueprint's functions
 
 | You write | What it does | Status |
 |---|---|---|
-| `void GetEnemySpawnedCount(int32 &SpawnCount) { SpawnCount = 42; }` in a patch | Replaces the Blueprint's own function of that name. The function keeps the game's flags and parameters, so every caller still fits, and takes the method's locals and code. | Yes |
-| `ENE_Spider_Grunt_Normal_C::GetEnemySpawnedCount(SpawnCount);` in the replacement | Runs the game's body, which the package keeps beside it as `<Function>__Vanilla`. An RPC's body runs there as a plain function, where the RPC has already arrived. | Yes |
-| a method the Blueprint does not define | Added to it: a helper that the other methods call, or an override of a function it inherits, such as `void ReceiveTick(float DeltaSeconds)`. An override changes this Blueprint and its children only; patch the parent that defines the function to change them all. | Yes |
-| `void ReceiveTick(float DeltaSeconds)` added to an actor that never ticks | Also sets `PrimaryActorTick.bCanEverTick` on the default object, as the editor does for a class that gains the event. A widget's added `Tick` or `OnPaint` sets its flag the same way. | Yes |
-| a variable at namespace scope that a patch's method uses | Kept as any namespace-scope variable is: its class is cooked into the mod's own package. See [Global variables](#global-variables). | Yes |
-| a method whose parameters differ from the game function's | Refused: "its parameters ... are not the game function's ...; a replacement takes the same ones, in the same order". Copy them from the SDK header: the type, the name and the direction (a Blueprint output is `T &`). | Refused |
-| a method that the SDK header declares and the game's package lacks | Refused: "has no function of that name of its own, though its declaration has one: the declaration is not the game's". Regenerate the SDK from the same game build as the extracted pak. | Refused |
-| `UKismetSystemLibrary::Delay(1.0f);` in a patch's method, or another latent call | Waits, as in a class of your own. The code after the wait runs from an ubergraph the patch adds to the Blueprint, `ExecuteUbergraph_<Patch>`; the Blueprint's own stays the game's. The engine keeps a frame across a wait only for a class's own ubergraph, so what the method keeps across it (its locals, its parameters) are transient variables of the Blueprint, `<Method>_<Name>`. A second call while the first waits shares them, as a Blueprint's event graph does. Checked in DRG: a patched grunt's `ReceiveBeginPlay` waited and resumed with its local intact. | Yes |
+| <a id="replacing-a-game.void-getenemyspawnedcount-int32"></a>`void GetEnemySpawnedCount(int32 &SpawnCount) { SpawnCount = 42; }` in a patch | Replaces the Blueprint's own function of that name. The function keeps the game's flags and parameters, so every caller still fits, and takes the method's locals and code. | Yes |
+| <a id="replacing-a-game.ene-spider-grunt-normal-c"></a>`ENE_Spider_Grunt_Normal_C::GetEnemySpawnedCount(SpawnCount);` in the replacement | Runs the game's body, which the package keeps beside it as `<Function>__Vanilla`. An RPC's body runs there as a plain function, where the RPC has already arrived. | Yes |
+| <a id="replacing-a-game.a-method-the-blueprint-does"></a>a method the Blueprint does not define | Added to it: a helper that the other methods call, or an override of a function it inherits, such as `void ReceiveTick(float DeltaSeconds)`. An override changes this Blueprint and its children only; patch the parent that defines the function to change them all. | Yes |
+| <a id="replacing-a-game.void-receivetick-float"></a>`void ReceiveTick(float DeltaSeconds)` added to an actor that never ticks | Also sets `PrimaryActorTick.bCanEverTick` on the default object, as the editor does for a class that gains the event. A widget's added `Tick` or `OnPaint` sets its flag the same way. | Yes |
+| <a id="replacing-a-game.a-variable-at-namespace-scope"></a>a variable at namespace scope that a patch's method uses | Kept as any namespace-scope variable is: its class is cooked into the mod's own package. See [Global variables](#global-variables). | Yes |
+| <a id="replacing-a-game.a-method-whose-parameters-differ"></a>a method whose parameters differ from the game function's | Refused: "its parameters ... are not the game function's ...; a replacement takes the same ones, in the same order". Copy them from the SDK header: the type, the name and the direction (a Blueprint output is `T &`). | Refused |
+| <a id="replacing-a-game.a-method-that-the-sdk"></a>a method that the SDK header declares and the game's package lacks | Refused: "has no function of that name of its own, though its declaration has one: the declaration is not the game's". Regenerate the SDK from the same game build as the extracted pak. | Refused |
+| <a id="replacing-a-game.ukismetsystemlibrary-delay-1-0f"></a>`UKismetSystemLibrary::Delay(1.0f);` in a patch's method, or another latent call | Waits, as in a class of your own. The code after the wait runs from an ubergraph the patch adds to the Blueprint, `ExecuteUbergraph_<Patch>`; the Blueprint's own stays the game's. The engine keeps a frame across a wait only for a class's own ubergraph, so what the method keeps across it (its locals, its parameters) are transient variables of the Blueprint, `<Method>_<Name>`. A second call while the first waits shares them, as a Blueprint's event graph does. Checked in DRG: a patched grunt's `ReceiveBeginPlay` waited and resumed with its local intact. | Yes |
 
 ```cpp
 #include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"
@@ -4008,8 +4012,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `assetgen compile <source> <UeApi> <out-dir> --game <extracted pak>/FSD/Content` | Reads each package an edit names from that folder and writes the edited copy at the same path under the `Content` folder the out dir sits in, as for a class in a `Game::` namespace (see [Building mods](GUIDE.md#building-mods)). It prints one line per package: `edit -> <package>.uasset (the game's, edited: ...)`. | Yes |
-| `game_content: <extracted pak>/FSD/Content` in `mods.yaml` | bpbuild passes it to every compile as `--game`. An edited package counts as the mod's output, so a newer copy of it in `game_content`, from a new extract after a game update, rebuilds the mod. | Yes |
+| <a id="building-edits.assetgen-compile-source-ueapi"></a>`assetgen compile <source> <UeApi> <out-dir> --game <extracted pak>/FSD/Content` | Reads each package an edit names from that folder and writes the edited copy at the same path under the `Content` folder the out dir sits in, as for a class in a `Game::` namespace (see [Building mods](GUIDE.md#building-mods)). It prints one line per package: `edit -> <package>.uasset (the game's, edited: ...)`. | Yes |
+| <a id="building-edits.game-content-extracted-pak-fsd"></a>`game_content: <extracted pak>/FSD/Content` in `mods.yaml` | bpbuild passes it to every compile as `--game`. An edited package counts as the mod's output, so a newer copy of it in `game_content`, from a new extract after a game update, rebuilds the mod. | Yes |
 
 Notes:
 
@@ -4037,11 +4041,11 @@ declares, binds and broadcasts one.
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_DISPATCHER(OnScored, int32 Points, AActor *By);` | The editor's Event Dispatcher (My Blueprint > Event Dispatchers). The class gets the dispatcher OnScored and its signature function, which holds the parameter list. Game Blueprints can bind to it and call it, as with one made in the editor. | Yes |
-| `UE_DISPATCHER(OnReady);` | A dispatcher with no parameters. Its handlers are `void F()`, and `Broadcast()` takes no arguments. | Yes |
-| `TMulticastInlineDelegate<void(int32 Points)> OnHit;` | Refused: "a dispatcher is declared with UE_DISPATCHER". The macro also declares the signature function, which is where the parameter names survive. Use UE_DISPATCHER. | Refused |
-| `TMulticastSparseDelegate<void(int32 Points)> OnHit;` | Refused with the generic "unimplemented property" message. A mod class cannot own a sparse dispatcher. Use UE_DISPATCHER. | Refused |
-| `UE_DISPATCHER(...)` inside a `UE_INTERFACE` | Refused: "an interface cannot declare a UE_DISPATCHER". A dispatcher cannot move to the implementing classes the way an interface variable does. Declare it on each implementing class. | Refused |
+| <a id="declaring-a-dispatcher.ue-dispatcher-onscored-int32"></a>`UE_DISPATCHER(OnScored, int32 Points, AActor *By);` | The editor's Event Dispatcher (My Blueprint > Event Dispatchers). The class gets the dispatcher OnScored and its signature function, which holds the parameter list. Game Blueprints can bind to it and call it, as with one made in the editor. | Yes |
+| <a id="declaring-a-dispatcher.ue-dispatcher-onready"></a>`UE_DISPATCHER(OnReady);` | A dispatcher with no parameters. Its handlers are `void F()`, and `Broadcast()` takes no arguments. | Yes |
+| <a id="declaring-a-dispatcher.tmulticastinlinedelegate-void"></a>`TMulticastInlineDelegate<void(int32 Points)> OnHit;` | Refused: "a dispatcher is declared with UE_DISPATCHER". The macro also declares the signature function, which is where the parameter names survive. Use UE_DISPATCHER. | Refused |
+| <a id="declaring-a-dispatcher.tmulticastsparsedelegate-void"></a>`TMulticastSparseDelegate<void(int32 Points)> OnHit;` | Refused with the generic "unimplemented property" message. A mod class cannot own a sparse dispatcher. Use UE_DISPATCHER. | Refused |
+| <a id="declaring-a-dispatcher.ue-dispatcher"></a>`UE_DISPATCHER(...)` inside a `UE_INTERFACE` | Refused: "an interface cannot declare a UE_DISPATCHER". A dispatcher cannot move to the implementing classes the way an interface variable does. Declare it on each implementing class. | Refused |
 
 ```cpp
 class Scorer : public AActor {
@@ -4063,17 +4067,17 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `OnScored.Add(this, &Scorer::HandleScored);` | Bind Event to OnScored with a Create Event wired in. From then on, every broadcast of OnScored calls HandleScored on this object. | Yes |
-| `OnDestroyed.Add(this, &Scorer::HandleDestroyed);` | Binds to a game or engine dispatcher of this object or of its component, inline or sparse: OnDestroyed, `Box->OnComponentBeginOverlap`. The handler runs whenever the game broadcasts it. | Yes |
-| `C->OnFirePressed.Add(this, &Scorer::OnFire);` | Bind Event with another object as Target, also through a component: `C->InventoryComponent->OnItemEquipped`. The bound function is still this object's own. | Yes |
-| `OnHit.Add(this, &PBase::BaseHandle);` | In a child of a mod class: Add, Remove and Clear work on a dispatcher the mod parent declares, and a handler the parent defines can be bound. | Yes |
-| `OnHit.Add(H, &Helper::Take);` on a dispatcher a mod or game Blueprint parent declares | Binds Take on H, as on a dispatcher of this class. The delegate is typed with the parent's own `OnHit__DelegateSignature`, imported from its package, as the editor's Create Event does on an inherited dispatcher. The class makes no function of that name, which would hide the parent's. | Yes |
-| The same `Add` twice | The handler is bound once. The engine skips a second binding with the same object and function. | Yes |
-| `OnScored.Remove(this, &Scorer::HandleScored);` | Unbind Event from OnScored. Removes the binding that has this object and this function name. It works on every dispatcher Add works on. | Yes |
-| `OnScored.Clear();` | Unbind all Events from OnScored. Empties the whole list. | Yes |
-| `Proxy->OnCompleted.Add(this, &Scorer::Done);` | An async node with its output pins wired to custom events. Each Add binds one outcome, and one method can serve several. | Yes |
-| `E->EventTriggeredDelegate.Add(this, &Scorer::Ping);` on a native dispatcher that is not BlueprintAssignable | Refused: "EventTriggeredDelegate is a native dispatcher that is not BlueprintAssignable (AGameEvent::EventTriggeredDelegate)". The editor's Bind, Unbind and Unbind All nodes refuse one ("Event Dispatcher is not 'BlueprintAssignable'"); only the engine's own code binds it. 17 of the game's are; Remove and Clear are refused the same. A UeApi from before genueapi marked them says nothing, and then Add is taken. | Refused |
-| `OnHit.IsBound()`, `OnHit.AddUnique(...)`, `OnHit.Contains(...)` | Refused by clang: "no member named 'IsBound'". A dispatcher has Add, Remove, Clear and Broadcast, and nothing else. Add already skips a duplicate. To know whether your own dispatcher has listeners, count them where you call Add and Remove. | Refused |
+| <a id="binding-handlers.onscored-add-this-scorer"></a>`OnScored.Add(this, &Scorer::HandleScored);` | Bind Event to OnScored with a Create Event wired in. From then on, every broadcast of OnScored calls HandleScored on this object. | Yes |
+| <a id="binding-handlers.ondestroyed-add-this-scorer"></a>`OnDestroyed.Add(this, &Scorer::HandleDestroyed);` | Binds to a game or engine dispatcher of this object or of its component, inline or sparse: OnDestroyed, `Box->OnComponentBeginOverlap`. The handler runs whenever the game broadcasts it. | Yes |
+| <a id="binding-handlers.c-onfirepressed-add-this-scorer"></a>`C->OnFirePressed.Add(this, &Scorer::OnFire);` | Bind Event with another object as Target, also through a component: `C->InventoryComponent->OnItemEquipped`. The bound function is still this object's own. | Yes |
+| <a id="binding-handlers.onhit-add-this-pbase-basehandle"></a>`OnHit.Add(this, &PBase::BaseHandle);` | In a child of a mod class: Add, Remove and Clear work on a dispatcher the mod parent declares, and a handler the parent defines can be bound. | Yes |
+| <a id="binding-handlers.onhit-add-h-helper-take"></a>`OnHit.Add(H, &Helper::Take);` on a dispatcher a mod or game Blueprint parent declares | Binds Take on H, as on a dispatcher of this class. The delegate is typed with the parent's own `OnHit__DelegateSignature`, imported from its package, as the editor's Create Event does on an inherited dispatcher. The class makes no function of that name, which would hide the parent's. | Yes |
+| <a id="binding-handlers.add"></a>The same `Add` twice | The handler is bound once. The engine skips a second binding with the same object and function. | Yes |
+| <a id="binding-handlers.onscored-remove-this-scorer"></a>`OnScored.Remove(this, &Scorer::HandleScored);` | Unbind Event from OnScored. Removes the binding that has this object and this function name. It works on every dispatcher Add works on. | Yes |
+| <a id="binding-handlers.onscored-clear"></a>`OnScored.Clear();` | Unbind all Events from OnScored. Empties the whole list. | Yes |
+| <a id="binding-handlers.proxy-oncompleted-add-this"></a>`Proxy->OnCompleted.Add(this, &Scorer::Done);` | An async node with its output pins wired to custom events. Each Add binds one outcome, and one method can serve several. | Yes |
+| <a id="binding-handlers.e-eventtriggereddelegate-add"></a>`E->EventTriggeredDelegate.Add(this, &Scorer::Ping);` on a native dispatcher that is not BlueprintAssignable | Refused: "EventTriggeredDelegate is a native dispatcher that is not BlueprintAssignable (AGameEvent::EventTriggeredDelegate)". The editor's Bind, Unbind and Unbind All nodes refuse one ("Event Dispatcher is not 'BlueprintAssignable'"); only the engine's own code binds it. 17 of the game's are; Remove and Clear are refused the same. A UeApi from before genueapi marked them says nothing, and then Add is taken. | Refused |
+| <a id="binding-handlers.onhit-isbound"></a>`OnHit.IsBound()`, `OnHit.AddUnique(...)`, `OnHit.Contains(...)` | Refused by clang: "no member named 'IsBound'". A dispatcher has Add, Remove, Clear and Broadcast, and nothing else. Add already skips a duplicate. To know whether your own dispatcher has listeners, count them where you call Add and Remove. | Refused |
 
 ```cpp
 class Watcher : public AActor {
@@ -4151,17 +4155,17 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `void HandleScored(int32 Points, AActor *By)` | A handler bound on `this` is a non-inline member function of the class or of a mod ancestor. It returns void and takes exactly the dispatcher's parameter types. clang checks this at the Add call. An inherited native or game Blueprint function bound on `this` follows the rules of one bound on another object below. | Yes |
-| `const FHitResult &Hit` where the header says `FHitResult Hit` | Binds: a parameter may be the header's type by value or by `const&`. A native signature's UeApi spelling does not say which the engine's is (the dump keeps no reference flag), and the engine hands the handler the value either way. `TSubclassOf<UObject>` and `UClass*` match the same way, and so do `TEnum<E>` and `E`. | Yes |
-| A `const` handler, or a parameter of another type | clang error: "no matching member function for call to 'Add'". Copy the parameter list as the header spells it. | Refused |
-| `OnHit.Add(Held);`, `OnHit.Remove(Held);` with `TDelegate<void(int32 Points)> Held` | Adds or removes the delegate value as it is: the editor's Add / Remove node fed a delegate pin. Its parameters match the dispatcher's as a handler's do. | Yes |
-| `inline void Handle(int32 Points)` as a handler | Refused: "a delegate cannot bind Handle: an inline function is expanded where it is called". An inline method never becomes a function of the class. Drop `inline`. | Refused |
-| `OnHit.Add(H, &Helper::HandleHit);` | Binds HandleHit on the object H points to: the editor's Create Event with its Object pin wired. The binding is made where the Add runs, with H as it is then. HandleHit must be a function of H's class or of an ancestor of it: a mod class's method, a game Blueprint's function, or a native BlueprintCallable one (`OnRate.Add(Pawn, &AActor::SetActorTickInterval)`). Remove takes the same pair off. | Yes |
-| `OnHit.Add(H, &Other::HandleHit);` where H's class has no HandleHit | Refused: "a delegate on a Helper cannot bind Other::HandleHit: the engine looks it up by name on that object, whose class has no such function". The broadcast would skip it. | Refused |
-| `OnTick.Add(A, &AActor::ReceiveTick);` | Refused: "a delegate cannot bind AActor::ReceiveTick on another object: the editor binds a BlueprintCallable function that is not pure or latent, and ReceiveTick is not BlueprintCallable". An event the engine calls is not one Blueprint code can bind, on another object or on `this` ("on this object"), nor a pure or latent function. A mod method that overrides such an event is refused the same. | Refused |
-| `OnUse.Add(Item, &AItem::Server_StartUsing);`, `OnPing.Add(this, &AActor::OnRep_Instigator);` | Refused the same way: "... and Server_StartUsing is not BlueprintCallable". A native function the engine does not mark BlueprintCallable, such as an RPC or a RepNotify, is not one the editor binds. UeApi's `NotCallable.json` names them. | Refused |
-| `OnPing.Add(PC, &APlayerController::ClientClearCameraLensEffects);` | Binds it: an RPC the engine marks BlueprintCallable (49 are, `Server_ResetHUD` among them) is one the editor binds, on another object or on `this`. Being an RPC says nothing either way. | Yes |
-| `OnHit.Add(H, &Helper::Half);` where Helper declares Half and never defines it | Refused: "a delegate cannot bind Helper::Half, which Helper declares and never defines". No function of that name exists. | Refused |
+| <a id="handler-functions.void-handlescored-int32-points"></a>`void HandleScored(int32 Points, AActor *By)` | A handler bound on `this` is a non-inline member function of the class or of a mod ancestor. It returns void and takes exactly the dispatcher's parameter types. clang checks this at the Add call. An inherited native or game Blueprint function bound on `this` follows the rules of one bound on another object below. | Yes |
+| <a id="handler-functions.const-fhitresult-hit"></a>`const FHitResult &Hit` where the header says `FHitResult Hit` | Binds: a parameter may be the header's type by value or by `const&`. A native signature's UeApi spelling does not say which the engine's is (the dump keeps no reference flag), and the engine hands the handler the value either way. `TSubclassOf<UObject>` and `UClass*` match the same way, and so do `TEnum<E>` and `E`. | Yes |
+| <a id="handler-functions.const"></a>A `const` handler, or a parameter of another type | clang error: "no matching member function for call to 'Add'". Copy the parameter list as the header spells it. | Refused |
+| <a id="handler-functions.onhit-add-held"></a>`OnHit.Add(Held);`, `OnHit.Remove(Held);` with `TDelegate<void(int32 Points)> Held` | Adds or removes the delegate value as it is: the editor's Add / Remove node fed a delegate pin. Its parameters match the dispatcher's as a handler's do. | Yes |
+| <a id="handler-functions.inline-void-handle-int32-points"></a>`inline void Handle(int32 Points)` as a handler | Refused: "a delegate cannot bind Handle: an inline function is expanded where it is called". An inline method never becomes a function of the class. Drop `inline`. | Refused |
+| <a id="handler-functions.onhit-add-h-helper-handlehit"></a>`OnHit.Add(H, &Helper::HandleHit);` | Binds HandleHit on the object H points to: the editor's Create Event with its Object pin wired. The binding is made where the Add runs, with H as it is then. HandleHit must be a function of H's class or of an ancestor of it: a mod class's method, a game Blueprint's function, or a native BlueprintCallable one (`OnRate.Add(Pawn, &AActor::SetActorTickInterval)`). Remove takes the same pair off. | Yes |
+| <a id="handler-functions.onhit-add-h-other-handlehit"></a>`OnHit.Add(H, &Other::HandleHit);` where H's class has no HandleHit | Refused: "a delegate on a Helper cannot bind Other::HandleHit: the engine looks it up by name on that object, whose class has no such function". The broadcast would skip it. | Refused |
+| <a id="handler-functions.ontick-add-a-aactor-receivetick"></a>`OnTick.Add(A, &AActor::ReceiveTick);` | Refused: "a delegate cannot bind AActor::ReceiveTick on another object: the editor binds a BlueprintCallable function that is not pure or latent, and ReceiveTick is not BlueprintCallable". An event the engine calls is not one Blueprint code can bind, on another object or on `this` ("on this object"), nor a pure or latent function. A mod method that overrides such an event is refused the same. | Refused |
+| <a id="handler-functions.onuse-add-item-aitem-server"></a>`OnUse.Add(Item, &AItem::Server_StartUsing);`, `OnPing.Add(this, &AActor::OnRep_Instigator);` | Refused the same way: "... and Server_StartUsing is not BlueprintCallable". A native function the engine does not mark BlueprintCallable, such as an RPC or a RepNotify, is not one the editor binds. UeApi's `NotCallable.json` names them. | Refused |
+| <a id="handler-functions.onping-add-pc-aplayercontroller"></a>`OnPing.Add(PC, &APlayerController::ClientClearCameraLensEffects);` | Binds it: an RPC the engine marks BlueprintCallable (49 are, `Server_ResetHUD` among them) is one the editor binds, on another object or on `this`. Being an RPC says nothing either way. | Yes |
+| <a id="handler-functions.onhit-add-h-helper-half"></a>`OnHit.Add(H, &Helper::Half);` where Helper declares Half and never defines it | Refused: "a delegate cannot bind Helper::Half, which Helper declares and never defines". No function of that name exists. | Refused |
 
 ```cpp
 class Pad : public AActor {
@@ -4215,13 +4219,13 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `OnScored.Broadcast(N, this);` | Call OnScored. Every bound handler runs right away, one after another, before Broadcast returns. | Yes |
-| `GetPeer()->OnPeerHit.Broadcast(X);` | Fires the dispatcher of another object of the same class. The object is evaluated before the arguments, so an argument that changes what GetPeer() returns does not redirect the broadcast. | Yes |
-| `UE_DISPATCHER(OnList, TArray<int32> &Items);` | A non-const reference parameter. The declaration compiles, but a Broadcast is refused: "Items is a non-const reference, which a Broadcast never writes back to the caller". The engine copies each argument into a parameter block of its own. Take it by value or by `const &`. | Refused |
-| `OnHit.Broadcast(1);` on a dispatcher a mod parent declares | Broadcasts through the parent's signature function, as the editor's node on a child does. | Yes |
-| `T->OnHit.Broadcast(P);`, `Burrow->OnBurrowComplete.Broadcast(true);` | The Call node with another object as Target: a dispatcher another mod class declares, or a game Blueprint's (every Blueprint dispatcher is BlueprintCallable). It broadcasts through that class's signature function, imported from its package. | Yes |
-| `State->OnTerrainGenerated.Broadcast();` | A native dispatcher the engine marks BlueprintCallable (41 of the game's). UeApi does not say which signature function the engine gives it, so the broadcast names one of the class's own with the same parameters and warns that it does; the handlers get the same arguments. | Warns |
-| `OnDestroyed.Broadcast(this);` | Refused: "OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable". The editor's Call node refuses a native dispatcher without BlueprintCallable ("Event Dispatcher is not 'BlueprintCallable'"), and none of the engine's has it; only the engine's own code broadcasts it. With a UeApi from before genueapi marked them, every native dispatcher is refused this way, the message saying the UeApi does not tell. | Refused |
+| <a id="broadcast.onscored-broadcast-n-this"></a>`OnScored.Broadcast(N, this);` | Call OnScored. Every bound handler runs right away, one after another, before Broadcast returns. | Yes |
+| <a id="broadcast.getpeer-onpeerhit-broadcast-x"></a>`GetPeer()->OnPeerHit.Broadcast(X);` | Fires the dispatcher of another object of the same class. The object is evaluated before the arguments, so an argument that changes what GetPeer() returns does not redirect the broadcast. | Yes |
+| <a id="broadcast.ue-dispatcher-onlist-tarray"></a>`UE_DISPATCHER(OnList, TArray<int32> &Items);` | A non-const reference parameter. The declaration compiles, but a Broadcast is refused: "Items is a non-const reference, which a Broadcast never writes back to the caller". The engine copies each argument into a parameter block of its own. Take it by value or by `const &`. | Refused |
+| <a id="broadcast.onhit-broadcast-1"></a>`OnHit.Broadcast(1);` on a dispatcher a mod parent declares | Broadcasts through the parent's signature function, as the editor's node on a child does. | Yes |
+| <a id="broadcast.t-onhit-broadcast-p"></a>`T->OnHit.Broadcast(P);`, `Burrow->OnBurrowComplete.Broadcast(true);` | The Call node with another object as Target: a dispatcher another mod class declares, or a game Blueprint's (every Blueprint dispatcher is BlueprintCallable). It broadcasts through that class's signature function, imported from its package. | Yes |
+| <a id="broadcast.state-onterraingenerated"></a>`State->OnTerrainGenerated.Broadcast();` | A native dispatcher the engine marks BlueprintCallable (41 of the game's). UeApi does not say which signature function the engine gives it, so the broadcast names one of the class's own with the same parameters and warns that it does; the handlers get the same arguments. | Warns |
+| <a id="broadcast.ondestroyed-broadcast-this"></a>`OnDestroyed.Broadcast(this);` | Refused: "OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable". The editor's Call node refuses a native dispatcher without BlueprintCallable ("Event Dispatcher is not 'BlueprintCallable'"), and none of the engine's has it; only the engine's own code broadcasts it. With a UeApi from before genueapi marked them, every native dispatcher is refused this way, the message saying the UeApi does not tell. | Refused |
 
 ```cpp
 class PBase : public AActor {
@@ -4252,13 +4256,13 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `{this, &Scorer::HandleTimer}` | Create Event wired into a delegate pin, written as the argument of a call that takes a TDelegate (timers, engine callbacks). The rules are those of a handler: a non-inline method, and the signature of the `TDelegate<...>` in the header. | Yes |
-| `{Peer, &Scorer::HandleTimer}` | The same with the Object pin wired: HandleTimer bound on Peer, which the timer then calls. The rules are those of a handler on another object. | Yes |
-| `TDelegate<void()>(this, &Scorer::HandleTimer)` | The same value, spelled out. | Yes |
-| `K2_ClearTimerDelegate({})` | Refused: "a delegate value is {this, &Class::Function}". There is no empty or unbound delegate. | Refused |
-| `.D = {}` in an asset's braces, `{}` as a map's value in a default (`TMap<FString, TDelegate<void()>> M = {{"A", {}}};`) | An unbound delegate, the one value a default holds (`D = {this, &C::F}` in UE_DEFAULTS is refused: a default is known when the mod is built). Written as the engine writes one, a null object and the name None; an asset's tags name no signature function. | Yes |
-| `TDelegate<void()> Callback;` as a class variable, a function parameter or a local | A delegate variable (DelegateProperty). `Callback = {this, &Class::Method};` stores a value, and `Callback` passes it on, to a timer or another function. Its signature function is one the class makes per delegate type, as the editor makes one per dispatcher. One C++ type is one however it is spelled (`TDelegate<void(int32)>` and `TDelegate<void(int)>`, an enum named short or with its namespace), and two types are two, a reference and a const reference among them (`void(FVector&)`, `void(const FVector&)`). It is named `<Name>__DelegateSignature` after what needs it first: a variable or parameter of the class, the function a value binds, or the class's parameter or variable through which a class compiled with it, and generated before it - a subclass or not -, overrides a function, hands it a value or stores one into it (`Delegate__DelegateSignature` when that is a local the compiler made up). The name is numbered past a name the class, a mod or game Blueprint parent, or a mod child compiled with it already uses (not past a native parent's own delegate signatures, such as UWidget's `GetText__DelegateSignature`, which UeApi does not list). A struct makes none, so a delegate member of one is refused; a mod interface's TDelegate variable is its implementer's property. | Yes |
-| `void Use(TDelegate<void()> D) override` of a mod parent's `Use`; `Take({Peer, &Scorer::Ping})` with Take a mod parent's or a sibling class's of this mod; `ParentVar = {Peer, &Scorer::Ping}`, `Other->Var = {Peer, &Scorer::Ping}`, `ParentArr[0] = {Peer, &Scorer::Ping}`, `Other->Map[K] = {Peer, &Scorer::Ping}` | The override's parameter names the signature function of the class that declares `Use` first, imported from its package, as the editor's override copies its parent's parameters, even where the override spells the type another way (`int` for `int32`, an enum with or without its namespace); a static hiding a parent's static does the same. A value bound on another object is typed with the signature of the parameter or variable it goes to, as a Create Event wired to that pin is, on this object or another, and one stored into an element of such a variable's TArray or a value of its TMap with the element's; a comma value `(Bump(), D)` handed to such a parameter is held in a local of its type. `ParentArr.Add({Peer, &Scorer::Ping})` and the other container functions still type the value with a signature of this class's own, which runs the same. A call whose body is copied in (`Parent::Take(...)`, a static of a class this source cooks) has no parameter to wire, and the value keeps a signature of this class's own. Only classes the same compile cooks: one another mod cooks (UE_CLASS / UE_CLASS_IN) keeps a signature of this class's own, which runs the same, since its name there is not known here. | Yes |
+| <a id="delegate-values.this-scorer-handletimer"></a>`{this, &Scorer::HandleTimer}` | Create Event wired into a delegate pin, written as the argument of a call that takes a TDelegate (timers, engine callbacks). The rules are those of a handler: a non-inline method, and the signature of the `TDelegate<...>` in the header. | Yes |
+| <a id="delegate-values.peer-scorer-handletimer"></a>`{Peer, &Scorer::HandleTimer}` | The same with the Object pin wired: HandleTimer bound on Peer, which the timer then calls. The rules are those of a handler on another object. | Yes |
+| <a id="delegate-values.tdelegate-void-this-scorer"></a>`TDelegate<void()>(this, &Scorer::HandleTimer)` | The same value, spelled out. | Yes |
+| <a id="delegate-values.k2-cleartimerdelegate"></a>`K2_ClearTimerDelegate({})` | Refused: "a delegate value is {this, &Class::Function}". There is no empty or unbound delegate. | Refused |
+| <a id="delegate-values.d"></a>`.D = {}` in an asset's braces, `{}` as a map's value in a default (`TMap<FString, TDelegate<void()>> M = {{"A", {}}};`) | An unbound delegate, the one value a default holds (`D = {this, &C::F}` in UE_DEFAULTS is refused: a default is known when the mod is built). Written as the engine writes one, a null object and the name None; an asset's tags name no signature function. | Yes |
+| <a id="delegate-values.tdelegate-void-callback"></a>`TDelegate<void()> Callback;` as a class variable, a function parameter or a local | A delegate variable (DelegateProperty). `Callback = {this, &Class::Method};` stores a value, and `Callback` passes it on, to a timer or another function. Its signature function is one the class makes per delegate type, as the editor makes one per dispatcher. One C++ type is one however it is spelled (`TDelegate<void(int32)>` and `TDelegate<void(int)>`, an enum named short or with its namespace), and two types are two, a reference and a const reference among them (`void(FVector&)`, `void(const FVector&)`). It is named `<Name>__DelegateSignature` after what needs it first: a variable or parameter of the class, the function a value binds, or the class's parameter or variable through which a class compiled with it, and generated before it - a subclass or not -, overrides a function, hands it a value or stores one into it (`Delegate__DelegateSignature` when that is a local the compiler made up). The name is numbered past a name the class, a mod or game Blueprint parent, or a mod child compiled with it already uses (not past a native parent's own delegate signatures, such as UWidget's `GetText__DelegateSignature`, which UeApi does not list). A struct makes none, so a delegate member of one is refused; a mod interface's TDelegate variable is its implementer's property. | Yes |
+| <a id="delegate-values.void-use-tdelegate-void-d"></a>`void Use(TDelegate<void()> D) override` of a mod parent's `Use`; `Take({Peer, &Scorer::Ping})` with Take a mod parent's or a sibling class's of this mod; `ParentVar = {Peer, &Scorer::Ping}`, `Other->Var = {Peer, &Scorer::Ping}`, `ParentArr[0] = {Peer, &Scorer::Ping}`, `Other->Map[K] = {Peer, &Scorer::Ping}` | The override's parameter names the signature function of the class that declares `Use` first, imported from its package, as the editor's override copies its parent's parameters, even where the override spells the type another way (`int` for `int32`, an enum with or without its namespace); a static hiding a parent's static does the same. A value bound on another object is typed with the signature of the parameter or variable it goes to, as a Create Event wired to that pin is, on this object or another, and one stored into an element of such a variable's TArray or a value of its TMap with the element's; a comma value `(Bump(), D)` handed to such a parameter is held in a local of its type. `ParentArr.Add({Peer, &Scorer::Ping})` and the other container functions still type the value with a signature of this class's own, which runs the same. A call whose body is copied in (`Parent::Take(...)`, a static of a class this source cooks) has no parameter to wire, and the value keeps a signature of this class's own. Only classes the same compile cooks: one another mod cooks (UE_CLASS / UE_CLASS_IN) keeps a signature of this class's own, which runs the same, since its name there is not known here. | Yes |
 
 The timers in [Timers and input](#timers-and-input) show delegate values in use.
 
@@ -4275,16 +4279,16 @@ restarts it. [examples/Beacon.cpp](examples/Beacon.cpp) runs a looping timer, an
 
 | You write | What it does | Status |
 |---|---|---|
-| `K2_SetTimerDelegate({this, &Pulser::OnPulse}, 0.5f, true, 0.0f, 0.0f)` | Set Timer by Event. The third argument is Looping: `true` calls OnPulse every 0.5 s until the timer is cleared, `false` calls it once. The last two are the initial start delay and its variance. It returns the timer's handle. | Yes |
-| `FTimerHandle Pulse;` | The return value promoted to a variable. An FTimerHandle member is an ordinary struct variable. | Yes |
-| `K2_ClearAndInvalidateTimerHandle(Pulse)` | Clear and Invalidate Timer by Handle. Stops the timer and resets Pulse to an invalid handle, because it takes the handle by reference. | Yes |
-| `K2_ClearTimerHandle(Pulse)` | Clear Timer by Handle. Stops the timer, but takes the handle by value, so Pulse keeps its old value. | Yes |
-| `K2_ClearTimerDelegate({this, &Pulser::OnPulse})` | Clear Timer by Event. Stops the timer without a handle. | Yes |
-| `K2_PauseTimerHandle(Pulse)`, `K2_UnPauseTimerHandle(Pulse)` | Pause and resume the timer. AssetGen fills the world context in as self. | Yes |
-| `K2_IsTimerActiveHandle(Pulse)`, `K2_GetTimerRemainingTimeHandle(Pulse)`, `K2_IsValidTimerHandle(Pulse)` | Ask about the timer. The first two get self as world context; K2_IsValidTimerHandle takes only the handle. | Yes |
-| `K2_SetTimer(this, "Poll", 1.0f, true, 0.0f, 0.0f)` | Set Timer by Function Name. AssetGen passes the name as a plain string. The engine looks the method up by that name at run time. With `this` and a literal name, AssetGen checks the method the way the engine will (see below). | Yes |
-| `K2_ClearTimer(this, "Poll")` | Clear Timer by Function Name. K2_PauseTimer, K2_UnPauseTimer, K2_IsTimerActive, K2_GetTimerRemainingTime and the other by-name calls find the timer by the same name. | Yes |
-| `UFSDWidgetBlueprintLibrary::SetTimerForNextTick({this, &Pulser::Later})` | DRG's own next-frame timer. It takes a delegate value, returns a handle, and gets self as world context. | Yes |
+| <a id="timers.k2-settimerdelegate-this-pulser"></a>`K2_SetTimerDelegate({this, &Pulser::OnPulse}, 0.5f, true, 0.0f, 0.0f)` | Set Timer by Event. The third argument is Looping: `true` calls OnPulse every 0.5 s until the timer is cleared, `false` calls it once. The last two are the initial start delay and its variance. It returns the timer's handle. | Yes |
+| <a id="timers.ftimerhandle-pulse"></a>`FTimerHandle Pulse;` | The return value promoted to a variable. An FTimerHandle member is an ordinary struct variable. | Yes |
+| <a id="timers.k2-clearandinvalidatetimerhandle"></a>`K2_ClearAndInvalidateTimerHandle(Pulse)` | Clear and Invalidate Timer by Handle. Stops the timer and resets Pulse to an invalid handle, because it takes the handle by reference. | Yes |
+| <a id="timers.k2-cleartimerhandle-pulse"></a>`K2_ClearTimerHandle(Pulse)` | Clear Timer by Handle. Stops the timer, but takes the handle by value, so Pulse keeps its old value. | Yes |
+| <a id="timers.k2-cleartimerdelegate-this"></a>`K2_ClearTimerDelegate({this, &Pulser::OnPulse})` | Clear Timer by Event. Stops the timer without a handle. | Yes |
+| <a id="timers.k2-pausetimerhandle-pulse"></a>`K2_PauseTimerHandle(Pulse)`, `K2_UnPauseTimerHandle(Pulse)` | Pause and resume the timer. AssetGen fills the world context in as self. | Yes |
+| <a id="timers.k2-istimeractivehandle-pulse"></a>`K2_IsTimerActiveHandle(Pulse)`, `K2_GetTimerRemainingTimeHandle(Pulse)`, `K2_IsValidTimerHandle(Pulse)` | Ask about the timer. The first two get self as world context; K2_IsValidTimerHandle takes only the handle. | Yes |
+| <a id="timers.k2-settimer-this-poll-1"></a>`K2_SetTimer(this, "Poll", 1.0f, true, 0.0f, 0.0f)` | Set Timer by Function Name. AssetGen passes the name as a plain string. The engine looks the method up by that name at run time. With `this` and a literal name, AssetGen checks the method the way the engine will (see below). | Yes |
+| <a id="timers.k2-cleartimer-this-poll"></a>`K2_ClearTimer(this, "Poll")` | Clear Timer by Function Name. K2_PauseTimer, K2_UnPauseTimer, K2_IsTimerActive, K2_GetTimerRemainingTime and the other by-name calls find the timer by the same name. | Yes |
+| <a id="timers.ufsdwidgetblueprintlibrary"></a>`UFSDWidgetBlueprintLibrary::SetTimerForNextTick({this, &Pulser::Later})` | DRG's own next-frame timer. It takes a delegate value, returns a handle, and gets self as world context. | Yes |
 
 All calls above are statics of UKismetSystemLibrary except SetTimerForNextTick.
 
@@ -4337,9 +4341,9 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `void ReceiveTick(float DeltaSeconds)` | Work that must run every frame. Overriding ReceiveTick turns ticking on for the actor. | Yes |
-| `UKismetSystemLibrary::Delay(0.5f);` in a loop | Waits for something, then carries on in the same method with its locals intact. Waiting in ReceiveBeginPlay for the local player is the typical case. See [Latent calls](#latent-calls). | Yes |
-| `K2_SetTimerDelegate(...)` | Calls a separate method at a fixed rate, or once after a delay, when the call must be paused, queried or stopped from elsewhere through its handle. | Yes |
+| <a id="timer-tick-or.void-receivetick-float"></a>`void ReceiveTick(float DeltaSeconds)` | Work that must run every frame. Overriding ReceiveTick turns ticking on for the actor. | Yes |
+| <a id="timer-tick-or.ukismetsystemlibrary-delay-0-5f"></a>`UKismetSystemLibrary::Delay(0.5f);` in a loop | Waits for something, then carries on in the same method with its locals intact. Waiting in ReceiveBeginPlay for the local player is the typical case. See [Latent calls](#latent-calls). | Yes |
+| <a id="timer-tick-or.k2-settimerdelegate"></a>`K2_SetTimerDelegate(...)` | Calls a separate method at a fixed rate, or once after a delay, when the call must be paused, queried or stopped from elsewhere through its handle. | Yes |
 
 ```cpp
 class Follower : public AActor {
@@ -4378,22 +4382,22 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_INPUT_KEY("F5") void Toggle();` | An InputKey event: the engine calls Toggle each time F5 goes down while the actor receives input. The method returns void and takes nothing, or `FKey Key`, the key that fired it. | Yes |
-| `UE_INPUT_KEY("F5", Released)`, `UE_INPUT_KEY("F5", Pressed, Released)` | The key coming up; both edges, a call for each. Pressed alone is the default. These are the node's Pressed and Released pins. | Yes |
-| `UE_INPUT_KEY("S", Ctrl, Shift)` | A chord: the node's Shift, Ctrl, Alt and Cmd tick boxes. The modifiers named must be held. | Yes |
-| `UE_INPUT_KEY("Space") void Jump();` | Refused: "names no key the engine has, so it would never fire: the closest is SpaceBar". The engine binds a key by its name and says nothing of a name it has no key of. | Refused |
-| `UE_INPUT_ACTION("Use") void Used(FKey Key);` | An InputAction event: the game's Use action, whichever key the player has mapped to it. It takes the same edges and options as a key, but no modifiers. | Yes |
-| `NoConsume`, `WhenPaused`, `KeepParent` | Options, written after the key or action like an edge: the node's Consume Input unticked, Execute when Paused ticked, Override Parent Binding unticked. | Yes |
-| `UE_DEFAULTS { AutoReceiveInput = EAutoReceiveInput::Player0; }` | Auto Receive Input in the class defaults: the actor enables input for the first player as it is spawned. Without it, or a call to `EnableInput(PC)`, an actor's input events never fire. | Yes |
-| `PC->WasInputKeyJustPressed(ToggleKey)` in ReceiveTick | Polls the local player controller. True during the one input frame in which the key went down, so check it every tick. | Yes |
-| `PC->IsInputKeyDown(K)`, `PC->WasInputKeyJustReleased(K)`, `PC->GetInputKeyTimeDown(K)` | True while the key is held; true during the frame in which it comes up; how long it has been held. | Yes |
-| `FKey{"F5"}`, `FKey{FName("F5")}` | A key value, named by the engine's key names. It works as an argument, a local, a class variable and a `static inline const` member. | Yes |
-| `FKey{"Space"}` | Compiles, with a warning naming the closest key, SpaceBar: no input matches it. It is not refused, as code may compare it with a key the engine makes up as it runs. | Warns |
-| `FKey("F5")`, `FKey(FName("F5"))`, `FKey K{FName("F5")};`, `FKey K = {"F5"};` | The same key as `FKey{"F5"}`, and the same warning for a name the engine has no key of. So is any one-member struct's constructor in parentheses, `FFrameNumber(5)`. | Yes |
-| `FKey(Name)`, `FKey(FName(S))`, `FKey(S)` with a run-time FName or FString | The key of that name, made when the line runs: a string is made a name first (Conv_StringToName), as FKey's own constructor takes one. No warning can be given for a name not known when the mod is built. | Yes |
-| `PC->WasInputKeyJustPressed("F5")` | clang error: "no viable conversion from 'const char[3]' to 'FKey'". | Refused |
-| `C->OnFirePressed.Add(this, &Toggler::OnFire)` | For the player's own actions, bind the game's dispatchers on APlayerCharacter: OnFirePressed, OnFireReleased, OnJumpPressed, OnSecondaryFirePressed, OnLaserPointerPressed, OnTerrainScannerPressed and others. They fire for whatever key the player has mapped to that action. | Yes |
-| `InputComponent->BindKey(...)`, `BindAction(...)` | clang error: "no member named 'BindKey' in 'UInputComponent'". They are native C++ only and absent from the SDK; mark a method instead. | Refused |
+| <a id="reacting-to-input.ue-input-key-f5-void"></a>`UE_INPUT_KEY("F5") void Toggle();` | An InputKey event: the engine calls Toggle each time F5 goes down while the actor receives input. The method returns void and takes nothing, or `FKey Key`, the key that fired it. | Yes |
+| <a id="reacting-to-input.ue-input-key-f5-released"></a>`UE_INPUT_KEY("F5", Released)`, `UE_INPUT_KEY("F5", Pressed, Released)` | The key coming up; both edges, a call for each. Pressed alone is the default. These are the node's Pressed and Released pins. | Yes |
+| <a id="reacting-to-input.ue-input-key-s-ctrl"></a>`UE_INPUT_KEY("S", Ctrl, Shift)` | A chord: the node's Shift, Ctrl, Alt and Cmd tick boxes. The modifiers named must be held. | Yes |
+| <a id="reacting-to-input.ue-input-key-space-void"></a>`UE_INPUT_KEY("Space") void Jump();` | Refused: "names no key the engine has, so it would never fire: the closest is SpaceBar". The engine binds a key by its name and says nothing of a name it has no key of. | Refused |
+| <a id="reacting-to-input.ue-input-action-use-void"></a>`UE_INPUT_ACTION("Use") void Used(FKey Key);` | An InputAction event: the game's Use action, whichever key the player has mapped to it. It takes the same edges and options as a key, but no modifiers. | Yes |
+| <a id="reacting-to-input.noconsume"></a>`NoConsume`, `WhenPaused`, `KeepParent` | Options, written after the key or action like an edge: the node's Consume Input unticked, Execute when Paused ticked, Override Parent Binding unticked. | Yes |
+| <a id="reacting-to-input.ue-defaults-autoreceiveinput"></a>`UE_DEFAULTS { AutoReceiveInput = EAutoReceiveInput::Player0; }` | Auto Receive Input in the class defaults: the actor enables input for the first player as it is spawned. Without it, or a call to `EnableInput(PC)`, an actor's input events never fire. | Yes |
+| <a id="reacting-to-input.pc-wasinputkeyjustpressed"></a>`PC->WasInputKeyJustPressed(ToggleKey)` in ReceiveTick | Polls the local player controller. True during the one input frame in which the key went down, so check it every tick. | Yes |
+| <a id="reacting-to-input.pc-isinputkeydown-k"></a>`PC->IsInputKeyDown(K)`, `PC->WasInputKeyJustReleased(K)`, `PC->GetInputKeyTimeDown(K)` | True while the key is held; true during the frame in which it comes up; how long it has been held. | Yes |
+| <a id="reacting-to-input.fkey-f5"></a>`FKey{"F5"}`, `FKey{FName("F5")}` | A key value, named by the engine's key names. It works as an argument, a local, a class variable and a `static inline const` member. | Yes |
+| <a id="reacting-to-input.fkey-space"></a>`FKey{"Space"}` | Compiles, with a warning naming the closest key, SpaceBar: no input matches it. It is not refused, as code may compare it with a key the engine makes up as it runs. | Warns |
+| <a id="reacting-to-input.fkey-f5-2"></a>`FKey("F5")`, `FKey(FName("F5"))`, `FKey K{FName("F5")};`, `FKey K = {"F5"};` | The same key as `FKey{"F5"}`, and the same warning for a name the engine has no key of. So is any one-member struct's constructor in parentheses, `FFrameNumber(5)`. | Yes |
+| <a id="reacting-to-input.fkey-name"></a>`FKey(Name)`, `FKey(FName(S))`, `FKey(S)` with a run-time FName or FString | The key of that name, made when the line runs: a string is made a name first (Conv_StringToName), as FKey's own constructor takes one. No warning can be given for a name not known when the mod is built. | Yes |
+| <a id="reacting-to-input.pc-wasinputkeyjustpressed-f5"></a>`PC->WasInputKeyJustPressed("F5")` | clang error: "no viable conversion from 'const char[3]' to 'FKey'". | Refused |
+| <a id="reacting-to-input.c-onfirepressed-add-this-toggler"></a>`C->OnFirePressed.Add(this, &Toggler::OnFire)` | For the player's own actions, bind the game's dispatchers on APlayerCharacter: OnFirePressed, OnFireReleased, OnJumpPressed, OnSecondaryFirePressed, OnLaserPointerPressed, OnTerrainScannerPressed and others. They fire for whatever key the player has mapped to that action. | Yes |
+| <a id="reacting-to-input.inputcomponent-bindkey"></a>`InputComponent->BindKey(...)`, `BindAction(...)` | clang error: "no member named 'BindKey' in 'UInputComponent'". They are native C++ only and absent from the SDK; mark a method instead. | Refused |
 
 ```cpp
 class Hotkey : public AActor {
@@ -4469,18 +4473,18 @@ lifts a light.
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_TIMELINE(Fade, 2.0f);` | A timeline 2 seconds long: the Timeline node's template. `Fade` is a `UTimelineComponent *` variable. The engine makes the component as the actor spawns, before the construction script and BeginPlay, and stores it there. | Yes |
-| `UE_TIMELINE(Fade, 2.0f, AutoPlay, Loop);` | Options after the length, the template's tick boxes: AutoPlay (plays from the start as the actor spawns), Loop, Replicated (the component replicates its play state), IgnoreTimeDilation, and LastKeyframe (the length is the time of the last key of any track, the editor's Use Last Keyframe). | Yes |
-| `UE_FLOAT_TRACK(Fade, Alpha, (0, 0), (1, 1, Cubic), (2, 0));` | A float track of Fade and its curve. Each key is `(time, value)`, interpolated Linear to the next key unless Cubic or Constant follows the value, as the curve editor's key menu sets it. A Cubic key's tangents are the editor's Auto ones. The macro declares `float Alpha`, which the timeline sets every frame it plays. | Yes |
-| `UE_VECTOR_TRACK(Fade, Lift, (0, 0, 0, 0), (2, 0, 0, 100));` | A vector track: each key is `(time, x, y, z)`. Declares `FVector Lift`. | Yes |
-| `UE_COLOR_TRACK(Fade, Tint, (0, 1, 1, 1, 1), (2, 1, 0, 0, 1));` | A linear color track: each key is `(time, r, g, b, a)`. Declares `FLinearColor Tint`. | Yes |
-| `UE_TIMELINE_UPDATE(Fade) void OnFade();` | The node's Update pin: the engine calls OnFade every frame the timeline plays, after it has written the tracks' variables, and when SetNewTime moves it. | Yes |
-| `UE_TIMELINE_FINISHED(Fade) void OnFaded();` | The Finished pin: called when the timeline reaches its end playing forward, or its start playing in reverse. A looping timeline never finishes. | Yes |
-| `UE_TIMELINE_EVENT(Fade, 0.5, 1.5) void Blink();` | An event track: the engine calls Blink each time the timeline passes 0.5 s and 1.5 s, forward or in reverse. | Yes |
-| `UE_FLOAT_TRACK_CURVE(Fade, Alpha, UeAssets::UCurveFloat::Game::LevelElements::Blueprints::Hologram_FadeIn);` | A track over a curve asset, the editor's External Curve: the timeline plays the asset's keys as the game has them. The curve is any UE_ASSET_AT of a curve, so the game's (the UeAssets headers name them all) or another mod's, or a curve of this mod's own. Declares `float Alpha`, as UE_FLOAT_TRACK does. | Yes |
-| `UE_VECTOR_TRACK_CURVE(Fade, Lift, Path);`, `UE_COLOR_TRACK_CURVE(Fade, Tint, Glow);` | A vector track over a UCurveVector, a color track over a UCurveLinearColor. | Yes |
-| `UE_FLOAT_CURVE(Ramp, (0, 0), (1, 1, Cubic));` at namespace scope | A curve asset of the mod's own, as the Content Browser's Miscellaneous > Curve makes one: a UCurveFloat cooked at `<mod package>/Ramp`, its keys written as a track's are. `UE_VECTOR_CURVE` and `UE_COLOR_CURVE` make a UCurveVector and a UCurveLinearColor. `&Ramp` points at it in a track, a default or code, and another mod names it with UE_ASSET_AT. In a namespace, it goes to that folder. | Yes |
-| `UE_FLOAT_TRACK_CURVE(Fade, Alpha, Path)` where Path is a UCurveVector | Refused: "a UCurveVector: the track's float is played from a UCurveFloat". | Refused |
+| <a id="declaring-a-timeline.ue-timeline-fade-2-0f"></a>`UE_TIMELINE(Fade, 2.0f);` | A timeline 2 seconds long: the Timeline node's template. `Fade` is a `UTimelineComponent *` variable. The engine makes the component as the actor spawns, before the construction script and BeginPlay, and stores it there. | Yes |
+| <a id="declaring-a-timeline.ue-timeline-fade-2-0f-2"></a>`UE_TIMELINE(Fade, 2.0f, AutoPlay, Loop);` | Options after the length, the template's tick boxes: AutoPlay (plays from the start as the actor spawns), Loop, Replicated (the component replicates its play state), IgnoreTimeDilation, and LastKeyframe (the length is the time of the last key of any track, the editor's Use Last Keyframe). | Yes |
+| <a id="declaring-a-timeline.ue-float-track-fade-alpha"></a>`UE_FLOAT_TRACK(Fade, Alpha, (0, 0), (1, 1, Cubic), (2, 0));` | A float track of Fade and its curve. Each key is `(time, value)`, interpolated Linear to the next key unless Cubic or Constant follows the value, as the curve editor's key menu sets it. A Cubic key's tangents are the editor's Auto ones. The macro declares `float Alpha`, which the timeline sets every frame it plays. | Yes |
+| <a id="declaring-a-timeline.ue-vector-track-fade-lift"></a>`UE_VECTOR_TRACK(Fade, Lift, (0, 0, 0, 0), (2, 0, 0, 100));` | A vector track: each key is `(time, x, y, z)`. Declares `FVector Lift`. | Yes |
+| <a id="declaring-a-timeline.ue-color-track-fade-tint"></a>`UE_COLOR_TRACK(Fade, Tint, (0, 1, 1, 1, 1), (2, 1, 0, 0, 1));` | A linear color track: each key is `(time, r, g, b, a)`. Declares `FLinearColor Tint`. | Yes |
+| <a id="declaring-a-timeline.ue-timeline-update-fade-void"></a>`UE_TIMELINE_UPDATE(Fade) void OnFade();` | The node's Update pin: the engine calls OnFade every frame the timeline plays, after it has written the tracks' variables, and when SetNewTime moves it. | Yes |
+| <a id="declaring-a-timeline.ue-timeline-finished-fade-void"></a>`UE_TIMELINE_FINISHED(Fade) void OnFaded();` | The Finished pin: called when the timeline reaches its end playing forward, or its start playing in reverse. A looping timeline never finishes. | Yes |
+| <a id="declaring-a-timeline.ue-timeline-event-fade-0"></a>`UE_TIMELINE_EVENT(Fade, 0.5, 1.5) void Blink();` | An event track: the engine calls Blink each time the timeline passes 0.5 s and 1.5 s, forward or in reverse. | Yes |
+| <a id="declaring-a-timeline.ue-float-track-curve-fade"></a>`UE_FLOAT_TRACK_CURVE(Fade, Alpha, UeAssets::UCurveFloat::Game::LevelElements::Blueprints::Hologram_FadeIn);` | A track over a curve asset, the editor's External Curve: the timeline plays the asset's keys as the game has them. The curve is any UE_ASSET_AT of a curve, so the game's (the UeAssets headers name them all) or another mod's, or a curve of this mod's own. Declares `float Alpha`, as UE_FLOAT_TRACK does. | Yes |
+| <a id="declaring-a-timeline.ue-vector-track-curve-fade"></a>`UE_VECTOR_TRACK_CURVE(Fade, Lift, Path);`, `UE_COLOR_TRACK_CURVE(Fade, Tint, Glow);` | A vector track over a UCurveVector, a color track over a UCurveLinearColor. | Yes |
+| <a id="declaring-a-timeline.ue-float-curve-ramp-0"></a>`UE_FLOAT_CURVE(Ramp, (0, 0), (1, 1, Cubic));` at namespace scope | A curve asset of the mod's own, as the Content Browser's Miscellaneous > Curve makes one: a UCurveFloat cooked at `<mod package>/Ramp`, its keys written as a track's are. `UE_VECTOR_CURVE` and `UE_COLOR_CURVE` make a UCurveVector and a UCurveLinearColor. `&Ramp` points at it in a track, a default or code, and another mod names it with UE_ASSET_AT. In a namespace, it goes to that folder. | Yes |
+| <a id="declaring-a-timeline.ue-float-track-curve-fade-2"></a>`UE_FLOAT_TRACK_CURVE(Fade, Alpha, Path)` where Path is a UCurveVector | Refused: "a UCurveVector: the track's float is played from a UCurveFloat". | Refused |
 
 ```cpp
 #include "UeAssets/UCurveFloat.h"
@@ -4517,13 +4521,13 @@ The node's input pins are functions of the component, called on the timeline's v
 
 | You write | What it does | Status |
 |---|---|---|
-| `Fade->Play()` | Play: plays forward from where the timeline is. | Yes |
-| `Fade->PlayFromStart()` | Play from Start: back to time 0, then forward. | Yes |
-| `Fade->Reverse()`, `Fade->ReverseFromEnd()` | Reverse from where it is; or from the end. | Yes |
-| `Fade->Stop()` | Stop: halts it where it is. Play goes on from there. | Yes |
-| `Fade->SetNewTime(1.0f)` | Set New Time: moves it to 1 s without passing the event tracks' times, and calls the update method. | Yes |
-| `Fade->SetPlayRate(2.0f)`, `Fade->SetLooping(true)`, `Fade->SetTimelineLength(3.0f)` | The component's settings, changed as it runs. | Yes |
-| `Fade->GetPlaybackPosition()`, `Fade->IsPlaying()`, `Fade->IsReversing()` | Where it is and how it plays. IsReversing is the node's Direction output: true while it plays backward. | Yes |
+| <a id="playing-a-timeline.fade-play"></a>`Fade->Play()` | Play: plays forward from where the timeline is. | Yes |
+| <a id="playing-a-timeline.fade-playfromstart"></a>`Fade->PlayFromStart()` | Play from Start: back to time 0, then forward. | Yes |
+| <a id="playing-a-timeline.fade-reverse"></a>`Fade->Reverse()`, `Fade->ReverseFromEnd()` | Reverse from where it is; or from the end. | Yes |
+| <a id="playing-a-timeline.fade-stop"></a>`Fade->Stop()` | Stop: halts it where it is. Play goes on from there. | Yes |
+| <a id="playing-a-timeline.fade-setnewtime-1-0f"></a>`Fade->SetNewTime(1.0f)` | Set New Time: moves it to 1 s without passing the event tracks' times, and calls the update method. | Yes |
+| <a id="playing-a-timeline.fade-setplayrate-2-0f"></a>`Fade->SetPlayRate(2.0f)`, `Fade->SetLooping(true)`, `Fade->SetTimelineLength(3.0f)` | The component's settings, changed as it runs. | Yes |
+| <a id="playing-a-timeline.fade-getplaybackposition"></a>`Fade->GetPlaybackPosition()`, `Fade->IsPlaying()`, `Fade->IsReversing()` | Where it is and how it plays. IsReversing is the node's Direction output: true while it plays backward. | Yes |
 
 Notes:
 
@@ -4563,15 +4567,15 @@ declares and implements one.
 
 | You write | What it does | Status |
 |---|---|---|
-| `TScriptInterface<IAimable> Current;` | An interface-typed variable, parameter or return value (InterfaceProperty: the object plus the interface pointer, 16 bytes). The interface can be the game's (a /Script interface such as IHealth), a game Blueprint Interface (through its `UeApi/Game/` header), or one the mod declares. | Yes |
-| `TScriptInterface<IAimable> Seen = Other;` | Cast To IAimable. If the object's class does not implement the interface, or the object is null, the result is empty, so testing it is the cast's success check. | Yes |
-| `TScriptInterface<IAimable> Target = Mark;` | Converts one interface value to another. The result is empty if the object behind it does not implement the target interface. Converting to the same interface is a plain copy. | Yes |
-| `Health.GetObject()` | The object behind the interface. GetObject() is the only method a TScriptInterface has. | Yes |
-| `Current->GetPriority()` | Calls the interface function on the object behind it, with the interface value as Target. The implementation is whatever that object has under that name. | Yes |
-| `TScriptInterface<ITargetable>(Player)->GetTargetHealthComponent()` | Calls the interface function on an object directly, as the editor does when the object's class implements the interface: InterfaceContext of the object, with no Cast To in between. The way to call a game interface's function on a game object, since UeApi does not record which interfaces a game class implements. | Yes |
-| `if (Seen)`, `!Seen`, `Seen == nullptr`, `Seen != nullptr`, `Seen ? A : B` | Whether an object is behind the interface. | Yes |
-| `Health = nullptr;`, `TakeIface(nullptr)` | The null interface. It clears both halves of the value. | Yes |
-| `Cast<IAimable>(Other)` | Refused for a mod interface: "Cast<> to an unknown class". Write `TScriptInterface<IAimable> I = Other;` instead. | Refused |
+| <a id="interface-values.tscriptinterface-iaimable"></a>`TScriptInterface<IAimable> Current;` | An interface-typed variable, parameter or return value (InterfaceProperty: the object plus the interface pointer, 16 bytes). The interface can be the game's (a /Script interface such as IHealth), a game Blueprint Interface (through its `UeApi/Game/` header), or one the mod declares. | Yes |
+| <a id="interface-values.tscriptinterface-iaimable-seen"></a>`TScriptInterface<IAimable> Seen = Other;` | Cast To IAimable. If the object's class does not implement the interface, or the object is null, the result is empty, so testing it is the cast's success check. | Yes |
+| <a id="interface-values.tscriptinterface-iaimable-target"></a>`TScriptInterface<IAimable> Target = Mark;` | Converts one interface value to another. The result is empty if the object behind it does not implement the target interface. Converting to the same interface is a plain copy. | Yes |
+| <a id="interface-values.health-getobject"></a>`Health.GetObject()` | The object behind the interface. GetObject() is the only method a TScriptInterface has. | Yes |
+| <a id="interface-values.current-getpriority"></a>`Current->GetPriority()` | Calls the interface function on the object behind it, with the interface value as Target. The implementation is whatever that object has under that name. | Yes |
+| <a id="interface-values.tscriptinterface-itargetable"></a>`TScriptInterface<ITargetable>(Player)->GetTargetHealthComponent()` | Calls the interface function on an object directly, as the editor does when the object's class implements the interface: InterfaceContext of the object, with no Cast To in between. The way to call a game interface's function on a game object, since UeApi does not record which interfaces a game class implements. | Yes |
+| <a id="interface-values.if-seen"></a>`if (Seen)`, `!Seen`, `Seen == nullptr`, `Seen != nullptr`, `Seen ? A : B` | Whether an object is behind the interface. | Yes |
+| <a id="interface-values.health-nullptr"></a>`Health = nullptr;`, `TakeIface(nullptr)` | The null interface. It clears both halves of the value. | Yes |
+| <a id="interface-values.cast-iaimable-other"></a>`Cast<IAimable>(Other)` | Refused for a mod interface: "Cast<> to an unknown class". Write `TScriptInterface<IAimable> I = Other;` instead. | Refused |
 
 ```cpp
 class IAimable {
@@ -4627,23 +4631,23 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `class Singer : public AActor, public ICurveSourceInterface` | Class Settings > Implemented Interfaces. The first base is the UE parent, and every base after it is an implemented interface. A class can implement several, game and mod interfaces alike. | Yes |
-| `float GetCurveValue(FName CurveName) const { return 0.5f; }` | An implementation is an ordinary method, matched to the interface function by name. Only functions the interface marks BlueprintNativeEvent or BlueprintImplementableEvent can be implemented; AssetGen checks this against the SDK's Events.json. | Yes |
-| A function left out | Gets an empty stub, as the editor compiles one. The stub returns the zero value (0, false, None, null) and leaves out-parameters unchanged. | Yes |
-| A function left out that a parent this source cooks already has, without listing the interface | The parent's function implements it, as in C++: AssetGen adds an override of it that only calls the parent's (or expands it, if inline), the editor's override with a parent call, so calls through the interface and by name run the parent's body. An empty stub would replace it for every caller, and with no function at all a call would find the interface's own empty one first. | Yes |
-| The same, where the parent's function has a parameter with no name | The added override names it (`P0`, `P1`, ... by position) and passes it on, as the editor's override names every pin. | Yes |
-| The same, where the parent's function is a multicast | Refused: "... no override can call it for ITrigger, and an empty one would replace it; declare Pistol::Pull". An override would send a multicast twice on a server. | Refused |
-| The same, where the parent's function is `final`, or has another signature than the interface's | Refused: "Pistol implements ITrigger, whose Pull needs a function of that name in Pistol, and the Rifle::Pull it inherits is final ..." or "... whose Pull is int32 (int32), and the Rifle::Pull it inherits is float (float): a Blueprint class has one function of a name ...". No function of a final one's name may follow it, and callers through the interface pass the interface's parameters. Rename one of them. | Refused |
-| `int32 Pull(int32 N)` implementing ITrigger, where a parent has `float Pull(float)` | Refused: "Pistol::Pull implements ITrigger::Pull, int32 (int32), and replaces the Rifle::Pull it inherits, float (float) ...". A Blueprint function overrides the parent's of its name too, so it would have two signatures. The parent may be another mod's class, from the header it shares; the same goes for ITrigger's stub when the class leaves `Pull` out. Rename one of them. | Refused |
-| The same, where the parent has no `Pull` but implements another interface, IAim, whose `Pull` is `float Pull(float)`, and leaves it out; or the class leaves ITrigger's `Pull` out too | Refused: "Pistol::Pull implements ITrigger::Pull, int32 (int32), and replaces the Pull of IAim, float (float), that Rifle implements ..." or "Pistol implements ITrigger, whose Pull is int32 (int32), and replaces the Pull of IAim ...". The parent's stub for IAim is a function of that name, and the editor refuses an override of another signature ("Cannot override ... declared in a parent with a different signature"). Rename one of the interface functions. | Refused |
-| The same, where the parent's function is static, or the class declares its own `Pull` beside the parent's static | Refused: "... is static: the editor takes such a function for an override of the static and refuses it ...; rename Rifle::Pull". A static implements no interface function, but the editor makes any function of its name in a subclass an override of it, and an override of a static must be static. | Refused |
-| An implementation that returns a value, is `const`, or has out-parameters | Compiled as a function, where the editor would make a function graph rather than an event. It takes the interface function's flags, so callers through the interface find it. A void event such as ShowDamageEffects is compiled as a function too. | Yes |
-| `class Pistol : public Weapons::Rifle` | A subclass implements the interface through its parent without listing it. Redefining an interface function is an ordinary override, and `Weapons::Rifle::Pull(Times)` calls the parent's. | Yes |
-| `class NativeOnly : public AActor, public IHealth` | Refused: "IHealth::GetHealth is native only ..., so a Blueprint cannot implement IHealth". The editor refuses the same. Calling IHealth through `TScriptInterface<IHealth>` on the game's objects still works. | Refused |
-| Listing an interface a mod parent already implements | Refused: "... which its parent Beacon already implements". The child's stubs would override the parent's implementations. Override single functions in the child instead. | Refused |
-| `class TwoShare : public AActor, public IAimable, public IMarkable` (IMarkable extends IAimable) | Refused: "... which both extend IAimable". List only the most derived interface, which already implements its parents. | Refused |
-| A base after the parent that is not an interface | Refused: "... which is not an interface". A struct there gives "implements an undeclared interface". | Refused |
-| An interface whose implementable function uses a type AssetGen cannot write | Refused: "takes a type AssetGen cannot write yet". No interface in the current SDK triggers it. | Refused |
+| <a id="implementing-an.class-singer-public-aactor"></a>`class Singer : public AActor, public ICurveSourceInterface` | Class Settings > Implemented Interfaces. The first base is the UE parent, and every base after it is an implemented interface. A class can implement several, game and mod interfaces alike. | Yes |
+| <a id="implementing-an.float-getcurvevalue-fname"></a>`float GetCurveValue(FName CurveName) const { return 0.5f; }` | An implementation is an ordinary method, matched to the interface function by name. Only functions the interface marks BlueprintNativeEvent or BlueprintImplementableEvent can be implemented; AssetGen checks this against the SDK's Events.json. | Yes |
+| <a id="implementing-an.a-function-left-out"></a>A function left out | Gets an empty stub, as the editor compiles one. The stub returns the zero value (0, false, None, null) and leaves out-parameters unchanged. | Yes |
+| <a id="implementing-an.a-function-left-out-that"></a>A function left out that a parent this source cooks already has, without listing the interface | The parent's function implements it, as in C++: AssetGen adds an override of it that only calls the parent's (or expands it, if inline), the editor's override with a parent call, so calls through the interface and by name run the parent's body. An empty stub would replace it for every caller, and with no function at all a call would find the interface's own empty one first. | Yes |
+| <a id="implementing-an.the-same-where-the-parent"></a>The same, where the parent's function has a parameter with no name | The added override names it (`P0`, `P1`, ... by position) and passes it on, as the editor's override names every pin. | Yes |
+| <a id="implementing-an.the-same-where-the-parent-2"></a>The same, where the parent's function is a multicast | Refused: "... no override can call it for ITrigger, and an empty one would replace it; declare Pistol::Pull". An override would send a multicast twice on a server. | Refused |
+| <a id="implementing-an.final"></a>The same, where the parent's function is `final`, or has another signature than the interface's | Refused: "Pistol implements ITrigger, whose Pull needs a function of that name in Pistol, and the Rifle::Pull it inherits is final ..." or "... whose Pull is int32 (int32), and the Rifle::Pull it inherits is float (float): a Blueprint class has one function of a name ...". No function of a final one's name may follow it, and callers through the interface pass the interface's parameters. Rename one of them. | Refused |
+| <a id="implementing-an.int32-pull-int32-n"></a>`int32 Pull(int32 N)` implementing ITrigger, where a parent has `float Pull(float)` | Refused: "Pistol::Pull implements ITrigger::Pull, int32 (int32), and replaces the Rifle::Pull it inherits, float (float) ...". A Blueprint function overrides the parent's of its name too, so it would have two signatures. The parent may be another mod's class, from the header it shares; the same goes for ITrigger's stub when the class leaves `Pull` out. Rename one of them. | Refused |
+| <a id="implementing-an.pull"></a>The same, where the parent has no `Pull` but implements another interface, IAim, whose `Pull` is `float Pull(float)`, and leaves it out; or the class leaves ITrigger's `Pull` out too | Refused: "Pistol::Pull implements ITrigger::Pull, int32 (int32), and replaces the Pull of IAim, float (float), that Rifle implements ..." or "Pistol implements ITrigger, whose Pull is int32 (int32), and replaces the Pull of IAim ...". The parent's stub for IAim is a function of that name, and the editor refuses an override of another signature ("Cannot override ... declared in a parent with a different signature"). Rename one of the interface functions. | Refused |
+| <a id="implementing-an.pull-2"></a>The same, where the parent's function is static, or the class declares its own `Pull` beside the parent's static | Refused: "... is static: the editor takes such a function for an override of the static and refuses it ...; rename Rifle::Pull". A static implements no interface function, but the editor makes any function of its name in a subclass an override of it, and an override of a static must be static. | Refused |
+| <a id="implementing-an.const"></a>An implementation that returns a value, is `const`, or has out-parameters | Compiled as a function, where the editor would make a function graph rather than an event. It takes the interface function's flags, so callers through the interface find it. A void event such as ShowDamageEffects is compiled as a function too. | Yes |
+| <a id="implementing-an.class-pistol-public-weapons"></a>`class Pistol : public Weapons::Rifle` | A subclass implements the interface through its parent without listing it. Redefining an interface function is an ordinary override, and `Weapons::Rifle::Pull(Times)` calls the parent's. | Yes |
+| <a id="implementing-an.class-nativeonly-public-aactor"></a>`class NativeOnly : public AActor, public IHealth` | Refused: "IHealth::GetHealth is native only ..., so a Blueprint cannot implement IHealth". The editor refuses the same. Calling IHealth through `TScriptInterface<IHealth>` on the game's objects still works. | Refused |
+| <a id="implementing-an.listing-an-interface-a-mod"></a>Listing an interface a mod parent already implements | Refused: "... which its parent Beacon already implements". The child's stubs would override the parent's implementations. Override single functions in the child instead. | Refused |
+| <a id="implementing-an.class-twoshare-public-aactor"></a>`class TwoShare : public AActor, public IAimable, public IMarkable` (IMarkable extends IAimable) | Refused: "... which both extend IAimable". List only the most derived interface, which already implements its parents. | Refused |
+| <a id="implementing-an.a-base-after-the-parent"></a>A base after the parent that is not an interface | Refused: "... which is not an interface". A struct there gives "implements an undeclared interface". | Refused |
+| <a id="implementing-an.an-interface-whose-implementable"></a>An interface whose implementable function uses a type AssetGen cannot write | Refused: "takes a type AssetGen cannot write yet". No interface in the current SDK triggers it. | Refused |
 
 ```cpp
 class Singer : public AActor, public ICurveSourceInterface {
@@ -4701,21 +4705,21 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `class IAimable { public: UE_INTERFACE; void OnAimed(AActor *By); int32 GetPriority(); };` | A Blueprint Interface asset, cooked at `<UE_MOD_PACKAGE>/IAimable` as class IAimable_C, with one empty function per method. The asset registry lists `<UE_MOD_PACKAGE>/IAimable.IAimable_C`, as for a class. Functions can return values and take reference (out) parameters. | Yes |
-| `class Turret : public AActor, public IAimable` | Implements it as for a game interface: matched by name, with stubs for the functions left out. There is no Events.json check, because every function of a mod interface can be implemented. | Yes |
-| `virtual int32 GetPriority() = 0;` on the interface | The same as a declaration without a body. A class that leaves it out gets the empty stub and is not cooked Abstract. | Yes |
-| `int32 GetPriority() { return 1; }` on the interface | A default implementation. A class that leaves the function out gets this body, with `this` being that class, instead of an empty stub. Blueprint Interface functions have no bodies in the editor. | Yes |
-| `class IMarkable : public IAimable { public: UE_INTERFACE; ... };` | An interface that extends one other. A class that lists IMarkable alone implements both: a cast to either succeeds, and it gets stubs for the parent's functions it leaves out. | Yes |
-| `class IPriorityTarget : public ITargetable { public: UE_INTERFACE; ... };` | A mod interface that extends a game interface (FSD's Targetable). An implementer gets the game interface's functions too, checked against Events.json. | Yes |
-| `int32 Marks = 3;` on the interface | A variable on an interface, AssetGen's own feature: the engine's interfaces hold no state. It becomes a property of every class that directly implements the interface, not declared again in their subclasses. The initializer is its default, and the implementer's or a subclass's UE_DEFAULTS can set another; a subclass's TSet or TMap is written over the implementer's value, as any inherited one is. Its name is held to the implementer's as its own variables are: one its parents already have (`Tags` on an actor), or that a subclass declares again, is refused. | Yes |
-| `UTurretDef TD_Big = {{}, {.Marks = 5}, 100};` | A data asset of a class that implements IMarkable gives the interface's variables in the interface's own braces, after the base's (here UPrimaryDataAsset's `{}`), then the class's own members. | Yes |
-| `UE_REPLICATED_USING(int32, Score, OnRep_Score);` on the interface | A replicated variable. Each implementing class gets the replicated property and an OnRep_Score of its own: its own definition, else the interface's body, else an empty stub. See [Replication](#replication). | Yes |
-| `TScriptInterface<IMarkable> M = Other; return M->Marks;` | Refused: "Marks is a variable of the interface IMarkable, which holds no state itself". Read it through an object of an implementing class, or declare a getter function on the interface. | Refused |
-| `int32 Marks;` in a class that implements IMarkable | Refused: "the variable Marks of the interface IMarkable is declared twice". The interface's variable already is this class's property; set its default in UE_DEFAULTS. | Refused |
-| `class IBoth : public IAimable, public IMarkable` | Refused: "an interface extends one interface at most". A UClass has one super. | Refused |
-| `class IActorish : public AActor { public: UE_INTERFACE; };` | Refused: "IActorish extends AActor, which is not an interface". An interface's only base is another interface, the mod's or the game's. | Refused |
-| `UE_COMPONENT(UStaticMeshComponent, Hull);` on an interface | Refused: "an interface cannot declare a UE_COMPONENT". Declare it on the implementing actor. | Refused |
-| `generate_api: true` with a `UE_INTERFACE` | The interface's editor API stub is a Blueprint Interface asset at the interface's own path, so a Blueprint made in the UE 4.27 editor can list it under Implemented Interfaces and implement its functions. Cooked by the editor, that Blueprint uses the interface the mod's pak cooks: a call through the interface, from the mod or from another Blueprint, runs its implementation. In DRG, a mod's call through the interface ran an editor-made Blueprint's implementation. The interface's variables are not in the stub, since the editor's interfaces hold none, so an editor Blueprint that implements it does not have them. See [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
+| <a id="declaring-an-interface.class-iaimable-public-ue"></a>`class IAimable { public: UE_INTERFACE; void OnAimed(AActor *By); int32 GetPriority(); };` | A Blueprint Interface asset, cooked at `<UE_MOD_PACKAGE>/IAimable` as class IAimable_C, with one empty function per method. The asset registry lists `<UE_MOD_PACKAGE>/IAimable.IAimable_C`, as for a class. Functions can return values and take reference (out) parameters. | Yes |
+| <a id="declaring-an-interface.class-turret-public-aactor"></a>`class Turret : public AActor, public IAimable` | Implements it as for a game interface: matched by name, with stubs for the functions left out. There is no Events.json check, because every function of a mod interface can be implemented. | Yes |
+| <a id="declaring-an-interface.virtual-int32-getpriority-0"></a>`virtual int32 GetPriority() = 0;` on the interface | The same as a declaration without a body. A class that leaves it out gets the empty stub and is not cooked Abstract. | Yes |
+| <a id="declaring-an-interface.int32-getpriority-return-1"></a>`int32 GetPriority() { return 1; }` on the interface | A default implementation. A class that leaves the function out gets this body, with `this` being that class, instead of an empty stub. Blueprint Interface functions have no bodies in the editor. | Yes |
+| <a id="declaring-an-interface.class-imarkable-public-iaimable"></a>`class IMarkable : public IAimable { public: UE_INTERFACE; ... };` | An interface that extends one other. A class that lists IMarkable alone implements both: a cast to either succeeds, and it gets stubs for the parent's functions it leaves out. | Yes |
+| <a id="declaring-an-interface.class-iprioritytarget-public"></a>`class IPriorityTarget : public ITargetable { public: UE_INTERFACE; ... };` | A mod interface that extends a game interface (FSD's Targetable). An implementer gets the game interface's functions too, checked against Events.json. | Yes |
+| <a id="declaring-an-interface.int32-marks-3"></a>`int32 Marks = 3;` on the interface | A variable on an interface, AssetGen's own feature: the engine's interfaces hold no state. It becomes a property of every class that directly implements the interface, not declared again in their subclasses. The initializer is its default, and the implementer's or a subclass's UE_DEFAULTS can set another; a subclass's TSet or TMap is written over the implementer's value, as any inherited one is. Its name is held to the implementer's as its own variables are: one its parents already have (`Tags` on an actor), or that a subclass declares again, is refused. | Yes |
+| <a id="declaring-an-interface.uturretdef-td-big-marks-5"></a>`UTurretDef TD_Big = {{}, {.Marks = 5}, 100};` | A data asset of a class that implements IMarkable gives the interface's variables in the interface's own braces, after the base's (here UPrimaryDataAsset's `{}`), then the class's own members. | Yes |
+| <a id="declaring-an-interface.ue-replicated-using-int32-score"></a>`UE_REPLICATED_USING(int32, Score, OnRep_Score);` on the interface | A replicated variable. Each implementing class gets the replicated property and an OnRep_Score of its own: its own definition, else the interface's body, else an empty stub. See [Replication](#replication). | Yes |
+| <a id="declaring-an-interface.tscriptinterface-imarkable-m"></a>`TScriptInterface<IMarkable> M = Other; return M->Marks;` | Refused: "Marks is a variable of the interface IMarkable, which holds no state itself". Read it through an object of an implementing class, or declare a getter function on the interface. | Refused |
+| <a id="declaring-an-interface.int32-marks"></a>`int32 Marks;` in a class that implements IMarkable | Refused: "the variable Marks of the interface IMarkable is declared twice". The interface's variable already is this class's property; set its default in UE_DEFAULTS. | Refused |
+| <a id="declaring-an-interface.class-iboth-public-iaimable"></a>`class IBoth : public IAimable, public IMarkable` | Refused: "an interface extends one interface at most". A UClass has one super. | Refused |
+| <a id="declaring-an-interface.class-iactorish-public-aactor"></a>`class IActorish : public AActor { public: UE_INTERFACE; };` | Refused: "IActorish extends AActor, which is not an interface". An interface's only base is another interface, the mod's or the game's. | Refused |
+| <a id="declaring-an-interface.ue-component"></a>`UE_COMPONENT(UStaticMeshComponent, Hull);` on an interface | Refused: "an interface cannot declare a UE_COMPONENT". Declare it on the implementing actor. | Refused |
+| <a id="declaring-an-interface.generate-api-true"></a>`generate_api: true` with a `UE_INTERFACE` | The interface's editor API stub is a Blueprint Interface asset at the interface's own path, so a Blueprint made in the UE 4.27 editor can list it under Implemented Interfaces and implement its functions. Cooked by the editor, that Blueprint uses the interface the mod's pak cooks: a call through the interface, from the mod or from another Blueprint, runs its implementation. In DRG, a mod's call through the interface ran an editor-made Blueprint's implementation. The interface's variables are not in the stub, since the editor's interfaces hold none, so an editor Blueprint that implements it does not have them. See [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
 
 ```cpp
 class IAimable {
@@ -4776,19 +4780,19 @@ together.
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_REPLICATED(int32, Score) = 5;` | A replicated variable, the editor's Replication: Replicated. The server sends its value to clients. A write on a client changes only that client's copy. The initializer after the macro is the class default, as for any member. | Yes |
-| `UE_REPLICATED_USING(bool, bOpen, OnRep_Open);` | Replication: RepNotify. When a new value arrives on a client, the engine calls `OnRep_Open()` there. Your own assignment calls it too, on the machine that writes (see the next table). | Yes |
-| `UE_REPLICATED_IF(float, Aim, SkipOwner);` | The editor's Replication Condition. The third argument is an `ELifetimeCondition` name, with or without the `COND_` prefix. | Yes |
-| `UE_REPLICATED_USING_IF(TArray<int32>, Slots, OnRep_Slots, OwnerOnly);` | RepNotify and a condition on one variable. An array replicates, and its OnRep fires for the array as a whole. | Yes |
-| `UE_DEFAULTS { bReplicates = true; }` | A class that declares a replicated variable or an RPC of its own gets `bReplicates = true` in its Class Defaults, and a subclass inherits it. A class with neither keeps its parent's setting: set it by hand in `UE_DEFAULTS`. A `bReplicates` the class sets in its own `UE_DEFAULTS` wins over the automatic one: `bReplicates = false;` keeps a component with an RPC unreplicated, as the editor leaves a component until you tick Component Replicates. | Yes |
-| `UE_REPLICATED_IF(float, Aim, OwnerAndSimulated);` | Refused: "unknown replication condition". The name is case-sensitive, so `ownerOnly` is refused too. | Refused |
-| `UE_REPLICATED(TScriptInterface<IMark>, Target);`, or a replicated `UE_STRUCT` holding a TMap or an interface at any depth | Refused: "an interface does not replicate", "a TMap or TSet in FBag does not replicate". The engine sends a struct member by member, and sends nothing for a TMap, a TSet or an interface. | Refused |
-| `UE_REPLICATED(TSet<int32>, Ids);` | Refused: "a TMap or TSet does not replicate". The engine replicates neither, so the variable would never leave the server. A `TMap` or `TSet` inside a replicated array is refused too. Replicate two arrays, keys and values, and rebuild the map in the OnRep. | Refused |
-| `UE_REPLICATED(TMap<FName, int32>, Scores);` | Never reaches AssetGen. The comma in `TMap<FName, int32>` splits the macro argument, and clang stops with "too many arguments provided to function-like macro invocation". A type alias for the map is no way around it: through an alias declared in the class, the variable is refused as above ("a TMap or TSet does not replicate"), and an alias at namespace scope of a container or value type is refused as a variable's type ("unimplemented property"). | Refused |
-| `void OnRep_Ammo(int32 OldAmmo)` | Refused: the RepNotify "must be a method of the class taking no parameters". A Blueprint RepNotify takes none, so C++'s previous-value form has no equivalent. The same message appears when no method of that name exists. Keep the previous value in a member and compare it in the OnRep. | Refused |
-| `int32 OnRep_Ammo()` | Refused: the RepNotify "must return void". The engine calls it with no room for a result. | Refused |
-| `inline void OnRep_Ammo()` | Refused: the RepNotify "is inline, so no function of the class". An inline method is no Blueprint function, so a client would never find the OnRep. Drop `inline`. | Refused |
-| `UE_REPLICATED(int32, A);` in a `UE_STRUCT` | Refused: "UE_REPLICATED on a struct member has no effect". UE has no per-member replication for a struct. Replicate the class variable that holds the struct, which replicates it as a whole. | Refused |
+| <a id="replicated-variables.ue-replicated-int32-score-5"></a>`UE_REPLICATED(int32, Score) = 5;` | A replicated variable, the editor's Replication: Replicated. The server sends its value to clients. A write on a client changes only that client's copy. The initializer after the macro is the class default, as for any member. | Yes |
+| <a id="replicated-variables.ue-replicated-using-bool-bopen"></a>`UE_REPLICATED_USING(bool, bOpen, OnRep_Open);` | Replication: RepNotify. When a new value arrives on a client, the engine calls `OnRep_Open()` there. Your own assignment calls it too, on the machine that writes (see the next table). | Yes |
+| <a id="replicated-variables.ue-replicated-if-float-aim"></a>`UE_REPLICATED_IF(float, Aim, SkipOwner);` | The editor's Replication Condition. The third argument is an `ELifetimeCondition` name, with or without the `COND_` prefix. | Yes |
+| <a id="replicated-variables.ue-replicated-using-if-tarray"></a>`UE_REPLICATED_USING_IF(TArray<int32>, Slots, OnRep_Slots, OwnerOnly);` | RepNotify and a condition on one variable. An array replicates, and its OnRep fires for the array as a whole. | Yes |
+| <a id="replicated-variables.ue-defaults-breplicates-true"></a>`UE_DEFAULTS { bReplicates = true; }` | A class that declares a replicated variable or an RPC of its own gets `bReplicates = true` in its Class Defaults, and a subclass inherits it. A class with neither keeps its parent's setting: set it by hand in `UE_DEFAULTS`. A `bReplicates` the class sets in its own `UE_DEFAULTS` wins over the automatic one: `bReplicates = false;` keeps a component with an RPC unreplicated, as the editor leaves a component until you tick Component Replicates. | Yes |
+| <a id="replicated-variables.ue-replicated-if-float-aim-2"></a>`UE_REPLICATED_IF(float, Aim, OwnerAndSimulated);` | Refused: "unknown replication condition". The name is case-sensitive, so `ownerOnly` is refused too. | Refused |
+| <a id="replicated-variables.ue-replicated-tscriptinterface"></a>`UE_REPLICATED(TScriptInterface<IMark>, Target);`, or a replicated `UE_STRUCT` holding a TMap or an interface at any depth | Refused: "an interface does not replicate", "a TMap or TSet in FBag does not replicate". The engine sends a struct member by member, and sends nothing for a TMap, a TSet or an interface. | Refused |
+| <a id="replicated-variables.ue-replicated-tset-int32-ids"></a>`UE_REPLICATED(TSet<int32>, Ids);` | Refused: "a TMap or TSet does not replicate". The engine replicates neither, so the variable would never leave the server. A `TMap` or `TSet` inside a replicated array is refused too. Replicate two arrays, keys and values, and rebuild the map in the OnRep. | Refused |
+| <a id="replicated-variables.ue-replicated-tmap-fname-int32"></a>`UE_REPLICATED(TMap<FName, int32>, Scores);` | Never reaches AssetGen. The comma in `TMap<FName, int32>` splits the macro argument, and clang stops with "too many arguments provided to function-like macro invocation". A type alias for the map is no way around it: through an alias declared in the class, the variable is refused as above ("a TMap or TSet does not replicate"), and an alias at namespace scope of a container or value type is refused as a variable's type ("unimplemented property"). | Refused |
+| <a id="replicated-variables.void-onrep-ammo-int32-oldammo"></a>`void OnRep_Ammo(int32 OldAmmo)` | Refused: the RepNotify "must be a method of the class taking no parameters". A Blueprint RepNotify takes none, so C++'s previous-value form has no equivalent. The same message appears when no method of that name exists. Keep the previous value in a member and compare it in the OnRep. | Refused |
+| <a id="replicated-variables.int32-onrep-ammo"></a>`int32 OnRep_Ammo()` | Refused: the RepNotify "must return void". The engine calls it with no room for a result. | Refused |
+| <a id="replicated-variables.inline-void-onrep-ammo"></a>`inline void OnRep_Ammo()` | Refused: the RepNotify "is inline, so no function of the class". An inline method is no Blueprint function, so a client would never find the OnRep. Drop `inline`. | Refused |
+| <a id="replicated-variables.ue-replicated-int32-a"></a>`UE_REPLICATED(int32, A);` in a `UE_STRUCT` | Refused: "UE_REPLICATED on a struct member has no effect". UE has no per-member replication for a struct. Replicate the class variable that holds the struct, which replicates it as a whole. | Refused |
 
 ```cpp
 class Door : public AActor {
@@ -4823,15 +4827,15 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `bOpen = true;` | The editor's Set w/ Notify node. On an actor, AssetGen calls `FlushNetDormancy()` first, so a dormant actor still sends the change. Then it writes. Then, for a RepNotify variable, it calls `OnRep_Open()` on whichever machine runs the code, the server included. Native UE C++ never calls an OnRep on the server by itself, so this differs from C++. | Yes |
-| `Other->bOpen = false;` | The flush, the write and the OnRep all go to `Other`, not to self. | Yes |
-| `Slots[0] = 4;` | An element write counts as a set of the whole array: flush, write, `OnRep_Slots()`. | Yes |
-| `Score += 1;` or `++Score;` | Rewritten as `Score = Score + 1`, with the target found once, so it gets the same flush and OnRep. | Yes |
-| `Me()->bOpen = true;` | The object expression runs once per statement, as C++ runs it, and the flush, the write and the OnRep all use that one result. | Yes |
-| `Slots.Add(3);` | A container call changes the array in place and adds neither the flush nor the OnRep. The editor does the same: only its Set node adds them. The change still replicates on the next update of an actor that is not dormant. Call `FlushNetDormancy()` and the OnRep yourself, or assign the whole array. | Yes |
-| `Target.Z = 100.0f;` | A write to one member of a replicated struct gets no flush and no OnRep. To get both, copy the value, change the copy and assign it back. | Yes |
-| `bReplicateMovement = true;` | An engine or game C++ replicated property: the flush and the write, and no OnRep call, because a native RepNotify is meant for clients. The editor does the same. Where the engine has a setter, such as `SetReplicateMovement`, the setter may do work that a raw write skips. | Yes |
-| `Glass->Thrown = true;` | A replicated variable that one of the game's Blueprints declares works like one of yours: flush, write, then its OnRep (`OnRep_Thrown`), called on that object. Here `Glass` is a `Game::GameElements::Bar::Bar_Glass_Physics_C *` from `UeApi/Game/Bar_Glass_Physics_C.h`. | Yes |
+| <a id="writing-replicated.bopen-true"></a>`bOpen = true;` | The editor's Set w/ Notify node. On an actor, AssetGen calls `FlushNetDormancy()` first, so a dormant actor still sends the change. Then it writes. Then, for a RepNotify variable, it calls `OnRep_Open()` on whichever machine runs the code, the server included. Native UE C++ never calls an OnRep on the server by itself, so this differs from C++. | Yes |
+| <a id="writing-replicated.other-bopen-false"></a>`Other->bOpen = false;` | The flush, the write and the OnRep all go to `Other`, not to self. | Yes |
+| <a id="writing-replicated.slots-0-4"></a>`Slots[0] = 4;` | An element write counts as a set of the whole array: flush, write, `OnRep_Slots()`. | Yes |
+| <a id="writing-replicated.score-1"></a>`Score += 1;` or `++Score;` | Rewritten as `Score = Score + 1`, with the target found once, so it gets the same flush and OnRep. | Yes |
+| <a id="writing-replicated.me-bopen-true"></a>`Me()->bOpen = true;` | The object expression runs once per statement, as C++ runs it, and the flush, the write and the OnRep all use that one result. | Yes |
+| <a id="writing-replicated.slots-add-3"></a>`Slots.Add(3);` | A container call changes the array in place and adds neither the flush nor the OnRep. The editor does the same: only its Set node adds them. The change still replicates on the next update of an actor that is not dormant. Call `FlushNetDormancy()` and the OnRep yourself, or assign the whole array. | Yes |
+| <a id="writing-replicated.target-z-100-0f"></a>`Target.Z = 100.0f;` | A write to one member of a replicated struct gets no flush and no OnRep. To get both, copy the value, change the copy and assign it back. | Yes |
+| <a id="writing-replicated.breplicatemovement-true"></a>`bReplicateMovement = true;` | An engine or game C++ replicated property: the flush and the write, and no OnRep call, because a native RepNotify is meant for clients. The editor does the same. Where the engine has a setter, such as `SetReplicateMovement`, the setter may do work that a raw write skips. | Yes |
+| <a id="writing-replicated.glass-thrown-true"></a>`Glass->Thrown = true;` | A replicated variable that one of the game's Blueprints declares works like one of yours: flush, write, then its OnRep (`OnRep_Thrown`), called on that object. Here `Glass` is a `Game::GameElements::Bar::Bar_Glass_Physics_C *` from `UeApi/Game/Bar_Glass_Physics_C.h`. | Yes |
 
 ```cpp
 class Door : public AActor {
@@ -4865,9 +4869,9 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_REPLICATED_USING(int32, Points, OnRep_Points) = 0;` in a `UE_INTERFACE` | Each class that implements the interface gets `Points` as a replicated variable of its own, with the replication settings written on the interface. A write calls the RepNotify as usual. | Yes |
-| `void OnRep_Points() { Seen += 1; }` in the implementing class | The RepNotify belongs to the implementing class. AssetGen looks for it on the class first, then on the interface. A class that leaves it out gets the interface's out-of-line body when there is one (`void IScored::OnRep_Points() { Mirror = Points; }`), otherwise an empty function, and every write still calls it. | Yes |
-| an OnRep declared on neither | Refused: the RepNotify "must be a method of the class taking no parameters". If the interface leaves the declaration out, every implementing class has to define it. | Refused |
+| <a id="replicated-variables-on.ue-replicated-using-int32-points"></a>`UE_REPLICATED_USING(int32, Points, OnRep_Points) = 0;` in a `UE_INTERFACE` | Each class that implements the interface gets `Points` as a replicated variable of its own, with the replication settings written on the interface. A write calls the RepNotify as usual. | Yes |
+| <a id="replicated-variables-on.void-onrep-points-seen-1"></a>`void OnRep_Points() { Seen += 1; }` in the implementing class | The RepNotify belongs to the implementing class. AssetGen looks for it on the class first, then on the interface. A class that leaves it out gets the interface's out-of-line body when there is one (`void IScored::OnRep_Points() { Mirror = Points; }`), otherwise an empty function, and every write still calls it. | Yes |
+| <a id="replicated-variables-on.an-onrep-declared-on-neither"></a>an OnRep declared on neither | Refused: the RepNotify "must be a method of the class taking no parameters". If the interface leaves the declaration out, every implementing class has to define it. | Refused |
 
 ```cpp
 class IScored {
@@ -4895,11 +4899,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UKismetSystemLibrary::IsServer(this)` | The editor's Is Server node. True on a listen-server host, on a dedicated server and in a solo (standalone) game. False on a client. `IsServer()` without the argument passes self. `IsDedicatedServer()` and `IsStandalone()` work the same way. | Yes |
-| `HasAuthority()`, `Other->HasAuthority()` | The editor's Has Authority node. True when this machine holds the authoritative copy of the actor: on the server for an actor that replicates, and on any machine for an actor that machine spawned itself. | Yes |
-| `GetLocalRole() == ENetRole::ROLE_AutonomousProxy` | Get Local Role. Tells a client's own copy (`ROLE_AutonomousProxy`) from other players' copies (`ROLE_SimulatedProxy`). | Yes |
-| `Watched->IsLocallyControlled()` | Is Locally Controlled, on a pawn. True only on the machine whose own controller possesses it: on the host, the host's pawn; on a client, that client's own. A pawn with no controller gives false. DRG's `UGameFunctionLibrary::GetLocalPlayerCharacter(this)` returns this machine's player directly. | Yes |
-| `GetOwner()` in a component | A component has no role of its own, so it asks its owner: `AActor *O = GetOwner(); if (O) bAuth = O->HasAuthority();`. | Yes |
+| <a id="host-or-client.ukismetsystemlibrary-isserver"></a>`UKismetSystemLibrary::IsServer(this)` | The editor's Is Server node. True on a listen-server host, on a dedicated server and in a solo (standalone) game. False on a client. `IsServer()` without the argument passes self. `IsDedicatedServer()` and `IsStandalone()` work the same way. | Yes |
+| <a id="host-or-client.hasauthority"></a>`HasAuthority()`, `Other->HasAuthority()` | The editor's Has Authority node. True when this machine holds the authoritative copy of the actor: on the server for an actor that replicates, and on any machine for an actor that machine spawned itself. | Yes |
+| <a id="host-or-client.getlocalrole-enetrole-role"></a>`GetLocalRole() == ENetRole::ROLE_AutonomousProxy` | Get Local Role. Tells a client's own copy (`ROLE_AutonomousProxy`) from other players' copies (`ROLE_SimulatedProxy`). | Yes |
+| <a id="host-or-client.watched-islocallycontrolled"></a>`Watched->IsLocallyControlled()` | Is Locally Controlled, on a pawn. True only on the machine whose own controller possesses it: on the host, the host's pawn; on a client, that client's own. A pawn with no controller gives false. DRG's `UGameFunctionLibrary::GetLocalPlayerCharacter(this)` returns this machine's player directly. | Yes |
+| <a id="host-or-client.getowner"></a>`GetOwner()` in a component | A component has no role of its own, so it asks its owner: `AActor *O = GetOwner(); if (O) bAuth = O->HasAuthority();`. | Yes |
 
 ```cpp
 class Tally : public AActor {
@@ -4952,18 +4956,18 @@ put these markers only on an ordinary method with a body, neither `inline` nor `
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_SERVER UE_RELIABLE void ServerOpen(bool bValue);` | The editor's custom event with Replicates: Run on Server. Called on the owning client, it runs on the server. Called on the server, it runs right there. The marker may sit on the declaration in the class or on the definition. | Yes |
-| `UE_CLIENT void ClientPing(int32 Seq) { Seen = Seq; }` | Replicates: Run on owning Client. Called on the server, it runs on the client that owns the actor. | Yes |
-| `UE_MULTICAST void PlayCreak() { Seen = 2; }` | Replicates: Multicast. Called on the server, it runs on the server and on every client. Called on a client, it runs only there. | Yes |
-| `UE_MULTICAST UE_RELIABLE void PlayHit() { Local = 5; }` | The Reliable checkbox. An RPC without `UE_RELIABLE` is unreliable. | Yes |
-| `UE_RELIABLE void Ping() { N = 1; }` | Refused: "UE_RELIABLE needs UE_SERVER, UE_CLIENT or UE_MULTICAST". | Refused |
-| `UE_SERVER int32 ServerScore() { return N; }` | Refused: "an RPC returns void". An RPC runs on another machine and cannot hand a value back. Answer with a Client RPC or a replicated variable. | Refused |
-| `UE_SERVER void ServerBump(int32 &Count) { Count += 1; }` | Warns once per parameter it writes: "reaches the caller only when the call runs locally". The receiving machine works on a copy, so the caller sees the write only when the call ran locally, as when the server calls its own Server RPC. Take the parameter by value or `const &`. | Warns |
-| `UE_SERVER void ServerSync(TMap<FName, int32> Scores) { Kept = Scores; }` | Refused: "an RPC parameter cannot be a TMap or TSet". The engine sends nothing for either, so the argument would arrive empty. Pass two arrays, keys and values. | Refused |
-| `UE_SERVER void Send(FBag Sack)`, where `FBag` holds a `TMap`; `UE_SERVER void S(TScriptInterface<IMark> T)` | Refused: "an RPC parameter cannot hold what does not replicate". A struct is sent member by member, and neither a TMap nor an interface sends anything. Pass the object as a `UObject*` or an actor pointer instead of an interface. | Refused |
-| `UE_SERVER inline void ServerPing() { Pings += 1; }` | Refused: "an RPC, authority-only or cosmetic marker on an inline method does nothing". An inline method is expanded at each call and is no Blueprint function, so no call to it is routed. The same holds for `UE_AUTHORITY_ONLY` and `UE_COSMETIC`, and for a marker on the method's definition out of the class, `UE_SERVER inline void AMine::ServerPing() { ... }`, which used to compile. Drop `inline`. | Refused |
-| `UE_SERVER static void S(int32 X) { }` | Refused: "a static function cannot be an RPC". The engine routes a static function without looking at its net flags, so it would run locally and never be sent. Use a member function. | Refused |
-| `UE_MULTICAST UE_SERVER void Also() { }` | Refused: "an RPC goes one way". The sender picks one direction and the receiver checks its own, so a second marker would drop the call on one side. `UE_MULTICAST UE_CLIENT` is refused the same way. | Refused |
+| <a id="declaring-rpcs.ue-server-ue-reliable-void"></a>`UE_SERVER UE_RELIABLE void ServerOpen(bool bValue);` | The editor's custom event with Replicates: Run on Server. Called on the owning client, it runs on the server. Called on the server, it runs right there. The marker may sit on the declaration in the class or on the definition. | Yes |
+| <a id="declaring-rpcs.ue-client-void-clientping-int32"></a>`UE_CLIENT void ClientPing(int32 Seq) { Seen = Seq; }` | Replicates: Run on owning Client. Called on the server, it runs on the client that owns the actor. | Yes |
+| <a id="declaring-rpcs.ue-multicast-void-playcreak-seen"></a>`UE_MULTICAST void PlayCreak() { Seen = 2; }` | Replicates: Multicast. Called on the server, it runs on the server and on every client. Called on a client, it runs only there. | Yes |
+| <a id="declaring-rpcs.ue-multicast-ue-reliable-void"></a>`UE_MULTICAST UE_RELIABLE void PlayHit() { Local = 5; }` | The Reliable checkbox. An RPC without `UE_RELIABLE` is unreliable. | Yes |
+| <a id="declaring-rpcs.ue-reliable-void-ping-n"></a>`UE_RELIABLE void Ping() { N = 1; }` | Refused: "UE_RELIABLE needs UE_SERVER, UE_CLIENT or UE_MULTICAST". | Refused |
+| <a id="declaring-rpcs.ue-server-int32-serverscore"></a>`UE_SERVER int32 ServerScore() { return N; }` | Refused: "an RPC returns void". An RPC runs on another machine and cannot hand a value back. Answer with a Client RPC or a replicated variable. | Refused |
+| <a id="declaring-rpcs.ue-server-void-serverbump-int32"></a>`UE_SERVER void ServerBump(int32 &Count) { Count += 1; }` | Warns once per parameter it writes: "reaches the caller only when the call runs locally". The receiving machine works on a copy, so the caller sees the write only when the call ran locally, as when the server calls its own Server RPC. Take the parameter by value or `const &`. | Warns |
+| <a id="declaring-rpcs.ue-server-void-serversync-tmap"></a>`UE_SERVER void ServerSync(TMap<FName, int32> Scores) { Kept = Scores; }` | Refused: "an RPC parameter cannot be a TMap or TSet". The engine sends nothing for either, so the argument would arrive empty. Pass two arrays, keys and values. | Refused |
+| <a id="declaring-rpcs.ue-server-void-send-fbag"></a>`UE_SERVER void Send(FBag Sack)`, where `FBag` holds a `TMap`; `UE_SERVER void S(TScriptInterface<IMark> T)` | Refused: "an RPC parameter cannot hold what does not replicate". A struct is sent member by member, and neither a TMap nor an interface sends anything. Pass the object as a `UObject*` or an actor pointer instead of an interface. | Refused |
+| <a id="declaring-rpcs.ue-server-inline-void-serverping"></a>`UE_SERVER inline void ServerPing() { Pings += 1; }` | Refused: "an RPC, authority-only or cosmetic marker on an inline method does nothing". An inline method is expanded at each call and is no Blueprint function, so no call to it is routed. The same holds for `UE_AUTHORITY_ONLY` and `UE_COSMETIC`, and for a marker on the method's definition out of the class, `UE_SERVER inline void AMine::ServerPing() { ... }`, which used to compile. Drop `inline`. | Refused |
+| <a id="declaring-rpcs.ue-server-static-void-s"></a>`UE_SERVER static void S(int32 X) { }` | Refused: "a static function cannot be an RPC". The engine routes a static function without looking at its net flags, so it would run locally and never be sent. Use a member function. | Refused |
+| <a id="declaring-rpcs.ue-multicast-ue-server-void"></a>`UE_MULTICAST UE_SERVER void Also() { }` | Refused: "an RPC goes one way". The sender picks one direction and the receiver checks its own, so a second marker would drop the call on one side. `UE_MULTICAST UE_CLIENT` is refused the same way. | Refused |
 
 ```cpp
 class Door : public AActor {
@@ -5002,8 +5006,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UE_AUTHORITY_ONLY void GrantReward() { Credits += 10; }` | The editor's Authority Only function flag (BlueprintAuthorityOnly). A call on a machine without authority over the actor is skipped instead of failing. | Yes |
-| `UE_COSMETIC void PlaySparks() { Seen = 3; }` | The Cosmetic function flag (BlueprintCosmetic). The engine skips the call on a dedicated server. A listen-server host and clients run it. | Yes |
+| <a id="authority-only-and.ue-authority-only-void"></a>`UE_AUTHORITY_ONLY void GrantReward() { Credits += 10; }` | The editor's Authority Only function flag (BlueprintAuthorityOnly). A call on a machine without authority over the actor is skipped instead of failing. | Yes |
+| <a id="authority-only-and.ue-cosmetic-void-playsparks-seen"></a>`UE_COSMETIC void PlaySparks() { Seen = 3; }` | The Cosmetic function flag (BlueprintCosmetic). The engine skips the call on a dedicated server. A listen-server host and clients run it. | Yes |
 
 Notes:
 
@@ -5016,16 +5020,16 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `ServerOpen(false);`, `Other->PlayCreak();` | A call to an RPC, or to an authority-only or cosmetic function, goes through the engine's call routing, which runs it here, sends it over the network or drops it. A plain method is called directly. | Yes |
-| `Char->Server_SetRunning(false);` | The game's and the engine's RPCs carry the same markers in UeApi. A call to one is an ordinary call, and the engine routes it. | Yes |
+| <a id="calling-rpcs.serveropen-false"></a>`ServerOpen(false);`, `Other->PlayCreak();` | A call to an RPC, or to an authority-only or cosmetic function, goes through the engine's call routing, which runs it here, sends it over the network or drops it. A plain method is called directly. | Yes |
+| <a id="calling-rpcs.char-server-setrunning-false"></a>`Char->Server_SetRunning(false);` | The game's and the engine's RPCs carry the same markers in UeApi. A call to one is an ordinary call, and the engine routes it. | Yes |
 
 ### RPCs in subclasses
 
 | You write | What it does | Status |
 |---|---|---|
-| `void ServerOpen(bool bValue) { Seen = bValue ? 7 : 8; }` in a subclass | An override without a marker keeps the parent's net flags (Server, Reliable) and is still that RPC. | Yes |
-| `void OnRep_Open() { Seen = 10; }` in a subclass | When the parent's code assigns the variable, the subclass's OnRep runs in the parent's place, because the call goes by name. | Yes |
-| `UE_SERVER void ServerOpen(bool bValue) { Seen = 2; }` in a subclass | Refused: "an override takes its parent's replication; drop the RPC marker". The engine asserts on a mismatch. Any RPC marker on any override is refused, one on an engine event such as `UE_MULTICAST void ReceiveBeginPlay()` included. | Refused |
+| <a id="rpcs-in-subclasses.void-serveropen-bool-bvalue-seen"></a>`void ServerOpen(bool bValue) { Seen = bValue ? 7 : 8; }` in a subclass | An override without a marker keeps the parent's net flags (Server, Reliable) and is still that RPC. | Yes |
+| <a id="rpcs-in-subclasses.void-onrep-open-seen-10"></a>`void OnRep_Open() { Seen = 10; }` in a subclass | When the parent's code assigns the variable, the subclass's OnRep runs in the parent's place, because the call goes by name. | Yes |
+| <a id="rpcs-in-subclasses.ue-server-void-serveropen-bool"></a>`UE_SERVER void ServerOpen(bool bValue) { Seen = 2; }` in a subclass | Refused: "an override takes its parent's replication; drop the RPC marker". The engine asserts on a mismatch. Any RPC marker on any override is refused, one on an engine event such as `UE_MULTICAST void ReceiveBeginPlay()` included. | Refused |
 
 ```cpp
 class DoorKid : public Door {
@@ -5053,12 +5057,12 @@ and is not `static`, and its caller carries on as soon as it reaches its first w
 
 | You write | What it does | Status |
 |---|---|---|
-| `UKismetSystemLibrary::Delay(0.5f);` | The editor's Delay node. The code after it runs when the delay ends, with the method's locals intact. Leave out the world context (`Delay(this, 0.5f)` is the same call) and the `FLatentActionInfo`: AssetGen supplies both. | Yes |
-| `UKismetSystemLibrary::RetriggerableDelay(HoldTime);` | Retriggerable Delay. A call while one is pending restarts the countdown instead of being ignored, so the code after it runs once, `HoldTime` after the last call. All callers of the method share its one call site, so a tick and any other caller restart the same countdown. | Yes |
-| `UPendingLatentActionLibrary::WaitOneFrame();` | Any latent function, static or a method, has a UeApi overload without the `FLatentActionInfo` and without the world context, and that is the one you call. AssetGen fills in the resume point, an ID for this call site and self. | Yes |
-| `Mover->FindNearestPathfinderPoint_Async(Pos, 500.0f, Ok, At);` | A latent function that answers through reference parameters. `Ok` and `At` are locals in the frame, so the action can fill them in, and the code after the call reads them. This is how the editor wires a latent node's output pins. | Yes |
-| `UKismetSystemLibrary::Delay(this, 1.0f, FLatentActionInfo(0, 1, "ExecuteUbergraph_Door", this));` | Refused: "leave the FLatentActionInfo argument out". The resume point exists only once AssetGen has laid out the event graph. | Refused |
-| `UKismetSystemLibrary::Delay(1.0f, FLatentActionInfo(0, 1, "ExecuteUbergraph_Door", this));` | Refused the same way, without the world context too. | Refused |
+| <a id="waiting-with-delay.ukismetsystemlibrary-delay-0-5f"></a>`UKismetSystemLibrary::Delay(0.5f);` | The editor's Delay node. The code after it runs when the delay ends, with the method's locals intact. Leave out the world context (`Delay(this, 0.5f)` is the same call) and the `FLatentActionInfo`: AssetGen supplies both. | Yes |
+| <a id="waiting-with-delay.ukismetsystemlibrary"></a>`UKismetSystemLibrary::RetriggerableDelay(HoldTime);` | Retriggerable Delay. A call while one is pending restarts the countdown instead of being ignored, so the code after it runs once, `HoldTime` after the last call. All callers of the method share its one call site, so a tick and any other caller restart the same countdown. | Yes |
+| <a id="waiting-with-delay.upendinglatentactionlibrary"></a>`UPendingLatentActionLibrary::WaitOneFrame();` | Any latent function, static or a method, has a UeApi overload without the `FLatentActionInfo` and without the world context, and that is the one you call. AssetGen fills in the resume point, an ID for this call site and self. | Yes |
+| <a id="waiting-with-delay.mover-findnearestpathfinderpoint"></a>`Mover->FindNearestPathfinderPoint_Async(Pos, 500.0f, Ok, At);` | A latent function that answers through reference parameters. `Ok` and `At` are locals in the frame, so the action can fill them in, and the code after the call reads them. This is how the editor wires a latent node's output pins. | Yes |
+| <a id="waiting-with-delay.ukismetsystemlibrary-delay-this"></a>`UKismetSystemLibrary::Delay(this, 1.0f, FLatentActionInfo(0, 1, "ExecuteUbergraph_Door", this));` | Refused: "leave the FLatentActionInfo argument out". The resume point exists only once AssetGen has laid out the event graph. | Refused |
+| <a id="waiting-with-delay.ukismetsystemlibrary-delay-1-0f"></a>`UKismetSystemLibrary::Delay(1.0f, FLatentActionInfo(0, 1, "ExecuteUbergraph_Door", this));` | Refused the same way, without the world context too. | Refused |
 
 ```cpp
 UDeepPathfinderMovement *Mover;
@@ -5099,14 +5103,14 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `FindPlayer(); Ready = true;` | A call to a method that waits returns when that method reaches its first wait, and the rest of it runs later. The caller never waits for it to finish, as with an editor custom event that contains a Delay. The code before the first wait runs inside the caller's call. | Yes |
-| `Log.Add(Tag); UKismetSystemLibrary::Delay(Seconds); Log.Add(Tag + 1);` | Parameters and locals keep their values across the wait: parameters are copied into the frame, and locals live there. Member variables are read fresh after the resume. | Yes |
-| `while (C == nullptr)` with a Delay inside | Each round waits before the next one starts, and the loop variables survive each wait. A `for` loop works the same way. This differs from a Delay in the body of the editor's For Loop node, which does not pause the loop. | Yes |
-| `Pause(2.0f);`, an inline helper that calls Delay | The helper is expanded into the caller, so the caller becomes the method that waits, and it resumes after the helper's Delay. Each expansion is a call site of its own. The caller has to follow the latent rules. A non-inline helper that waits returns to its caller at its first wait instead. | Yes |
-| `void ReceiveBeginPlay()` with a Delay inside | An override of an engine event can wait. The engine still calls it as that event. | Yes |
-| `Twice(1); Twice(2);` before `Twice` resumes | An object has one frame for a method that waits, not one per call. The second call starts at the top and overwrites the pending call's parameters and locals, and its Delay is ignored because one is already pending at that call site. The method resumes once, with the second call's values. An editor event graph behaves the same; a C++ coroutine would not. | Yes |
-| `UUserWidget *W = CreateWidget<UUserWidget>(P); UKismetSystemLibrary::Delay(1.0f); Kept = W;` | The frame holds an object local weakly: unless the object is flagged RF_StrongRefOnFrame, as SpawnObject's (`NewObject`) and the callback proxies' are, a garbage collection during the wait can take it, and the local then reads None. The editor's event graph is the same. The compiler warns where a local may hold an object the method made or loaded (not one read out of a property, nor an actor, component or async action) across a wait and reads it after: keep such an object in a member. | Warns |
-| `TArray<int32> Nums;` with no initializer | Empty on the object's first call. On a later call it holds whatever the previous call left in it, where C++ would give a new empty array. Initialize the local, or `Clear()` it at the top. Inside a loop it is reset every round, as usual. | Yes |
+| <a id="when-the-code.findplayer-ready-true"></a>`FindPlayer(); Ready = true;` | A call to a method that waits returns when that method reaches its first wait, and the rest of it runs later. The caller never waits for it to finish, as with an editor custom event that contains a Delay. The code before the first wait runs inside the caller's call. | Yes |
+| <a id="when-the-code.log-add-tag-ukismetsystemlibrary"></a>`Log.Add(Tag); UKismetSystemLibrary::Delay(Seconds); Log.Add(Tag + 1);` | Parameters and locals keep their values across the wait: parameters are copied into the frame, and locals live there. Member variables are read fresh after the resume. | Yes |
+| <a id="when-the-code.while-c-nullptr"></a>`while (C == nullptr)` with a Delay inside | Each round waits before the next one starts, and the loop variables survive each wait. A `for` loop works the same way. This differs from a Delay in the body of the editor's For Loop node, which does not pause the loop. | Yes |
+| <a id="when-the-code.pause-2-0f"></a>`Pause(2.0f);`, an inline helper that calls Delay | The helper is expanded into the caller, so the caller becomes the method that waits, and it resumes after the helper's Delay. Each expansion is a call site of its own. The caller has to follow the latent rules. A non-inline helper that waits returns to its caller at its first wait instead. | Yes |
+| <a id="when-the-code.void-receivebeginplay"></a>`void ReceiveBeginPlay()` with a Delay inside | An override of an engine event can wait. The engine still calls it as that event. | Yes |
+| <a id="when-the-code.twice-1-twice-2"></a>`Twice(1); Twice(2);` before `Twice` resumes | An object has one frame for a method that waits, not one per call. The second call starts at the top and overwrites the pending call's parameters and locals, and its Delay is ignored because one is already pending at that call site. The method resumes once, with the second call's values. An editor event graph behaves the same; a C++ coroutine would not. | Yes |
+| <a id="when-the-code.uuserwidget-w-createwidget"></a>`UUserWidget *W = CreateWidget<UUserWidget>(P); UKismetSystemLibrary::Delay(1.0f); Kept = W;` | The frame holds an object local weakly: unless the object is flagged RF_StrongRefOnFrame, as SpawnObject's (`NewObject`) and the callback proxies' are, a garbage collection during the wait can take it, and the local then reads None. The editor's event graph is the same. The compiler warns where a local may hold an object the method made or loaded (not one read out of a property, nor an actor, component or async action) across a wait and reads it after: keep such an object in a member. | Warns |
+| <a id="when-the-code.tarray-int32-nums"></a>`TArray<int32> Nums;` with no initializer | Empty on the object's first call. On a later call it holds whatever the previous call left in it, where C++ would give a new empty array. Initialize the local, or `Clear()` it at the top. Inside a loop it is reset every round, as usual. | Yes |
 
 ```cpp
 class Door : public AActor {
@@ -5164,13 +5168,13 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `static void Later(UObject *WorldContextObject)` with a Delay inside | Refused: "a static function has no object whose ubergraph frame could keep its locals". | Refused |
-| `int32 CountLater()` with a Delay inside | Refused: "a function that resumes later returns nothing and takes no non-const reference parameters". The caller gets control back at the first wait, before there is a value. Store the result in a member, or broadcast a dispatcher when done. | Refused |
-| `void SayLater(const FString &Msg)` with a Delay inside | Msg is copied into the event graph's frame when the method is called, through EX_LocalOutVariable, as the editor's event stubs copy one (a ReceiveHit's `const FHitResult &Hit`); the code after the wait reads that copy. | Yes |
-| `void FillLater(int32 &Out)` with a Delay inside | Refused with the CountLater message: a write after the wait would land in the frame's copy, the caller having gone on. Store the result in a member. | Refused |
-| a Delay in a `UObject` child class | Warns: "finds its world only through its Outer". Actor, ActorComponent, UserWidget, GameInstance and Subsystem classes have a world of their own; any other object uses its Outer's. Make the object with an actor or component as its Outer, or the wait does nothing and the method never resumes. The editor offers Delay only where the class has a world. | Warns |
-| `V = __Read64__(Addr);` in a method that waits | Reads the memory when the line runs: a read after the wait sees what the memory holds then. Writes through a pointer, `GetOuter()` and `GetTypedOuter` work the same way. See [Pointers and memory](#pointers-and-memory). | Yes |
-| `void ExecuteUbergraph_Door(int32 EntryPoint);` | Refused: "ExecuteUbergraph_<Class> is the name of a class's ubergraph". The engine resumes a class's latent calls through that function, found by name on the object, so a method of that name in the class or a subclass would catch them. | Refused |
+| <a id="where-a-method.static-void-later-uobject"></a>`static void Later(UObject *WorldContextObject)` with a Delay inside | Refused: "a static function has no object whose ubergraph frame could keep its locals". | Refused |
+| <a id="where-a-method.int32-countlater"></a>`int32 CountLater()` with a Delay inside | Refused: "a function that resumes later returns nothing and takes no non-const reference parameters". The caller gets control back at the first wait, before there is a value. Store the result in a member, or broadcast a dispatcher when done. | Refused |
+| <a id="where-a-method.void-saylater-const-fstring-msg"></a>`void SayLater(const FString &Msg)` with a Delay inside | Msg is copied into the event graph's frame when the method is called, through EX_LocalOutVariable, as the editor's event stubs copy one (a ReceiveHit's `const FHitResult &Hit`); the code after the wait reads that copy. | Yes |
+| <a id="where-a-method.void-filllater-int32-out"></a>`void FillLater(int32 &Out)` with a Delay inside | Refused with the CountLater message: a write after the wait would land in the frame's copy, the caller having gone on. Store the result in a member. | Refused |
+| <a id="where-a-method.uobject"></a>a Delay in a `UObject` child class | Warns: "finds its world only through its Outer". Actor, ActorComponent, UserWidget, GameInstance and Subsystem classes have a world of their own; any other object uses its Outer's. Make the object with an actor or component as its Outer, or the wait does nothing and the method never resumes. The editor offers Delay only where the class has a world. | Warns |
+| <a id="where-a-method.v-read64-addr"></a>`V = __Read64__(Addr);` in a method that waits | Reads the memory when the line runs: a read after the wait sees what the memory holds then. Writes through a pointer, `GetOuter()` and `GetTypedOuter` work the same way. See [Pointers and memory](#pointers-and-memory). | Yes |
+| <a id="where-a-method.void-executeubergraph-door-int32"></a>`void ExecuteUbergraph_Door(int32 EntryPoint);` | Refused: "ExecuteUbergraph_<Class> is the name of a class's ubergraph". The engine resumes a class's latent calls through that function, found by name on the object, so a method of that name in the class or a subclass would catch them. | Refused |
 
 ```cpp
 #include "../include/Objects.h"   // AssetGen's include/ folder, by its path from your source
@@ -5198,9 +5202,9 @@ public:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UObject *Obj = UKismetSystemLibrary::LoadAsset(Icon);` | The editor's Async Load Asset node, written as a call that returns. The method waits for the load, and the value is the loaded object, or null if the load failed. | Yes |
-| `auto Cls = UKismetSystemLibrary::LoadAssetClass(EnemyClass);` | Async Load Class Asset. The value is the loaded class, or null. | Yes |
-| `UKismetSystemLibrary::LoadAsset_Blocking(Icon)` | An ordinary call that does not wait, for a caller that must not become latent. | Yes |
+| <a id="async-loads.uobject-obj-ukismetsystemlibrary"></a>`UObject *Obj = UKismetSystemLibrary::LoadAsset(Icon);` | The editor's Async Load Asset node, written as a call that returns. The method waits for the load, and the value is the loaded object, or null if the load failed. | Yes |
+| <a id="async-loads.auto-cls-ukismetsystemlibrary"></a>`auto Cls = UKismetSystemLibrary::LoadAssetClass(EnemyClass);` | Async Load Class Asset. The value is the loaded class, or null. | Yes |
+| <a id="async-loads.ukismetsystemlibrary-loadasset"></a>`UKismetSystemLibrary::LoadAsset_Blocking(Icon)` | An ordinary call that does not wait, for a caller that must not become latent. | Yes |
 
 ```cpp
 TSoftObjectPtr<UTexture2D> Icon;
@@ -5233,11 +5237,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `static int32 Count = Stage + 10;` in a method that waits | The static lives in the object's frame. Its initializer runs on that object's first call only, and the value is kept after that: once per object, not once per program as in C++. A plain local of the same name elsewhere in the method is a separate variable and does not reset it. | Yes |
-| `static int32 Seen;` | Starts at zero on the object's first call and keeps its value across calls and loop rounds. A loop around it does not reset it, as it would a plain local. | Yes |
-| `static int32 Count = N;` in a method that never waits | Refused: "static Count lives in the ubergraph's frame". Only the frame of a method that waits outlives a call. Make `Count` a member. | Refused |
-| `static int32 Count = 0;` in an inline helper | Refused: "each expansion would keep its own", unlike C++'s single static. | Refused |
-| `static constexpr int32 kFive = 5;` | A static that holds a constant nothing writes is replaced by that constant. It needs no frame, so it works in any method, waiting or not. | Yes |
+| <a id="static-locals.static-int32-count-stage-10"></a>`static int32 Count = Stage + 10;` in a method that waits | The static lives in the object's frame. Its initializer runs on that object's first call only, and the value is kept after that: once per object, not once per program as in C++. A plain local of the same name elsewhere in the method is a separate variable and does not reset it. | Yes |
+| <a id="static-locals.static-int32-seen"></a>`static int32 Seen;` | Starts at zero on the object's first call and keeps its value across calls and loop rounds. A loop around it does not reset it, as it would a plain local. | Yes |
+| <a id="static-locals.static-int32-count-n"></a>`static int32 Count = N;` in a method that never waits | Refused: "static Count lives in the ubergraph's frame". Only the frame of a method that waits outlives a call. Make `Count` a member. | Refused |
+| <a id="static-locals.static-int32-count-0"></a>`static int32 Count = 0;` in an inline helper | Refused: "each expansion would keep its own", unlike C++'s single static. | Refused |
+| <a id="static-locals.static-constexpr-int32-kfive-5"></a>`static constexpr int32 kFive = 5;` | A static that holds a constant nothing writes is replaced by that constant. It needs no frame, so it works in any method, waiting or not. | Yes |
 
 ```cpp
 int32 Stage;
@@ -5273,18 +5277,18 @@ the game's dispatchers and one of its own, and its comments show the async-actio
 
 | You write | What it does | Status |
 |---|---|---|
-| `FName Notify = UE_AWAIT(Proxy->OnCompleted);` | Binds a generated event to the dispatcher and returns to the caller. When the dispatcher fires, the event stores its one parameter, and the method resumes after the await with that value. | Yes |
-| `Image = UE_AWAIT(Task->OnSuccess);` on an async action | For a `UBlueprintAsyncActionBase`, such as `UAsyncTaskDownloadImage`, AssetGen calls `Activate()` right after the bind, as the editor's async node does, at the first await of that variable on each path the method runs: in whichever branch of an `if` runs, and in a loop on the first round only. A later await on the same variable does not activate it again, until the variable is assigned a new action. An object that is not an async action, such as the montage proxy, is never activated: its factory already started the work. | Yes |
-| `if (Stop) UE_AWAIT(T->OnSuccess);` then `UE_AWAIT(T->OnFail);` | Refused: `some paths reach it with T's async action already activated and some without`. Keeping the second await's `Activate()` would start the action twice on one path, dropping it would never start it on the other. The same for a loop that can skip its await, such as with `continue` before it. | Refused |
-| `UE_AWAIT(Target->OnDestroyed);` | As a statement: waits for the dispatcher and drops its values. | Yes |
-| `UE_AWAIT(Task->OnSuccess);` with `Task` None | The bind, and `Activate()` for an async action, run only when the object passes IsValid, as the editor's async node tests its proxy. A None or pending-kill object binds nothing and logs no "Accessed None"; the method stays parked at the await. | Yes |
-| `int32 Code = UE_AWAIT(OnReady);` | The object in front of the dispatcher may be self, a member or a local. | Yes |
-| the code after the await, on a later broadcast | The generated event stays bound, so each later broadcast runs the code after the await again: it acts as a handler, not a one-shot wait. The event has no name you can write, so only `Clear()` on the dispatcher stops it, and that drops every binding. | Yes |
-| `auto [Who, Points] = UE_AWAIT(OnScored);` on a dispatcher of two or more parameters | Each name gets one of the dispatcher's values, in order, as the editor's async node gives each output a pin of its own; a later broadcast gives them its values. `const auto& [Who, Points]` is the same. `UE_AWAIT(OnScored);` as a statement waits and keeps none of them. `auto V = UE_AWAIT(OnScored);` is refused: `UE_AWAIT gives a dispatcher's two or more values one name each`. | Yes |
-| `bool WaitDone() { UE_AWAIT(Proxy->OnCompleted); return true; }` | Refused with the latent messages ("a function that resumes later returns nothing and takes no non-const reference parameters"; for a static method, "a static function has no object whose ubergraph frame could keep its locals"). A method that awaits returns `void`, takes no non-const reference parameters and is not `static`. | Refused |
-| `UE_AWAIT(UAsyncTaskDownloadImage::DownloadImage(Url)->OnSuccess);` | Refused: "keep the object in a variable, it is used twice", once for the bind and once for `Activate()`. | Refused |
-| `UE_AWAIT(Temp);` on a local delegate | Refused: `UE_AWAIT` takes a dispatcher property of an object. A multicast delegate as a local or a parameter is refused before `UE_AWAIT` sees it ("unimplemented local"). A single-cast `TDelegate` cannot be awaited at all. | Refused |
-| `Task->OnSuccess.Add(this, &Door::Done);` | Callback style: a handler per outcome, and the method does not wait. `Add` never calls `Activate()`, so call `Task->Activate()` yourself after binding. See [Event dispatchers](#event-dispatchers). | Yes |
+| <a id="ue-await.fname-notify-ue-await-proxy"></a>`FName Notify = UE_AWAIT(Proxy->OnCompleted);` | Binds a generated event to the dispatcher and returns to the caller. When the dispatcher fires, the event stores its one parameter, and the method resumes after the await with that value. | Yes |
+| <a id="ue-await.image-ue-await-task-onsuccess"></a>`Image = UE_AWAIT(Task->OnSuccess);` on an async action | For a `UBlueprintAsyncActionBase`, such as `UAsyncTaskDownloadImage`, AssetGen calls `Activate()` right after the bind, as the editor's async node does, at the first await of that variable on each path the method runs: in whichever branch of an `if` runs, and in a loop on the first round only. A later await on the same variable does not activate it again, until the variable is assigned a new action. An object that is not an async action, such as the montage proxy, is never activated: its factory already started the work. | Yes |
+| <a id="ue-await.if-stop-ue-await-t"></a>`if (Stop) UE_AWAIT(T->OnSuccess);` then `UE_AWAIT(T->OnFail);` | Refused: `some paths reach it with T's async action already activated and some without`. Keeping the second await's `Activate()` would start the action twice on one path, dropping it would never start it on the other. The same for a loop that can skip its await, such as with `continue` before it. | Refused |
+| <a id="ue-await.ue-await-target-ondestroyed"></a>`UE_AWAIT(Target->OnDestroyed);` | As a statement: waits for the dispatcher and drops its values. | Yes |
+| <a id="ue-await.ue-await-task-onsuccess"></a>`UE_AWAIT(Task->OnSuccess);` with `Task` None | The bind, and `Activate()` for an async action, run only when the object passes IsValid, as the editor's async node tests its proxy. A None or pending-kill object binds nothing and logs no "Accessed None"; the method stays parked at the await. | Yes |
+| <a id="ue-await.int32-code-ue-await-onready"></a>`int32 Code = UE_AWAIT(OnReady);` | The object in front of the dispatcher may be self, a member or a local. | Yes |
+| <a id="ue-await.the-code-after-the-await"></a>the code after the await, on a later broadcast | The generated event stays bound, so each later broadcast runs the code after the await again: it acts as a handler, not a one-shot wait. The event has no name you can write, so only `Clear()` on the dispatcher stops it, and that drops every binding. | Yes |
+| <a id="ue-await.auto-who-points-ue-await"></a>`auto [Who, Points] = UE_AWAIT(OnScored);` on a dispatcher of two or more parameters | Each name gets one of the dispatcher's values, in order, as the editor's async node gives each output a pin of its own; a later broadcast gives them its values. `const auto& [Who, Points]` is the same. `UE_AWAIT(OnScored);` as a statement waits and keeps none of them. `auto V = UE_AWAIT(OnScored);` is refused: `UE_AWAIT gives a dispatcher's two or more values one name each`. | Yes |
+| <a id="ue-await.bool-waitdone-ue-await-proxy"></a>`bool WaitDone() { UE_AWAIT(Proxy->OnCompleted); return true; }` | Refused with the latent messages ("a function that resumes later returns nothing and takes no non-const reference parameters"; for a static method, "a static function has no object whose ubergraph frame could keep its locals"). A method that awaits returns `void`, takes no non-const reference parameters and is not `static`. | Refused |
+| <a id="ue-await.ue-await-uasynctaskdownloadimage"></a>`UE_AWAIT(UAsyncTaskDownloadImage::DownloadImage(Url)->OnSuccess);` | Refused: "keep the object in a variable, it is used twice", once for the bind and once for `Activate()`. | Refused |
+| <a id="ue-await.ue-await-temp"></a>`UE_AWAIT(Temp);` on a local delegate | Refused: `UE_AWAIT` takes a dispatcher property of an object. A multicast delegate as a local or a parameter is refused before `UE_AWAIT` sees it ("unimplemented local"). A single-cast `TDelegate` cannot be awaited at all. | Refused |
+| <a id="ue-await.task-onsuccess-add-this-door"></a>`Task->OnSuccess.Add(this, &Door::Done);` | Callback style: a handler per outcome, and the method does not wait. `Add` never calls `Activate()`, so call `Task->Activate()` yourself after binding. See [Event dispatchers](#event-dispatchers). | Yes |
 
 ```cpp
 #include "UeApi/AnimGraphRuntime.h"
@@ -5348,13 +5352,13 @@ crashes the game, as it would in native C++. [examples/MemoryRead.cpp](examples/
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 *P`, `void *Q`, `FVector *V`, `UObject **PP` | A pointer to anything but a UObject is an int64 address. Pointer parameters, return values and locals are Int64 variables in the Blueprint. The compiler keeps the pointee type, so `*P` knows what it reads. There is no editor node for any of this. | Yes |
-| `FString *S`, `FName *N`, `TArray<int32> *A` | FString, FName and the containers are plain records, not objects, so pointers to them are raw addresses too. | Yes |
-| `AActor *A`, `UObject *O` | A pointer to a UObject class stays an object reference that the garbage collector sees. | Yes |
-| `AActor &A = *Other;`, `Others[1]` | An object pointer is not an address, so `*` and `[]` on one are refused ("which is not a raw pointer", "indexing that is not through a raw pointer"). Use the pointer as it is, `Other->Field`. For the object's memory, convert it: `(uint8 *)Other`. | Refused |
-| `const char *S`, `wchar_t *W` | Never an address. A `char*` parameter or local is an FString, and a string literal is a string constant. Walk raw bytes with `int8*` or `uint8*`. | Yes |
-| `if (P)`, `P != nullptr` | Compares the address with 0 (NotEqual_Int64Int64). `nullptr` is the int64 0. | Yes |
-| `if (Obj)` | On an object pointer this is an IsValid test, not a null check: see [Working with other objects](#working-with-other-objects). | Yes |
+| <a id="raw-pointers-and.int32-p"></a>`int32 *P`, `void *Q`, `FVector *V`, `UObject **PP` | A pointer to anything but a UObject is an int64 address. Pointer parameters, return values and locals are Int64 variables in the Blueprint. The compiler keeps the pointee type, so `*P` knows what it reads. There is no editor node for any of this. | Yes |
+| <a id="raw-pointers-and.fstring-s"></a>`FString *S`, `FName *N`, `TArray<int32> *A` | FString, FName and the containers are plain records, not objects, so pointers to them are raw addresses too. | Yes |
+| <a id="raw-pointers-and.aactor-a"></a>`AActor *A`, `UObject *O` | A pointer to a UObject class stays an object reference that the garbage collector sees. | Yes |
+| <a id="raw-pointers-and.aactor-a-other"></a>`AActor &A = *Other;`, `Others[1]` | An object pointer is not an address, so `*` and `[]` on one are refused ("which is not a raw pointer", "indexing that is not through a raw pointer"). Use the pointer as it is, `Other->Field`. For the object's memory, convert it: `(uint8 *)Other`. | Refused |
+| <a id="raw-pointers-and.const-char-s"></a>`const char *S`, `wchar_t *W` | Never an address. A `char*` parameter or local is an FString, and a string literal is a string constant. Walk raw bytes with `int8*` or `uint8*`. | Yes |
+| <a id="raw-pointers-and.if-p"></a>`if (P)`, `P != nullptr` | Compares the address with 0 (NotEqual_Int64Int64). `nullptr` is the int64 0. | Yes |
+| <a id="raw-pointers-and.if-obj"></a>`if (Obj)` | On an object pointer this is an IsValid test, not a null check: see [Working with other objects](#working-with-other-objects). | Yes |
 
 Notes:
 
@@ -5366,21 +5370,21 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 V = *P;` | Reads the value at the address. | Yes |
-| `P[I]`, `2[P]` | Reads the element at P + I × sizeof(pointee); a literal I folds to a constant offset. This is pointer indexing, not `Items[I]` on a TArray. | Yes |
-| `*P = 42;`, `P[2] = 7;` | Writes the value straight into the memory. | Yes |
-| `*(int8 *)Addr`, `*(signed char *)Addr` | Reads one byte, sign-extended: 0x80 to 0xFF read as negative ints, as in C++. | Yes |
-| `*(uint8 *)Addr`, `*(bool *)Addr` | Reads one byte as 0 to 255. A bool read is `byte != 0`. | Yes |
-| `FString S = *(FString *)Addr;` | Copies the string out. The function owns its copy, which is freed when it returns. | Yes |
-| `FText T = *(FText *)Addr;`, `*(FText *)Addr = T;` | Copies the text with the engine's FText copy, which shares the text data by reference count. Needs the FDerefTextView helper struct (see Helper code you supply, below). | Yes |
-| `*(UObject **)Addr`, `*(UClass **)Addr` | Reads 8 bytes as an object or class reference. | Yes |
-| `(int64)*(void **)Addr` | A pointer to a raw pointer reads a plain int64 address. | Yes |
-| `int64 V = *(uint32 *)Addr;` | Not built: Kismet has no unsigned 32-bit integer, and an int32 read would make 0xFFFFFFFF compare as -1. Refused with "reading a uint32 through a pointer". Read an int32 and mask it, as below. | Not yet |
-| `*(uint32 *)Addr = 5;` | Refused with "no Kismet conversion from int to uint32". Write through an int32 pointer: `*(int32 *)Addr = 5;`. | Refused |
-| `FVector V = *Pv;`, `*Pv = FVector(1.0f, 2.0f, 3.0f);`, `Pv[1] = *Pv;` | Reads, writes or copies the whole struct, at its size in the game: 12 bytes for an FVector. A struct holding an FString or a TArray is copied deeply, as C++'s copy is. Any struct a variable can be works, the mod's own included. | Yes |
-| `int32 V = *P16;`, `*P16 = 7;` with `uint16 *P16` or `int16 *P16` | Two bytes. A read is an int32, since Blueprint has no 16-bit integer: 0 to 65535 for uint16, sign-extended for int16. A write stores the value's low 16 bits and touches nothing past them. | Yes |
-| `float F = (float)*Pd;`, `*Pd = F;` with `double *Pd` | Blueprint has no double, so a read gives the float nearest the double, rounded as C++ converts it, and a write stores the float widened to a double. A value below the smallest normal float (about 1.2e-38) reads as 0 and is written as 0, where C++ keeps a denormal. | Yes |
-| `TArray<int32> A = *Pa;`, `TSet`, `TMap` | Refused with "a whole TArray<int32> through a pointer". Index the elements through the pointer's own data, or copy the container in a function that owns it. | Refused |
+| <a id="reading-and-writing.int32-v-p"></a>`int32 V = *P;` | Reads the value at the address. | Yes |
+| <a id="reading-and-writing.p-i"></a>`P[I]`, `2[P]` | Reads the element at P + I × sizeof(pointee); a literal I folds to a constant offset. This is pointer indexing, not `Items[I]` on a TArray. | Yes |
+| <a id="reading-and-writing.p-42"></a>`*P = 42;`, `P[2] = 7;` | Writes the value straight into the memory. | Yes |
+| <a id="reading-and-writing.int8-addr"></a>`*(int8 *)Addr`, `*(signed char *)Addr` | Reads one byte, sign-extended: 0x80 to 0xFF read as negative ints, as in C++. | Yes |
+| <a id="reading-and-writing.uint8-addr"></a>`*(uint8 *)Addr`, `*(bool *)Addr` | Reads one byte as 0 to 255. A bool read is `byte != 0`. | Yes |
+| <a id="reading-and-writing.fstring-s-fstring-addr"></a>`FString S = *(FString *)Addr;` | Copies the string out. The function owns its copy, which is freed when it returns. | Yes |
+| <a id="reading-and-writing.ftext-t-ftext-addr"></a>`FText T = *(FText *)Addr;`, `*(FText *)Addr = T;` | Copies the text with the engine's FText copy, which shares the text data by reference count. Needs the FDerefTextView helper struct (see Helper code you supply, below). | Yes |
+| <a id="reading-and-writing.uobject-addr"></a>`*(UObject **)Addr`, `*(UClass **)Addr` | Reads 8 bytes as an object or class reference. | Yes |
+| <a id="reading-and-writing.int64-void-addr"></a>`(int64)*(void **)Addr` | A pointer to a raw pointer reads a plain int64 address. | Yes |
+| <a id="reading-and-writing.int64-v-uint32-addr"></a>`int64 V = *(uint32 *)Addr;` | Not built: Kismet has no unsigned 32-bit integer, and an int32 read would make 0xFFFFFFFF compare as -1. Refused with "reading a uint32 through a pointer". Read an int32 and mask it, as below. | Not yet |
+| <a id="reading-and-writing.uint32-addr-5"></a>`*(uint32 *)Addr = 5;` | Refused with "no Kismet conversion from int to uint32". Write through an int32 pointer: `*(int32 *)Addr = 5;`. | Refused |
+| <a id="reading-and-writing.fvector-v-pv"></a>`FVector V = *Pv;`, `*Pv = FVector(1.0f, 2.0f, 3.0f);`, `Pv[1] = *Pv;` | Reads, writes or copies the whole struct, at its size in the game: 12 bytes for an FVector. A struct holding an FString or a TArray is copied deeply, as C++'s copy is. Any struct a variable can be works, the mod's own included. | Yes |
+| <a id="reading-and-writing.int32-v-p16"></a>`int32 V = *P16;`, `*P16 = 7;` with `uint16 *P16` or `int16 *P16` | Two bytes. A read is an int32, since Blueprint has no 16-bit integer: 0 to 65535 for uint16, sign-extended for int16. A write stores the value's low 16 bits and touches nothing past them. | Yes |
+| <a id="reading-and-writing.float-f-float-pd"></a>`float F = (float)*Pd;`, `*Pd = F;` with `double *Pd` | Blueprint has no double, so a read gives the float nearest the double, rounded as C++ converts it, and a write stores the float widened to a double. A value below the smallest normal float (about 1.2e-38) reads as 0 and is written as 0, where C++ keeps a denormal. | Yes |
+| <a id="reading-and-writing.tarray-int32-a-pa"></a>`TArray<int32> A = *Pa;`, `TSet`, `TMap` | Refused with "a whole TArray<int32> through a pointer". Index the elements through the pointer's own data, or copy the container in a function that owns it. | Refused |
 
 ```cpp
 TArray<int32> Items;
@@ -5417,8 +5421,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `V->Z = 5.0f;`, `float Y = V->Y;` | Reads or writes one member in place, at the address plus the member's offset. The struct is never copied, so a pointer to a struct of any size works. | Yes |
-| `(*V).X` | The same as `V->X`. | Yes |
+| <a id="struct-members-through.v-z-5-0f"></a>`V->Z = 5.0f;`, `float Y = V->Y;` | Reads or writes one member in place, at the address plus the member's offset. The struct is never copied, so a pointer to a struct of any size works. | Yes |
+| <a id="struct-members-through.v-x"></a>`(*V).X` | The same as `V->X`. | Yes |
 
 ```cpp
 TArray<FVector> Points;
@@ -5441,24 +5445,24 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `P + N`, `N + P`, `P - N` | Moves by N elements, as in C++: the byte offset is N × sizeof(pointee). The result is another address. | Yes |
-| `P - Q` | The number of elements between two pointers, as an int64. | Yes |
-| `P += N`, `P -= N`, `++P`, `--P`, `P++` | Steps a pointer variable in place, by elements. `P++` yields the value from before the step. | Yes |
-| `(int64)P + 4`, `(uint8 *)P + 4` | Byte arithmetic: an int64 or a byte pointer moves by bytes. | Yes |
+| <a id="pointer-arithmetic.p-n"></a>`P + N`, `N + P`, `P - N` | Moves by N elements, as in C++: the byte offset is N × sizeof(pointee). The result is another address. | Yes |
+| <a id="pointer-arithmetic.p-q"></a>`P - Q` | The number of elements between two pointers, as an int64. | Yes |
+| <a id="pointer-arithmetic.p-n-2"></a>`P += N`, `P -= N`, `++P`, `--P`, `P++` | Steps a pointer variable in place, by elements. `P++` yields the value from before the step. | Yes |
+| <a id="pointer-arithmetic.int64-p-4"></a>`(int64)P + 4`, `(uint8 *)P + 4` | Byte arithmetic: an int64 or a byte pointer moves by bytes. | Yes |
 
 ### Taking an address
 
 | You write | What it does | Status |
 |---|---|---|
-| `&Items[I]` | The address of a TArray element: the array's data pointer plus I × the element size. The array must be a variable, a member or a local. | Yes |
-| `&MakeArr()[0]` | Refused with "the address of an element needs an array variable". Store the array in a local first. | Refused |
-| `&*P`, `&P[I]` | P itself, and P + I × sizeof(pointee). Nothing is read. | Yes |
-| `&Obj->Member`, `&Member` | The address of an object's property (`&Member` is one of the class's own), looked up by name at run time. Needs a class named ReadProperty that you supply (see Helper code you supply, below). The result is 0 when the object's class has no such property. | Yes |
-| `&Pv->Y`, `&(*Pv).Y`, `&Items[I].Y`, `&R.Y` | The address of a struct member: where the struct sits plus the member's offset in the game's layout, through any number of members (`&P[I].Inner.Y`). The struct may be memory through a pointer, a TArray element, a reference that keeps an address, or a call that returns a reference. | Yes |
-| `&Obj->Loc.Y`, `&Loc.Y` | The same, with the struct's address found at run time through ReadProperty, as `&Obj->Member`'s is. | Yes |
-| `&C->ExternalCurve` with `FRuntimeCurveLinearColor *C` | An engine struct's members are placed from its reflected ones, which is right only when nothing unreflected sits between them. When the ones UeApi has do not add up to the struct's size, the build stops: "FRuntimeCurveLinearColor's reflected members take 8 bytes and it takes 520 in the game" (its `ColorCurves` array is not in UeApi). Add the offset yourself, from the game's SDK. `&H->Distance` on an `FHitResult *H` is placed, as its weak members are in UeApi. | Refused |
-| `&Local`, `&Param`, `&V.X` of a local struct | A local or a parameter is a Blueprint variable, which has no address the VM hands out. Refused with "a Blueprint variable has none the VM hands out". Point into an object, a TArray element or memory through a pointer instead. | Refused |
-| `&this->K` with `static inline int32 K = 3;` | An inline class variable has no storage: each use is its initializer. Refused with "a static variable has no address". A bare `&K` gets the Blueprint-variable message instead. | Refused |
+| <a id="taking-an-address.items-i"></a>`&Items[I]` | The address of a TArray element: the array's data pointer plus I × the element size. The array must be a variable, a member or a local. | Yes |
+| <a id="taking-an-address.makearr-0"></a>`&MakeArr()[0]` | Refused with "the address of an element needs an array variable". Store the array in a local first. | Refused |
+| <a id="taking-an-address.p"></a>`&*P`, `&P[I]` | P itself, and P + I × sizeof(pointee). Nothing is read. | Yes |
+| <a id="taking-an-address.obj-member"></a>`&Obj->Member`, `&Member` | The address of an object's property (`&Member` is one of the class's own), looked up by name at run time. Needs a class named ReadProperty that you supply (see Helper code you supply, below). The result is 0 when the object's class has no such property. | Yes |
+| <a id="taking-an-address.pv-y"></a>`&Pv->Y`, `&(*Pv).Y`, `&Items[I].Y`, `&R.Y` | The address of a struct member: where the struct sits plus the member's offset in the game's layout, through any number of members (`&P[I].Inner.Y`). The struct may be memory through a pointer, a TArray element, a reference that keeps an address, or a call that returns a reference. | Yes |
+| <a id="taking-an-address.obj-loc-y"></a>`&Obj->Loc.Y`, `&Loc.Y` | The same, with the struct's address found at run time through ReadProperty, as `&Obj->Member`'s is. | Yes |
+| <a id="taking-an-address.c-externalcurve"></a>`&C->ExternalCurve` with `FRuntimeCurveLinearColor *C` | An engine struct's members are placed from its reflected ones, which is right only when nothing unreflected sits between them. When the ones UeApi has do not add up to the struct's size, the build stops: "FRuntimeCurveLinearColor's reflected members take 8 bytes and it takes 520 in the game" (its `ColorCurves` array is not in UeApi). Add the offset yourself, from the game's SDK. `&H->Distance` on an `FHitResult *H` is placed, as its weak members are in UeApi. | Refused |
+| <a id="taking-an-address.local"></a>`&Local`, `&Param`, `&V.X` of a local struct | A local or a parameter is a Blueprint variable, which has no address the VM hands out. Refused with "a Blueprint variable has none the VM hands out". Point into an object, a TArray element or memory through a pointer instead. | Refused |
+| <a id="taking-an-address.this-k"></a>`&this->K` with `static inline int32 K = 3;` | An inline class variable has no storage: each use is its initializer. Refused with "a static variable has no address". A bare `&K` gets the Blueprint-variable message instead. | Refused |
 
 ```cpp
 #include "ReadProperty.h"   // your helper's header
@@ -5489,11 +5493,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `int32 &R = *P;`, `int32 &R = P[2];` | Keeps the address in a hidden int64 local. Reads and writes through R go to that memory. | Yes |
-| `int32 &Alias = Local;` | Another name for the variable, with no storage of its own. Writes reach the original. | Yes |
-| `const FString &R = MakeName();` | A `const T&` bound to a temporary is an ordinary local holding a copy. | Yes |
-| `Bump(*P);` with `void Bump(int32 &V)` | Passes the memory itself, so the callee's writes land at the address. A T& parameter of a mod function is an out-parameter in the Blueprint. | Yes |
-| `int32 &Get(int32 *P) { return *P; }` | Returns the address P holds, so `Get(P) = 5` writes there and `Get(P)` reads there. Reference returns are in [Functions](#parameters-and-return-values). | Yes |
+| <a id="references-to-memory.int32-r-p"></a>`int32 &R = *P;`, `int32 &R = P[2];` | Keeps the address in a hidden int64 local. Reads and writes through R go to that memory. | Yes |
+| <a id="references-to-memory.int32-alias-local"></a>`int32 &Alias = Local;` | Another name for the variable, with no storage of its own. Writes reach the original. | Yes |
+| <a id="references-to-memory.const-fstring-r-makename"></a>`const FString &R = MakeName();` | A `const T&` bound to a temporary is an ordinary local holding a copy. | Yes |
+| <a id="references-to-memory.bump-p"></a>`Bump(*P);` with `void Bump(int32 &V)` | Passes the memory itself, so the callee's writes land at the address. A T& parameter of a mod function is an out-parameter in the Blueprint. | Yes |
+| <a id="references-to-memory.int32-get-int32-p-return"></a>`int32 &Get(int32 *P) { return *P; }` | Returns the address P holds, so `Get(P) = 5` writes there and `Get(P)` reads there. Reference returns are in [Functions](#parameters-and-return-values). | Yes |
 
 ```cpp
 void Bump(int32 &V) { V = V + 1; }
@@ -5513,10 +5517,10 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `(int64)Obj`, `(uint8 *)Obj` | The object's address, as an int64 or a byte pointer: the reference's 8 bytes, reinterpreted. `__AddrOf__(Obj)` is the explicit form. | Yes |
-| `(AActor *)Addr` | An int64 reinterpreted as an object reference. Nothing checks that an object lives there. | Yes |
-| `(AActor *)0`, `(AActor *)5` | The literal 0 is null. Any other integer literal is widened to int64 first. | Yes |
-| `(AActor *)N` with an int32 N | Refused with "an int becomes a pointer through int64". Store the value in an int64 variable first: `int64 Addr = N;` then `(AActor *)Addr`. `(AActor *)(int64)N` is refused too. | Refused |
+| <a id="objects-and-addresses.int64-obj"></a>`(int64)Obj`, `(uint8 *)Obj` | The object's address, as an int64 or a byte pointer: the reference's 8 bytes, reinterpreted. `__AddrOf__(Obj)` is the explicit form. | Yes |
+| <a id="objects-and-addresses.aactor-addr"></a>`(AActor *)Addr` | An int64 reinterpreted as an object reference. Nothing checks that an object lives there. | Yes |
+| <a id="objects-and-addresses.aactor-0"></a>`(AActor *)0`, `(AActor *)5` | The literal 0 is null. Any other integer literal is widened to int64 first. | Yes |
+| <a id="objects-and-addresses.aactor-n"></a>`(AActor *)N` with an int32 N | Refused with "an int becomes a pointer through int64". Store the value in an int64 variable first: `int64 Addr = N;` then `(AActor *)Addr`. `(AActor *)(int64)N` is refused too. | Refused |
 
 ```cpp
 int64 Where(AActor *Obj) { return (int64)Obj; }
@@ -5537,9 +5541,9 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `sizeof(FVector)`, `sizeof(*P)` | The type's size in the game, folded to a constant: 12 for FVector. This is not the size clang gives the SDK's stand-in type. Pointer arithmetic uses the same sizes. | Yes |
-| `alignof(FTransform)` | The type's alignment in the game, folded to a constant: 16 here. | Yes |
-| `sizeof(AActor)` | An object class by value has no layout the compiler knows. Refused with "unimplemented struct member type: AActor". `sizeof(AActor *)` is 8. | Refused |
+| <a id="sizeof-and-alignof.sizeof-fvector"></a>`sizeof(FVector)`, `sizeof(*P)` | The type's size in the game, folded to a constant: 12 for FVector. This is not the size clang gives the SDK's stand-in type. Pointer arithmetic uses the same sizes. | Yes |
+| <a id="sizeof-and-alignof.alignof-ftransform"></a>`alignof(FTransform)` | The type's alignment in the game, folded to a constant: 16 here. | Yes |
+| <a id="sizeof-and-alignof.sizeof-aactor"></a>`sizeof(AActor)` | An object class by value has no layout the compiler knows. Refused with "unimplemented struct member type: AActor". `sizeof(AActor *)` is 8. | Refused |
 
 Notes:
 
@@ -5553,8 +5557,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `while (*Q != 0) { ++Q; }` | A condition that reads memory is read again before every iteration, as in C++. The compiler writes the loop as `while (true) { if (!Cond) break; ... }`. | Yes |
-| `Value = *P;` in a function that also calls `Delay(1.0f)` | Reads when the line runs. A function that waits runs in a generated event graph, and its locals, P included, live in that graph's frame, so a read after the wait uses the same P. Writes and inline functions work the same way. | Yes |
+| <a id="where-pointer-code.while-q-0-q"></a>`while (*Q != 0) { ++Q; }` | A condition that reads memory is read again before every iteration, as in C++. The compiler writes the loop as `while (true) { if (!Cond) break; ... }`. | Yes |
+| <a id="where-pointer-code.value-p"></a>`Value = *P;` in a function that also calls `Delay(1.0f)` | Reads when the line runs. A function that waits runs in a generated event graph, and its locals, P included, live in that graph's frame, so a read after the wait uses the same P. Writes and inline functions work the same way. | Yes |
 
 ```cpp
 int64 Addr = 0;
@@ -5588,8 +5592,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `*P`, `P[I]`, `P->X` | Nothing to declare. Every read or write through a pointer goes through a 16-byte scratch struct, FDeref (`int64 Data; int32 Num; int32 Max;`). The compiler creates it on first use and cooks it as FDeref.uasset in the mod's package, beside the class. | Yes |
-| `struct FDeref { UE_STRUCT; int64 Data; int32 Num; int32 Max; };` | A struct the mod declares under this name is used instead, and none is created. | Yes |
+| <a id="the-fderef-scratch.p"></a>`*P`, `P[I]`, `P->X` | Nothing to declare. Every read or write through a pointer goes through a 16-byte scratch struct, FDeref (`int64 Data; int32 Num; int32 Max;`). The compiler creates it on first use and cooks it as FDeref.uasset in the mod's package, beside the class. | Yes |
+| <a id="the-fderef-scratch.struct-fderef-ue-struct-int64"></a>`struct FDeref { UE_STRUCT; int64 Data; int32 Num; int32 Max; };` | A struct the mod declares under this name is used instead, and none is created. | Yes |
 
 Notes:
 
@@ -5606,9 +5610,9 @@ that the compiler does not generate, so you supply it:
 
 | You write | What it does | Status |
 |---|---|---|
-| `&Obj->Member` | Calls the Blueprint function `GetPropertyAddress` on the class named ReadProperty that the source can see. | Yes |
-| `*(FText *)Addr`, `__ReadText__(Addr)` | Imports the struct `/Game/_ElytrasMods/ReadProperty/FDerefTextView`, a path the compiler hard-codes. | Yes |
-| `__ClassOf__(x)` | Calls GetParmClassName on the class that uses it: see [Intrinsics](#intrinsics). | Yes |
+| <a id="helper-code-you.obj-member"></a>`&Obj->Member` | Calls the Blueprint function `GetPropertyAddress` on the class named ReadProperty that the source can see. | Yes |
+| <a id="helper-code-you.ftext-addr"></a>`*(FText *)Addr`, `__ReadText__(Addr)` | Imports the struct `/Game/_ElytrasMods/ReadProperty/FDerefTextView`, a path the compiler hard-codes. | Yes |
+| <a id="helper-code-you.classof-x"></a>`__ClassOf__(x)` | Calls GetParmClassName on the class that uses it: see [Intrinsics](#intrinsics). | Yes |
 
 One small helper mod covers the first two. It cooks FDerefTextView at the fixed path, and a ReadProperty class that
 exports a real GetPropertyAddress. The function walks the object's class and its super classes for a property with
@@ -5694,17 +5698,17 @@ intrinsic".
 
 | You write | What it does | Status |
 |---|---|---|
-| `__Read64__(A)` | Reads 8 bytes at the int64 address A, as an int64. | Yes |
-| `__Read32__(A)` | Reads 4 bytes as an int32. | Yes |
-| `__ReadFloat__(A)` | Reads 4 bytes as a float. | Yes |
-| `__ReadByte__(A)` | Reads 1 byte as a uint8, 0 to 255. | Yes |
-| `__ReadObject__(A)`, `__ReadClass__(A)` | Reads 8 bytes as a UObject* or a UClass*. `__ReadClass__` assigns to a UClass* variable without a cast. | Yes |
-| `__ReadName__(A)` | Reads 8 bytes as an FName. | Yes |
-| `__ReadString__(A)` | Copies the 16-byte FString at A. | Yes |
-| `__ReadText__(A)` | Copies the 24-byte FText at A. Needs the FDerefTextView helper struct: see [Pointers and memory](#pointers-and-memory). | Yes |
-| `__Read32__(P)` with `int32 *P` | Every read also takes a pointer, and reads at the address it holds. | Yes |
-| `__AddrOf__(Obj)` | The object's address as an int64, the same as `(int64)Obj`. | Yes |
-| `__NameIndex__(Name)` | The FName's comparison index, its first 4 bytes, as an int32. A cheap identity to compare with a name read from memory. It ignores the name's number suffix. | Yes |
+| <a id="reading-memory.read64-a"></a>`__Read64__(A)` | Reads 8 bytes at the int64 address A, as an int64. | Yes |
+| <a id="reading-memory.read32-a"></a>`__Read32__(A)` | Reads 4 bytes as an int32. | Yes |
+| <a id="reading-memory.readfloat-a"></a>`__ReadFloat__(A)` | Reads 4 bytes as a float. | Yes |
+| <a id="reading-memory.readbyte-a"></a>`__ReadByte__(A)` | Reads 1 byte as a uint8, 0 to 255. | Yes |
+| <a id="reading-memory.readobject-a"></a>`__ReadObject__(A)`, `__ReadClass__(A)` | Reads 8 bytes as a UObject* or a UClass*. `__ReadClass__` assigns to a UClass* variable without a cast. | Yes |
+| <a id="reading-memory.readname-a"></a>`__ReadName__(A)` | Reads 8 bytes as an FName. | Yes |
+| <a id="reading-memory.readstring-a"></a>`__ReadString__(A)` | Copies the 16-byte FString at A. | Yes |
+| <a id="reading-memory.readtext-a"></a>`__ReadText__(A)` | Copies the 24-byte FText at A. Needs the FDerefTextView helper struct: see [Pointers and memory](#pointers-and-memory). | Yes |
+| <a id="reading-memory.read32-p"></a>`__Read32__(P)` with `int32 *P` | Every read also takes a pointer, and reads at the address it holds. | Yes |
+| <a id="reading-memory.addrof-obj"></a>`__AddrOf__(Obj)` | The object's address as an int64, the same as `(int64)Obj`. | Yes |
+| <a id="reading-memory.nameindex-name"></a>`__NameIndex__(Name)` | The FName's comparison index, its first 4 bytes, as an int32. A cheap identity to compare with a name read from memory. It ignores the name's number suffix. | Yes |
 
 ```cpp
 #include "../include/Intrin.h"   // AssetGen's include/Intrin.h
@@ -5723,12 +5727,12 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `__PtrCast__<int64>(Obj)` | The object's address. | Yes |
-| `__PtrCast__<AActor *>(Addr)` | The object at an address. | Yes |
-| `__PtrCast__<int32 *>(Addr)` | The address as a pointer, which is still an int64. | Yes |
-| `__PtrCast__<int32 &>(Addr)` | The int32 at Addr, as a value you can read and assign to. | Yes |
-| `__PtrCast__<int64>(R)` with `int32 &R = *P` | The address R keeps, not the value there. | Yes |
-| `__PtrCast__<int64>(R)` with `int32 &R = Local` | A reference to a Blueprint variable has no address. Refused with "a reference to a Blueprint variable, which has no address". | Refused |
+| <a id="ptrcast.ptrcast-int64-obj"></a>`__PtrCast__<int64>(Obj)` | The object's address. | Yes |
+| <a id="ptrcast.ptrcast-aactor-addr"></a>`__PtrCast__<AActor *>(Addr)` | The object at an address. | Yes |
+| <a id="ptrcast.ptrcast-int32-addr"></a>`__PtrCast__<int32 *>(Addr)` | The address as a pointer, which is still an int64. | Yes |
+| <a id="ptrcast.ptrcast-int32-addr-2"></a>`__PtrCast__<int32 &>(Addr)` | The int32 at Addr, as a value you can read and assign to. | Yes |
+| <a id="ptrcast.ptrcast-int64-r"></a>`__PtrCast__<int64>(R)` with `int32 &R = *P` | The address R keeps, not the value there. | Yes |
+| <a id="ptrcast.ptrcast-int64-r-2"></a>`__PtrCast__<int64>(R)` with `int32 &R = Local` | A reference to a Blueprint variable has no address. Refused with "a reference to a Blueprint variable, which has no address". | Refused |
 
 ```cpp
 #include "../include/Intrin.h"   // AssetGen's include/Intrin.h
@@ -5753,7 +5757,7 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `__RefAt__(Addr)` | Passes the memory at Addr by reference to an engine function whose native code steps its wildcard argument itself (a CustomThunk). The function sees Addr, not the address of a temporary copy. Read as a plain value, it is 8 bytes of int64. | Yes |
+| <a id="refat.refat-addr"></a>`__RefAt__(Addr)` | Passes the memory at Addr by reference to an engine function whose native code steps its wildcard argument itself (a CustomThunk). The function sees Addr, not the address of a temporary copy. Read as a plain value, it is 8 bytes of int64. | Yes |
 
 ```cpp
 #include "../include/Wildcard.h"   // AssetGen's include/Wildcard.h: the engine's wildcard setters, int64 in place
@@ -5777,8 +5781,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `__ClassOf__(Out)` | The property class name (IntProperty, FloatProperty, ...) of a parameter or local of the current function, found at run time. It compiles to `GetParmClassName(<this function>, FName("Out"))` on the class that uses it; Out itself is not evaluated. Slower than a string literal, but it follows a rename or a retype. | Yes |
-| `__ClassOf__(Obj->Field)` | Refused with "argument must be a bare parameter or local reference". | Refused |
+| <a id="classof.classof-out"></a>`__ClassOf__(Out)` | The property class name (IntProperty, FloatProperty, ...) of a parameter or local of the current function, found at run time. It compiles to `GetParmClassName(<this function>, FName("Out"))` on the class that uses it; Out itself is not evaluated. Slower than a string literal, but it follows a rename or a retype. | Yes |
+| <a id="classof.classof-obj-field"></a>`__ClassOf__(Obj->Field)` | Refused with "argument must be a bare parameter or local reference". | Refused |
 
 ```cpp
 #include "../include/Intrin.h"   // AssetGen's include/Intrin.h
@@ -5812,8 +5816,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `__Asm__("0B");` | Appends the hex bytes to the function's bytecode unchanged (0x0B is EX_Nothing). Whitespace, commas and underscores are skipped, and case does not matter. A statement only. | Yes |
-| `__Asm__("0B", 1);` | The same, with the VM memory size the bytes stand for. Pass it for a token that carries an FName, an object reference or a jump target. | Yes |
+| <a id="asm.asm-0b"></a>`__Asm__("0B");` | Appends the hex bytes to the function's bytecode unchanged (0x0B is EX_Nothing). Whitespace, commas and underscores are skipped, and case does not matter. A statement only. | Yes |
+| <a id="asm.asm-0b-1"></a>`__Asm__("0B", 1);` | The same, with the VM memory size the bytes stand for. Pass it for a token that carries an FName, an object reference or a jump target. | Yes |
 
 Notes:
 
@@ -5827,7 +5831,7 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `TArray<uint8> Payload = __EmbedFile__("data/blob.bin");` | Bakes a file's bytes into a `TArray<uint8>` member's default at build time: see [Classes and variables](#classes-and-variables). In a function body it is refused as an "unimplemented intrinsic". | Yes |
+| <a id="embedfile.tarray-uint8-payload-embedfile"></a>`TArray<uint8> Payload = __EmbedFile__("data/blob.bin");` | Bakes a file's bytes into a `TArray<uint8>` member's default at build time: see [Classes and variables](#classes-and-variables). In a function body it is refused as an "unimplemented intrinsic". | Yes |
 
 ## Macro and intrinsic index
 
@@ -5880,7 +5884,7 @@ listed here is refused with "unimplemented intrinsic".
 | `for (auto &X : Items)`, `for (auto &[Key, Value] : Map)` | Range-for: a TArray by index, a TSet through a copy, a TMap by key and value. | [Loops](#loops) |
 | FString methods, `S.Len()` | UKismetStringLibrary statics as methods, the string first: `S.Len()` is `UKismetStringLibrary::Len(S)`. | [Strings and text](#strings-and-text) |
 | `GetClass()`, `GetName()` | Get Class and Get Object Name, on this or any object. | [Working with other objects](#working-with-other-objects) |
-| `GetOuter()` | The object's outer, read from memory. Not on a null object, and not in a function that waits. | [Working with other objects](#working-with-other-objects) |
+| `GetOuter()` | The object's outer, read from memory. Not on a null object. | [Working with other objects](#working-with-other-objects) |
 | `GetOutermostTypedOuter<T>(Obj)` | The farthest outer of Obj that is a T, or null. | [Working with other objects](#working-with-other-objects) |
 | `GetParmClassName` | The method that `__ClassOf__` calls on the class that uses it. You define it, with exactly two parameters. | [Intrinsics](#intrinsics) |
 | `GetSubsystem<T>()` | The same as `T::Get()`. | [Working with other objects](#working-with-other-objects) |
