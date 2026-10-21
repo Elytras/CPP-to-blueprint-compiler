@@ -1511,6 +1511,8 @@ Notes:
 |---|---|---|
 | <a id="comparisons.health-25-f"></a>`Health < 25.f`, `A >= B`, `A == B` | The comparison node for the operand type: Less_IntInt, GreaterEqual_FloatFloat, EqualEqual_Int64Int64 and so on. This covers numbers and bools. | Yes |
 | <a id="comparisons.m-emood-calm"></a>`M < EMood::Calm` | An enum compares through its underlying type. A uint8 enum uses the Byte nodes (Less_ByteByte), and an int64-backed enum compares all 64 bits. | Yes |
+| `B == 7`, `B != Other`, `(uint8)M != (uint8)EMood::Calm` on uint8s or byte enums | The byte compare, EqualEqual_ByteByte / NotEqual_ByteByte, the editor's == on bytes. C++ promotes both sides to int, but that changes no equality, so no Conv_ByteToInt is made. A side may be a byte, a byte enum, a cast to uint8 or a constant 0..255. | Yes |
+| `B == 300`, `B != -1` on a uint8 | A constant that is no byte keeps C++'s int compare, so these are always false and always true, as clang warns. | Yes |
 | <a id="comparisons.a-this"></a>`A == this`, `P == nullptr` | Object identity, the Equal and Not Equal (Object) nodes. How `P != nullptr` differs from `if (P)` is in [Working with other objects](#working-with-other-objects). | Yes |
 | <a id="comparisons.a-b"></a>`A < B` on object pointers | Refused ("unimplemented binary operator < on ObjectObject"): Kismet has only == and != for objects. | Refused |
 | <a id="comparisons.a-b-2"></a>`A == B` on FString or FName | Compares case-insensitively, so "abc" == "ABC" is true for both. See [Strings and text](#strings-and-text). | Yes |
@@ -1633,8 +1635,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| <a id="switch.switch-code"></a>`switch (Code)` on an int32, uint8, bool or enum | The editor's Switch on Int, Byte or Enum. The value is evaluated once, and the case bodies are compiled in source order, so fallthrough, `[[fallthrough]]`, `default` in any position, `break` and `continue` behave as in C++. | Yes |
-| <a id="switch.switch-id"></a>`switch (Id)` on an int64 | A chain of full 64-bit compares. | Yes |
+| <a id="switch.switch-code"></a>`switch (Code)` on an int32, uint8, bool or enum | A jump table: the value is evaluated once into a local, one Select on it (EX_SwitchValue) picks the code offset of the matching case, and one jump (EX_ComputedJump) goes there. The case bodies are compiled in source order, so fallthrough, `[[fallthrough]]`, `default` in any position, `break` and `continue` behave as in C++. | Yes |
+| <a id="switch.switch-id"></a>`switch (Id)` on an int64 | The same jump table, comparing all 64 bits. | Yes |
 | <a id="switch.switch-int32-k-v-1"></a>`switch (int32 K = V + 1; K)` | An init-statement or a declaring condition runs once, then the plain switch. | Yes |
 | <a id="switch.switch-ue-name-switch-kind"></a>`switch (UE_NAME_SWITCH(Kind))` | The editor's Switch on Name, shown below. | Yes |
 | <a id="switch.case-1-3"></a>`case 1 ... 3:` | GNU case ranges are refused ("unimplemented statement IntegerLiteral"). List the cases. | Refused |
@@ -1664,14 +1666,17 @@ int32 NameKind(FName Kind) {
 
 Notes:
 
-- A dense run of three or more cases, spread over at most four times their count, dispatches through a jump table.
-  Other cases cost one compare each. An int64 or FName switch never uses a table.
+- Every switch dispatches the same way, however many cases it has and however they are spread: one evaluation, one
+  native scan of the case values, one jump. The editor's own Switch on Int instead compares the value with each case in
+  turn, one Kismet call per case.
+- A value no case names goes to `default`, or past the switch. It never makes the engine's "Switch statement failed
+  to match case" warning: the scan's last entry is the value itself, which always matches, and carries that target.
 - On a uint8, bool or byte enum, a case outside 0..255 (-128..127 for int8) can never match, so it is left out of the
-  tests. Its code is reached only by falling through into it, as in C++.
+  table. Its code is reached only by falling through into it, as in C++.
 - `using enum` and `[[likely]]` inside a switch are fine.
 - C++ switches only on integers, so UE_NAME_SWITCH and UE_NAME_CASE give clang a switch over hashes of the case
-  texts. AssetGen stores the name once and compares it with each case (NotEqual_NameName), case-insensitively, as
-  FName comparison is. Fallthrough and `default` work as in any switch.
+  texts. AssetGen stores the name once and dispatches through the same jump table, comparing names
+  case-insensitively, as FName comparison is. Fallthrough and `default` work as in any switch.
 - Every case of a name switch must be `UE_NAME_CASE("literal")`, or the switch is refused ("a case of UE_NAME_SWITCH
   needs UE_NAME_CASE"). Two identical texts are a duplicate-case error from clang. Two texts that differ only in case
   compile, but only the first can ever match.
@@ -2002,7 +2007,7 @@ stays what C++ says.
 | <a id="what-the-optimizer.return-x-a-b"></a>`return X + A * B;` after `int32 X = A * B;` | A repeated pure call is not reused: it is evaluated each time it appears. To compute it once, keep the result in a local and read the local. | Not yet |
 | <a id="what-the-optimizer.if-isready-item"></a>`if (IsReady(Item))` over an inline bool function whose returns are all constants | Each `return true` and `return false` jumps straight to the branch it picks: no bool is stored and then tested. | Yes |
 | <a id="what-the-optimizer.scale-value-tick"></a>`Scale(Value, Tick())` into `inline int32 Scale(int32 V, int32 By)` | A parameter the body only reads is the caller's local variable itself, not a copy, while nothing can change that variable during the call. Another argument that writes it, or a reference parameter bound to it, keeps the copy. | Yes |
-| <a id="what-the-optimizer.bump-v"></a>`Bump(V)` in a `final` class or to a `final` method, `Base::Bump(V)`, or a static of a class this source cooks | The call: the body is copied in, as an inline function's is. See [Calling your own functions](#calling-your-own-functions). | Yes |
+| <a id="what-the-optimizer.bump-v"></a>`Bump(V)` in a `final` class or to a `final` method, `Base::Bump(V)`, or a static of a class this source cooks that is no function library | The call: the body is copied in, as an inline function's is. A function library's static stays a call unless it is `[[gnu::always_inline]]`. See [Calling your own functions](#calling-your-own-functions). | Yes |
 
 ```cpp
 int32 Drops(int32 A) {
@@ -2113,7 +2118,9 @@ Notes:
 | <a id="calling-your-own.fact-v-1"></a>`Fact(V - 1)` inside `Fact` | Recursion. Each call gets its own frame, as a recursive Blueprint function does. Mutual recursion works the same way. | Yes |
 | <a id="calling-your-own.other-twice-3"></a>`Other->Twice(3)` where `Twice` is inline | Refused; see the inline table below. | Not yet |
 | <a id="calling-your-own.bump-by-2"></a>`Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. A function the final class inherits, overrides, or implements for an interface it lists is not cooked Final (an override takes its parent's flags, an implementation keeps the interface function's BlueprintEvent), so a call to one whose body is not copied in (authority-only, an RPC, `noinline`) stays a call by name, as the editor's is; with no subclass, the name finds that one function. | Yes |
-| <a id="calling-your-own.twice-v"></a>`Twice(V)`, a static of a class this source cooks | Its body is copied in the same way. | Yes |
+| <a id="calling-your-own.twice-v"></a>`Twice(V)`, a static of a class this source cooks | Its body is copied in the same way, unless the class is a function library. | Yes |
+| `MyLib::Twice(V)`, a static of a `UBlueprintFunctionLibrary` this source cooks | A call, as the editor's library node is: the library's function runs, and native code hooking it by name sees the call. | Yes |
+| `[[gnu::always_inline]] static int32 Twice(int32 V)` in a function library | The function is cooked, and every call this source makes to it is copied in, as a static of any other class is. | Yes |
 | <a id="calling-your-own.peer-bump-1-2"></a>`Peer->Bump(1)` in a `final` class | Direct, but not copied in: the body would need Peer as its `this`. | Yes |
 | <a id="calling-your-own.gnu-noinline-int32-kept-int32"></a>`[[gnu::noinline]] int32 Kept(int32 V)` | Calls to Kept stay calls, wherever they could be copied in. | Yes |
 
@@ -2160,6 +2167,8 @@ Notes:
   another mod cooks (UE_CLASS); a function whose body calls a parent's function that is not copied in, such as
   `Base::AuthOnly()`, itself or in an inline body it expands (see [Calling the parent](#calling-the-parent)): that
   call is bound from the function's own class, and in a subclass's copy it would be the subclass's.
+- A function library's statics are never copied in unless they say `[[gnu::always_inline]]`: a library is code its
+  callers share, as the editor's is. `static inline` in a library still expands with no function, as anywhere.
 - Copying makes the caller bigger. A large function called in many places may be worth `[[gnu::noinline]]`.
 - A function that native code intercepts by name, such as an empty one a DLL or script mod hooks to read its
   arguments, must be `[[gnu::noinline]]`: a copied call runs the body in place and never reaches the hook.
@@ -2250,7 +2259,7 @@ Notes:
 |---|---|---|
 | <a id="static-functions-and.static-int32-twice-int32-v"></a>`static int32 Twice(int32 V)` | A static Blueprint function (Static, Final, Public, BlueprintCallable). `Twice(X)` and `AMyActor::Twice(1)` both run it on the class default object, so inside it `this` is that default object, which has no world. | Yes |
 | <a id="static-functions-and.static-apawn-firstpawn-uobject"></a>`static APawn *FirstPawn(UObject *WorldContextObject = nullptr)` | The first parameter whose name starts with `WorldContext` is what every engine call inside the static receives as its world context, as the editor wires the hidden pin. A caller that leaves it out passes its own `this`, or its own world context when the caller is itself such a static. | Yes |
-| <a id="static-functions-and.class-mylib-public"></a>`class MyLib : public UBlueprintFunctionLibrary` holding statics | The editor's Blueprint Function Library. Another mod that includes its header calls the statics like an engine library's: a final call on the library's default object, with a world context left out filled with the caller's `this`. | Yes |
+| <a id="static-functions-and.class-mylib-public"></a>`class MyLib : public UBlueprintFunctionLibrary` holding statics | The editor's Blueprint Function Library. Every call goes to the library's function, from this source too, unless the static is `[[gnu::always_inline]]` or `inline`; see [Calling your own functions](#calling-your-own-functions). Another mod that includes its header calls the statics like an engine library's: a final call on the library's default object, with a world context left out filled with the caller's `this`. | Yes |
 | <a id="static-functions-and.lib-f-log-c-addlogentry"></a>`LIB_F_Log_C::AddLogEntry(Main, Severity, Prefix, Entry, this)`, a game Blueprint library's static taking one of the game's Blueprint enums | UeApi declares the enum parameter `uint8`, the byte the call passes. The game's Blueprint enums have no C++ type yet, so a method, field or delegate of one is left out of UeApi. | Yes |
 | <a id="static-functions-and.a-static-that-calls-delay"></a>A static that calls Delay or UE_AWAIT | Refused: `a static function has no object whose ubergraph frame could keep its locals`; see [Latent calls](#latent-calls). | Refused |
 | <a id="static-functions-and.static-int32-tell-int32-v"></a>`static int32 Tell(int32 V)` in a class whose mod parent has a static `Tell` too | Hides the parent's, as in C++, with a warning: "... hides Parent::Tell, a static: compiled as C++ name hiding ...". Every call to a static is bound to the one it names, so `Tell(V)` runs this one and `Parent::Tell(V)` the parent's. It is cooked with the parent's static as its super, as the editor links any function named like a parent's; the editor itself would refuse the name ("cannot be overridden"). | Warns |
@@ -5911,6 +5920,7 @@ listed here is refused with "unimplemented intrinsic".
 | `__NameSwitch__` | What UE_NAME_SWITCH expands to. Write UE_NAME_SWITCH. | [Statements and control flow](#statements-and-control-flow) |
 | `NewObject<T>(Outer)` | Construct Object from Class: an object that is neither an actor nor a component. The Outer gives it its world. | [Creating objects](#creating-objects) |
 | `[[gnu::noinline]]`, `__attribute__((noinline))` | Calls to the function stay calls: AssetGen never copies its body in. | [Calling your own functions](#calling-your-own-functions) |
+| `[[gnu::always_inline]]`, `__attribute__((always_inline))` | On a function library's static: calls this source makes to it are copied in, the function still cooked. Elsewhere it changes nothing; those calls are copied in anyway. | [Calling your own functions](#calling-your-own-functions) |
 | Number conversions, `float F = Count;`, `int32(F)` | Convert as C++ converts, through Blueprint's conversion nodes. | [Literals and conversions](#literals-and-conversions) |
 | `Obj == nullptr` | A plain compare with None: an object that is being destroyed is still not null. | [Working with other objects](#working-with-other-objects) |
 | `&Obj->Member` | The member's address, found at run time by `ReadProperty::GetPropertyAddress`, which you supply. | [Pointers and memory](#pointers-and-memory) |
