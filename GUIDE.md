@@ -55,7 +55,8 @@ The source is C++, but what runs is a Blueprint. These are the differences that 
 - **A method is a Blueprint function unless it is `inline`**, and a free function must be `inline`. See
   [Functions and events](#functions-and-events).
 - **Only Blueprint's types exist.** There is no `double`, and the only integer types are `uint8`, `int32` and
-  `int64`: write `0.5f`, not `0.5`. See [Types](REFERENCE.md#types).
+  `int64`: write `0.5f`, not `0.5`. There is no char either: `'y'`, and `C ? 'y' : 'n'`, is its int code. See
+  [Types](REFERENCE.md#types).
 - **The engine's C++ is out of reach.** A mod calls the reflected functions in the SDK headers. There is no `FMath`
   and no standard library, and Print String shows nothing in the retail game. See
   [Talking to the game](#talking-to-the-game).
@@ -396,7 +397,9 @@ node: the object if it is a `T`, else null. Math is in `UKismetMathLibrary` (`Cl
 
 Reading another object's property is the Get node with a Target: `Me->HealthComponent->GetHealth()`. Unlike C++, a
 read or a call through a null object does not crash: the game logs `Accessed None`, and a value reads as zero.
-`if (Obj)` is the IsValid node, which is also false for an object that is being destroyed. A subsystem is its class's
+`if (Obj)` is the IsValid node, which is also false for an object that is being destroyed; `if (Cls)` on a
+`TSubclassOf` is Is Valid Class. `A->GetComponentsByClass<UStaticMeshComponent>()` is the Get Components by Class node,
+typed `TArray<UStaticMeshComponent *>`, so its elements need no cast. A subsystem is its class's
 static `Get()`, the editor's Get node for it: `UTracerManager::Get()`, or `GetSubsystem<UTracerManager>()`. Left out,
 the world context is `this`. See [Working with other objects](REFERENCE.md#working-with-other-objects) for the kinds
 and for spelling the getter by hand.
@@ -759,7 +762,10 @@ its own statement, left to right. Braces, positional or with designated members,
 `FHitResult Hit = { .Time = 0.5f };`. Members the braces leave out keep their defaults; a member given `{}` is a fresh
 value of its type, as in C++: zero, empty, None. Member reads and writes, nested to any depth, act on the struct in
 place. A struct of your own carries `UE_STRUCT;` in its body. It is cooked as a Structure asset in the mod package, and
-its members' initializers are its default values.
+its members' initializers are its default values. `==` and `!=` on two vectors compare every component exactly, as
+in UE C++, not with the editor node's 1e-4 tolerance; on two rotators they compare rotations, with a warning.
+`FTransform(Rotation, Translation, Scale)`, UE's order with an FRotator, and `FTransform(Location, Rotation, Scale)`,
+the Make Transform node's, are both that node.
 
 An enum of your own is an `enum class` with a `uint8`, `int32` or `int64` underlying type, followed by `UE_ENUM(Name);`.
 It is cooked as an Enumeration asset and then works like any Blueprint enum: variables, parameters, constants and
@@ -774,7 +780,8 @@ enumerator of value N, with `.Has(E)`, `.Add(E)`, `.Remove(E)` and `.Clear()`.
 UE's C++ API: `Add`, `Contains`, `Find(Key, Out)`, `Keys(OutArray)`, `Num()` and so on, with results coming back
 through reference parameters. `Map[Key]` reads with the Find node: you get a copy of the value, or the value type's
 default for a missing key, and nothing is added. `Map[Key] = V`, `+=` and `++` store with the Add node. A range-for
-with `auto& [Key, Value]` walks the map where it lives, so a write to `Value` changes the map. A container inside a
+with `auto& [Key, Value]` walks the map where it lives, so a write to `Value` changes the map. A range-for over a
+call, `for (int32 X : GetItems())`, runs the call once and walks its result. A container inside a
 container works through a generated wrapper struct ([Containers](REFERENCE.md#containers) says where it is cooked).
 
 ```cpp
@@ -1894,7 +1901,7 @@ void Bump(int32 Player) { Add5(ByPlayer[Player]); }   // warns
   registry       -> ./AssetRegistry.bin  (1 asset)
 ```
 
-Read each warning: whether the difference matters depends on your code. AssetGen has five warnings, and the table
+Read each warning: whether the difference matters depends on your code. AssetGen has six warnings, and the table
 below has the three you meet first. clang prints warnings of its own, with the file and line in front, such as
 `-Wunused-value` for a pure call whose result you ignore. They do not stop the build either.
 

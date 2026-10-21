@@ -1971,6 +1971,67 @@ for items, scores in (([], {}), ([1, 2, 3], {'a': 5, 'b': 7}), ([4, -7], {'b': -
         assert got == (want['Items'], want['Scores'], peers()[1].vars), (fn, items, scores, got)
 print('ok  RangeTest: a pointer reseated in a range-for body leaves the range where it was  (9 cases)')
 
+# ---- SugarForms: GetComponentsByClass<T>(), a class as a bool, struct ==, a computed range, ?: over chars
+import struct
+def f32(v): return struct.unpack('<f', struct.pack('<f', v))[0]
+def vec(x, y, z): return {'X': f32(x), 'Y': f32(y), 'Z': f32(z)}
+def equals(a, b, tol): return all(abs(a[k] - b[k]) <= tol for k in a)     # FVector::Equals, what the Kismet node runs
+SUGAR = {'EqualEqual_VectorVector': lambda vm, ctx, a, b, tol: equals(a, b, tol),
+         'NotEqual_VectorVector': lambda vm, ctx, a, b, tol: not equals(a, b, tol),
+         'Conv_FloatToVector': lambda vm, ctx, f: vec(f, f, f), 'IsValidClass': lambda vm, ctx, c: c is not None}
+for own, other in ((0, 0), (2, 3), (1, 0)):
+    them = Obj('Actor')
+    def get(vm, ctx, cls):
+        assert cls == 'StaticMeshComponent', cls
+        return [Obj('StaticMeshComponent') for _ in range(own if ctx is vm.self else other)]
+    vm = VM(asset('SugarForms'), natives=dict(SUGAR, K2_GetComponentsByClass=get))
+    assert vm.call('CountMeshes', Other=them) == own * 100 + other, (own, other)
+print('ok  SugarForms.CountMeshes: GetComponentsByClass<T>() is K2_GetComponentsByClass(T::StaticClass()), on self and '
+      'on another actor  (3 cases)')
+for cls, want in ((None, 210), ('Actor', 101)):
+    assert VM(asset('SugarForms'), natives=SUGAR, Cls=cls).call('ClassSet') == want, cls
+print('ok  SugarForms.ClassSet: a TSubclassOf tests as a bool through IsValidClass, in if, ! and ?:  (2 cases)')
+near = 3 + 2 ** -20         # within Kismet's default 1e-4 tolerance, but another float
+for a, b in ((vec(1, 2, 3), vec(1, 2, 3)), (vec(1, 2, 3), vec(1, 2, near)), (vec(0, 0, 0), vec(0, 0, 0)), (vec(0, 0, 0), vec(0, 1, 0))):
+    want = (a == b) + 10 * (a != b) + 100 * (a == vec(0, 0, 0))
+    assert VM(asset('SugarForms'), natives=SUGAR).call('VecCompare', A=a, B=b) == want, (a, b)
+assert VM(asset('SugarForms'), natives=SUGAR).call('Twos') == vec(2, 2, 2)
+print('ok  SugarForms.VecCompare: FVector == and != are exact, as in UE C++; `V == 0` and `FVector V = 2` fill all three '
+      'components  (5 cases)')
+for items in ([], [3], [1, 2, 4]):
+    vm = VM(asset('SugarForms'), natives=SUGAR, Items=list(items), Gets=0)
+    want = 0
+    for x in items: want = want * 10 + x
+    assert vm.call('SumGot') == want * 100 + 1, items
+    vm = VM(asset('SugarForms'), natives=SUGAR, Items=list(items), Gets=0)
+    assert (vm.call('BumpGot'), vm.self.vars['Items']) == (sum(items) + len(items), items), items
+    vm = VM(asset('SugarForms'), natives=SUGAR, Seen=list(items), Gets=0)
+    assert vm.call('SumSeen') == sum(items) * 100 + 1, items
+print('ok  SugarForms: a range over a call\'s TArray or TSet runs the call once, and a T& loop writes the copy  (9 cases)')
+assert [VM(asset('SugarForms'), natives=SUGAR).call('PickChar', B=b) for b in (True, False)] == [ord('y'), ord('n')]
+assert [VM(asset('SugarForms'), natives=SUGAR).call('PickSign', B=b) for b in (True, False)] == ['x+', 'x-']
+print('ok  SugarForms: ?: over two chars is their code, over two one-length string literals an FString  (4 cases)')
+rot, at, size = {'Pitch': 10.0, 'Yaw': 20.0, 'Roll': 30.0}, vec(1, 2, 3), vec(4, 5, 6)
+def xyz(v): return list(v.values()) if isinstance(v, dict) else list(v)     # a literal reads as a list, a parameter a dict
+make = dict(SUGAR, MakeTransform=lambda vm, ctx, l, r, s: ('xf', xyz(l), xyz(r), xyz(s)))
+for fn, parms, want in (('PlaceUe', dict(R=rot, T=at, S=size), (at, rot, size)),
+                        ('PlaceUeUnit', dict(R=rot, T=at), (at, rot, vec(1, 1, 1))),
+                        ('PlaceMake', dict(L=at, R=rot, S=size), (at, rot, size))):
+    assert VM(asset('SugarForms'), natives=make).call(fn, **parms) == ('xf',) + tuple(map(xyz, want)), fn
+print('ok  SugarForms: FTransform(R, T, S), FTransform(R, T) and FTransform(L, R, S) are MakeTransform(L, R, S), '
+      'each argument on its own pin, the scale 1 when left out  (3 cases)')
+with tempfile.TemporaryDirectory() as tmp:       # clang's own refusal, which it prints to stderr
+    src = os.path.join(tmp, 'TransformThreeVectors.cpp')
+    with open(src, 'w', encoding='utf-8') as f:
+        f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/TransformThreeVectors");\n'
+                'class TransformThreeVectors : public AActor {\npublic:\n'
+                '  FTransform F(FVector A, FVector B, FVector C) { return FTransform(A, B, C); }\n};\n')
+    proc = assetgen_compile([src, UEAPI, tmp])
+    assert proc.returncode and "call to constructor of 'FTransform' is ambiguous" in proc.stdout + proc.stderr, proc.stdout
+print('ok  TransformThreeVectors: FTransform of three vectors is refused, as either rotator order would take it')
+assert 'SugarForms::RotSame: FRotator == compares rotations' in LOGS['SugarForms'], LOGS['SugarForms']
+print('ok  SugarForms.RotSame: FRotator == warns that it compares rotations (angles wrap), not components')
+
 
 def lists_in_place(f, d):
     s = 0

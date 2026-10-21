@@ -920,7 +920,7 @@ Notes:
 - C++ runs the initializer once. Here every use runs it, so an initializer that calls something, such as
   `RandomInteger`, calls it at every use. A range-for makes its array only once.
 - `Contains` on an inline TMap, or on a list of texts or structs, makes the container, because their `==` is not exact
-  (a vector's `==` has a tolerance). `UE_NO_OPTIMIZE` on the function turns the no-array `Contains` off.
+  (a rotator's `==` wraps its angles). `UE_NO_OPTIMIZE` on the function turns the no-array `Contains` off.
 - A function-local `static` is something else again: [Latent calls](#latent-calls).
 
 ## Enums
@@ -1123,8 +1123,11 @@ Notes:
 - 944 of the 2983 structs have fields AssetGen cannot write, such as weak pointers, delegates or bitfields, so the SDK
   gives them no whole-struct constructor. Build them with braces.
 - A braced value is made afresh each time the code runs, so a loop never sees the previous pass's values.
-- For an identity transform, write `FTransform(FQuat(0, 0, 0, 1), FVector(0, 0, 0), FVector(1, 1, 1))` or call
-  `UKismetMathLibrary::MakeTransform`.
+- For an identity transform, write `FTransform(FQuat(0, 0, 0, 1), FVector(0, 0, 0), FVector(1, 1, 1))` or
+  `FTransform(FRotator(), FVector())`.
+- `FTransform(Rotation, Translation, Scale)` with an FRotator, UE's own order, and `FTransform(Location, Rotation, Scale)`,
+  Make Transform's order, are both `UKismetMathLibrary::MakeTransform(Location, Rotation, Scale)`; the types tell them
+  apart. See [Struct conversions](#struct-conversions).
 
 ### Struct operators
 
@@ -1132,7 +1135,9 @@ Notes:
 |---|---|---|
 | `Home + Home * 2.0f`, `(A + B) / 2`, `Tint * 0.5f` | The Kismet math node for that pair of types (Add_VectorVector, Multiply_VectorFloat, Divide_VectorInt...). Only the pairs Kismet has exist. | Yes |
 | `2.0f * V` | The float converts to a vector first, which gives the same result. | Yes |
-| `Home == Twice` | For FVector, FVector2D, FVector4, FRotator and FQuat this is Kismet's Equal node with an error tolerance of 1e-4, so nearly equal values compare equal. UE C++'s FVector `==` is exact. No warning is printed. | Yes |
+| `Home == Twice`, `Home != Twice` | For FVector, FVector2D, FVector4 and FMatrix this is Kismet's Equal (Not Equal) node with an error tolerance of 0, so it compares every component exactly, as UE C++'s `==` does. The editor's node defaults to 1e-4; for that, call `UKismetMathLibrary::EqualEqual_VectorVector(A, B, 1e-4f)`. | Yes |
+| `Facing == Aim` with two FRotators or two FQuats | The Equal node with a tolerance of 0, with a warning: it compares rotations, so angles 360 degrees apart (a quaternion and its negation) are equal, where UE C++ compares the components. | Warns |
+| `Home == 0`, `Home != 0.5f` | The number fills all three components first (Conv_FloatToVector), so `Home == 0` is true for the zero vector. UE C++ has no such operator: its FVector constructor from a float is explicit. | Yes |
 | `Tint == Other` | FLinearColor, FTransform and other structs use their own Kismet Equal node. FLinearColor's has no tolerance. | Yes |
 | `Home += W;` | Refused by clang (`no viable overloaded '+='`): structs have no compound assignment. Write `Home = Home + W;`. | Refused |
 | `-V` | Refused by clang (`invalid argument type 'FVector' to unary expression`). Call `UKismetMathLibrary::NegateVector(V)`. | Refused |
@@ -1143,7 +1148,8 @@ Notes:
 FVector Mid(FVector A, FVector B) { return (A + B) / 2; }
 FVector Away(FVector V) { return UKismetMathLibrary::NegateVector(V); }
 FRotator Turn(FRotator A, FRotator B) { return UKismetMathLibrary::ComposeRotators(A, B); }
-bool Same(FVector A, FVector B) { return A == B; }  // with a tolerance of 1e-4
+bool Same(FVector A, FVector B) { return A == B; }  // exact, as in C++
+bool Near(FVector A, FVector B) { return UKismetMathLibrary::EqualEqual_VectorVector(A, B, 1e-4f); }
 ```
 
 Notes:
@@ -1156,7 +1162,10 @@ Notes:
 |---|---|---|
 | `Facing = Twice;` (FVector to FRotator) | The rotation of the direction, not a copy of X, Y and Z. | Yes |
 | `FTransform Placed = Home;` | A translation. | Yes |
-| `FVector V = 2.0f;` | A float fills all three components. | Yes |
+| `FTransform(Facing, Home, Size)`, `FTransform(Facing, Home)` | UE's constructor order, Rotation (an FRotator), Translation, Scale: the Make Transform node, `MakeTransform(Home, Facing, Size)`. Left out, the scale is 1. | Yes |
+| `FTransform(Home, Facing, Size)` | Make Transform's own order, Location, Rotation, Scale, with the same result. UE C++ has no such constructor; UeApi declares it so the node's order reads as written. | Yes |
+| `FTransform(A, B, C)` with three FVectors | Refused by clang ("call to constructor of 'FTransform' is ambiguous"): a vector converts to a rotator, so both orders, and the FQuat constructor, would take it. Write the rotator as one: `FTransform(FRotator(A), B, C)`. | Refused |
+| `FVector V = 2.0f;`, `FVector V = 2;` | A float fills all three components; an int converts to float first. | Yes |
 | `FLinearColor L = FColor(255, 0, 0);` | FColor and FLinearColor convert both ways through sRGB. | Yes |
 | `FVector V = Flat;` (FVector2D) | Z is 0. | Yes |
 | `FVector V = Facing;` (FRotator) | Refused by clang: left out on purpose, because a rotator is not a direction. Call `UKismetMathLibrary::GetForwardVector(Facing)`. | Refused |
@@ -1272,7 +1281,7 @@ Notes:
 
 `TArray`, `TSet` and `TMap` are Blueprint's Array, Set and Map. Their methods are the Blueprint Array, Set and Map
 nodes, not UE's C++ API. The rule to remember: a container is a value. Assigning one copies it, and a container node
-needs a container variable, not one a call returns.
+needs a container variable, not one a call returns (a range-for makes its own).
 
 ### Container variables
 
@@ -1335,8 +1344,8 @@ Notes:
 - `TMap`: `Add`, `Clear`, `Contains`, `Find`, `Keys`, `Length`, `Remove`, `Values`.
 - On a `TArray<int32>`, both `Remove(Value)` and `Remove(Index)` compile. C++ code that removes by value removes by
   index here.
-- The "needs a variable" rule also applies to `[]` and to range-for. A braced list, an inline class variable and an
-  inline function's result already count as variables.
+- The "needs a variable" rule also applies to `[]`. A braced list, an inline class variable and an inline function's
+  result already count as variables. A range-for over a computed value stores it in a local first.
 
 ### Indexing
 
@@ -1505,7 +1514,8 @@ Notes:
 | `!bFiring` | The NOT Boolean node. Many negations cost nothing instead; see [The optimizer](#the-optimizer). | Yes |
 | `X != 0 && 10 / X > 2` | C++ short-circuiting is kept: the right side's calls, reads and divisions run only when C++ would run them, so this never divides by zero. `\|\|` runs its right side only when the left is false. | Yes |
 | `X > 0 ? X * 2 : X < -5 ? -1 : 7` | Only the chosen arm runs. The operator compiles to an if/else that stores into a temp, or straight into the variable being assigned, and `return C ? A : B;` becomes two returns. Nested ternaries work. | Yes |
-| `FString(C ? "On" : "Off")` | A select of two strings: the temp is an FString. | Yes |
+| `FString(C ? "On" : "Off")`, `FString("x") + (C ? "+" : "-")` | A select of two strings: the temp is an FString, whether the two literals have one length (a `const char[2]` in C++) or not. | Yes |
+| `C ? 'y' : 'n'` | Blueprint has no char: the select is an int32, the code of the char picked, which is what C++ promotes a char to. | Yes |
 | `(C ? Left : Right) = 5` | Refused ("assignment to ConditionalOperator"): Blueprint has no reference to whichever variable the condition picks. Write `if (C) Left = 5; else Right = 5;`. | Refused |
 | `Add5(C ? A : B)` into a `T&` parameter | The callee gets a copy, stored back into the picked variable after the call, with a warning. See [Functions](#functions). | Warns |
 | `A = 1, B = 2;`, `++I, --J` | The comma operator as a statement: each side runs in turn, as two statements. A side that does nothing (`I, J++`) is dropped. A declaration of several variables, `int32 I = 0, J = N;`, is not the comma operator and works too. | Yes |
@@ -1803,7 +1813,7 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `for (int32 X : PickPeer()->Items)` | The range expression is evaluated once, into a local, as C++ binds its range once. PickPeer runs once, and reseating a pointer in the body does not move the walk. | Yes |
-| `for (int32 X : GetItems())` | Refused when GetItems is a function that is not inline ("range-for needs a container variable, not a computed value"). Store the result in a local and walk that. An inline function's result is accepted: it is computed once into a local. | Refused |
+| `for (int32 X : GetItems())`, `for (auto *C : A->GetComponentsByClass<UStaticMeshComponent>())` | The value is computed once, into a local, before the loop: the temporary C++ binds the range to. GetItems runs once, and an `int32 &X` loop writes that copy, not the container GetItems read. | Yes |
 | `for (int32 X : {1, 2, 3})` | Refused: the range is a std::initializer_list, not a Blueprint container. A `TArray<int32>{1, 2, 3}` written in the range is refused as well. Declare `TArray<int32> L = {1, 2, 3};` and walk L, or walk a `static inline const` array. | Refused |
 | `for (int32 P : kPrimes)` | A `static inline const` array of constants; see [Constants](#constants). | Yes |
 | `for (int32 Scale = 3; int32 X : Items)` | The C++20 init-statement runs once, before the loop. | Yes |
@@ -1812,9 +1822,8 @@ Notes:
 TArray<int32> Items;
 TArray<int32> GetItems() { return Items; }
 int32 SumItems() {
-  TArray<int32> Copy = GetItems();   // for (int32 X : GetItems()) is refused
   int32 Sum = 0;
-  for (int32 X : Copy) Sum += X;
+  for (int32 X : GetItems()) Sum += X;   // GetItems runs once
   return Sum;
 }
 ```
@@ -3391,6 +3400,7 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `if (Obj)`, `!Obj`, `Obj ? A : B` | The Is Valid node: true only for an object that is not null and is not being destroyed (pending kill). This is stricter than C++'s null test. | Yes |
+| `if (Cls)`, `!Cls`, `Cls ? A : B` on a `TSubclassOf<T>` | The Is Valid Class node: true for a class that is set and not stale. A `UClass *` tests with Is Valid, as an object. | Yes |
 | `Obj != nullptr`, `Obj == nullptr` | The Equal and Not Equal (Object) nodes against None: a plain pointer comparison. An object that is being destroyed still compares `!= nullptr`. Use `if (Obj)` to treat it as gone. | Yes |
 | `Hit != this`, `Other->GetClass() == GetClass()` | `EqualEqual_ObjectObject` and `NotEqual_ObjectObject`: object identity. | Yes |
 | `Target && Target->InitialLifeSpan > 0.0f` | The right side is not read when `Target` is null, as in C++. Blueprint's AND node would evaluate both sides, so AssetGen keeps a branch here. | Yes |
@@ -3536,6 +3546,7 @@ Notes:
 | `GetAllActorsWithInterface(ITargetable::StaticClass(), Found)` | Get All Actors With Interface: every actor that implements the interface. | Yes |
 | `UGameplayStatics::GetActorOfClass(AMyManager::StaticClass())` | Get Actor Of Class: the first actor of the class (subclasses included) that the world's actor iterator reaches, or null. With several actors of the class, which one comes back depends on that order, so use it for a class the world holds one of. | Yes |
 | `A->GetComponentByClass(UHealthComponentBase::StaticClass())` | Get Component by Class: the actor's first component of that class, or null. It is typed `UActorComponent*`, so Cast it. `K2_GetComponentsByClass(Class)` returns all of them, and `GetComponentsByTag(Class, Tag)` also filters by component tag. | Yes |
+| `A->GetComponentsByClass<UStaticMeshComponent>()`, `GetComponentsByClass<UMyPart>()` | Get Components by Class: every component of that class, as a `TArray<UStaticMeshComponent *>` that needs no cast. It is `K2_GetComponentsByClass(UStaticMeshComponent::StaticClass())`, whose array of `UActorComponent *` holds only that class. | Yes |
 | `UActorFunctionLibrary::GetPlayersInRange(K2_GetActorLocation(), 1000.0f, true)` | DRG's getter for the player characters within a radius, as a `TArray<APlayerCharacter *>` that needs no cast. The last argument is MustBeAlive. DRG marks it authority-only: on a client the call is skipped and returns an empty array. | Yes |
 | an engine or game static marked `UE_AUTHORITY_ONLY` or `UE_COSMETIC` | Called on its class's default object, as the editor's node calls it, so the engine decides where it runs. For a static of a function library, an actor or a component class, which is nearly all of them, an authority-only one is skipped on a client and a cosmetic one on a dedicated server. A skipped call returns zero or None and leaves its output parameters as they were. | Yes |
 
@@ -6132,6 +6143,11 @@ and where the feature is described. In each group, the messages you are most lik
   goes through int32 and only its low 32 bits survive: 2^32 + 5 becomes 5.0, where C++ would round the whole value.
   Fix: nothing, when the value fits in an int32. Otherwise bring it into that range before converting. See
   [Literals and conversions](#literals-and-conversions).
+- `warning: <Class>::<Function>: FRotator == compares rotations, not components: angles 360 degrees apart are equal,
+  where C++ compares each component exactly` (for FQuat: `Q and -Q are equal`): `==` or `!=` on two rotators or two
+  quaternions. Kismet's Equal node wraps each angle (a quaternion's takes either sign), so `FRotator(0, 360, 0)` equals
+  `FRotator(0, 0, 0)`. Fix: nothing, when you mean the same rotation; to compare the numbers, compare the members. See
+  [Struct operators](#struct-operators).
 - `no template named 'TWeakObjectPtr'; did you mean 'TSoftObjectPtr'?`: clang's message. The SDK declares no weak or
   lazy object pointer. Fix: use an object pointer, tested with `if (Obj)`, or a soft reference. See [Types](#types).
 - `no conversion from <From> to <To>`: a conversion to `TScriptInterface<I>` where AssetGen has no declaration of `I`,

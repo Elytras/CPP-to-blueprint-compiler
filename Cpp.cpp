@@ -2122,6 +2122,7 @@ private:
     std::set<std::string> WarnedNoWorld;        // Class::Function that passed self as a world context without a world
     std::set<std::string> UcsReached;           // the class's functions UserConstructionScript runs, itself included
     std::set<std::string> WarnedUcsSpawn;
+    std::set<std::string> WarnedRotationEq;     // Class::Function that compared FRotators or FQuats with ==
     std::set<std::string> WarnedMakes;          // Class::Function what: a spawn or construct the engine will not make
     std::map<std::string, const FRecord*> LocalClass;   // an inline parameter's local -> the X::StaticClass() it holds
 
@@ -4193,6 +4194,8 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     const EStrKind FromKind = KindOfLowered(Arg, Arg.InnerType);
     const std::string From = FromKind != SK_None ? TypeNameOf(FromKind) : Canon(Arg.InnerType);
     const EStrKind ToKind = StrKindOf(To);
+    /* Blueprint has no char: a char literal is its int code, and a char slot (a `?:` arm's) keeps it so. */
+    if ((To == "char" || To == "signed char" || To == "wchar_t") && FromKind == SK_Int) return true;
 
     /* Addresses, raw pointers being int64 by now: nullptr is 0, an object pointer is its object's
        address, an address read back as an object pointer is the same 8 bytes, and an address is true
@@ -4223,6 +4226,15 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     if (ToKind == SK_Object && KindOfLowered(Arg, Arg.InnerType) == SK_Int64)
     {
         Reinterpret("__AsObject__", BP.ScriptStruct("/Script/Engine", "DebugDisplayProperty"), ToType);
+        return true;
+    }
+    std::string Held = StripTypeKeywords(Arg.InnerType), Of;
+    while (!Held.empty() && (Held.back() == '&' || Held.back() == ' ')) Held.pop_back();
+    if (ToKind == SK_Bool && TemplateArg(Held, "TSubclassOf", &Of))
+    {
+        /* `if (Cls)` on a TSubclassOf is the editor's Is Valid Class node: a class that is set and not stale. */
+        WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetSystemLibrary", "IsValidClass"));
+        Arg.InnerType = "bool";
         return true;
     }
     if (ToKind == SK_Bool && FromKind == SK_Object)
@@ -4335,6 +4347,13 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
                "int32's range wraps\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str());
         ApplyConv(*In, BP, Arg);
         ApplyConv(*Out, BP, Arg);
+        return true;
+    }
+    /* An int fills a vector (`V == 0`, `FVector V = 2;`) as a float does, which C++ converts it to first. */
+    if (const FConv* Fill = FindConv("float", To); Fill && (FromKind == SK_Int || FromKind == SK_Byte) && ToKind == SK_None)
+    {
+        if (!ConvertArg("float", BP, Arg, Err)) return false;
+        ApplyConv(*Fill, BP, Arg);
         return true;
     }
     const auto IsNumber = [](EStrKind K) { return K == SK_Int || K == SK_Int64 || K == SK_Float || K == SK_Bool || K == SK_Byte; };
@@ -6054,6 +6073,28 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     }
     if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr")
     {
+        /* UE's `FTransform(Rotation, Translation[, Scale])` and Make Transform's order `FTransform(Location, Rotation,
+           Scale)`, which UeApi declares beside it, told apart by their types: either is Make Transform, the scale 1
+           when left out. Three vectors match both and the FQuat constructor, which clang calls ambiguous. */
+        const std::string Ctor = N->value("ctorType", Json::object()).value("qualType", std::string());
+        const bool bUeOrder = Ctor.find("(const FRotator &, const FVector &") != std::string::npos;
+        if (StripTypeKeywords(TypeOf(*N)) == "FTransform"
+            && (bUeOrder || Ctor.find("(const FVector &, const FRotator &, const FVector &") != std::string::npos))
+        {
+            Out.K = FArgIR::Call;
+            Out.InnerType = "FTransform";
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "MakeTransform");
+            Out.Sub->bPure = true;
+            for (const Json* Part : { Nth(*N, bUeOrder ? 1 : 0), Nth(*N, bUeOrder ? 0 : 1), Nth(*N, 2) })
+            {
+                FArgIR A;
+                if (Part ? !LowerArg(*Part, BP, A, Err) : !ZeroArg("FVector", BP, A, Err)) return false;
+                if (!Part && A.Sub) for (FArgIR& One : A.Sub->Args) One.F = 1;
+                Out.Sub->Args.push_back(std::move(A));
+            }
+            return true;
+        }
         auto SI = Structs.find(StripTypeKeywords(TypeOf(*N)));
         if (SI != Structs.end()) return LowerStructLiteral(*N, SI->second, BP, Out, Err);
         /* `{}` or `TArray<int32>()` as a value: an empty container, a Make Array (Set, Map) with no element. */
@@ -6490,7 +6531,20 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                     if (!LowerArg(*Side, BP, A, Err)) return false;
                     Out.Sub->Args.push_back(A);
                 }
-                for (const Json& E : O->Extra) Out.Sub->Args.push_back(ConstArg(E));
+                /* `==` / `!=` on a vector, rotator, quat or matrix is Kismet's Equals node, whose ErrorTolerance
+                   defaults to 1e-4: 0 makes it C++'s exact compare. A rotator's Equals still wraps each angle (0 and
+                   360 are equal) and a quat's takes Q and -Q as equal, which C++'s == does not. */
+                const bool bExact = O->Op == "==" || O->Op == "!=";
+                for (const Json& E : O->Extra)
+                {
+                    FArgIR X = ConstArg(E);
+                    if (bExact && X.K == FArgIR::Float) X.F = 0;
+                    Out.Sub->Args.push_back(X);
+                }
+                if (bExact && (O->Lhs == "FRotator" || O->Lhs == "FQuat") && WarnedRotationEq.insert((Cur ? Cur->CppName : std::string()) + "::" + CurFnName).second)
+                    printf("  warning: %s::%s: %s == compares rotations, not components: %s, where C++ compares each "
+                           "component exactly\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), O->Lhs.c_str(),
+                           O->Lhs == "FRotator" ? "angles 360 degrees apart are equal" : "Q and -Q are equal");
                 Out.Sub->RefParms.resize(Out.Sub->Args.size());
                 for (const size_t At : O->Refs)
                     if (At < 2) Out.Sub->RefParms[At] = At == 0 ? O->Lhs : O->Rhs;
@@ -6987,6 +7041,12 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         /* `C ? A : B`: the hoist pass turns this into `if (C) T = A; else T = B;`. */
         Out.K = FArgIR::Call;
         Out.InnerType = TypeOf(*N);
+        /* Blueprint has no char: `B ? 'y' : 'n'` selects an int32, what C++ promotes a char to, and two string
+           literals of one length (`B ? "+" : "-"`, a `const char[2]`) an FString, as two of different lengths do. */
+        if (const std::string Sel = StripTypeKeywords(Out.InnerType); Sel == "char" || Sel == "signed char" || Sel == "wchar_t")
+            Out.InnerType = "int";
+        else if (StrKindOf(Sel) == SK_Str && Sel.back() == ']')
+            Out.InnerType = "FString";
         Out.Sub = std::make_shared<FCallIR>();
         Out.Sub->Intrinsic = "__Select__";
         for (size_t I = 0; I < 3; ++I)
@@ -7801,6 +7861,30 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             { *Err = CurFnName + ": K2_SetTimer by name " + Target + " " + Why + ", so the engine sets no timer; "
                      "name a void method without parameters, or pass a delegate"; return false; }
         }
+    }
+    /* `A->GetComponentsByClass<T>()` (UeApi's AActor declares it, no UFunction) is the editor's Get Components by Class
+       node: `A->K2_GetComponentsByClass(T::StaticClass())`, the TArray<UActorComponent*> it returns taken as the
+       TArray<T*> the call is typed, which costs nothing, as every element is a T. */
+    if (MethodName == "GetComponentsByClass" && K == "CXXMemberCallExpr" && CallExprNode["inner"].size() == 1)
+    {
+        std::string Elem;
+        TemplateArg(StripTypeKeywords(TypeOf(CallExprNode)), "TArray", &Elem);
+        while (!Elem.empty() && (Elem.back() == '*' || Elem.back() == ' ')) Elem.pop_back();
+        const FRecord* Actor = Find("AActor");
+        const Json* K2 = nullptr;
+        if (Actor)
+            if (const auto It = Actor->Methods.find("K2_GetComponentsByClass"); It != Actor->Methods.end()) K2 = It->second;
+        if (!K2 || !Find(StripTypeKeywords(Elem)))
+        { *Err = "GetComponentsByClass<" + Elem + ">: no AActor::K2_GetComponentsByClass, or an unknown class"; return false; }
+        Json Member = *Callee;
+        Member["name"] = "K2_GetComponentsByClass";
+        Member["referencedMemberDecl"] = K2->value("id", std::string());
+        const Json Of = { {"kind", "DeclRefExpr"}, {"type", {{"qualType", "UClass *(" + Elem + " *)"}}},
+                          {"referencedDecl", {{"kind", "FunctionDecl"}, {"name", "StaticClassOf"}}} };
+        Json Call = CallExprNode;
+        Call["inner"] = Json::array({ std::move(Member), { {"kind", "CallExpr"}, {"type", {{"qualType", "UClass *"}}},
+                                                           {"valueCategory", "prvalue"}, {"inner", Json::array({ Of })} } });
+        return LowerCall(Call, BP, Out, Err);
     }
 
     /* __NAME__ free functions are compiler intrinsics; each resolves its imports here (Extra/Extra2). */
@@ -12982,7 +13066,16 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         RangeExpr = &Made;
     }
     if (Range.K != FArgIR::Field && Range.K != FArgIR::Local && Range.K != FArgIR::LocalOut && Range.K != FArgIR::Member)
-    { *Err = "range-for needs a container variable, not a computed value"; return false; }
+    {
+        /* A computed range (`for (auto* A : GetThings())`) is evaluated once into a local, the temporary C++ binds
+           the range to: a `T&` loop writes that copy. */
+        Json Pre = Json::array();
+        Made = SynthLocal(RangeTy, *RangeExpr, Pre)["inner"][0];
+        Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+        if (!LowerBody(Wrap, BP, Out, Locals, Err)) return false;
+        RangeExpr = &Made;
+        if (!LowerArg(*RangeExpr, BP, Range, Err)) return false;
+    }
 
     /* `auto& [K, V]` and `const auto& [K, V]` over a TMap walk the map's own slots (MapSlotView): V is the value where it
        lives, so a write through it is what `Map[K]` reads next, a T& binds it, and a container value changes in place.

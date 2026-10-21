@@ -571,8 +571,8 @@ CONTAINERS = {
     'Set_Union': _union,
     'Set_Difference': _set_filter(False),
     'Set_Intersection': _set_filter(True),
-    'Set_ToArray': lambda ev, store, a: store(a[1], list(ev(a[0]))),
-    'Map_Keys': lambda ev, store, a: store(a[1], list(ev(a[0]).keys())),
+    'Set_ToArray': lambda ev, store, a: store(a[1], list(ev(a[0]) or [])),     # an unset set reads as 0
+    'Map_Keys': lambda ev, store, a: store(a[1], list((ev(a[0]) or {}).keys())),
     'Map_Find': lambda ev, store, a: (store(a[2], _made(ev, store, a[0], {}).get(ev(a[1]), 0)), ev(a[1]) in ev(a[0]))[1],
     'Map_Add': lambda ev, store, a: _made(ev, store, a[0], {}).__setitem__(ev(a[1]), copy.deepcopy(ev(a[2]))),
     'Map_Remove': lambda ev, store, a: _made(ev, store, a[0], {}).pop(ev(a[1]), None) is not None,

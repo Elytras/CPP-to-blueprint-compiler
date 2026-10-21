@@ -80,7 +80,11 @@ CTOR_PARAMS = {"FColor": ("uint8 R", "uint8 G", "uint8 B", "uint8 A = 255")}
 # names, which is what the cook writes for it (AssetGen reads the argument as the handle's value).
 # A wildcard struct parameter (SetStructurePropertyByName's) takes any struct, which AssetGen passes as it is.
 CTOR_EXTRA = {"FNiagaraTypeDefinitionHandle": "FNiagaraTypeDefinitionHandle(const struct FNiagaraTypeDefinition &) {}",
-              "FGenericStruct": "template <class T> FGenericStruct(const T &) {}"}
+              "FGenericStruct": "template <class T> FGenericStruct(const T &) {}",
+              # UE's own order and Make Transform's: AssetGen makes either with UKismetMathLibrary::MakeTransform.
+              "FTransform": "FTransform(const FRotator &Rotation, const FVector &Translation) {}\n"
+                            "    FTransform(const FRotator &Rotation, const FVector &Translation, const FVector &Scale3D) {}\n"
+                            "    FTransform(const FVector &Location, const FRotator &Rotation, const FVector &Scale) {}"}
 INCLUDE = re.compile(r'^#include\s+"(\w+)_classes\.hpp"')
 
 SCALARS = {
@@ -2044,6 +2048,10 @@ def main():
                 for ret, name, target in UOBJECT_FORWARDS:
                     body.append("    %s %s();" % (ret, name))
                     marks.append('static constexpr const char* %s__UeForward = "%s";' % (name, target))
+            if k.cpp == "AActor":
+                body.append("    /* The editor's Get Components by Class node: K2_GetComponentsByClass(T::StaticClass()), its array of")
+                body.append("       UActorComponent* taken as an array of T* (every element is a T). AssetGen lowers it; no UFunction. */")
+                body.append("    template <class T> TArray<T *> GetComponentsByClass() const;")
             for ret, name, params, target in CLASS_FORWARDS.get(k.cpp, ()):
                 body.append("    %s %s(%s);" % (ret, name, params))
                 marks.append('static constexpr const char* %s__UeForward = "%s";' % (name, target))
