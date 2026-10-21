@@ -57,8 +57,9 @@ The source is C++, but what runs is a Blueprint. These are the differences that 
 - **Only Blueprint's types exist.** There is no `double`, and the only integer types are `uint8`, `int32` and
   `int64`: write `0.5f`, not `0.5`. There is no char either: `'y'`, and `C ? 'y' : 'n'`, is its int code. See
   [Types](REFERENCE.md#types).
-- **The engine's C++ is out of reach.** A mod calls the reflected functions in the SDK headers. There is no `FMath`
-  and no standard library, and Print String shows nothing in the retail game. See
+- **The engine's C++ is out of reach.** A mod calls the reflected functions in the SDK headers. There is no standard
+  library, `FMath` is only the math nodes that `AssetGen/include/FMath.h` spells its way, and Print String shows
+  nothing in the retail game. See
   [Talking to the game](#talking-to-the-game).
 - **Locals have no address and no scope.** Two locals of one name and type in different blocks are one variable, which
   correct C++ cannot notice. Give locals of different types different names: `{ int32 X; } { FString X; }` makes two
@@ -395,7 +396,8 @@ game message. The dwarf is null until it exists; [Timers, waiting and input](#ti
 wait for it. The engine's getters, such as `UGameplayStatics::GetPlayerController(0)`, work too.
 `UGameplayStatics::GetAllActorsOfClass` fills a `TArray<AActor *>` that you pass in, and `Cast<T>` is the Cast To
 node: the object if it is a `T`, else null. Math is in `UKismetMathLibrary` (`Clamp`, `FMin`, `Sqrt`,
-`RandomInteger`, ...); there is no `FMath` and no C++ standard library.
+`RandomInteger`, ...), which `AssetGen/include/FMath.h` also spells UE's way (`FMath::Clamp`, `FMath::Max`, ...);
+there is no C++ standard library.
 
 Reading another object's property is the Get node with a Target: `Me->HealthComponent->GetHealth()`. Unlike C++, a
 read or a call through a null object does not crash: the game logs `Accessed None`, and a value reads as zero.
@@ -1938,7 +1940,7 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | `no Kismet conversion from float to double` | In C++, `0.5` is a `double`, and Blueprint has no double. | `X * 0.5f` | [Literals and conversions](REFERENCE.md#literals-and-conversions) |
 | `TODO: unimplemented local D: double`, `TODO: unimplemented property Mask: uint32` | A variable, parameter or return needs a Blueprint type. `double`, `int8`, `int16`, `uint16`, `uint32` and `uint64` have none. | `float`, `int32` or `int64` | [Types](REFERENCE.md#types) |
 | `call to an unknown function: Helper` | A Blueprint has no free functions. A free function or template without `inline` is not compiled. | `inline int32 Helper(int32 X) { ... }`, or a method of the class | [Inline functions and templates](REFERENCE.md#inline-functions-and-templates) |
-| clang: `use of undeclared identifier 'FMath'`, `no member named 'min' in namespace 'std'` | There is no FMath and no standard library. | `UKismetMathLibrary::FClamp(V, 0.0f, 10.0f)`, `UKismetMathLibrary::Min(A, B)` | [Calling engine and game functions](REFERENCE.md#calling-engine-and-game-functions) |
+| clang: `use of undeclared identifier 'FMath'`, `no member named 'min' in namespace 'std'` | There is no standard library, and FMath only through `AssetGen/include/FMath.h`. | `#include "../include/FMath.h"`, then `FMath::Clamp(V, 0.0f, 10.0f)`, `FMath::Min(A, B)` | [Calling engine and game functions](REFERENCE.md#calling-engine-and-game-functions) |
 | clang: `only virtual member functions can be marked 'override'` | The SDK declares engine functions non-virtual. The method's name alone makes the override. | `void ReceiveTick(float DeltaSeconds) { ... }` | [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls) |
 | `<Member>: a default is a value known when the mod is built - ...` | A member initializer is read when the mod is built and never runs, so it takes only a value known then. A call's result is not one. | Set it in `ReceiveBeginPlay`: `Roll = UKismetMathLibrary::RandomInteger(3);` | [Classes and variables](REFERENCE.md#classes-and-variables) |
 | `<Class>::UE_DEFAULTS: Charges is declared here - give it an initializer instead` | `UE_DEFAULTS` sets inherited variables and components, not the class's own. | `int32 Charges = 3;` | [Class defaults](REFERENCE.md#class-defaults) |

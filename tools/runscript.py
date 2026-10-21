@@ -7,7 +7,7 @@ ReturnValue. Anything outside the subset stops with `unsupported`, so a test tha
 every instruction it reached. Parms not given start at 0, the way a frame zeroes them.
 
 As a module: run(base, function, **parms) -> (return value, locals)."""
-import copy, struct, sys, os
+import copy, math, struct, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dumpexp
 from walkscript import W
@@ -397,6 +397,8 @@ MATH = {
     'Conv_BoolToInt': int, 'Multiply_Int64Int64': lambda a, b: a * b, 'Conv_IntToInt64': int, 'Conv_Int64ToInt': lambda a: i32(a),
     'InRange_IntInt': lambda v, lo, hi, imin, imax: (v >= lo if imin else v > lo) and (v <= hi if imax else v < hi),
     'Abs_Int': lambda a: i32(abs(a)), 'RandomInteger': lambda a: 0,     # RandomInteger: a stand-in; CALLS shows it ran
+    'Max': max, 'Min': min, 'FMax': max, 'FMin': min, 'Abs': abs, 'Clamp': lambda v, lo, hi: min(max(v, lo), hi),
+    'FClamp': lambda v, lo, hi: min(max(v, lo), hi), 'Percent_FloatFloat': lambda a, b: math.fmod(a, b) if b else 0.0,
     'SelectInt': lambda a, b, pick: a if pick else b,
 }
 CALLS = []     # every library call run, as (name, args): a test can see an impure or kept call happen
