@@ -114,7 +114,6 @@ logical-operators-and.c-left-right-5
 evaluation-order.bump-100-bumpinline
 conditions.if-f
 conditions.target-target-customtimedilation
-switch.switch-id
 switch.case-1-3
 switch.switch-x-case-1-return
 switch.case-0-r-1-case
@@ -158,7 +157,6 @@ calling-your-own.other-twice-3
 parameters-and-return.auto-half-int32-v-return
 parameters-and-return.int32-byval-tarray-int32-a
 reference-parameters-and.bump-p
-static-functions-and.class-mylib-public
 overloading.int32-ov-int32-a
 overloading.int32-get
 lambdas-function.auto-l-x-int32-y
