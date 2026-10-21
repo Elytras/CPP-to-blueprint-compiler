@@ -206,10 +206,21 @@ FIndex FBlueprintClass::Asset(const std::string& ClassPackage, const std::string
     const std::string Key = "asset:" + AssetPackage + "." + AssetName;
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
+    /* `&Assets::...::EMode` names the enum (or struct) a property's type already imported: one import, not two. */
+    const std::string Typed = ClassName_ == "UserDefinedEnum"   ? "enum:" + AssetPackage + "." + AssetName
+                            : ClassName_ == "UserDefinedStruct" ? "str:" + AssetPackage + "." + AssetName : "";
+    if (auto T = Typed.empty() ? ImportCache.end() : ImportCache.find(Typed); T != ImportCache.end())
+    {
+        ImportCache.emplace(Key, T->second);
+        if (std::find(CallImports.begin(), CallImports.end(), Imp(T->second).V) == CallImports.end())
+            CallImports.push_back(Imp(T->second).V);
+        return Imp(T->second);
+    }
 
     EngineClass(ClassPackage, ClassName_);      // the linker resolves an import's class through its own import
     const int32 Row = P.AddImport({ ClassPackage, ClassName_, PackageImport(AssetPackage), AssetName });
     ImportCache.emplace(Key, Row);
+    if (!Typed.empty()) ImportCache.emplace(Typed, Row);
     CallImports.push_back(Imp(Row).V);
     return Imp(Row);
 }

@@ -7226,7 +7226,125 @@ def ctx_struct_arg():
     print('ok  CtxStructArg: a struct from a call on another object, as an argument, is zeroed when the object is None')
 
 
+BOOL_EQ_SPILL_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/BoolEqSpill");
+class BoolEqSpill : public AActor {
+public:
+  TArray<int32> Upto(int32 N) { TArray<int32> R; for (int32 I = 0; I < 2 * N; ++I) R.Add(I); return R; }
+  int32 Eq(bool X, bool Y) { return (X == true ? 1 : 0) + (X != Y ? 10 : 0) + (Y == false ? 100 : 0); }
+  int32 Count(int32 N) { return Upto(N).Num() * 10 + (Upto(N).Contains(3) ? 1 : 0); }
+};
+'''
+
+
+def bool_eq_spill():
+    """`X == true` over bools is EqualEqual_BoolBool, as the editor's node, not EqualEqual_IntInt of two Conv_BoolToInt;
+    and a container read on a call's result (`Upto(N).Num()`) steps it from a local, where it was refused."""
+    tmp, out, _ = compile_to(BOOL_EQ_SPILL_SRC, 'BoolEqSpill')
+    try:
+        base = os.path.join(out, 'BoolEqSpill')
+        vm = VM(base)
+        for x, y in itertools.product((True, False), repeat=2):
+            want = (1 if x else 0) + (10 if x != y else 0) + (100 if not y else 0)
+            assert vm.call('Eq', X=x, Y=y) == want, (x, y)
+        for n in (0, 1, 2):
+            assert vm.call('Count', N=n) == 20 * n + (1 if 2 * n > 3 else 0), n
+        assert 'EqualEqual_IntInt' not in dump('walkscript.py', base, exports_of(base).index('Eq'))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  BoolEqSpill: bool == / != is EqualEqual_BoolBool; Get().Num() reads the result from a local')
+
+
+PARTIAL_QUAL_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/PartialQual");
+namespace PqOuter::PqLib {
+class PqMgr : public AActor {
+public:
+  int32 N;
+};
+class PqData : public AActor {
+public:
+  ::PqOuter::PqLib::PqMgr *Cached;
+  void SetMgr(::PqOuter::PqLib::PqMgr *M) { Cached = M; }
+};
+}
+namespace PqOuter {
+class PqUser : public AActor {
+public:
+  PqLib::PqData *D;
+  void Pick(bool C) { PqLib::PqMgr *A = nullptr; D->SetMgr(C ? A : D->Cached); }
+};
+}
+'''
+
+
+def partial_qual():
+    """A mod class named as far as its namespace needs (`PqLib::PqMgr *` inside PqOuter), as clang also spells a ?:
+    over two of them, is that class: an object, not the int64 of a raw pointer. Before, the value went in an
+    Int64Property, which the GC does not see, into an object parameter."""
+    tmp, out, _ = compile_to(PARTIAL_QUAL_SRC, 'PartialQual')
+    try:
+        base = os.path.join(out, 'PqOuter', 'PqUser')
+        w = dump('walkscript.py', base, exports_of(base).index('Pick'))
+        assert 'Int64Const' not in w and not re.search(r'\bLet\s+__Branch', w), w
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  PartialQual: a partly qualified mod class pointer is an object, in a local and through ?:')
+
+
+ENUM_ASSET_REF_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/EnumAssetRef");
+enum class EPick : uint8 { A = 0, B = 1, EPick_MAX = 2 };
+UE_ENUM(EPick);
+namespace Assets::_ElytrasMods::EnumAssetRef {
+UE_ASSET_AT(::UUserDefinedEnum, EPickAsset, "/Game/_ElytrasMods/EnumAssetRef/EPick.EPick");
+}
+class EnumAssetRef : public AActor {
+public:
+  EPick Cur;
+  FString Named(EPick P) {
+    Cur = P;
+    return UKismetNodeHelperLibrary::GetEnumeratorUserFriendlyName(&Assets::_ElytrasMods::EnumAssetRef::EPickAsset, (uint8)P);
+  }
+};
+'''
+
+
+def enum_asset_ref():
+    """A UE_ENUM a property is typed with, also named as an asset (`&Assets::...::EPick` to GetValidValue or
+    GetEnumeratorUserFriendlyName), is one import: two rows for one object break the linker's import_unique rule."""
+    tmp, out, _ = compile_to(ENUM_ASSET_REF_SRC, 'EnumAssetRef')
+    try:
+        vmsem_holds(os.path.join(out, 'EnumAssetRef'), 'import_unique')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  EnumAssetRef: an enum used as a type and named as an asset is imported once')
+
+
+STR_SELECT_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/StrSelect");
+class StrSelect : public AActor {
+public:
+  FString Said(bool Init) { return FString(Init ? "Enabled" : "Disabled") + " listener"; }
+};
+'''
+
+
+def str_select():
+    """`C ? "A" : "B"` is a select of two FStrings: its temp is stored with EX_Let, as a string, not EX_LetObj, which
+    only ran because execLetObj steps an EX_StringConst into the FString it is given."""
+    tmp, out, _ = compile_to(STR_SELECT_SRC, 'StrSelect')
+    try:
+        base = os.path.join(out, 'StrSelect')
+        vmsem_holds(base, 'typing_let_opcode', 'typing_literal_receiver')
+        vm = VM(base)
+        assert [vm.call('Said', Init=b) for b in (True, False)] == ['Enabled listener', 'Disabled listener']
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  StrSelect: a ?: over string literals stores a string')
+
+
 ctx_struct_arg()
+bool_eq_spill()
+partial_qual()
+enum_asset_ref()
+str_select()
 drop_result()
 print('ok  DropResult: a discarded FString / TArray result lands in a local, not the 64-byte statement buffer')
 out_array_reset()

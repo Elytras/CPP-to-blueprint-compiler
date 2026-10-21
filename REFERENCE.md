@@ -136,6 +136,7 @@ Notes:
 |---|---|---|
 | `namespace Weapons { class Rifle : public AActor {}; }` | A namespace is a subfolder. `Rifle` is cooked at `/Game/_MyMods/Hello/Weapons/Rifle`, and child classes, calls, variable types and the registry all use that path. The same holds for a `UE_STRUCT`, an interface, a `UE_ENUM` and a braced asset. | Yes |
 | `Rifle` inside `namespace Weapons`, `Weapons::Rifle` outside it | Both name the same class, as in C++. | Yes |
+| `Weapons::Rifle *` inside `namespace Game::_MyMods`, where the class is `Game::_MyMods::Weapons::Rifle` | The same class, qualified only as far as the namespace needs. clang also spells a type this way, for example a `?:` over two such pointers where a parameter named after the class hides it. When another namespace also declares a `Rifle`, write the full name. | Yes |
 | `namespace Game::WeaponsNTools::GrapplingGun { ... }` | A namespace that starts at `Game` is an absolute `/Game` path. The class leaves the mod folder and is cooked at `/Game/WeaponsNTools/GrapplingGun/<Class>`. The SDK declares each game Blueprint in the namespace of its folder, so a class that extends one can sit beside it. | Yes |
 | `namespace Tally { int32 Hits; }` | A global variable in a namespace gets no subfolder. See [Global variables](#global-variables). | Yes |
 | `namespace Game::_MyMods::Hello { class Hello : public AActor {}; }` beside a plain `class Hello` | Both land on `/Game/_MyMods/Hello/Hello`. Refused: "would both be cooked as". | Refused |
@@ -1302,7 +1303,8 @@ needs a container variable, not one a call returns.
 | `Items.Empty()`, `Items.Sort()`, `Items.Pop()` | Refused by clang. `Empty`, `Emplace`, `FindOrAdd`, `IsEmpty`, `Last`, `Pop`, `Sort` and the like are UE C++, not Blueprint nodes, and the SDK does not declare them. | Refused |
 | `Off = Active - Wanted;`, `A + B`, `A & B` on TSets | Set_Difference, Set_Union and Set_Intersection, the result in a temp that is the value. Both sides must be set variables or another of these (`(A + B) - C`). | Yes |
 | `Seen[0]` on a TSet | Refused by clang: a set has no `[]`. | Refused |
-| `GetItems().Num()` | Refused (`a container operation needs a variable, not a computed value`). Store the result in a local first. | Refused |
+| `GetItems().Num()`, `GetItems().Contains(3)` | A method that only reads (`Num`, `Contains`, `Find`, `Get`, `IsValidIndex` and the like) puts the result in a local and reads it there. | Yes |
+| `GetItems().Add(3)` | Refused (`a container operation needs a variable, not a computed value`). A change would go into a copy. Store the result in a local first. | Refused |
 | `TArray<int32> R = GetItems(); return R.Num();` | The local stays a variable, read once or not: a container function reads its container where it lies, so the call is never folded into its place. The same for a parameter of an `inline` function. | Yes |
 
 ```cpp
@@ -1463,6 +1465,7 @@ Notes:
 |---|---|---|
 | `(A & 0xFF) \| (B ^ 1)` | The Bitwise AND, OR and XOR nodes (And_IntInt, Or_IntInt, Xor_IntInt, or the Int64Int64 versions). | Yes |
 | `Any \|= Hit`, `A & B`, `A ^ B` on bools | The OR, AND and XOR Boolean nodes (BooleanOR, BooleanAND, BooleanXOR). Both sides run, as in C++. A constant side decides the value or drops out, but a side that calls something still runs. Under UE_NO_OPTIMIZE the bools are promoted to int as in C++ (Conv_BoolToInt) and the result converted back (Conv_IntToBool). | Yes |
+| `bDone == true`, `A != B` on bools | The Equal and Not Equal Boolean nodes (EqualEqual_BoolBool, NotEqual_BoolBool), not an int compare of two promoted bools. | Yes |
 | `~B & 0xFF` | `~` is the Bitwise NOT node (Not_Int, Not_Int64). | Yes |
 | `Hi << 16` | Kismet has no shift node. `X << N` is a multiply by 2^N, which wraps as a shift does. | Yes |
 | `X >> 1` | Clears the low N bits and then divides, so it floors as C++ does: -3 >> 1 is -2 and -7 >> 1 is -4. A uint8 is promoted to int first, so 255 >> 1 is 127. | Yes |
@@ -1502,6 +1505,7 @@ Notes:
 | `!bFiring` | The NOT Boolean node. Many negations cost nothing instead; see [The optimizer](#the-optimizer). | Yes |
 | `X != 0 && 10 / X > 2` | C++ short-circuiting is kept: the right side's calls, reads and divisions run only when C++ would run them, so this never divides by zero. `\|\|` runs its right side only when the left is false. | Yes |
 | `X > 0 ? X * 2 : X < -5 ? -1 : 7` | Only the chosen arm runs. The operator compiles to an if/else that stores into a temp, or straight into the variable being assigned, and `return C ? A : B;` becomes two returns. Nested ternaries work. | Yes |
+| `FString(C ? "On" : "Off")` | A select of two strings: the temp is an FString. | Yes |
 | `(C ? Left : Right) = 5` | Refused ("assignment to ConditionalOperator"): Blueprint has no reference to whichever variable the condition picks. Write `if (C) Left = 5; else Right = 5;`. | Refused |
 | `Add5(C ? A : B)` into a `T&` parameter | The callee gets a copy, stored back into the picked variable after the call, with a warning. See [Functions](#functions). | Warns |
 | `A = 1, B = 2;`, `++I, --J` | The comma operator as a statement: each side runs in turn, as two statements. A side that does nothing (`I, J++`) is dropped. A declaration of several variables, `int32 I = 0, J = N;`, is not the comma operator and works too. | Yes |
@@ -6145,7 +6149,8 @@ and where the feature is described. In each group, the messages you are most lik
 - `a container operation needs a variable, not a computed value: <Method>`,
   `` `[]` on a map needs a map variable, not a computed value `` and
   `indexing needs an array variable, not a computed value`: a container method, a map's `[]` or an array index on a
-  container that a function call returns, as in `GetItems().Num()` or `GetItems()[0]`. `<Method>` is the Blueprint
+  container that a function call returns, as in `GetItems().Add(3)` or `GetItems()[0]` (a method that only reads,
+  such as `GetItems().Num()`, compiles). `<Method>` is the Blueprint
   node's name, so `Num` shows as `Length`. A braced list, an inline class variable and an inline function's result
   already count as variables. Fix: store the container in a local first, `TArray<int32> L = GetItems(); L.Num();`.
   After changing a copy of a map, store it back where it came from. See [Containers](#containers).

@@ -2191,6 +2191,12 @@ private:
         if (It != Records.end()) return &It->second;
         auto B = Bare.find(CppName);
         if (B != Bare.end()) { It = Records.find(B->second); return It == Records.end() ? nullptr : &It->second; }
+        /* `Turrets::Gun`: clang spells a type as the source did, qualified as far as its namespace needs. */
+        // ponytail: only a leaf one record has (Bare); a shared leaf would need a suffix scan of Records.
+        if (const size_t Colon = CppName.rfind("::"); Colon != std::string::npos && Colon > 0)
+            if (auto L = Bare.find(CppName.substr(Colon + 2)); L != Bare.end() && L->second.size() > CppName.size()
+                && L->second.compare(L->second.size() - CppName.size() - 2, std::string::npos, "::" + CppName) == 0)
+                if (It = Records.find(L->second); It != Records.end()) return &It->second;
         /* `using Gun_C = Game::Weapons::Rifles::Gun_C;` - how a mod names a class two
            packages both have, which the headers can give no short name. clang spells a use as the alias. */
         if (auto S = SlotStructs.find(CppName); S != SlotStructs.end()) return &S->second;
@@ -3958,10 +3964,12 @@ bool TemplateArg(const std::string& T, const char* Tpl, std::string* Inner)
     return true;
 }
 
+EStrKind StrKindOf(const std::string& QualType);
 EExprToken LetOpFor(const std::string& QualType)
 {
     std::string Inner;
     if (QualType == "bool") return EX_LetBool;
+    if (StrKindOf(QualType) == SK_Str) return EX_Let;      // `C ? "On" : "Off"`: a `const char *` is an FString
     /* A delegate is stored with EX_LetDelegate, as the editor stores one (EmitDestinationExpression,
        KismetCompilerVMBackend.cpp 1431-1434). */
     if (StripTypeKeywords(QualType).compare(0, 10, "TDelegate<") == 0) return EX_LetDelegate;
@@ -6210,7 +6218,10 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             }
             FArgIR Target;
             if (!LowerArg(*Obj, BP, Target, Err)) return false;
-            if (!IsContainerVariable(Target))
+            /* `Get().Num()`: a read of a computed container steps it from a local (HoistCallArgs). A write stays refused,
+               since one through an inline helper's `TArray&` result would land in the copy. */
+            const bool bSpill = !IsContainerVariable(Target) && IsContainerRead(Method);
+            if (!bSpill && !IsContainerVariable(Target))
             { *Err = "a container operation needs a variable, not a computed value: " + Method; return false; }
             if (!IsContainerRead(Method)) WarnRpcRefWrite(Target);
             Out.K = FArgIR::Call;
@@ -6220,7 +6231,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Sub->EmptiedArgs = OutArraysOf("/Script/Engine", Lib, Prefix + Method);    // ToArray, Keys, Values
             Out.Sub->bOnArg0 = true;
             Out.Sub->Args.push_back(Target);
-            Out.Sub->RefParms.emplace_back();
+            Out.Sub->RefParms.push_back(bSpill ? C : std::string());
             bool bFirst = true, bOk = true;
             std::string LastType;
             ForEach(*N, [&](const Json& A) {
@@ -6816,6 +6827,21 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Sub = std::make_shared<FCallIR>();
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary",
                                             Op == "|" ? "BooleanOR" : Op == "&" ? "BooleanAND" : "BooleanXOR");
+            Out.Sub->bPure = true;
+            Out.Sub->Args = { std::move(L), std::move(R) };
+            return true;
+        }
+        /* `X == true`, `X != Y` over bools: the same promotion, which EqualEqual_BoolBool / NotEqual_BoolBool skip, as
+           the editor's own == node does. */
+        if (const Json *LB = BoolSide(LhsRaw), *RB = BoolSide(RhsRaw); LB && RB && (Op == "==" || Op == "!="))
+        {
+            FArgIR L, R;
+            if (!LowerArg(*LB, BP, L, Err) || !LowerArg(*RB, BP, R, Err)) return false;
+            Out = FArgIR();
+            Out.K = FArgIR::Call;
+            Out.InnerType = "bool";
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", Op == "==" ? "EqualEqual_BoolBool" : "NotEqual_BoolBool");
             Out.Sub->bPure = true;
             Out.Sub->Args = { std::move(L), std::move(R) };
             return true;
