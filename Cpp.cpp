@@ -12946,6 +12946,15 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
     const Json* LoopDecl = LoopStmt ? First(*LoopStmt) : nullptr;
     const Json* Body = Nth(ForNode, 7);
     if (!RangeExpr || !LoopDecl || !Body) { *Err = "a range-for with a missing part"; return false; }
+    /* `Items.Enumerate()` (Types.h) walks Items itself; its bindings take the element and the index (below). */
+    bool bEnumerate = false;
+    if (const Json* Call = Strip(RangeExpr); Call && Kind(*Call) == "CXXMemberCallExpr")
+        if (const Json* M = First(*Call); M && Kind(*M) == "MemberExpr" && M->value("name", std::string()) == "Enumerate"
+            && First(*M) && StripTypeKeywords(TypeOf(*Call)).compare(0, 12, "TEnumerated<") == 0)
+        {
+            RangeExpr = First(*M);
+            bEnumerate = true;
+        }
     if (const Json* Init = Nth(ForNode, 0); Init && Init->is_object() && Init->contains("kind"))
     {
         /* `for (Init; T E : Range)`: the init-statement runs once, before the loop. */
@@ -13212,7 +13221,27 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
                         {"inner", Json::array({ Json{ {"kind", "DeclRefExpr"}, {"referencedDecl", {{"kind", "CXXMethodDecl"}, {"name", "operator[]"}}} },
                                                 IterJson, RefToLocal(Idx, "int32") })} };
     ++LoopDepth;
-    if (Which != 'M')
+    if (bEnumerate)
+    {
+        /* `auto& [Item, Index]`: Item is `Items[Idx]` where it lives, as a `T&` loop variable is; `auto [Item, Index]`
+           copies it each pass. Index reads the loop's own index, which Types.h makes const. */
+        std::vector<const Json*> Bindings;
+        ForEach(*LoopDecl, [&](const Json& C) { if (Kind(C) == "BindingDecl") Bindings.push_back(&C); });
+        if (Kind(*LoopDecl) != "DecompositionDecl" || Bindings.size() != 2)
+        { *Err = "an Enumerate() range-for binds `auto& [Item, Index]`"; --LoopDepth; return false; }
+        RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Idx, "int32");
+        const std::string PairTy = TypeOf(*LoopDecl);
+        if (!PairTy.empty() && PairTy.back() == '&') RefAlias[Bindings[0]->value("id", std::string())] = Elem;
+        else
+        {
+            const std::string Item = "__RangeItem" + N + "__";
+            FArgIR At;
+            if (!AddLocal(Item, ElemTy) || !LowerArg(Elem, BP, At, Err)) { --LoopDepth; return false; }
+            Loop.Body->push_back(AssignStmt(Item, ElemTy, std::move(At)));
+            RefAlias[Bindings[0]->value("id", std::string())] = RefToLocal(Item, ElemTy);
+        }
+    }
+    else if (Which != 'M')
     {
         if (Kind(*LoopDecl) != "VarDecl") { *Err = "TODO: a structured binding over a " + RangeTy; --LoopDepth; return false; }
         std::string VarTy = TypeOf(*LoopDecl);
