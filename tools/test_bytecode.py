@@ -2856,6 +2856,8 @@ def natural_forms():
             for k in n.kids: walk(k)
         for n in runscript.script_of(base, fn): walk(n)
         return out
+    proves('calling-your-own.mylib-twice-v', 'calling-your-own.gnu-always-inline-static-int32',
+           'static-functions-and.class-mylib-public')
     vm = VM(lib)
     vm.objects['Default__NaturalForms_C'] = vm.self                 # a library call runs on the class default object
     for v in (-7, 0, 5, 2**29):
@@ -2878,6 +2880,7 @@ def natural_forms():
             want = oracle(**parms, **(self_vars or {}))
             assert got == want, '%s(%s) = %r, want %r' % (fn, parms, got, want)
 
+    proves('comparisons.b-7', 'comparisons.b-300')                 # ByteConst holds the constants that are no byte
     B = (0, 1, 7, 9, 200, 254, 255)
     chk('ByteEq', lambda A, B: (A == B) + 10 * (A != B), [dict(A=a, B=b) for a in B for b in (0, 7, 255)])
     chk('ByteConst', lambda A: (A == 255) + 10 * (A != 0) + 1000, [dict(A=a) for a in B])
@@ -2891,6 +2894,7 @@ def natural_forms():
             (fn, named(user, fn))
     print('ok  NaturalForms: == / != over bytes compare the bytes')
 
+    proves('switch.switch-code', 'switch.switch-id')
     chk('Wide', lambda V: {1: 10, 5000000000: 20, -7: 30}.get(V, 0),
         [dict(V=v) for v in (1, 5000000000, -7, 0, 5000000000 & 0xFFFFFFFF, 2**40, -2**63)])
     chk('OnMood', lambda M: {0: 11, 7: 10, 200: 100}.get(M, 0), [dict(M=m) for m in (0, 3, 7, 200, 255)])
