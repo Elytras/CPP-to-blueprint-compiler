@@ -595,6 +595,28 @@ CONTAINERS = {
 BARE_CONTAINERS = {'ArrayProperty', 'SetProperty', 'MapProperty'}
 
 
+_LIBRARY = {}
+
+
+def library_of(base, n):
+    """(package base, function) of the static script function in another /Game package of the same build that final
+    call n names - a function library's static, which the engine runs on its class's default object - else None. A
+    test that answers the function itself (MATH) keeps answering it."""
+    if n.op not in (0x1C, 0x68) or n.own or getattr(n, 'imp', None) is None: return None
+    if (base, n.imp) in MATH or n.val in MATH: return None
+    key = (base, n.imp)
+    if key not in _LIBRARY:
+        import invariants
+        hit, r = None, invariants.load(base).resolve(-n.imp - 1)
+        if r:
+            other, k = r
+            st = other.struct(k)
+            if st is not None and getattr(st, 'function_flags', 0) & 0x2000:      # FUNC_Static
+                hit = (other.base, other.exports[k]['name'])
+        _LIBRARY[key] = hit
+    return _LIBRARY[key]
+
+
 def same_case(key, k, v):
     """An EX_SwitchValue case matches by its index property's Identical: an FName's compares the comparison index, so
     a NameConst case ignores case, as EqualEqual_NameName does."""
@@ -665,9 +687,11 @@ def run(base, function, self_vars=None, **parms):
             size, read, _ = view_of(n.kids[0].val)
             return read(ev(n.kids[0].kids[0])['Data'] + ev(n.kids[1]) * size)
         if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
-        if o in (0x1B, 0x45) or n.own:                               # the class's own function: a frame of its own
-            names = params_of(base, n.val)
-            outs = params_of(base, n.val, 0x100)
+        lib = library_of(base, n)                                    # or a library's static, in its own package
+        if o in (0x1B, 0x45) or n.own or lib:                        # the class's own function: a frame of its own
+            callee_base, fn = lib or (base, n.val)
+            names = params_of(callee_base, fn)
+            outs = params_of(callee_base, fn, 0x100)
             # The VM steps a reference argument with no result buffer (ProcessScriptFunction), so a constant or a
             # call there writes through null in game: it must be a variable.
             for name, a in zip(names, n.kids):
@@ -678,7 +702,7 @@ def run(base, function, self_vars=None, **parms):
             bound = [i < len(names) and names[i] in outs and read_late(a) for i, a in enumerate(n.kids)]
             vals = [None if b else copy.deepcopy(ev(a)) for b, a in zip(bound, n.kids)]
             vals = [copy.deepcopy(ev(a)) if b else v for b, a, v in zip(bound, n.kids, vals)]
-            r, callee = run(base, n.val, self_vars, **dict(zip(names, vals)))
+            r, callee = run(callee_base, fn, {} if lib else self_vars, **dict(zip(names, vals)))
             for name, a in zip(names, n.kids):                       # a reference parameter is its argument's variable
                 if name in outs and a.op in ADDRESSABLE: store(a, callee.get(name, 0))
             return r

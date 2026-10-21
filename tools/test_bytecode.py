@@ -2848,7 +2848,14 @@ def natural_forms():
     case names included (runscript stops on an EX_SwitchValue that matches no case: a LogScript warning in game)."""
     lib = asset('NaturalForms')
     user = os.path.join(os.path.dirname(lib), 'NfUser')
-    named = lambda base, fn: {name for name, _ in calls_in(base, fn)}
+    def named(base, fn):
+        """Every function fn's script calls by name or pointer, native math (EX_CallMath) included."""
+        out = set()
+        def walk(n):
+            if n.op in (0x1B, 0x1C, 0x45, 0x46, 0x68): out.add(n.val)
+            for k in n.kids: walk(k)
+        for n in runscript.script_of(base, fn): walk(n)
+        return out
     vm = VM(lib)
     vm.objects['Default__NaturalForms_C'] = vm.self                 # a library call runs on the class default object
     for v in (-7, 0, 5, 2**29):
@@ -2881,7 +2888,7 @@ def natural_forms():
             chk('MemberIs', lambda Byte, Mood: (Byte == Mood) + 10 * (Byte == 7), [{}], dict(Byte=b, Mood=m))
     for fn in ('ByteEq', 'MoodIs', 'PlainIs', 'MemberIs'):
         assert 'Conv_ByteToInt' not in named(user, fn) and named(user, fn) & {'EqualEqual_ByteByte', 'NotEqual_ByteByte'}, \
-            (fn, calls_in(user, fn))
+            (fn, named(user, fn))
     print('ok  NaturalForms: == / != over bytes compare the bytes')
 
     chk('Wide', lambda V: {1: 10, 5000000000: 20, -7: 30}.get(V, 0),
