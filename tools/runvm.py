@@ -20,12 +20,12 @@ def _ref(s):
 def _node(s):
     """runscript's parser plus what latent / async / spawn bodies use. Nodes runscript already read keep its val."""
     op, mem = s.b[s.o], s.mem
-    if op not in (0, 0x48, 0x19, 0x20, 0x2E, 0x2F, 0x30, 0x4B, 0x5B, 0x5C, 0x63, 0x64, 0x44, 0x5D, 0x61, 0x62):
+    if op not in (0, 0x48, 0x12, 0x19, 0x20, 0x2E, 0x2F, 0x30, 0x4B, 0x5B, 0x5C, 0x63, 0x64, 0x44, 0x5D, 0x61, 0x62):
         return _parse(s)                                                     # final calls too: runscript marks an export callee own
     s.u8()
     n = Node(op, mem)
     if op in (0, 0x48, 0x64): n.val, n.owner = s.fieldpath().split('@')
-    if op == 0x19: n.kids.append(s.node()); s.i32(); n.rvalue, n.rvalue_owner = s.fieldpath().split('@'); n.kids.append(s.node())
+    if op in (0x12, 0x19): n.kids.append(s.node()); s.i32(); n.rvalue, n.rvalue_owner = s.fieldpath().split('@'); n.kids.append(s.node())
     elif op in (0x20, 0x2E, 0x2F): n.val = _ref(s)
     elif op == 0x63: n.val = _ref(s); s.args(n.kids)                        # the signature, the dispatcher, its args
     elif op == 0x4B: n.val = s.name()
@@ -222,7 +222,7 @@ class VM:
             o = n.op
             if o in (0, 0x48): return env.get(local(n), 0)
             if o == 1: return ctx.vars.get(n.val, 0)
-            if o == 0x17: return me
+            if o == 0x17: return ctx                       # P_THIS: a context's object when it is the context's expression
             if o == 0x2A: return None
             if o == 0x20: return s.objects.get(n.val, n.val)
             if o in (0x1D, 0x1E, 0x1F, 0x34, 0x24, 0x2C, 0x35, 0x21, 0x5B): return n.val
@@ -240,6 +240,11 @@ class VM:
             if o == 0x38:                                   # CST_ObjectToBool / CST_InterfaceToBool: GetObject() != null
                 if n.val not in (0x47, 0x49): raise SystemExit('vm: PrimitiveCast %#x' % n.val)
                 return ev(n.kids[0]) not in (None, 0)
+            if o == 0x12:                                   # EX_ClassContext: the expression runs on the class's default
+                cls = ev(n.kids[0])                         # object (execClassContext, ScriptCore.cpp 2209-2256)
+                if cls is None: s.accessed_none.append((fn, n.mem))
+                if cls is None and s.null_rvalues: return s.none_context(n, keep)
+                return None if cls is None else ev(n.kids[1], s.objects.setdefault('Default__' + cls, Obj(cls)), keep)
             if o == 0x19:
                 obj = ev(n.kids[0])
                 if obj is None: s.accessed_none.append((fn, n.mem))  # ProcessContextOpcode, ScriptCore.cpp 2904-2937

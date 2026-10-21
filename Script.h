@@ -228,10 +228,12 @@ public:
                  const std::function<void(FScript&)>& Value);
 
     /* The skip count is MEMORY bytes of ContextExpr, measured here. RValue is the property
-       ContextExpr reads, which the VM zeroes when the object is null. */
+       ContextExpr reads, which the VM zeroes when the object is null. EX_ClassContext has the same layout, with a
+       class for ObjectExpr: ContextExpr runs on its default object (execClassContext, ScriptCore.cpp 2209-2256). */
     void Context(const std::function<void(FScript&)>& ObjectExpr,
                  const std::function<void(FScript&)>& ContextExpr,
-                 const std::optional<FFieldRef>& RValue = std::nullopt);
+                 const std::optional<FFieldRef>& RValue = std::nullopt,
+                 EExprToken ContextOp = EX_Context);
 
     void StructConst(FIndex Struct, int32 SerializedSize, const std::function<void(FScript&)>& Members);
 

@@ -384,15 +384,25 @@ class Body:
         return E('%s->%s' % (s.expr(obj).at(P_PRIMARY), s.expr(inner).text))
 
     def class_context(s, n):
+        """Get Class Defaults: GetDefault<T>(Class)->Member, GetMutableDefault<T>(Class)->Fn(), and the object itself,
+        EX_Self run in the context, GetMutableDefault<UObject>(Class)."""
         cls, inner = n.kids[0], n.kids[1]
-        base = s.expr(cls)
-        # Get Class Defaults: AssetGen has no EX_ClassContext yet, so the umbrella's ClassDefaults finds the object
-        s.fx.run.class_defaults_used = True
+        if inner.op == 0x17: return E('GetMutableDefault<UObject>(%s)' % s.expr(cls).text)
         if inner.op in CALLS:
-            info = s.fx.callee(s, inner, None)
-            return s.call(inner, None, prefix='Cast<%s>(ClassDefaults(%s))->' % (info.owner_cpp, base.text))
+            owner = s.fx.callee(s, inner, None).owner_cpp
+            return s.call(inner, None, prefix='GetMutableDefault<%s>(%s)->' % (owner, s.held_class(cls, owner)))
         name, owner = var_name(inner)
-        return E('Cast<%s>(ClassDefaults(%s))->%s' % (s.fx.types.cls(s.pkg, owner, s.fx.asset), base.text, ident(name)))
+        owner = s.fx.types.cls(s.pkg, owner, s.fx.asset)
+        return E('GetDefault<%s>(%s)->%s' % (owner, s.held_class(cls, owner), ident(name)))
+
+    def held_class(s, cls, owner):
+        """The class expression of a Get Class Defaults whose member owner declares: as it is when its type says it holds
+        an owner, else converted to TSubclassOf<owner>, which GetDefault<owner> takes (the node's pin is typed so)."""
+        t, base = s.type_of(cls) or '', s.expr(cls)
+        m = re.match(r'(?:class )?TSubclassOf<(?:class )?([\w:]+)>', t.strip())
+        leaf = owner.split('::')[-1]
+        if leaf == 'UObject' or m and leaf in s.fx.m.ancestors(m.group(1).split('::')[-1]): return base.text
+        return 'TSubclassOf<%s>(%s)' % (owner, base.text)
 
     # ---- calls
 
