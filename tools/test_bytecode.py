@@ -11218,6 +11218,50 @@ def widget_animation():
 
 
 widget_tree()
+
+
+ACTOR_BIND_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/ActorBind");
+class ABindMine : public AActor {
+public:
+  UE_COMPONENT(USphereComponent, Trigger);
+  int32 Hits;
+  ABindMine() { Trigger->OnComponentBeginOverlap.Add(this, &ABindMine::OnTouch); }
+  void OnTouch(UPrimitiveComponent *OverlappedComponent, AActor *OtherActor, UPrimitiveComponent *OtherComp,
+               int32 OtherBodyIndex, bool bFromSweep, const FHitResult &SweepResult) { Hits = Hits + 1; }
+};
+class ABindShot : public AProjectile {
+public:
+  int32 Stops;
+  ABindShot() { MovementComponent->OnProjectileStop.Add(this, &ABindShot::OnStop); }
+  void OnStop(const FHitResult &ImpactResult) { Stops = Stops + 1; }
+};
+'''
+
+
+def actor_bind():
+    """`Comp->OnX.Add(this, &C::F)` in an actor's constructor is the editor's component-bound event: an entry of the
+    class's ComponentDelegateBinding, listed in DynamicBindingObjects, which BindDynamicDelegates binds as the actor is
+    made, finding the component by its property's name - the class's own UE_COMPONENT, or a native parent's. Without it
+    nothing binds the handler and it never runs."""
+    tmp, out, _ = compile_to(ACTOR_BIND_SRC, 'ActorBind')
+    try:
+        for cls, want in (('ABindMine', dict(ComponentPropertyName='Trigger', DelegatePropertyName='OnComponentBeginOverlap',
+                                             FunctionNameToBind='OnTouch')),
+                          ('ABindShot', dict(ComponentPropertyName='MovementComponent', DelegatePropertyName='OnProjectileStop',
+                                             FunctionNameToBind='OnStop'))):
+            p, ci = class_pkg(os.path.join(out, cls))
+            bound = [struct.unpack_from('<i', p.tag(ci, 'DynamicBindingObjects')['value'], 4)[0]]
+            assert [p.class_of(b) for b in bound] == ['ComponentDelegateBinding'] and p.exports[bound[0] - 1]['outer'] == ci + 1, cls
+            t = p.tag(bound[0] - 1, 'ComponentDelegateBindings')
+            got = [tag_values(p, bound[0] - 1, p.tags(bound[0] - 1, t['at'] + 4 + 49))]     # its one element
+            assert struct.unpack_from('<i', t['value'])[0] == 1 and got == [want], (cls, got)
+            keeps_invariants(os.path.join(out, cls))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok  ActorBind: an actor's Comp->OnX.Add(this, &C::F) is a ComponentDelegateBinding entry, own or native component")
+
+
+actor_bind()
 widget_animation()
 widget_event_flags()
 print('ok  WidgetEventFlags: a widget class\'s Tick and OnPaint flags are on exactly where it overrides the event '

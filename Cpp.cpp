@@ -332,6 +332,17 @@ bool AttachmentCall(const Json& S, const Json*& Callee, const Json*& Child, cons
     return Child != nullptr;
 }
 
+/* An actor's `Comp->OnHit.Add(this, &C::F)`: the dispatcher's MemberExpr, or null for any other statement. */
+const Json* ComponentEventCall(const Json& S)
+{
+    const Json* Call = Strip(&S);
+    const Json* Callee = Call && Kind(*Call) == "CXXMemberCallExpr" ? Strip(First(*Call)) : nullptr;
+    const Json* Disp = Callee && Kind(*Callee) == "MemberExpr" && Name(*Callee) == "Add" ? Strip(First(*Callee)) : nullptr;
+    const Json* Comp = Disp && Kind(*Disp) == "MemberExpr" ? Strip(First(*Disp)) : nullptr;
+    const Json* Self = Comp && Kind(*Comp) == "MemberExpr" ? Strip(First(*Comp)) : nullptr;
+    return Self && Kind(*Self) == "CXXThisExpr" && StripTypeKeywords(TypeOf(*Disp)).compare(0, 10, "TMulticast") == 0 ? Disp : nullptr;
+}
+
 /* UE_SLOT's, UE_BIND's and UE_KEYS' call (UeMeta.h), "UeSlot__", "UeBind__" or "UeKeys__", or "" for any other statement. */
 std::string LayoutHelperCall(const Json& S)
 {
@@ -3715,11 +3726,13 @@ bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
         std::vector<const Json*> SlotPart;
         if (!bAssign && !AttachmentCall(S, Callee, Child, Parent, Socket) && !R.bIsPatch     // a patch's may set part of one
             && !(!R.Widgets.empty() && (WidgetLayoutStatement(S) || LocalMemberAssignment(S, Lhs, Rhs, SlotPart)))
-            && !CallsFunction(S, "UeInstanced__") && !LocalMemberAssignment(S, Lhs, Rhs, SlotPart))     // UE_INSTANCED, its local's
+            && !CallsFunction(S, "UeInstanced__") && !LocalMemberAssignment(S, Lhs, Rhs, SlotPart)     // UE_INSTANCED, its local's
+            && !(R.Widgets.empty() && ComponentEventCall(S)))
         {
             *Err = Where + ": a constructor never runs in the game, so its statements are read as the class's defaults: each "
-                   "is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`, on this "
-                   "object's members or the members of a struct they hold. Do run-time setup in ReceiveBeginPlay";
+                   "is `Field = value;`, `Component->Field = value;`, `Component->SetupAttachment(Parent);` or "
+                   "`Component->OnHit.Add(this, &C::F);`, on this object's members or the members of a struct they hold. Do "
+                   "run-time setup in ReceiveBeginPlay";
             bOk = false;
             return;
         }
@@ -18172,6 +18185,39 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             Attachments[Comp] = A;
             return true;
         };
+        /* `Comp->OnHit.Add(this, &C::F)`: an entry of the class's ComponentDelegateBinding, which BindDynamicDelegates
+           adds to the dispatcher of the object the class's property Prop holds, by name, as the instance is made
+           (ComponentDelegateBinding.cpp 12-38): the designer's "On Clicked (Play)", an actor's component-bound event.
+           LowerDelegateValue holds the function to what the editor binds. */
+        auto BindEvent = [&](const std::string& Shown, const std::string& Prop, const Json& Disp, const Json& Call,
+                             const char* What) {
+            const Json* Self = Strip(Nth(Call, 1));
+            if (!Self || Kind(*Self) != "CXXThisExpr" || !Nth(Call, 2))
+            { *Err = Where + ": " + Shown + "'s " + Name(Disp) + " is bound to a function of this " + What + ": `" + Shown + "->"
+                     + Name(Disp) + ".Add(this, &" + R.CppName + "::OnPlay)`"; return false; }
+            const FRecord* DOwner = DispatcherOwner(Disp);
+            const bool bNative = DOwner && DOwner->IsNative() && DOwner->UePackage.compare(0, 6, "/Game/") != 0;
+            if (const auto Marked = bNative ? DOwner->Dispatchers.find(Name(Disp)) : std::map<std::string, std::string>::const_iterator();
+                bNative && Marked != DOwner->Dispatchers.end() && (" " + Marked->second + " ").find(" Assignable ") == std::string::npos)
+            { *Err = Where + ": " + Shown + "->" + Name(Disp) + " is a native dispatcher that is not BlueprintAssignable, and the "
+                     "editor binds none such"; return false; }
+            FArgIR Bound;
+            if (!LowerDelegateValue(*Self, *Nth(Call, 2), std::string(), Null(), Name(Disp), BP, Bound, Err))
+            { *Err = Where + ": " + *Err; return false; }
+            BP.AddComponentBinding({ Prop, DOwner ? UeNameOf(DOwner, Name(Disp)) : Name(Disp), Bound.S });
+            return true;
+        };
+        /* The actor's: `HitBox->OnComponentHit.Add(this, &AMine::OnHit);`, HitBox any component member - a UE_COMPONENT,
+           an ancestor Blueprint's or a native parent's - named by its property; a dispatcher of the actor itself
+           (`OnDestroyed.Add`) is not one, and stays an error. */
+        auto ComponentEvent = [&](const Json& S, bool& bHandled) {
+            const Json* Disp = ComponentEventCall(S);
+            if (!(bHandled = Disp != nullptr)) return true;
+            const Json* Comp = Strip(First(*Disp));
+            const FRecord* CompOwner = Find(OwnerOf(*Comp));
+            if (!CompOwner) { *Err = Where + ": cannot tell which class declares " + Name(*Comp); return false; }
+            return BindEvent(Name(*Comp), UeNameOf(CompOwner, Name(*Comp)), *Disp, *Strip(&S), "actor");
+        };
 
         /* S39: a widget class's layout, read and never called, as SetupAttachment is. A UE_WIDGET named as this class's
            member, `Title`, or "" for anything else. */
@@ -18433,24 +18479,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (const Json* Callee = Strip(First(*N)); Callee && Kind(*Callee) == "MemberExpr" && Name(*Callee) == "Add")
             {
                 const Json* Disp = Strip(First(*Callee));
-                if (const std::string W = WidgetOfMember(Disp); !W.empty())
-                {
-                    const Json* Self = Strip(Nth(*N, 1));
-                    if (!Self || Kind(*Self) != "CXXThisExpr" || !Nth(*N, 2))
-                    { *Err = Where + ": a layout binds " + W + "'s " + Name(*Disp) + " to a function of this widget: `" + W + "->"
-                             + Name(*Disp) + ".Add(this, &" + R.CppName + "::OnPlay)`"; return false; }
-                    const FRecord* DOwner = DispatcherOwner(*Disp);
-                    const bool bNative = DOwner && DOwner->IsNative() && DOwner->UePackage.compare(0, 6, "/Game/") != 0;
-                    if (const auto Marked = bNative ? DOwner->Dispatchers.find(Name(*Disp)) : std::map<std::string, std::string>::const_iterator();
-                        bNative && Marked != DOwner->Dispatchers.end() && (" " + Marked->second + " ").find(" Assignable ") == std::string::npos)
-                    { *Err = Where + ": " + W + "->" + Name(*Disp) + " is a native dispatcher that is not BlueprintAssignable, and the "
-                             "editor binds none such"; return false; }
-                    FArgIR Bound;
-                    if (!LowerDelegateValue(*Self, *Nth(*N, 2), std::string(), Null(), Name(*Disp), BP, Bound, Err))
-                    { *Err = Where + ": " + *Err; return false; }
-                    BP.AddComponentBinding({ W, DOwner ? UeNameOf(DOwner, Name(*Disp)) : Name(*Disp), Bound.S });
-                    return true;
-                }
+                if (const std::string W = WidgetOfMember(Disp); !W.empty()) return BindEvent(W, W, *Disp, *N, "widget");
             }
             const int32 Added = AddCall(N);
             if (Added != -2) return Added >= 0;
@@ -18533,6 +18562,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     bOk = Layout(S);
                     return;
                 }
+                if (bool bHandled = false; R.Widgets.empty())
+                    if (const bool bBound = ComponentEvent(S, bHandled); bHandled) { bOk = bBound; return; }
                 const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
                 if (AttachmentCall(S, Callee, Child, Parent, Socket))
                 {

@@ -177,6 +177,7 @@ class ClassEmit:
         s.member_props(dispatchers)
         s.functions(funcs, ug, dispatchers)
         s.class_defaults()
+        if s.a.kind != 'widget': s.defaults += s.component_bindings()
         if s.ctor: s.members.append(('public', '%s() {\n%s    }' % (a.cpp, ''.join('        %s\n' % l for l in s.ctor))))
         return s.write()
 
@@ -410,6 +411,15 @@ class ClassEmit:
     CHANNELS = {('Translation', 0): 'Translation.X', ('Translation', 1): 'Translation.Y', ('Rotation', 0): 'Angle',
                 ('Scale', 0): 'Scale.X', ('Scale', 1): 'Scale.Y', ('Shear', 0): 'Shear.X', ('Shear', 1): 'Shear.Y'}
 
+    def component_bindings(s):
+        """The class's ComponentDelegateBinding, one `Comp->Delegate.Add(this, &C::F);` per entry: the line of a widget's
+        layout, or of an actor's UE_DEFAULTS (the editor's component-bound events)."""
+        pkg, ci = s.pkg, s.a.export + 1
+        cdb = next((i for i, e in enumerate(pkg.exports) if e['outer'] == ci and pkg.class_of(i + 1) == 'ComponentDelegateBinding'), None)
+        return ['%s->%s.Add(this, &%s::%s);' % (ident(b['ComponentPropertyName']), ident(b['DelegatePropertyName']), s.a.cpp,
+                                                ident(b['FunctionNameToBind']))
+                for b in (s.struct_list(cdb, 'ComponentDelegateBindings') if cdb is not None else [])]
+
     def widget_layout(s):
         """A widget class as AssetGen's widget layout: a UE_WIDGET for each widget of the tree, the root first and each
         panel before what it holds, and a UE_ANIMATION for each animation; a constructor that adds each widget to its
@@ -461,10 +471,7 @@ class ClassEmit:
                 s.notes.append('%s: widget %s is in no panel of the tree; left out' % (a.path, e['name']))
         if pkg.tag(a.export, 'Bindings'):
             s.notes.append('%s: property bindings (UE_BIND) not decompiled' % a.path)
-        cdb = next((i for i, e in enumerate(pkg.exports) if e['outer'] == ci and pkg.class_of(i + 1) == 'ComponentDelegateBinding'), None)
-        for b in s.struct_list(cdb, 'ComponentDelegateBindings') if cdb is not None else []:
-            s.ctor.append('%s->%s.Add(this, &%s::%s);' % (ident(b['ComponentPropertyName']), ident(b['DelegatePropertyName']),
-                                                          a.cpp, ident(b['FunctionNameToBind'])))
+        s.ctor += s.component_bindings()
         for inst in refs(pkg.tag(a.export, 'Animations')):
             scene = ref(pkg.tag(inst - 1, 'MovieScene')) - 1
             anim = pkg.exports[scene]['name']
