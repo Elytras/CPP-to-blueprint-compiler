@@ -303,9 +303,9 @@ Watch for:
 - A constructor never runs. A default constructor is read as the class's defaults, `Lantern() : Charges(5) {}` as
   `int32 Charges = 5;`, and its other statements as `UE_DEFAULTS`; anything else in it is refused. Do run-time setup
   in `ReceiveBeginPlay`. See [Constructors](REFERENCE.md#constructors).
-- Redeclaring an inherited property, such as `float InitialLifeSpan = 3.0f;` in a class derived from `AActor`,
-  compiles with no warning. It adds a second variable that hides the parent's, and the engine never reads it. Use
-  `UE_DEFAULTS`.
+- Redeclaring an inherited property, such as `float InitialLifeSpan = 3.0f;` in a class derived from `AActor`, is
+  refused (`AActor already has a variable InitialLifeSpan`): it would be a second variable that hides the parent's,
+  which the engine never reads. Use `UE_DEFAULTS`.
 - UE 4.27 Blueprint has no `double`, `int8`, `int16`, `uint16`, `uint32` or `uint64`, and a variable of any of them is
   refused. `X * 0.5` with a `float X` is a `double` operation in C++, so it is refused too, with
   `no Kismet conversion from float to double`. Write `0.5f`.
@@ -460,8 +460,10 @@ keeping the relative transform, with a warning: the engine's own does nothing on
 
 Set a component's defaults in `UE_DEFAULTS`, one `Comp->Field = value;` each, as you would in its Details panel.
 Assign a struct whole (`FVector(...)`, `FColor(R, G, B)`), and an asset with `&Asset`
-(see [Data assets and game assets](#data-assets-and-game-assets)). The class must be an engine or game component
-class; add a component class of your own at run time with `AddComponentByType<T>(this)`.
+(see [Data assets and game assets](#data-assets-and-game-assets)). The class can be an engine or game component
+class, or a component class your mod declares
+([REFERENCE.md](REFERENCE.md#declaring-components.ue-component-ucharges-ammo)); `AddComponentByType<T>(this)` adds
+one at run time instead.
 
 The spawn and construct nodes are inline helpers in `Objects.h`, in AssetGen's `include` folder; include it by its
 path or copy it beside your source. `SpawnActor<T>(Class, Transform, Owner)` is Spawn Actor from Class, and the new
@@ -511,7 +513,8 @@ Watch for:
   such as a Blueprint parent or `ACharacter`, adds no root: its first scene component keeps its transform.) A mesh or a light as the root keeps them,
   and AssetGen warns that they are not applied. Declare a `USceneComponent` first.
 - `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, or another object's member is
-  refused. A part of a struct, `PrimaryActorTick.bStartWithTickEnabled = false;`, sets that part alone; a vector or a
+  refused; the calls it reads are `SetupAttachment` and binding a component's event (see
+  [Dispatchers and interfaces](#dispatchers-and-interfaces)). A part of a struct, `PrimaryActorTick.bStartWithTickEnabled = false;`, sets that part alone; a vector or a
   color is one value, so `Lamp->RelativeLocation.Z = 50.0f;` is refused: set it whole. A variable the class declares
   itself takes an initializer instead.
   `Target = nullptr;`, `Count = {};` and `Offset = FVector();` write the type's zero over the parent's value.
@@ -532,8 +535,8 @@ waits before the next one starts. An object in a local is kept only weakly acros
 made or loaded can be garbage-collected meanwhile and read None after it. The compiler warns where that can happen;
 keep such an object in a member. The caller gets control back at the method's first wait. Leave out the world
 context and the `FLatentActionInfo`: the compiler supplies both, and `RetriggerableDelay`, `MoveComponentTo` and the
-other latent functions are called the same way. Never pass the `FLatentActionInfo` yourself. With the world context
-the call is refused, and without it (`Delay(1.0f, Info)`) it is not caught yet and compiles to a broken call.
+other latent functions are called the same way. Never pass the `FLatentActionInfo` yourself: with or without the
+world context (`Delay(1.0f, Info)`), the call is refused with `leave the FLatentActionInfo argument out`.
 
 A timer calls a method at a fixed rate. `K2_SetTimerDelegate({this, &Class::Method}, Time, bLooping, 0.0f, 0.0f)` is
 Set Timer by Event; keep the `FTimerHandle` it returns in a member, and `K2_ClearAndInvalidateTimerHandle(Handle)`
@@ -630,7 +633,10 @@ once.
 `Add` and `Remove` also work on the game's dispatchers, on this actor, on another object or on a component:
 `OnDestroyed`, `Me->OnFlareThrown`, `Box->OnComponentBeginOverlap`. The handler returns `void` and takes exactly the
 parameters the header declares, spelled the same way, and clang checks this at the `Add`. It may be another object's:
-`OnScored.Add(Board, &Board::Show)` runs `Show` on Board at each broadcast. A function that takes a single delegate,
+`OnScored.Add(Board, &Board::Show)` runs `Show` on Board at each broadcast. Written in `UE_DEFAULTS` or the
+constructor, `Box->OnComponentBeginOverlap.Add(this, &Class::OnTouch);` is the editor's component-bound event: every
+actor of the class binds it as it is made
+([REFERENCE.md](REFERENCE.md#the-root-and.trigger-oncomponentbeginoverlap)). A function that takes a single delegate,
 such as a timer, takes `{this, &Class::Method}` or `{Other, &Other::Method}`. `Broadcast` works on a dispatcher of
 this class, of a mod parent, of another mod class or game Blueprint through a pointer (`T->OnHit.Broadcast(3)`), and
 on the few native ones the engine marks BlueprintCallable.
@@ -835,8 +841,9 @@ Watch for:
   call, and the compiler warns, since code that reads the map during the call sees the old value.
 - `TArray::Remove(I)` is the Remove Index node: it removes the element at index `I`. To remove by value, call
   `RemoveItem(V)`. On a `TArray<int32>` both compile, so C++ code ported with `Remove(Value)` removes the wrong element.
-- A mod struct has no methods and no operators. A non-inline method on a `UE_STRUCT` compiles without a word into a
-  call that cannot work, so write a free `inline` function that takes the struct instead. `==` on a mod struct or on
+- A mod struct has no methods and no operators. A non-inline method on a `UE_STRUCT` is refused
+  (`a UE_STRUCT holds no functions`), since a Blueprint struct has none, so write a free `inline` function that takes
+  the struct instead. `==` on a mod struct or on
   two containers is a clang error: compare the members, or use `A.Identical(B)` for arrays.
 - A container that a non-inline function returns has to be stored in a local before you call a method on it, index it
   or loop over it. `Append` and `Union` take one directly, and an inline function's result already counts as a
@@ -964,8 +971,8 @@ public:
 
 Watch for:
 
-- Change an inherited variable's default in `UE_DEFAULTS`. Redeclaring it (`float SpeedThreshold = 2000.0f;`) compiles
-  without a warning into a second variable that hides the parent's, and the game never reads it.
+- Change an inherited variable's default in `UE_DEFAULTS`. Redeclaring it (`float SpeedThreshold = 2000.0f;`) is
+  refused as `already has a variable`, since it would be a second variable that hides the parent's.
 - A component the game Blueprint adds is matched by its construction-script node, which the SDK records beside the
   member as `<Comp>__UeScsNode`. Only an SDK generated from a [Dumper-7 fork](https://github.com/Elytras/Dumper-7) dump
   has these markers. Without one, the override is refused: "... its header does not say which SCS node it is -
@@ -1912,8 +1919,8 @@ void Bump(int32 Player) { Add5(ByPlayer[Player]); }   // warns
   registry       -> ./AssetRegistry.bin  (1 asset)
 ```
 
-Read each warning: whether the difference matters depends on your code. AssetGen has six warnings, and the table
-below has the three you meet first. clang prints warnings of its own, with the file and line in front, such as
+Read each warning: whether the difference matters depends on your code. The table below has the three you meet
+first, and [Diagnostics](REFERENCE.md#diagnostics) lists every one. clang prints warnings of its own, with the file and line in front, such as
 `-Wunused-value` for a pure call whose result you ignore. They do not stop the build either.
 
 ### What a failed compile leaves behind

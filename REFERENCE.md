@@ -456,8 +456,9 @@ Notes:
   [Game assets](#game-assets)). How constants fold is in [Constants](#constants).
 - In `UE_DEFAULTS`, in a struct's member defaults and in a braced asset, an explicit zero is written, because there the
   value is compared with a base that need not be zero.
-- A member with the name of an inherited variable does not change the inherited default. It is a second variable that
-  hides the parent's, and nothing warns. Use `UE_DEFAULTS`; see [Class defaults](#class-defaults).
+- A member with the name of an inherited variable is refused ("... already has a variable X; rename it"): it would be a
+  second variable that hides the parent's. To change the inherited default, use `UE_DEFAULTS`; see
+  [Class defaults](#class-defaults).
 
 ### Access, read-only and categories
 
