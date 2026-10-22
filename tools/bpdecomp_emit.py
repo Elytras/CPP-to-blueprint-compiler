@@ -312,7 +312,7 @@ class ClassEmit:
             if v is not None: s.defaults += field_assigns('%s->%s' % (cpp, ident(t['name'])), v, partial=True)
 
     def instanced(s, i):
-        """Export i, an object instanced in the defaults, as the constructor's local holding it: its UE_INSTANCED line and
+        """Export i, an object instanced in the defaults, as the constructor's local holding it: its NewObject line and
         its own tags go in first, before the default that points at it, and an object under it before its own line that
         does. Its outer is `this`, the component whose template holds it, or another such local."""
         if i in s.inst_locals: return s.inst_locals[i]
@@ -335,7 +335,7 @@ class ClassEmit:
         s.inst_locals[i] = local
         h = s.run.api.header_of(cls)
         if h: s.run.extra_includes.setdefault(s.a.mod.name, set()).add(h)
-        s.defaults.append('%s *%s = UE_INSTANCED(%s, %s, %s);' % (cls, local, cls, outer, B.cstring(e['name'])))
+        s.defaults.append('%s *%s = NewObject<%s>(%s, %s);' % (cls, local, cls, outer, B.cstring(e['name'])))
         s.object_defaults(i, local)
         return local
 
@@ -399,7 +399,8 @@ class ClassEmit:
             if 'VariableGuid' in tags:      # the node's guid, which a subclass's override record names it by
                 s.markers.append('static constexpr const char* %s__UeScsNode = "%s";'
                                  % (cpp, bytes(tags['VariableGuid']['value'])[:16].hex()))
-            s.members.append(('public', 'UE_COMPONENT(%s, %s);' % (cls, cpp)))
+            s.members.append(('public', '%s* %s;' % (cls, cpp)))
+            s.defaults.append('%s = CreateDefaultSubobject<%s>(%s);' % (cpp, cls, B.cstring(cpp)))
             if tmpl > 0:
                 s.own_templates.add(tmpl)
                 s.object_defaults(tmpl - 1, cpp)
@@ -776,7 +777,7 @@ class ClassEmit:
         lines.append('};\n')
         lines.append(ns_close(a.ns))
         o.header = ''.join(lines)
-        # A class a default names (X::StaticClass(), a UE_COMPONENT's type, whose members a `Comp->` default reaches)
+        # A class a default names (X::StaticClass(), a component's type, whose members a `Comp->` default reaches)
         # must be complete before this one: its declaration comes first in the umbrella.
         by_cpp = s.run.__dict__.setdefault('by_cpp', {})
         if not by_cpp:
@@ -851,6 +852,17 @@ def link_mods(run, model, per_mod):
             if not any(re.search(r'(?<![\w:])(?:::)?%s\b' % re.escape('::'.join(o.a.ns + [o.a.cpp])), texts[m.name])
                        for o in classes): continue
             run.mod_needs[m.name].append(n.name)
+    # A struct or enum another declaration of its own mod names needs no marker: AssetGen cooks it for that use (REFERENCE
+    # mod-structs-ue.struct-fstats-int32-kills-float). One only other mods name keeps it, or its owner would cook nothing.
+    for m in model.mods:
+        outs = per_mod[m.name]
+        for o in [o for o in outs if o.a.kind in ('struct', 'enum')]:
+            rest = ''.join(re.sub(r'//[^\n]*', '', p.header + (p.cpp or '')) for p in outs if p is not o)
+            if not re.search(r'(?<!\w)%s\b' % re.escape(o.a.cpp), rest): continue
+            if o.a.kind == 'struct':
+                o.header = o.header.replace('struct %s {\n    UE_STRUCT;\n' % o.a.cpp, 'struct %s {\n' % o.a.cpp, 1)
+            else:
+                o.header = o.header.replace('};\nUE_ENUM(%s);\n' % o.a.cpp, '};\n', 1)
     needed = {n for ns in run.mod_needs.values() for n in ns}
     for m in model.mods:
         for o in [o for o in per_mod[m.name] if o.a.kind in ('class', 'widget')]:
