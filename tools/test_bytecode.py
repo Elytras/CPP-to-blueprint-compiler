@@ -5428,6 +5428,54 @@ def edit_staleness():
     print('ok  bpbuild: an edited game package is a mod\'s output, restaled by a newer game copy; an embedded dep is not one')
 
 
+def mint_game_content():
+    """A mod's `game_content` may be a mod.io URL as a MINT profile lists it: bpbuild reads MINT's cache.json and
+    takes the download MINT cached for it. Unpinned, the mod's latest file, the one the profile installs; pinned
+    (`#<mod id>/<modfile id>`), that file, with a note naming the newer one. A mod or file MINT never fetched stops
+    the build and says so."""
+    import json, tempfile
+    sys.path.insert(0, HERE)
+    import bpbuild
+    with tempfile.TemporaryDirectory() as cache:
+        blobs = os.path.join(cache, 'blobs')
+        os.makedirs(blobs)
+        for blob in ('aa', 'bb'):
+            open(os.path.join(blobs, blob), 'wb').close()
+        modio = {'type': 'ModioCache', 'mod_id_map': {'my-mod': 77}, 'dependencies': {}, 'last_update_time': None,
+                 'modfile_blobs': {'100': 'aa', '200': 'bb', '300': 'cc'},
+                 'mods': {'77': {'name_id': 'my-mod', 'name': 'My Mod', 'latest_modfile': 200, 'tags': [],
+                                 'modfiles': [{'id': 100, 'version': '1.0'}, {'id': 200, 'version': '1.1'}]}}}
+        with open(os.path.join(cache, 'cache.json'), 'w', encoding='utf-8') as f:
+            json.dump({'version': '0.0.0', 'cache': {'modio': modio}}, f)
+        resolve = lambda url: bpbuild.mint_blob(url, cache)
+        def stops(url, why):
+            try:
+                resolve(url)
+            except SystemExit as e:
+                assert why in str(e), (url, str(e))
+            else:
+                raise AssertionError('%s resolved' % url)
+        proves('building-edits.game-content-https-mod-io')
+        latest = (os.path.join(blobs, 'bb'), 'my-mod 1.1 (modfile 200)', None)
+        assert resolve('https://mod.io/g/drg/m/my-mod#77') == latest
+        assert resolve('https://mod.io/g/drg/m/my-mod') == latest            # the name alone, through mod_id_map
+        path, what, note = resolve('https://mod.io/g/drg/m/my-mod#77/100')   # pinned to the older file
+        assert (path, what) == (os.path.join(blobs, 'aa'), 'my-mod 1.0 (modfile 100)'), (path, what)
+        assert 'my-mod 1.1 (modfile 200)' in note, note
+        assert bpbuild.MODIO_URL.match('https://mod.io/g/drg/m/my-mod#77') and not bpbuild.MODIO_URL.match('D:/x.pak')
+        stops('https://mod.io/g/drg/m/other-mod', 'MINT has not fetched this mod')
+        stops('https://mod.io/g/drg/m/my-mod#77/300', 'has not downloaded my-mod ? (modfile 300)')   # listed, no blob
+        stops('https://mod.io/g/drg/m/my-mod#77/400', 'has not downloaded')
+        try:
+            bpbuild.mint_blob('https://mod.io/g/drg/m/my-mod', os.path.join(cache, 'none'))
+        except SystemExit as e:
+            assert 'MINT_CACHE' in str(e), str(e)
+        else:
+            raise AssertionError('resolved without a cache')
+    print('ok  bpbuild: a mod.io URL as game_content is the download MINT cached for it, latest or pinned, '
+          'with a note for a newer file')
+
+
 interfaces()
 interface_bodies()
 interface_calls()
@@ -5530,6 +5578,7 @@ edits()
 path_edits()
 game_edits()
 edit_staleness()
+mint_game_content()
 
 
 # ---- SoftTest

@@ -242,9 +242,55 @@ def stage_bundle(files, stage_fsd):
         shutil.copy2(src, to)
 
 
+# MINT's download cache (drg-mod-integration): cache.json maps each mod.io mod MINT has fetched to its files, and each
+# file to a blob, the download as mod.io serves it (a .zip holding the mod's .pak). MINT_CACHE overrides the folder.
+MINT_CACHE = os.environ.get("MINT_CACHE") or (
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "drg-mod-integration", "cache") if os.name == "nt" else
+    os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "drg-mod-integration"))
+
+# A mod.io mod as a MINT profile lists it: https://mod.io/g/drg/m/<name>, then MINT's `#<mod id>`, then `/<modfile id>`
+# when the profile pins one version.
+MODIO_URL = re.compile(r"(?:https?://)?(?:www\.)?mod\.io/g/drg/m/([^#/?]+)/?(?:#(\d+)(?:/(\d+))?)?$")
+
+
+def mint_blob(url, cache):
+    """The file MINT downloaded for `url`, a MODIO_URL, out of the MINT cache folder `cache`: (its path, what it is,
+    a note or None). Unpinned, it is the mod's latest file MINT knows, the one a profile that lists the same URL
+    installs; pinned, that file, with a note when MINT knows a newer one. Stops the build when MINT has not fetched
+    it. content_of calls it for a `game_content` or a `kept` `from` that is a mod.io URL."""
+    m = MODIO_URL.match(url)
+    index = os.path.join(cache, "cache.json")
+    if not os.path.exists(index):
+        sys.exit("%s: no MINT cache at %s (set MINT_CACHE to the folder that holds cache.json)" % (url, cache))
+    modio = json.load(io.open(index, encoding="utf-8"))["cache"]["modio"]
+    mod_id = m.group(2) or modio["mod_id_map"].get(m.group(1))
+    mod = modio["mods"].get(str(mod_id)) if mod_id is not None else None
+    if not mod:
+        sys.exit("%s: MINT has not fetched this mod; add it to a MINT profile and let MINT update" % url)
+    latest = str(mod["latest_modfile"])
+    want = m.group(3) or latest
+    versions = dict((str(f["id"]), f.get("version") or "?") for f in mod.get("modfiles") or [])
+    what = "%s %s (modfile %s)" % (mod.get("name_id", m.group(1)), versions.get(want, "?"), want)
+    blob = modio["modfile_blobs"].get(want)
+    path = os.path.join(cache, "blobs", blob) if blob else None
+    if not path or not os.path.exists(path):
+        sys.exit("%s: MINT has not downloaded %s; let MINT update a profile that lists it" % (url, what))
+    note = None
+    if want != latest:
+        note = "%s is pinned; MINT knows %s %s (modfile %s): recheck the patch against it" % (
+            what, mod.get("name_id", m.group(1)), versions.get(latest, "?"), latest)
+    return path, what, note
+
+
 def content_of(src, bp, root):
     """The Content folder of `src`, a path in mods.yaml: the folder itself, or, for a .pak or a .zip holding one (a
-    mod.io download, as MINT caches it), its extraction under `root`, made once and again only when the file changes."""
+    mod.io download, as MINT caches it), its extraction under `root`, made once and again only when the file changes.
+    A mod.io URL (MODIO_URL) names the download MINT cached for it (mint_blob)."""
+    what = None
+    if MODIO_URL.match(src):
+        src, what, note = mint_blob(src, MINT_CACHE)
+        if note:
+            print("note: " + note)
     src = os.path.abspath(os.path.join(bp, os.path.expandvars(src)))
     if os.path.isdir(src):
         root = src
@@ -266,6 +312,8 @@ def content_of(src, bp, root):
             if proc.returncode != 0:
                 sys.exit("UnrealPak could not extract %s:\n%s" % (pak, proc.stdout[-2000:]))
             io.open(stamp, "w", encoding="utf-8").write(want)
+            if what:
+                print("extracted %s -> %s" % (what, root))
     for sub in ("Content", os.path.join("FSD", "Content")):
         if os.path.isdir(os.path.join(root, sub)):
             return os.path.join(root, sub)
@@ -528,11 +576,17 @@ def main():
     game = config.get("game_content")
     game_dir = os.path.abspath(os.path.join(bp, os.path.expandvars(game))) if game else None
 
+    game_dirs = {}
+
     def mod_game_dir(mod):
-        """A mod's own `game_content` wins over the manifest's: another mod's pak or mod.io zip, for a patch of a
-        third-party mod's Blueprint, extracted under build/<mod>/game."""
+        """A mod's own `game_content` wins over the manifest's: another mod's pak, mod.io zip or mod.io URL, for a
+        patch of a third-party mod's Blueprint, extracted under build/<mod>/game. Resolved once a build."""
         own = mod.get("game_content")
-        return content_of(own, bp, os.path.join(bp, "build", mod["name"], "game")) if own else game_dir
+        if not own:
+            return game_dir
+        if mod["name"] not in game_dirs:
+            game_dirs[mod["name"]] = content_of(own, bp, os.path.join(bp, "build", mod["name"], "game"))
+        return game_dirs[mod["name"]]
 
     # The dumped headers mod_sources does not walk: UeApi and its sibling UeAssets, each with its subfolders.
     ue_assets = os.path.join(os.path.dirname(ue_api), "UeAssets")
