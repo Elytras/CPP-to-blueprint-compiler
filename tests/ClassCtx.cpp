@@ -34,3 +34,9 @@ public:
   ClassCtx *Held;
   void Hold() { Held = GetMutableDefault<ClassCtx>(Kind); }
 };
+
+/* A class whose default object is not the one a call runs on: what reads it reads another object. */
+class ClassCtxKid : public ClassCtx {
+public:
+  UE_DEFAULTS { Score = 9; }
+};
