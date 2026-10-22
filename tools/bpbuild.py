@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 import yaml
@@ -241,28 +242,40 @@ def stage_bundle(files, stage_fsd):
         shutil.copy2(src, to)
 
 
-def kept_source(entry, mod, bp, i):
-    """The Content folder a `kept` entry's packages come from: its `from` itself, or, for a .pak, its extraction under
-    build/<mod>/kept (kept<i> for the i-th entry after the first), made once and again only when the pak changes."""
-    src = os.path.abspath(os.path.join(bp, os.path.expandvars(entry["from"])))
+def content_of(src, bp, root):
+    """The Content folder of `src`, a path in mods.yaml: the folder itself, or, for a .pak or a .zip holding one (a
+    mod.io download, as MINT caches it), its extraction under `root`, made once and again only when the file changes."""
+    src = os.path.abspath(os.path.join(bp, os.path.expandvars(src)))
     if os.path.isdir(src):
         root = src
     else:
-        root = os.path.join(bp, "build", mod["name"], "kept" + (str(i) if i else ""))
         stamp = os.path.join(root, ".pak")
         want = "%s %d %d" % (src, os.path.getsize(src), int(os.path.getmtime(src)))
         if read_text(stamp) != want:
             shutil.rmtree(root, ignore_errors=True)
             os.makedirs(root)
-            proc = subprocess.run([UNREALPAK, src, "-Extract", root], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            pak = src
+            if zipfile.is_zipfile(src):
+                with zipfile.ZipFile(src) as z:
+                    paks = [n for n in z.namelist() if n.lower().endswith(".pak")]
+                    if len(paks) != 1:
+                        sys.exit("%s holds %d .pak files, not one" % (src, len(paks)))
+                    pak = z.extract(paks[0], os.path.join(root, ".zip"))
+            proc = subprocess.run([UNREALPAK, pak, "-Extract", root], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, errors="replace")
             if proc.returncode != 0:
-                sys.exit("kept: UnrealPak could not extract %s:\n%s" % (src, proc.stdout[-2000:]))
+                sys.exit("UnrealPak could not extract %s:\n%s" % (pak, proc.stdout[-2000:]))
             io.open(stamp, "w", encoding="utf-8").write(want)
     for sub in ("Content", os.path.join("FSD", "Content")):
         if os.path.isdir(os.path.join(root, sub)):
             return os.path.join(root, sub)
     return root
+
+
+def kept_source(entry, mod, bp, i):
+    """The Content folder a `kept` entry's packages come from: its `from`, extracted under build/<mod>/kept (kept<i>
+    for the i-th entry after the first)."""
+    return content_of(entry["from"], bp, os.path.join(bp, "build", mod["name"], "kept" + (str(i) if i else "")))
 
 
 def place_kept(mod, bp, stage_fsd):
@@ -515,6 +528,12 @@ def main():
     game = config.get("game_content")
     game_dir = os.path.abspath(os.path.join(bp, os.path.expandvars(game))) if game else None
 
+    def mod_game_dir(mod):
+        """A mod's own `game_content` wins over the manifest's: another mod's pak or mod.io zip, for a patch of a
+        third-party mod's Blueprint, extracted under build/<mod>/game."""
+        own = mod.get("game_content")
+        return content_of(own, bp, os.path.join(bp, "build", mod["name"], "game")) if own else game_dir
+
     # The dumped headers mod_sources does not walk: UeApi and its sibling UeAssets, each with its subfolders.
     ue_assets = os.path.join(os.path.dirname(ue_api), "UeAssets")
     toolchain_time = max(newest(tree_files(ue_api)), newest(tree_files(ue_assets)), newest([assetgen]))
@@ -540,6 +559,7 @@ def main():
             continue
 
         package = mod_package(sources)
+        game = mod_game_dir(mod)
         stage_fsd = os.path.join(bp, "build", name, PROJECT)
         stage_content = os.path.join(stage_fsd, "Content", *package.replace("/Game/", "").split("/"))
         assets = cooked_assets(stage_content)
@@ -556,7 +576,7 @@ def main():
 
         # An edit's output is the game's package, edited: it is stale when the game's copy is newer (a re-extract
         # after a game update), or an edit of the old package would ship over the new one.
-        edits = staged_edits(stage_fsd, stage_content, game_dir)
+        edits = staged_edits(stage_fsd, stage_content, game)
         outputs = assets + [s for s, _g in edits]
         # The stamp sits beside FSD, not in it: the pak takes the whole FSD tree.
         settings = mod_settings(mod, config)
@@ -568,7 +588,7 @@ def main():
                  or read_text(settings_file) != settings
                  or inputs_time > oldest(outputs)
                  or any(os.path.getmtime(g) > os.path.getmtime(s) for s, g in edits)
-                 or newest(read_files(reads_file, game_dir)) > oldest(outputs))
+                 or newest(read_files(reads_file, game)) > oldest(outputs))
         job = None
         if stale:
             # The pak takes the whole FSD tree, so the whole Content tree goes, not just this package's folder:
@@ -607,8 +627,8 @@ def main():
             cmd = [assetgen, "compile", unit, ue_api, stage_content]
             if api_content:
                 cmd += ["--api", api_content]
-            if game_dir:
-                cmd += ["--game", game_dir]
+            if game:
+                cmd += ["--game", game]
             job = pool.submit(run_compile, cmd)
         entries.append((mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings,
                         inputs_time))
@@ -659,7 +679,7 @@ def main():
         dep_stages = [dep_stage(d, by_name, bp) for d in transitive_needs(name, by_name)] if embed else []
         dep_assets = [f for content, _p, _f in dep_stages for f in cooked_assets(content)]
         bundle = bundle_files(mod, bp)
-        assets = cooked_assets(stage_content) + [s for s, _g in staged_edits(stage_fsd, stage_content, game_dir)]
+        assets = cooked_assets(stage_content) + [s for s, _g in staged_edits(stage_fsd, stage_content, mod_game_dir(mod))]
         pak = os.path.join(bp, "out", name + "_P.pak")
         # A dep's assets are baked into this pak, so a change to one restales it; likewise our own
         # assets after a --no-pak run. Judged on our sources alone the old pak would ship, and a mod
