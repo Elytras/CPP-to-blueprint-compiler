@@ -1818,6 +1818,8 @@ and `dumpedl.py` lists every export with its index.
 | `dumpstruct.py` | `dumpstruct.py <base> <export-index>` | A function or class export's body: its super, children, every property with flags and type, the bytecode sizes, then the function flags or the class trailer. |
 | `dumptags.py` | `dumptags.py <base> <export-index> [byte-offset]` | The export's tagged properties, decoded, such as a default object's defaults. A struct's default instance starts after the struct's body, so pass that offset. |
 | `dumpexp.py` | `dumpexp.py <base> <export-index> [count]` | The export's class, super and outer, then its payload as 4-byte words, each annotated with the name or import it may stand for. Reads cooked packages and single-file uncooked ones, such as editor stubs. |
+| `walk5.py` | `walk5.py <base> [function-name...]` | Every script function of a UE 5.6 package, or those whose names contain one of the words, with the memory offset of each expression: `walkscript.py` with the 5.6 operands. |
+| `pakx.py` | `pakx.py <file.pak> <out-dir> <path-part>... [--oodle <dll>]` | Extracts the files whose pak paths contain one of the parts from a v11 `.pak` written by UE 5, which UE 4.27's UnrealPak refuses to extract. Oodle-compressed files need `oo2core_9_win64.dll`: pass `--oodle`, or put it on PATH. |
 | `dumpar.py` | `dumpar.py <AssetRegistry.bin>` | Every row of a registry, AssetGen's or the game's, then `OK - consumed the whole file`. It exits with an error unless the whole file parses. |
 | `genenums.py` | `genenums.py <UE_4.27/Engine/Source/Runtime>` | Regenerates the compiler's `UeEnums.h` (bytecode tokens and flag values) from the engine source. For compiler development only. |
 
