@@ -6451,6 +6451,112 @@ def instanced_defaults():
     return 'and InstancedPlant, under a game component template'
 
 
+def infer_meta():
+    """InferMeta: what a mod's own types no longer have to say. A plain struct or uint8 enum a reflected position names
+    is cooked, one only C++ reads is not; CreateDefaultSubobject declares a component, a named NewObject an instanced
+    default, and a const method returning a value is BlueprintPure. Then two mods in folders of their own: the user
+    imports what the owner's folder declares and cooks none of it, and a header in a folder of several mods owns
+    nothing."""
+    base = asset('InferMeta')
+    made = {f[:-7] for f in os.listdir(os.path.dirname(base)) if f.endswith('.uasset')}
+    proves('mod-structs-ue.struct-fstats-int32-kills-float', 'mod-enums-ue.enum-class-erank-uint8-low',
+           'mod-structs-ue.struct-ftable-int32-x-constexpr')
+    assert {'FInferScore', 'FInferBox', 'EInferRank'} <= made and not {'FInferCppOnly', 'EInferUnused'} & made, made
+    check('InferMeta', 'RankValue', lambda R: 10 if R == 2 else 5 if R == 1 else 1, [dict(R=r) for r in (0, 1, 2)])
+    check('InferMeta', 'BoxPoints', lambda P: wrap(P + 5), [dict(P=p) for p in (0, -3, 2**31 - 1)])
+
+    proves('declaring-components.ustaticmeshcomponent-mesh')
+    children, roots, tags = scs_tree(base)
+    assert roots == ['Pivot'] and children['Pivot'] == ['Mesh'], (roots, children)
+    assert 'bVisible [0] BoolProperty size=0 value=0' in dump('dumptags.py', base, export_index(base, 'Mesh_GEN_VARIABLE'))
+    cls = dump('dumpstruct.py', base, 0)
+    assert re.search(r"ObjectProperty Mesh .*Class'StaticMeshComponent'", cls), cls
+    proves('declaring-components.mesh-createdefaultsubobject')
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'CdsNamed.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/CdsNamed");\n'
+                    'class CdsNamed : public AActor {\n  UStaticMeshComponent *Mesh;\npublic:\n'
+                    '  CdsNamed() { Mesh = CreateDefaultSubobject<UStaticMeshComponent>("Body"); }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0 and 'the component is named Mesh, after its member' in proc.stdout, proc.stdout
+        assert 'Mesh_GEN_VARIABLE' in exports_of(os.path.join(tmp, 'CdsNamed'))
+
+    exports = exports_of(base)
+    fflags = lambda b, fn: int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', b, exports_of(b).index(fn))).group(1), 16)
+    proves('methods-as-blueprint.int32-doubled-int32-p-const')
+    assert fflags(base, 'Doubled') & 0x10000000 and not fflags(base, 'Touch') & 0x10000000, hex(fflags(base, 'Doubled'))
+    assert fflags(base, 'Tripled') & 0x10000000 and not fflags(base, 'RankValue') & 0x10000000
+    assert fflags(os.path.join(os.path.dirname(base), 'InferMetaKid'), 'Doubled') & 0x10000000
+    assert run(base, 'Doubled', P=21)[0] == 42
+
+    proves('instanced-objects.statuseffects-newobject')
+    p = invariants.Package(os.path.join(os.path.dirname(base), 'InferMetaEffect'))
+    cdo = p.find('Default__InferMetaEffect_C')
+    v = bytes(p.tag(cdo, 'StatusEffects')['value'])
+    got = [p.path(struct.unpack_from('<i', v, 4 + 4 * j)[0]).rsplit(':', 1)[-1] for j in range(struct.unpack_from('<i', v)[0])]
+    assert got == ['Burn', 'Slow'], got
+    assert 'damageAmount' in {t['name'] for t in p.tags(p.find('Burn'))}
+    proves('instanced-objects.ue-instanced-6')
+    refused('NewObjNamed', '  void F() { StatusEffects = {NewObject<UDotStatusEffectItem>(this, "Burn")}; }\n',
+            'call to an unknown function: NewObject', base='UStatusEffect')
+    proves('mod-enums-ue.elocal-l')
+    refused('EnumWide', '  EWide W;\n', 'unimplemented property W: EWide', top='enum class EWide : int32 { A, B };\n')
+
+    # bpdecomp reads the cooked mod back in these forms.
+    content = base.replace(os.sep, '/').split('/FSD/Content/')[0] + '/FSD/Content'
+    dec = tempfile.mkdtemp()
+    try:
+        proc = subprocess.run([sys.executable, '-I', '-c',
+                               'import sys; sys.path.insert(0, %r); import bpdecomp_model; '
+                               'bpdecomp_model.Api.__init__.__defaults__ = (%r,); import bpdecomp_emit; bpdecomp_emit.main()'
+                               % (HERE, os.path.abspath(UEAPI)), content, dec,
+                               '--mod', '/Game/_ElytrasMods/InferMeta=IM'], capture_output=True, text=True)
+        mod = os.path.join(dec, 'IM')
+        src = ''.join(open(os.path.join(r, f), encoding='utf-8-sig').read() for r, _, fs in os.walk(mod) for f in fs
+                      if f.endswith(('.h', '.cpp')))
+        for want in ('Mesh = CreateDefaultSubobject<UStaticMeshComponent>("Mesh");', 'UStaticMeshComponent* Mesh;',
+                     'NewObject<UDotStatusEffectItem>(this, "Burn")', 'struct FInferScore {\n', 'enum class EInferRank : uint8 {'):
+            assert want in src, (want, proc.stdout[-2000:] + proc.stderr[-2000:], src)
+        assert 'UE_STRUCT' not in src and 'UE_ENUM(' not in src and 'UE_COMPONENT' not in src and 'UE_INSTANCED' not in src, src
+    finally:
+        shutil.rmtree(dec, ignore_errors=True)
+
+    # Owner/ and User/, each a mod folder; Mixed/ holds two mods' sources, so its header is nobody's.
+    with tempfile.TemporaryDirectory() as tmp:
+        head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\n'
+        files = {
+            'Owner/Shared.h': '#pragma once\n' + head + 'struct FShared { int32 A; };\nenum class EShared : uint8 { One, Two };\n'
+                              'class UShared : public UObject { public: FShared S; EShared E; };\n',
+            'Owner/Owner.cpp': '#include "Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Owner");\n',
+            'User/User.cpp': '#include "../Owner/Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/User");\n'
+                             'class AUser : public AActor { FShared S; EShared E; UShared *D; };\n',
+            'Mixed/Mixed.h': '#pragma once\n' + head + 'struct FMixed { int32 A; };\n',
+            'Mixed/A.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixA");\nclass AMixA : public AActor { FMixed M; };\n',
+            'Mixed/B.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixB");\nclass AMixB : public AActor {};\n'}
+        for name, text in files.items():
+            os.makedirs(os.path.join(tmp, os.path.dirname(name)), exist_ok=True)
+            with open(os.path.join(tmp, name), 'w', encoding='utf-8') as f: f.write(text)
+        out = lambda mod: os.path.join(tmp, 'out', mod)
+        for mod, src in (('Owner', 'Owner/Owner.cpp'), ('User', 'User/User.cpp')):
+            proc = assetgen_compile([os.path.join(tmp, src), UEAPI, out(mod)])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        proves('sharing-a-class.include-turrets-turrets-h')
+        assert {'EShared.uasset', 'FShared.uasset', 'UShared.uasset'} <= set(os.listdir(out('Owner'))), os.listdir(out('Owner'))
+        assert {f for f in os.listdir(out('User')) if f.endswith('.uasset')} == {'AUser.uasset'}, os.listdir(out('User'))
+        imports = set(import_paths(os.path.join(out('User'), 'AUser')))
+        assert {'/Game/_ElytrasMods/Owner/FShared.FShared', '/Game/_ElytrasMods/Owner/EShared.EShared',
+                '/Game/_ElytrasMods/Owner/UShared.UShared_C'} <= imports, sorted(imports)
+        proves('sharing-a-class.a-header-in-a-folder')
+        proc = assetgen_compile([os.path.join(tmp, 'Mixed/A.cpp'), UEAPI, out('MixA')])
+        assert proc.returncode != 0 and 'unimplemented property M: FMixed' in proc.stdout, proc.stdout
+    print('ok  InferMeta: plain structs and uint8 enums a reflected position names are cooked, by the folder\'s mod; '
+          'CreateDefaultSubobject, a named NewObject and const methods read as UE C++ means them')
+
+
+infer_meta()
+
+
 def self_ref_import():
     """SelfRefImport: a member of the mod's own class and a call to its own function on another instance reference
     this package's exports, never an import of the package itself."""
