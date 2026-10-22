@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """usage: test_bytecode.py [--assetgen <exe>] [--ueapi <UeApi dir>] [--cases <file>] [--game <folder /Game is in>]
                         [--sdk <Dumper-7 dump of the game>] [--no-prefetch | --check-prefetch]
 
@@ -4629,6 +4629,51 @@ def patch_members(comp_game):
           'UE_DEFAULTS) on the default object, and an interface of its own is added with its methods and variables')
 
 
+def free_functions():
+    """FreeTest: each free function a call reaches that is not inline is a static of BPL_FreeTest, the one function
+    library generated for the source, called on its default object. Each takes a hidden world context the call fills in
+    with its self, as a function of the editor's function library does, unless it declares its own. A template is
+    expanded, inline or not."""
+    lib = os.path.join(os.path.dirname(asset('FreeTest')), 'BPL_FreeTest')
+    fns = sorted(e for e in exports_of(lib) if not e.endswith('_C'))
+    assert fns == ['Fact', 'FirstPawn', 'Later', 'Pick', 'Sq', 'TheirPawn', 'Twice', 'Util__Clamp', 'Util__Twice'], fns  # no Max2
+    for fn in fns:
+        flags = int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', lib, export_index(lib, fn))).group(1), 16)
+        assert flags & 0x04022001 == 0x04022001, (fn, hex(flags))      # BlueprintCallable | Public | Static | Final
+        assert runscript.params_of(lib, fn)[-1] == 'WorldContextObject', fn
+    assert '/Game/_ElytrasMods/FreeTest/BPL_FreeTest' in {p.rsplit('.', 1)[0] for p, _c in registry_rows(registry_of('FreeTest'))}
+    # Run: the class's calls land in the library's VM, each on the library's default object.
+    cdo = Obj('BPL_FreeTest_C')
+    lib_vm = VM(lib, objects={'Default__BPL_FreeTest_C': cdo}, natives={'GetPlayerPawn': lambda vm, ctx, wco, i: wco})
+    vm = VM(asset('FreeTest'), objects={'Default__BPL_FreeTest_C': cdo},
+            natives={fn: (lambda fn: lambda _vm, ctx, *a: lib_vm.call(fn, *a))(fn) for fn in fns})
+    proves('free-functions.int32-twice-int32-v', 'free-functions.namespace-util-int32-twice-int32',
+           'free-functions.int32-fact-int32-n-return', 'free-functions.int32-later-int32-v',
+           'inline-functions.int32-helper-int32-x')
+    assert [vm.call('UseTwice', 5), vm.call('UseFact', 5), vm.call('UseLater', 7), vm.call('UseLater', 20)] == [21, 120, 21, 50]
+    proves('templates.template-class-t-t-max2', 'constexpr-and-consteval.constexpr-int32-sq-int32-x')
+    assert [vm.call('UseDefaults', 12), vm.call('UseDefaults', -3), vm.call('UsePick', 4), vm.call('UseMax', 3, 9)] == [1005, 3, 105, 9]
+    assert [vm.call('FromStatic', 4), vm.call('UseSq', 7)] == [8, 49]
+    proves('free-functions.apawn-firstpawn-return')
+    assert vm.call('UsePawn') is vm.self        # GetPlayerPawn got the caller through FirstPawn's hidden world context
+    proves('free-functions.apawn-firstpawn-uobject')
+    other = Obj('AActor')
+    assert vm.call('UseTheirs', other) is other and vm.call('UseTheirsDefault') is vm.self
+    assert vm.log and all(ctx is cdo for _fn, ctx, _a in vm.log), vm.log
+    print('ok  FreeTest: a free function is a static of the source\'s library, called on its default object with the '
+          'caller as its world context; recursion, namespaces, defaults, constexpr and a template expanded')
+    proves('free-functions.int32-ov-int32-v')
+    refused('FreeOverload', '  int32 F() { return Ov(1) + Ov(2.0f); }\n', 'Ov is overloaded',
+            top='int32 Ov(int32 V) { return V; }\nint32 Ov(float V) { return 1; }\n')
+    proves('free-functions.a-free-function-that-calls')
+    refused('FreeWaits', '  void F() { Wait(); }\n', 'a free function is one unless it is inline',
+            top='void Wait() { UKismetSystemLibrary::Delay(1.0f); }\n')
+    proves('free-functions.int32-helper-int32-v')
+    refused('FreeElsewhere', '  int32 F() { return Elsewhere(1); }\n', 'call to an unknown function: Elsewhere',
+            top='int32 Elsewhere(int32 V);\n')
+    print('ok  FreeTest: two non-inline overloads a source calls, a free function that waits, and one with no body here are refused')
+
+
 def edits():
     """EditTest (S38): UE_ASSET_EDIT and UE_PATCH rewrite AssetTest's cooked packages in place. Only the named tags
     change (replaced where they were, or appended); every name and import the package had keeps its index, a new one
@@ -5156,6 +5201,7 @@ static_assets()
 ue_assets()
 asset_elsewhere()
 globals_()
+free_functions()
 asset_values()
 edits()
 path_edits()
