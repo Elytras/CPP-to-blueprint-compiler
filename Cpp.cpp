@@ -1976,6 +1976,30 @@ private:
             if (!A->Widgets.empty()) return true;
         return false;
     }
+    /* A class's registry tags, as the cooker writes them (UBlueprintGeneratedClass::GetAssetRegistryTags, measured on
+       FSD/AssetRegistry.bin): its parent and nearest native ancestor as <class kind>'<path>', its
+       NumReplicatedProperties, and ModuleName, the package's short name. Parent is null for UInterface itself, and an
+       interface's chain of mod interfaces ends at no native record: UInterface is its native ancestor. */
+    std::vector<std::pair<std::string, std::string>> ClassTags(const std::string& PackageName, const std::string& ParentPkg,
+                                                               const std::string& ParentClass, const FRecord* Parent,
+                                                               int32 NumReplicated) const
+    {
+        auto PathOf = [&](const std::string& Pkg, const std::string& Class) {
+            std::string Kind = "Class";
+            if (Pkg.compare(0, 8, "/Script/") != 0)
+            {
+                const auto K = GameClassKinds.find(Pkg + "." + Class);
+                Kind = K == GameClassKinds.end() ? "BlueprintGeneratedClass" : K->second.second;
+            }
+            return Kind + "'" + Pkg + "." + Class + "'";
+        };
+        const FRecord* Native = Parent;
+        while (Native && PackageOf(*Native).compare(0, 8, "/Script/") != 0) Native = Native->Base.empty() ? nullptr : Find(Native->Base);
+        return { { "ParentClass", PathOf(ParentPkg, ParentClass) },
+                 { "NativeParentClass", Native ? PathOf(PackageOf(*Native), ClassOf(*Native)) : PathOf("/Script/CoreUObject", "Interface") },
+                 { "NumReplicatedProperties", std::to_string(NumReplicated) },
+                 { "ModuleName", PackageName.substr(PackageName.rfind('/') + 1) } };
+    }
     bool RootInheritedBy(const FRecord& R) const;
     bool ListsDefaultRootOf(const FRecord& R) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
@@ -17546,7 +17570,8 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     }
     /* The class, `<I>_C`, as a class's row names it and the game's Blueprint interfaces' rows do (TempRocketInterface);
        their `<I>` row is the editor's Blueprint asset, which a cooked package does not hold. */
-    RegistryRows.push_back({ PackageName, ClassOf(R), "BlueprintGeneratedClass" });
+    RegistryRows.push_back({ PackageName, ClassOf(R), "BlueprintGeneratedClass",
+                             ClassTags(PackageName, ParentPkg, !Parent ? "Interface" : ClassOf(*Parent), Parent, 0) });
     printf("  %-14s -> %s.uasset  (interface, %d functions)\n", R.CppName.c_str(), Shown(PackageName).c_str(),
            int32(R.Methods.size()));
     return true;
@@ -21864,7 +21889,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
         Err->clear();
     }
-    RegistryRows.push_back({ PackageName, ClassOf(R), HasWidgetTree(R) ? "WidgetBlueprintGeneratedClass" : "BlueprintGeneratedClass" });
+    RegistryRows.push_back({ PackageName, ClassOf(R), HasWidgetTree(R) ? "WidgetBlueprintGeneratedClass" : "BlueprintGeneratedClass",
+                             ClassTags(PackageName, PackageOf(*B), ClassOf(*B), B, BP.NumReplicatedVars()) });
     printf("  %-14s -> %s.uasset  (%s %s)\n", R.CppName.c_str(), Shown(PackageName).c_str(),
            B->IsNative() ? "extends" : "extends BP", R.Base.c_str());
     return true;

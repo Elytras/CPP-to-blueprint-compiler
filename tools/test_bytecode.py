@@ -871,7 +871,57 @@ def registry_non_ascii():
         proc = subprocess.run([ASSETGEN, 'registry', merged, os.path.join(tmp, 'AssetRegistry.bin'), registry_of('AssetTest')],
                               capture_output=True, encoding='utf-8')
         assert proc.returncode == 0 and set(want) <= set(rows(merged)), (proc.stdout, rows(merged))
+        # Its tags too: ModuleName is not ASCII, so a UTF-16 store string, and the merge reads the store back.
+        tags = lambda path: [r['tags'] for r in dumpar.read(path)[2] if r['asset_name'] == 'Größe_C']
+        proves('the-mod-package.a-class-s-registry-tags')
+        assert tags(merged) == tags(os.path.join(tmp, 'AssetRegistry.bin')) == [[
+            ('ParentClass', "Class'/Script/Engine.Actor'"), ('NativeParentClass', "Class'/Script/Engine.Actor'"),
+            ('NumReplicatedProperties', '0'), ('ModuleName', 'Größe')]], tags(merged)
     print('ok  a non-ASCII asset name reads back from the registry as written, and merges')
+
+
+def registry_class_tags():
+    """Every suite class's registry row carries the cooker's four tags (FSD/AssetRegistry.bin: ParentClass,
+    NativeParentClass, NumReplicatedProperties, ModuleName), each read off the cooked class it names: its super as
+    <class kind>'<path>', the native class its supers end at - following a Blueprint super into its own package -, its
+    serialized NumReplicatedProperties, its package's short name. Before, a row had no tags, and in game every mod
+    class's NativeParentClass read empty (EMM's AssetManager filter found no mod)."""
+    import struct
+    import invariants
+    import dumpar
+    checked = through_bp = replicated = 0
+    for reg in sorted(glob.glob(os.path.join(ROOT, '*', 'FSD', 'AssetRegistry.bin'))):
+        content = os.path.join(os.path.dirname(reg), 'Content')
+        for row in dumpar.read(reg)[2]:
+            if not row['asset_class'].endswith('BlueprintGeneratedClass'):
+                continue
+            pkg = invariants.load(os.path.join(content, row['package_name'][len('/Game/'):]))
+            i = pkg.find(row['asset_name'])
+            tags = dict(row['tags'])
+            assert [k for k, _ in row['tags']] == ['ParentClass', 'NativeParentClass', 'NumReplicatedProperties',
+                                                   'ModuleName'], (row['object_path'], row['tags'])
+            sup = pkg.exports[i]['super']
+            assert tags['ParentClass'] == "%s'%s'" % (pkg.class_of(sup), pkg.path(sup)), (row['object_path'], tags)
+            assert tags['ModuleName'] == row['package_name'].rsplit('/', 1)[1], tags
+            rep = pkg.tag(i, 'NumReplicatedProperties')
+            assert tags['NumReplicatedProperties'] == str(struct.unpack('<i', rep['value'])[0] if rep else 0), tags
+            replicated += rep is not None
+            # The native ancestor: up through Blueprint supers while their packages are at hand.
+            at, idx = pkg, sup
+            while at.class_of(idx) != 'Class':
+                up = at.resolve(idx)
+                if not up:
+                    break
+                at, k = up
+                idx = at.exports[k]['super']
+            else:
+                assert tags['NativeParentClass'] == "Class'%s'" % at.path(idx), (row['object_path'], tags)
+                through_bp += at is not pkg
+            assert tags['NativeParentClass'].startswith("Class'/Script/"), (row['object_path'], tags)
+            checked += 1
+    assert checked > 50 and through_bp and replicated, (checked, through_bp, replicated)
+    print('ok  %d class rows carry the cooker\'s registry tags, %d of them through a Blueprint parent, %d replicating'
+          % (checked, through_bp, replicated))
 
 
 def export_index(base, name):
@@ -985,6 +1035,8 @@ def nested(Size):
 sweep()
 registry_layout()
 registry_non_ascii()
+proves('the-mod-package.a-class-s-registry-tags')
+registry_class_tags()
 proves('jumps.break', 'for.for-int32-i-0-i')
 check('FlowTest', 'SumSkipping', sum_skipping, [dict(Count=c, Skip=k) for c in (0, 1, 5, 10, 20) for k in (-1, 0, 3, 9)])
 proves('while-and-do.while-true')
