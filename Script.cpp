@@ -828,9 +828,9 @@ void FScript::LetPath(EExprToken LetOp, const std::vector<std::string>& Path, FI
 
 void FScript::Context(const std::function<void(FScript&)>& ObjectExpr,
                       const std::function<void(FScript&)>& ContextExpr,
-                      const std::optional<FFieldRef>& RValue)
+                      const std::optional<FFieldRef>& RValue, EExprToken ContextOp)
 {
-    Op(EX_Context);
+    Op(ContextOp);
     ObjectExpr(*this);
 
     // Skip count is MEMORY bytes, so the inner expression is built and measured separately first.
