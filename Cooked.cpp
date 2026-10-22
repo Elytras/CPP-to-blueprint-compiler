@@ -693,9 +693,20 @@ bool FCookedPackage::Read(const std::vector<uint8>& Header, const std::vector<ui
     /* The summary. Each field an unversioned FilterEditorOnly cook writes as a constant is checked against it. */
     if (R.U32() != kPackageFileTag) return Refuse("not a package");
     if (R.I32() != -7) return Refuse("legacy file version");
+    /* A package the editor cooked versioned (a mod's, cooked without -unversioned) records the versions it was saved
+       at. One saved at 4.27's own (LegacyUE3 864, UE4 522, no licensee) is laid out as the unversioned cook lays it
+       out, so it reads the same, its custom versions and engine versions skipped; it is written back unversioned,
+       which the game reads at those same versions. */
     const int32 LegacyUE3 = R.I32(), UE4 = R.I32(), Licensee = R.I32(), CustomVersions = R.I32();
-    if (LegacyUE3 || UE4 || Licensee) return Refuse("versioned");
-    if (CustomVersions) return Refuse("custom versions");
+    const bool bVersioned = LegacyUE3 || UE4 || Licensee || CustomVersions;
+    if (bVersioned && (LegacyUE3 != 864 || UE4 != 522 || Licensee)) return Refuse("versioned, not at UE 4.27's versions");
+    if (CustomVersions < 0 || size_t(CustomVersions) > (Header.size() - R.P) / 20) return Refuse("custom versions");
+    for (int32 I = 0; I < CustomVersions; ++I)
+    {
+        uint32 Key[4];
+        R.Guid(Key);
+        R.I32();
+    }
     const int32 TotalHeaderSize = R.I32();
     if (R.Str() != "None") return Refuse("folder name");
     PackageFlags = R.U32();
@@ -710,8 +721,11 @@ bool FCookedPackage::Read(const std::vector<uint8>& Header, const std::vector<ui
     R.Guid(Guid);
     if (R.I32() != 1) return Refuse("generations");
     if (R.I32() != ExportCount || R.I32() != NameCount) return Refuse("generation counts");
-    for (int32 I = 0; I < 2; ++I)
-        if (R.U16() || R.U16() || R.U16() || R.U32() || !R.Str().empty()) return Refuse("engine version");
+    for (int32 I = 0; I < 2; ++I)                   // SavedByEngineVersion, CompatibleEngineVersion
+    {
+        const bool bSet = R.U16() | R.U16() | R.U16() | R.U32() | !R.Str().empty();
+        if (bSet && !bVersioned) return Refuse("engine version");
+    }
     if (R.U32() || R.I32()) return Refuse("package compression");
     PackageSource = R.U32();
     if (R.I32()) return Refuse("additional packages to cook");
