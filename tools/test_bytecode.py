@@ -2290,6 +2290,41 @@ proves('math-and-utility.fmath-h')
 fmath_nodes()
 
 
+# ---- FormatTest
+
+def format_text():
+    """Format.h: an fmt-style call is the Format node, each argument named by the placeholder it fills (a repeated name
+    is the same argument) and typed by its C++ type; a backtick escapes a brace. A pattern whose placeholders and
+    arguments differ in number does not compile."""
+    proves('formatting-text.format-name-value-key-map-key')
+    runscript.MATH['Format'] = runscript.format_text
+    try:
+        for fn, parms, want in (('NameValue', dict(Key='Gold', bOn=True), 'Gold:true'),
+                                ('NameValue', dict(Key='Nitra', bOn=False), 'Nitra:false'),
+                                ('Numbers', dict(Hits=1234, Rate=2.5, Who='Ann'), 'Ann hit 1,234 (2.5), Ann!'),
+                                ('Numbers', dict(Hits=-3, Rate=0.125, Who='Bo'), 'Bo hit -3 (0.125), Bo!'),
+                                ('Escaped', dict(N=7), '{N} is 7'),
+                                ('Computed', dict(S='ab', N=5), 'ab!-10-ab')):
+            got = run(asset('FormatTest'), fn, **parms)[0]
+            assert got == want, (fn, parms, got, want)
+    finally:
+        del runscript.MATH['Format']
+    proves('formatting-text.format-a-b-x')
+    header = os.path.join(TESTS, '..', 'include', 'Format.h').replace('\\', '/')
+    with tempfile.TemporaryDirectory() as tmp:       # clang's own refusal, which it prints to stderr
+        src = os.path.join(tmp, 'FormatCount.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "%s"\n#include "UeApi/FSD.h"\n'
+                    'UE_MOD_PACKAGE("/Game/_ElytrasMods/FormatCount");\nclass FormatCount : public AActor {\npublic:\n'
+                    '  FString F(int32 X) { return Format("{A} {B}", X); }\n};\n' % header)
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode and 'Format_PlaceholdersAndArgumentsDiffer' in proc.stdout + proc.stderr, proc.stdout
+    print('ok  FormatTest: Format fills each placeholder from its argument, and a count mismatch does not compile')
+
+
+format_text()
+
+
 # ---- RefObjBool
 
 proves('validity-and-comparison.if-obj')

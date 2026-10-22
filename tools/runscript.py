@@ -179,6 +179,9 @@ IMMUTABLE = {'Vector': ('<fff', 'X Y Z'), 'Vector2D': ('<ff', 'X Y'), 'Vector4':
              'Rotator': ('<fff', 'Pitch Yaw Roll'), 'Quat': ('<ffff', 'X Y Z W'), 'IntPoint': ('<ii', 'X Y'),
              'IntVector': ('<iii', 'X Y Z'), 'Color': ('<BBBB', 'B G R A'), 'LinearColor': ('<ffff', 'R G B A'),
              'Guid': ('<iiii', 'A B C D')}
+# Other engine structs a literal may build, by their members in declaration order (EX_StructConst's).
+LITERAL_MEMBERS = {'FormatArgumentData': 'ArgumentName ArgumentValueType ArgumentValue ArgumentValueInt '
+                                         'ArgumentValueFloat ArgumentValueGender'}
 
 
 class Unconstructed:
@@ -464,6 +467,22 @@ def atoi(t):
     return i32(int(m.group())) if m else 0
 
 
+def format_text(pattern, args):
+    """UKismetTextLibrary::Format, for a test to put in MATH while it runs (the mod tests log their Format calls
+    instead): each {Name} is its argument's value - an Int or Float as FText::AsNumber writes it
+    by default (grouped, at most 3 fractional digits), a Text as itself - and a backtick escapes the next brace, bar
+    or backtick. A name no argument has stays as written."""
+    import re
+    values = {}
+    for a in args:
+        t = a.get('ArgumentValueType', 0)
+        if t == 0: values[a['ArgumentName']] = '{:,}'.format(i32(a.get('ArgumentValueInt', 0)))
+        elif t == 2: values[a['ArgumentName']] = '{:,.3f}'.format(a.get('ArgumentValueFloat', 0.0)).rstrip('0').rstrip('.')
+        elif t == 4: values[a['ArgumentName']] = a.get('ArgumentValue', '')
+        else: raise SystemExit('Format: unsupported argument type %d' % t)
+    return re.sub(r'`([{}|`])|\{([^}]*)\}', lambda m: m.group(1) or values.get(m.group(2), m.group(0)), pattern)
+
+
 def int64_to_text(v, sign, grouping, lo, hi):
     t = ('{:,}' if grouping else '{}').format(abs(v)).rjust(lo, '0')
     return ('-' if v < 0 else '+' if sign else '') + t
@@ -477,6 +496,7 @@ MATH.update({
     'Conv_IntToString': str, 'Conv_FloatToString': sanitize_float, 'Conv_BoolToString': lambda b: 'true' if b else 'false',
     'Conv_StringToInt': atoi, 'Conv_Int64ToText': int64_to_text, 'Conv_ObjectToString': lambda o: str(o) if o else 'None',
     'Conv_StringToName': str, 'Conv_NameToString': str, 'Conv_NameToText': str, 'Conv_StringToText': str, 'Conv_TextToString': str,
+    'Conv_BoolToText': lambda b: 'true' if b else 'false',
     'EqualEqual_ObjectObject': lambda a, b: a == b, 'NotEqual_ObjectObject': lambda a, b: a != b, 'IsValid': bool,
     'GetFSDGameState': lambda world: GAME_STATE, 'PostGameMessage': MESSAGES.append, 'GetTickableWhenPaused': lambda: False,
 })
@@ -669,8 +689,9 @@ def run(base, function, self_vars=None, **parms):
             return s.get(n.val, 0) if isinstance(s, dict) else 0     # a struct is a dict; an unset member reads 0
         if o in (0x1F, 0x34): return n.val
         if o == 0x2F:                                                # an IMMUTABLE engine struct's literal: a dict
-            if n.val not in IMMUTABLE: raise SystemExit('unsupported struct literal %s at mem %d' % (n.val, n.mem))
-            return dict(zip(IMMUTABLE[n.val][1].split(), [ev(k) for k in n.kids]))
+            members = IMMUTABLE[n.val][1] if n.val in IMMUTABLE else LITERAL_MEMBERS.get(n.val)
+            if not members: raise SystemExit('unsupported struct literal %s at mem %d' % (n.val, n.mem))
+            return dict(zip(members.split(), [ev(k) for k in n.kids]))
         if o == 0x67: return ev(n.kids[0])
         if o == 0x29: return ev(n.kids[0]) if n.kids else ''
         if o == 0x17: return SELF
