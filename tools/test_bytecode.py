@@ -7916,16 +7916,17 @@ def class_ctx():
     base = asset('ClassCtx')
     vm = VM(base, Score=1, Calls=0, Seen=3, Kind=None, Held=None)
     own = vm.objects['Default__ClassCtx_C'] = Obj('ClassCtx_C', Score=5, Calls=0)
-    kid = vm.objects['Default__Kid_C'] = Obj('Kid_C', Score=9)
+    kid = vm.objects['Default__ClassCtxKid_C'] = Obj('ClassCtxKid_C', Score=9)
     proves('properties-of-other.getdefault-amyenemy-kind-health')
-    assert (vm.call('ScoreOf', 'ClassCtx_C'), vm.call('ScoreOf', 'Kid_C'), vm.call('OwnScore'), vm.call('RawScore', 'Kid_C'))         == (5, 9, 5, 9)
-    vm.self.vars['Kind'] = 'Kid_C'
+    got = vm.call('ScoreOf', 'ClassCtx_C'), vm.call('ScoreOf', 'ClassCtxKid_C'), vm.call('OwnScore'), vm.call('RawScore', 'ClassCtxKid_C')
+    assert got == (5, 9, 5, 9), got
+    vm.self.vars['Kind'] = 'ClassCtxKid_C'
     vm.call('Remember')
     assert vm.self.vars['Seen'] == 9, vm.self.vars
     assert (vm.call('BumpDefaults', 'ClassCtx_C'), vm.call('BumpDefaults', 'ClassCtx_C')) == (1, 2), own.vars
     assert own.vars['Calls'] == 2 and vm.self.vars['Calls'] == 0, (own.vars, vm.self.vars)
     proves('properties-of-other.uobject-defaults')
-    assert vm.call('DefaultsOf', 'Kid_C') is kid
+    assert vm.call('DefaultsOf', 'ClassCtxKid_C') is kid
     vm.call('Hold')
     assert vm.self.vars['Held'] is kid, vm.self.vars
     vm.null_rvalues = True
@@ -7936,13 +7937,9 @@ def class_ctx():
     assert (vm.call('ScoreOf', None), vm.call('DefaultsOf', None)) == (0, None)
     assert len(vm.accessed_none) == 4, vm.accessed_none
     vmsem_holds(base, *(set(vmsem_rules.VMSEM_RULES) - set(KNOWN_RULES)))
-    refused('CcRaw', '  int32 Hp = 3;
-  int32 Of(UClass *C) { return GetDefault<CcRaw>(C)->Hp; }
-',
-            'GetDefault<CcRaw>(Class) reads Class's default object as a CcRaw, and Class may hold any class')
-    refused('CcWide', '  int32 Hp = 3;
-  int32 Of(TSubclassOf<AActor> C) { return GetDefault<CcWide>(C)->Hp; }
-',
+    refused('CcRaw', '  int32 Hp = 3;\n  int32 Of(UClass *C) { return GetDefault<CcRaw>(C)->Hp; }\n',
+            "GetDefault<CcRaw>(Class) reads Class's default object as a CcRaw, and Class may hold any class")
+    refused('CcWide', '  int32 Hp = 3;\n  int32 Of(TSubclassOf<AActor> C) { return GetDefault<CcWide>(C)->Hp; }\n',
             'and Class may hold AActor, which is not one')
 
 
