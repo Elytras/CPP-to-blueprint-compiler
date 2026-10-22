@@ -112,6 +112,14 @@ std::string PathIn(const std::string& Package, const std::string& Qualified)
 /* `A::B::X` is X. */
 std::string LeafOf(const std::string& Qualified) { return Qualified.substr(Qualified.rfind(':') + 1); }
 
+/* `A::B::X` is A__B__X: the name of a global's class (LowerGlobal), and of a free function in its library (FreeLibrary). */
+std::string Flatten(const std::string& Qualified)
+{
+    std::string Out = Qualified;
+    for (size_t At; (At = Out.find("::")) != std::string::npos;) Out.replace(At, 2, "__");
+    return Out;
+}
+
 /* A CharacterLiteral's value is its code unit; a plain char is signed (clang for MSVC), so '\xff' is -1. */
 int64 CharValue(const Json& N)
 {
@@ -1943,6 +1951,12 @@ private:
                                                                         // (a template's: each instantiation)
     std::vector<const Json*> FreeInlineOrder;                           // the same definitions in document order: an id is
                                                                         // an address in clang, so the map's order is not fixed
+    /* A free function that is not inline and has a body here: its first declaration (the default arguments are on it),
+       its definition, and its qualified name. */
+    struct FFreeFn { const Json* Decl = nullptr; const Json* Def = nullptr; std::string Qual; };
+    std::map<std::string, FFreeFn> FreeFns;                             // any of its declarations' ids -> the function
+    FRecord FreeLib;                                                    // the source's function library, see FreeLibrary
+    bool FreeLibrary(const FFreeFn& F, std::string* Err);
     std::map<std::string, const Json*> MemberTemplates;                 // decl id -> a member template's instantiation,
                                                                         // expanded inline like an inline method
     /* The class a field access `Obj->Field` / `Field` reads from: Obj's static type, or the class being generated. */
@@ -7926,10 +7940,21 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            change from run to run. The recursion check goes by the definition's node. */
         if (auto Tm = MemberTemplates.find(DeclId); Tm != MemberTemplates.end())
             return ExpandInline(CallExprNode, *Tm->second, MethodName, true, BP, Out, Err);
-        auto Owner = MethodOwner.find(DeclId);
-        if (Owner == MethodOwner.end()) { *Err = "call to an unknown function: " + MethodName; return false; }
-        const FRecord* R = Find(Owner->second);
-        if (!R) { *Err = "call to a function on an unknown class: " + Owner->second; return false; }
+        /* From here on a free function is a static of the source's library, called as a static of any mod class is. */
+        const FRecord* R = nullptr;
+        if (auto Free = FreeFns.find(DeclId); Free != FreeFns.end())
+        {
+            if (!FreeLibrary(Free->second, Err)) return false;
+            R = &FreeLib;
+            MethodName = Flatten(Free->second.Qual);
+        }
+        else
+        {
+            auto Owner = MethodOwner.find(DeclId);
+            if (Owner == MethodOwner.end()) { *Err = "call to an unknown function: " + MethodName; return false; }
+            R = Find(Owner->second);
+            if (!R) { *Err = "call to a function on an unknown class: " + Owner->second; return false; }
+        }
 
         auto Decl = R->Methods.find(MethodName);
         /* `Obj->GetOuter()`: no UFunction of Object. The header forwards it to the static that does it
@@ -8156,9 +8181,11 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             Out.Context = BP.ClassDefaultObject(CalleePackage, CalleeName);
     }
 
-    /* The called declaration's parameters, for a defaulted argument: FullDecl, when it has the call's arity. */
+    /* The called declaration's parameters, for a defaulted argument: FullDecl, when it has the call's arity. A free
+       function's hidden world context (FreeLibrary) is no argument of the call's. */
     std::vector<const Json*> CalledParms;
-    if (FullDecl) ForEach(*FullDecl, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") CalledParms.push_back(&C); });
+    if (FullDecl)
+        ForEach(*FullDecl, [&](const Json& C) { if (Kind(C) == "ParmVarDecl" && !C.value("isImplicit", false)) CalledParms.push_back(&C); });
     if (CalledParms.size() != (Receiver ? 1u : 0u) + (CallExprNode.contains("inner") ? CallExprNode["inner"].size() - 1 : 0u))
         CalledParms.clear();
     std::vector<std::pair<const Json*, std::string>> CopyBacks;
@@ -14233,9 +14260,7 @@ bool FCompiler::LowerGlobal(const Json& Decl, FBlueprintClass& BP, FArgIR& Out, 
     if (!Globals.count(Qual))
     {
         FRecord G;
-        for (size_t At = 0; At < Qual.size(); ++At)
-            if (Qual.compare(At, 2, "::") == 0) { G.CppName += "__"; ++At; }
-            else G.CppName += Qual[At];
+        G.CppName = Flatten(Qual);
         G.Base = "UObject";
         if (AssetAlls.count(Qual))
         {
@@ -14542,6 +14567,51 @@ bool FCompiler::CheckAssetReads(std::string* Err)
             return false;
         }
     }
+    return true;
+}
+
+/*
+A free function that is not inline. A Blueprint has no free functions, so each one a call reaches is a static, named
+<Ns>__<Name>, of one function library generated for the source, BPL_<source file name> in the mod's package. Per source,
+not per mod: bpbuild compiles each source of a mod on its own into the same folder, so one shared by the mod would hold
+only what the last compile called. Its statics are added as lowering reaches them, the library's own included, and
+Generate cooks it after every class: from there on each is a static of a mod class, and a call is a final call on the
+library's default object. The editor gives every function of a function library a hidden world context each call wires
+to its self (UK2Node_FunctionEntry::AllocateDefaultPins), and so does this: a function that declares no WorldContext
+parameter gets one, so what it calls finds the caller's world, as it would from an inline body.
+*/
+bool FCompiler::FreeLibrary(const FFreeFn& F, std::string* Err)
+{
+    const std::string Fn = Flatten(F.Qual);
+    if (auto M = FreeLib.Methods.find(Fn); M != FreeLib.Methods.end())
+    {
+        if (M->second == F.Decl) return true;
+        *Err = F.Qual + " is overloaded, and a function library has one function per name: give each non-inline overload "
+               "a name of its own, or make all but one inline";
+        return false;
+    }
+    Json& Decl = const_cast<Json&>(*F.Decl);
+    Json& Def = const_cast<Json&>(*F.Def);
+    NormalizePointers(Decl);
+    NormalizePointers(Def);
+    Decl["storageClass"] = "static";
+    auto AddWco = [&](Json& Of) {
+        Json& Inner = Of["inner"];
+        if (!Inner.is_array()) Inner = Json::array();
+        size_t At = 0;      // after the last parameter, before the body
+        for (size_t I = 0; I < Inner.size(); ++I) if (Kind(Inner[I]) == "ParmVarDecl") At = I + 1;
+        Inner.insert(Inner.begin() + At, Json{ { "kind", "ParmVarDecl" }, { "id", F.Qual + "::WorldContextObject" },
+                                               { "name", "WorldContextObject" }, { "type", { { "qualType", "UObject *" } } },
+                                               { "isImplicit", true } });
+    };
+    const std::vector<std::string> Parms = ParmNames(Def);
+    if (std::none_of(Parms.begin(), Parms.end(), IsWcoName))
+    {
+        AddWco(Def);
+        if (&Decl != &Def) AddWco(Decl);
+    }
+    FreeLib.Methods[Fn] = &Decl;
+    FreeLib.MethodDefs[Fn] = &Def;
     return true;
 }
 
@@ -19593,75 +19663,83 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         return Body;
     };
     std::vector<FMethod> Methods;
-    for (const auto& Entry : R.Methods)
-    {
-        FMethod Fn{ Entry.first, Entry.second, Entry.second, nullptr };
-        if (IsInlineMethod(R, Fn.Name)) continue;
-        /* clang refuses an override of a final method, not one of the same name with other parameters, which a Blueprint
-           would still take for its override: calls by name would reach it, calls bound to the final one would not. */
-        for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
-            if (A->FinalMethods.count(Fn.Name))
+    size_t Seen = 0;        // R.Methods' size when AddOwn last read it: only the free functions' library grows
+    auto AddOwn = [&] {
+        if (R.Methods.size() == Seen) return true;
+        Seen = R.Methods.size();
+        for (const auto& Entry : R.Methods)
+        {
+            FMethod Fn{ Entry.first, Entry.second, Entry.second, nullptr };
+            if (IsInlineMethod(R, Fn.Name) || std::any_of(Methods.begin(), Methods.end(), [&](const FMethod& F) { return F.Name == Fn.Name; }))
+                continue;
+            /* clang refuses an override of a final method, not one of the same name with other parameters, which a Blueprint
+               would still take for its override: calls by name would reach it, calls bound to the final one would not. */
+            for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+                if (A->FinalMethods.count(Fn.Name))
+                {
+                    *Err = R.CppName + "::" + Fn.Name + ": " + A->CppName + "::" + Fn.Name + " is final, so no subclass may have a "
+                           "function of that name; rename this one";
+                    return false;
+                }
+            /* A function of a mod ancestor's name is an override of it to the editor, a static too: its super is
+               ParentClass->FindFunctionByName (KismetCompiler.cpp 1733-1774), and an override must agree with it on Static
+               ("Check flags: Exec, Final, Static", 1855-1868). C++ only hides the one above, so one that does not agree is
+               refused. A static over a static splits no caller - every call to either is bound - and keeps it as its super
+               (FindEvent). Another mod's class, from the header it shares, is a mod ancestor too: its declarations say
+               which of its functions are static. A native ancestor's is Generate's below: no function replaces one that is
+               no Blueprint event. */
+            if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name);
+                A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic != IsStaticDecl(*Fn.Decl))
             {
-                *Err = R.CppName + "::" + Fn.Name + ": " + A->CppName + "::" + Fn.Name + " is final, so no subclass may have a "
-                       "function of that name; rename this one";
+                const FRecord* Listed = nullptr;
+                for (const std::string& I : R.Interfaces)
+                    for (const FRecord* IR : InterfaceChain(Find(I)))
+                        if (!Listed && IR && IR->Methods.count(Fn.Name)) Listed = IR;
+                if (!bAboveStatic)
+                    *Err = R.CppName + "::" + Fn.Name + " is static, and the " + A->CppName + "::" + Fn.Name + " it hides is not: "
+                           "the editor takes it for an override of that one, which a static cannot be (\"Check flags: Exec, "
+                           "Final, Static\"); rename this one";
+                else if (Listed)
+                    *Err = R.CppName + " implements " + Listed->CppName + ", whose " + Fn.Name + " " + R.CppName + "::" + Fn.Name
+                         + " implements, and the " + A->CppName + "::" + Fn.Name + " it inherits is static: the editor takes "
+                           "such a function for an override of the static and refuses it (\"Check flags: Exec, Final, "
+                           "Static\"); rename " + A->CppName + "::" + Fn.Name;
+                else
+                    *Err = R.CppName + "::" + Fn.Name + ": " + A->CppName + "::" + Fn.Name + " is static, and the editor takes "
+                           "a function of that name in a subclass for an override of it, which only a static can be (\"Check "
+                           "flags: Exec, Final, Static\"); rename this one";
                 return false;
             }
-        /* A function of a mod ancestor's name is an override of it to the editor, a static too: its super is
-           ParentClass->FindFunctionByName (KismetCompiler.cpp 1733-1774), and an override must agree with it on Static
-           ("Check flags: Exec, Final, Static", 1855-1868). C++ only hides the one above, so one that does not agree is
-           refused. A static over a static splits no caller - every call to either is bound - and keeps it as its super
-           (FindEvent). Another mod's class, from the header it shares, is a mod ancestor too: its declarations say
-           which of its functions are static. A native ancestor's is Generate's below: no function replaces one that is
-           no Blueprint event. */
-        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name);
-            A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic != IsStaticDecl(*Fn.Decl))
-        {
-            const FRecord* Listed = nullptr;
-            for (const std::string& I : R.Interfaces)
-                for (const FRecord* IR : InterfaceChain(Find(I)))
-                    if (!Listed && IR && IR->Methods.count(Fn.Name)) Listed = IR;
-            if (!bAboveStatic)
-                *Err = R.CppName + "::" + Fn.Name + " is static, and the " + A->CppName + "::" + Fn.Name + " it hides is not: "
-                       "the editor takes it for an override of that one, which a static cannot be (\"Check flags: Exec, "
-                       "Final, Static\"); rename this one";
-            else if (Listed)
-                *Err = R.CppName + " implements " + Listed->CppName + ", whose " + Fn.Name + " " + R.CppName + "::" + Fn.Name
-                     + " implements, and the " + A->CppName + "::" + Fn.Name + " it inherits is static: the editor takes "
-                       "such a function for an override of the static and refuses it (\"Check flags: Exec, Final, "
-                       "Static\"); rename " + A->CppName + "::" + Fn.Name;
-            else
-                *Err = R.CppName + "::" + Fn.Name + ": " + A->CppName + "::" + Fn.Name + " is static, and the editor takes "
-                       "a function of that name in a subclass for an override of it, which only a static can be (\"Check "
-                       "flags: Exec, Final, Static\"); rename this one";
-            return false;
-        }
-        /* A static over a static is C++ name hiding, which no Blueprint writes: the editor's entry naming the parent's
-           function, no BlueprintEvent, "cannot be overridden" (KismetCompiler.cpp 3312-3316). It splits no caller, so
-           it compiles with a warning, its super the one it hides as FindFunctionByName gives it; but a super of other
-           parameters is a link no editor makes (IsSignatureCompatibleWith, 1993-2011), so one of another signature is
-           refused. Only a function this class compiles counts: UE_CLASS's StaticClass is in every class, and no
-           UFunction.
-           `= 0` with no body anywhere is an empty function, like an interface's stub below: a subclass's version needs
-           it as its super, and a call by name on an object without one would not find a function (a Fatal). */
-        const bool bCompiled = (Fn.Body = BodyOf(R, Fn.Name, Fn.Def)) || Fn.Decl->value("pure", false);
-        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name); bCompiled && Fn.Name != "StaticClass"
-            && A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic && IsStaticDecl(*Fn.Decl))
-        {
-            const Json& Above = *A->Methods.at(Fn.Name);
-            if (SignatureOf(Above) != SignatureOf(*Fn.Decl))
+            /* A static over a static is C++ name hiding, which no Blueprint writes: the editor's entry naming the parent's
+               function, no BlueprintEvent, "cannot be overridden" (KismetCompiler.cpp 3312-3316). It splits no caller, so
+               it compiles with a warning, its super the one it hides as FindFunctionByName gives it; but a super of other
+               parameters is a link no editor makes (IsSignatureCompatibleWith, 1993-2011), so one of another signature is
+               refused. Only a function this class compiles counts: UE_CLASS's StaticClass is in every class, and no
+               UFunction.
+               `= 0` with no body anywhere is an empty function, like an interface's stub below: a subclass's version needs
+               it as its super, and a call by name on an object without one would not find a function (a Fatal). */
+            const bool bCompiled = (Fn.Body = BodyOf(R, Fn.Name, Fn.Def)) || Fn.Decl->value("pure", false);
+            if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name); bCompiled && Fn.Name != "StaticClass"
+                && A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic && IsStaticDecl(*Fn.Decl))
             {
-                *Err = R.CppName + "::" + Fn.Name + " is static and hides " + A->CppName + "::" + Fn.Name + ", a static of "
-                       "another signature, " + TypeOf(Above) + " against " + TypeOf(*Fn.Decl) + ": a Blueprint class has "
-                       "one function of a name, and the editor makes the parent's its super, which takes the same "
-                       "parameters; rename this one";
-                return false;
+                const Json& Above = *A->Methods.at(Fn.Name);
+                if (SignatureOf(Above) != SignatureOf(*Fn.Decl))
+                {
+                    *Err = R.CppName + "::" + Fn.Name + " is static and hides " + A->CppName + "::" + Fn.Name + ", a static of "
+                           "another signature, " + TypeOf(Above) + " against " + TypeOf(*Fn.Decl) + ": a Blueprint class has "
+                           "one function of a name, and the editor makes the parent's its super, which takes the same "
+                           "parameters; rename this one";
+                    return false;
+                }
+                printf("  warning: %s::%s hides %s::%s, a static: compiled as C++ name hiding, each call running the one it "
+                       "names; the editor refuses a function named like its parent's (\"cannot be overridden\")\n",
+                       R.CppName.c_str(), Fn.Name.c_str(), A->CppName.c_str(), Fn.Name.c_str());
             }
-            printf("  warning: %s::%s hides %s::%s, a static: compiled as C++ name hiding, each call running the one it "
-                   "names; the editor refuses a function named like its parent's (\"cannot be overridden\")\n",
-                   R.CppName.c_str(), Fn.Name.c_str(), A->CppName.c_str(), Fn.Name.c_str());
+            if (bCompiled) Methods.push_back(Fn);
         }
-        if (bCompiled) Methods.push_back(Fn);
-    }
+        return true;
+    };
+    if (!AddOwn()) return false;
     /* The editor compiles every Blueprint-implementable function of an implemented interface, a stub
        where the Blueprint has none (KismetCompiler.cpp MergeUbergraphPagesIn, ConformImplementedInterfaces);
        without it a call finds the interface's own native UFunction. A native interface has no bodies,
@@ -19807,8 +19885,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const Json* F : A->Fields) TakenMembers.insert(Name(*F));
 
-    for (const FMethod& Fn : Methods)
+    /* After each method, its own again: the free functions' library gains one whenever one of its functions calls
+       another (FreeLibrary). No other class changes while it is lowered. */
+    for (size_t I = 0; I < Methods.size(); ++I, AddOwn())
     {
+        const FMethod Fn = Methods[I];      // a copy: AddOwn grows Methods
         const Json& Decl = *Fn.Decl;
         const Json& M = *Fn.Def;
         std::vector<FPropertyDef> Params;
@@ -19908,7 +19989,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             const std::string T = TypeOf(C);
             if (Kind(C) == "ParmVarDecl" && !T.empty() && T.back() == '&' && T.compare(0, 6, "const ") != 0) bWritableRef = true;
         });
-        LatentRefusal = IsStaticDecl(Decl) ? "a static function has no object whose ubergraph frame could keep its locals"
+        LatentRefusal = IsStaticDecl(Decl) ? std::string("a static function has no object whose ubergraph frame could keep its locals")
+                                             + (&R == &FreeLib ? ", and a free function is one unless it is inline" : "")
                       : (!RetType.empty() && RetType != "void") || bWritableRef
                           ? "a function that resumes later returns nothing and takes no non-const reference parameters"
                       : "";
@@ -21149,8 +21231,6 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 
     if (!LoadTables(IncludeDir, Err)) return false;
     if (!Collect(Err)) return false;
-    /* Inline free functions anywhere in the translation unit, a template's instantiations included: a call names
-       the instantiation's own FunctionDecl. Class bodies are skipped; their methods are the records'. */
     std::function<void(const Json&, bool)> IndexConsts = [&](const Json& N, bool bInClass) {
         const std::string K = Kind(N);
         if (K == "VarDecl" && N.contains("init") && N.contains("id")
@@ -21166,7 +21246,16 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     auto IndexTemplate = [&](const Json& T) {
         ForEach(T, [&](const Json& M) { TemplateOf[M.value("id", std::string())] = &T; });
     };
-    std::function<void(Json&)> IndexInlines = [&](Json& N) {
+    /* Free functions anywhere in the translation unit, a template's instantiations included. A call names whichever
+       declaration it found, so a function is keyed by all of them: previousDecl links each to the one before, back to
+       the first, which is inside the function's namespace. `inline` on any of them, or being a template's
+       instantiation (a call names its own FunctionDecl), expands the body at the call; any other function with a body
+       is a static of the source's function library (FreeLibrary). Class bodies are skipped; their methods are the records'. */
+    struct FChain { Json* First = nullptr; Json* Def = nullptr; std::string Qual; bool bInline = false; std::vector<std::string> Ids; };
+    std::map<std::string, FChain> Chains;           // the first declaration's id -> its function
+    std::map<std::string, std::string> ChainOf;     // any declaration's id -> the first's
+    std::vector<const FChain*> ChainOrder;          // Chains in document order: an id is an address in clang
+    std::function<void(Json&, const std::string&, bool)> IndexInlines = [&](Json& N, const std::string& Ns, bool bTemplate) {
         if (!N.is_object()) return;
         const std::string K = Kind(N);
         if (K == "FunctionTemplateDecl") IndexTemplate(N);
@@ -21175,7 +21264,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             /* Class bodies are the records', except member templates: no UFunction per instantiation, so each
                one a call names is inlined. The dependent pattern sits beside them and no call names it. */
             ForEach(N, [&](const Json& C) {
-                if (Kind(C) == "CXXRecordDecl") IndexInlines(const_cast<Json&>(C));
+                if (Kind(C) == "CXXRecordDecl") IndexInlines(const_cast<Json&>(C), Ns, false);
                 if (Kind(C) != "FunctionTemplateDecl") return;
                 IndexTemplate(C);
                 for (Json& M : const_cast<Json&>(C)["inner"])
@@ -21191,34 +21280,49 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             });
             return;
         }
-        if (K == "FunctionDecl" && N.value("inline", false))
+        if (K == "FunctionDecl")
         {
-            bool bBody = false;
-            ForEach(N, [&](const Json& C) { if (Kind(C) == "CompoundStmt") bBody = true; });
-            if (bBody)
-            {
-                NormalizePointers(N);
-                FreeInlines[N.value("id", std::string())] = &N;
-                FreeInlineOrder.push_back(&N);
-            }
+            const std::string Id = N.value("id", std::string());
+            const auto Prev = ChainOf.find(N.value("previousDecl", std::string()));
+            const std::string Head = ChainOf[Id] = Prev == ChainOf.end() ? Id : Prev->second;
+            FChain& C = Chains[Head];
+            if (!C.First) { C.First = &N; C.Qual = Ns + Name(N); ChainOrder.push_back(&C); }
+            C.Ids.push_back(Id);
+            C.bInline = C.bInline || bTemplate || N.value("inline", false);
+            ForEach(N, [&](const Json& B) { if (Kind(B) == "CompoundStmt") C.Def = &N; });
             return;
         }
+        const std::string In = K == "NamespaceDecl" && N.contains("name") ? Ns + Name(N) + "::" : Ns;
         auto It = N.find("inner");
-        if (It != N.end()) for (Json& C : *It) IndexInlines(C);
+        if (It != N.end()) for (Json& C : *It) IndexInlines(C, In, bTemplate || K == "FunctionTemplateDecl");
     };
-    IndexInlines(Doc);
+    IndexInlines(Doc, std::string(), false);
+    for (const FChain* C : ChainOrder)
+    {
+        if (!C->Def) continue;
+        if (C->bInline)
+        {
+            NormalizePointers(*C->Def);
+            FreeInlineOrder.push_back(C->Def);
+        }
+        for (const std::string& Id : C->Ids)
+            if (C->bInline) FreeInlines[Id] = C->Def;
+            else FreeFns[Id] = { C->First, C->Def, C->Qual };
+    }
+    FreeLib.CppName = "BPL_" + std::filesystem::path(SourcePath).stem().string();
+    FreeLib.Base = "UBlueprintFunctionLibrary";
     /* Each body that is compiled gets its own aliases written out before anything reads a local's type. */
     for (auto& [Cpp, R] : Records)
     {
         for (const Json* M : R.AllMethods) ExpandLocalAliases(const_cast<Json&>(*M), {});
         for (const auto& [Method, Def] : R.MethodDefs) ExpandLocalAliases(const_cast<Json&>(*Def), {});
     }
-    for (const Json* F : FreeInlineOrder) ExpandLocalAliases(const_cast<Json&>(*F), {});
+    for (const FChain* C : ChainOrder) if (C->Def) ExpandLocalAliases(*C->Def, {});
     for (const auto& [Id, M] : MemberTemplates) ExpandLocalAliases(const_cast<Json&>(*M), {});
     /* `FKey{"Space"}` names no key, so no input ever matches it. A warning, not a refusal: code may compare it with a
        key the engine makes up as it runs (FInputKeyManager::GetKeyFromCodes) or another module adds, and FKey{""} is
        the engine's own "no key". Each literal once, where the source writes it: the classes' methods, members and
-       UE_DEFAULTS, the constants, the inline functions. */
+       UE_DEFAULTS, the constants, the free functions. */
     std::set<const Json*> KeyLiterals;
     std::function<void(const Json&, const std::string&)> WarnKeyLiterals = [&](const Json& N, const std::string& Where) {
         const std::string K = Kind(N);
@@ -21242,7 +21346,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             if (R.Defaults) WarnKeyLiterals(*R.Defaults, Cpp + "::UE_DEFAULTS");
         }
     for (const auto& [Id, Var] : ConstVars) WarnKeyLiterals(*Var, Name(*Var));
-    for (const Json* F : FreeInlineOrder) WarnKeyLiterals(*F, Name(*F));
+    for (const FChain* C : ChainOrder) if (C->Def) WarnKeyLiterals(*C->Def, Name(*C->Def));
     /* Before anything reads a type: a raw pointer is an int64 from here on (see IsRawPointer). */
     for (const auto& Entry : Records)
     {
@@ -21342,6 +21446,12 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
        classes' lowering does (a global's class, the deref, a slot struct). */
     for (const auto& Entry : Records)
         if (Entry.second.bIsPatch && !GeneratePatch(Entry.second, Err)) return false;
+    /* The free functions called above, and those they call in turn (FreeLibrary). */
+    if (!FreeLib.Methods.empty())
+    {
+        if (!Generate(FreeLib, OutDir, Err)) return false;
+        ++Generated;
+    }
     /* After the loops, not in them: lowering is what discovers the deref, and the mod's own
        FDeref (if it declared one) was cooked above as an ordinary record. */
     if (bSynthDeref)

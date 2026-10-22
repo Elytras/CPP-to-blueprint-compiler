@@ -1,4 +1,4 @@
-# AssetGen guide
+﻿# AssetGen guide
 
 This guide shows how to write, build and run a Deep Rock Galactic mod with AssetGen. [REFERENCE.md](REFERENCE.md)
 covers every construct the compiler accepts, warns about or refuses. [examples/](examples/) holds complete mods that
@@ -52,8 +52,8 @@ The source is C++, but what runs is a Blueprint. These are the differences that 
 - **Your C++ never runs as C++.** Member initializers, `UE_DEFAULTS` and a default constructor are read when the mod
   is built, as the class's defaults, and run-time setup goes in `ReceiveBeginPlay`. See
   [Classes and variables](#classes-and-variables).
-- **A method is a Blueprint function unless it is `inline`**, and a free function must be `inline`. See
-  [Functions and events](#functions-and-events).
+- **A function is a Blueprint function unless it is `inline`**: a method one of its class, a free function one of
+  `BPL_<source>`, a function library the compiler generates. See [Functions and events](#functions-and-events).
 - **Only Blueprint's types exist.** There is no `double`, and the only integer types are `uint8`, `int32` and
   `int64`: write `0.5f`, not `0.5`. There is no char either: `'y'`, and `C ? 'y' : 'n'`, is its int code. See
   [Types](REFERENCE.md#types).
@@ -375,8 +375,10 @@ Watch for:
   from UeApi.
 - A Blueprint class has one function per name. Two non-inline methods with the same name are refused ("a second
   function of that name"). Rename one, or make the extra overloads `inline`.
-- A function outside a class must be `inline`. Without it the call is refused with
-  `call to an unknown function: Helper`. Lambdas and function pointers are refused.
+- A function outside a class is a static of `BPL_<source>`, a function library the compiler generates beside the
+  mod's classes, unless it is `inline`. Its body must be in the source or a header it includes, or the call is
+  refused with `call to an unknown function: Helper`. Two such functions of one name are refused: rename one, or make
+  it `inline`. Lambdas and function pointers are refused.
 
 Full rules: [Functions](REFERENCE.md#functions), [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls),
 [Inline functions and templates](REFERENCE.md#inline-functions-and-templates). Examples:
@@ -1948,7 +1950,7 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | --- | --- | --- | --- |
 | `no Kismet conversion from float to double` | In C++, `0.5` is a `double`, and Blueprint has no double. | `X * 0.5f` | [Literals and conversions](REFERENCE.md#literals-and-conversions) |
 | `TODO: unimplemented local D: double`, `TODO: unimplemented property Mask: uint32` | A variable, parameter or return needs a Blueprint type. `double`, `int8`, `int16`, `uint16`, `uint32` and `uint64` have none. | `float`, `int32` or `int64` | [Types](REFERENCE.md#types) |
-| `call to an unknown function: Helper` | A Blueprint has no free functions. A free function or template without `inline` is not compiled. | `inline int32 Helper(int32 X) { ... }`, or a method of the class | [Inline functions and templates](REFERENCE.md#inline-functions-and-templates) |
+| `call to an unknown function: Helper` | AssetGen compiles the functions whose body it sees. `Helper` is declared here and defined in another source, or it is a C runtime function such as `sqrtf`. | Define `Helper` in this source or a header it includes; for math, `UKismetMathLibrary` | [Free functions](REFERENCE.md#free-functions) |
 | clang: `use of undeclared identifier 'FMath'`, `no member named 'min' in namespace 'std'` | There is no standard library, and FMath only through `AssetGen/include/FMath.h`. | `#include "../include/FMath.h"`, then `FMath::Clamp(V, 0.0f, 10.0f)`, `FMath::Min(A, B)` | [Calling engine and game functions](REFERENCE.md#calling-engine-and-game-functions) |
 | clang: `only virtual member functions can be marked 'override'` | The SDK declares engine functions non-virtual. The method's name alone makes the override. | `void ReceiveTick(float DeltaSeconds) { ... }` | [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls) |
 | `<Member>: a default is a value known when the mod is built - ...` | A member initializer is read when the mod is built and never runs, so it takes only a value known then. A call's result is not one. | Set it in `ReceiveBeginPlay`: `Roll = UKismetMathLibrary::RandomInteger(3);` | [Classes and variables](REFERENCE.md#classes-and-variables) |
@@ -1961,7 +1963,7 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | `a delegate cannot bind AItem::Server_StartUsing on another object: the editor binds a BlueprintCallable function that is not pure or latent, and Server_StartUsing is not BlueprintCallable` | The editor's Create Event takes only a function Blueprint code can call; an event the engine calls, an RPC or a RepNotify is none. | Bind a method of your own class that calls it | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `OnDestroyed.Broadcast: OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable, ...` | The editor's Call node refuses a native dispatcher the engine does not mark BlueprintCallable. | Call what makes the event happen, such as `K2_DestroyActor()`, or write `UE_FORCE_BROADCAST(OnDestroyed).Broadcast(this)` to run the handlers anyway (it warns) | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `a container operation needs a variable, not a computed value: Length` | A container node works on a variable, not on the result of a call. | `TArray<int32> L = GetItems(); return L.Num();` | [Containers](REFERENCE.md#containers) |
-| `TODO: unimplemented local Inc: (lambda at ...)` | Lambdas are not compiled, in any form. | An `inline` method or a free `inline` function | [Functions](REFERENCE.md#functions) |
+| `TODO: unimplemented local Inc: (lambda at ...)` | Lambdas are not compiled, in any form. | An `inline` method or a free function | [Functions](REFERENCE.md#functions) |
 | `warning: ... reference parameter V is bound to a map element: ... V gets a copy, stored back after the call` | Blueprint has no reference to a map element. | Nothing, unless the callee reads the map while it runs: it sees the old value there | [Functions](REFERENCE.md#functions) |
 | `warning: <Class>::UE_DEFAULTS: Body is the actor's root, ... so its RelativeScale3D is not applied` | The engine puts the root component at the spawn transform. | Declare `UE_COMPONENT(USceneComponent, Root);` first, so the other components attach to it | [Components](REFERENCE.md#components) |
 | `warning: LatentJob::Run waits, and an object of this class finds its world only through its Outer ...` | A plain `UObject` has no world of its own, and a wait needs one. | Create it with an actor or a component as Outer: `NewObject<LatentJob>(this)` from `Objects.h` | [Latent calls](REFERENCE.md#latent-calls) |
