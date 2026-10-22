@@ -431,6 +431,10 @@ class VM:
             elif o == 0x4F: pass
             elif o == 4: return None if n.kids[0].op == 0xB else ev(n.kids[0], keep=True)
             elif o == 0x31: store(n.kids[0], [ev(k) for k in n.kids[1:]])   # SetArray: the variable, emptied, then each element
+            elif o in (0x39, 0x3B):                         # SetSet / SetMap, as runscript runs them
+                elems = [ev(k) for k in n.kids[1:]]
+                store(n.kids[0], dict(zip(elems[::2], elems[1::2])) if o == 0x3B else
+                      [e for i, e in enumerate(elems) if e not in elems[:i]])
             elif o != 0xB: ev(n)
         raise SystemExit('vm: runaway loop in ' + fn)
 
