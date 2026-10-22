@@ -833,6 +833,19 @@ FName MakeKey(FText Prefix, int32 Index) { return Prefix + "_" + Index; }
 | <a id="string-functions.ukismetstringlibrary-len-s"></a>`UKismetStringLibrary::Len(S)` | The Len node. Every string operation is a `UKismetStringLibrary` static: `Mid`, `Replace`, `ToUpper`, `ParseIntoArray` and the rest. | Yes |
 | <a id="string-functions.s-len"></a>`S.Len()`, `S.ToUpper()` | The same nodes as methods, with the string first: `S.Len()` is `UKismetStringLibrary::Len(S)`. See [Methods on structs, text and soft pointers](#methods-on-structs-text-and-soft-pointers). | Yes |
 
+### Formatting text
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="formatting-text.format-name-value-key-map-key"></a>`Format("{Name}:{Value}", Key, Map[Key])` with `#include "../include/Format.h"` | The Format node over one FFormatArgumentData per argument, named by the placeholder it fills: the arguments fill the placeholder names in the order they first appear, so `"{A} {B} {A}"` takes two. Each argument's type picks its kind: int32 (or smaller) Int, float or double Float, FText Text, ETextGender Gender; an FString, FName, bool or int64 is the Text of it. A backtick escapes the next brace. The pattern must be a string literal. The result is an FText, which converts to an FString where one is wanted. | Yes |
+| <a id="formatting-text.format-a-b-x"></a>`Format("{A} {B}", X)` | Refused by clang while it compiles the mod: the pattern names more or fewer placeholders than there are arguments, and the error names `Format_PlaceholdersAndArgumentsDiffer`. | Refused |
+
+```cpp
+#include "../include/Format.h"
+
+FString Line(FName Key, int32 Hits) { return Format("{Name}: {Hits} hits", Key, Hits); }
+```
+
 ## Constants
 
 This section covers constants, `consteval` functions and inline class variables. A constant has no storage in a

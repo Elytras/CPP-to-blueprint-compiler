@@ -654,6 +654,24 @@ bool FindLiteral(const Json& N, std::string& Out)
     return bFound;
 }
 
+/* The different names of a Format pattern's `{...}` placeholders, in the order they first appear; a backtick escapes
+   the next character. include/Format.h's FormatPlaceholderCount counts them the same way. */
+std::vector<std::string> FormatPlaceholders(const std::string& P)
+{
+    std::vector<std::string> Names;
+    for (size_t I = 0; I < P.size(); ++I)
+    {
+        if (P[I] == '`') { ++I; continue; }
+        if (P[I] != '{') continue;
+        const size_t End = P.find('}', I + 1);
+        if (End == std::string::npos) break;
+        std::string Name = P.substr(I + 1, End - I - 1);
+        if (std::find(Names.begin(), Names.end(), Name) == Names.end()) Names.push_back(std::move(Name));
+        I = End;
+    }
+    return Names;
+}
+
 /* Does this subtree call the named function? The call's own spelling, not a string. */
 bool CallsFunction(const Json& N, const char* Fn)
 {
@@ -5957,6 +5975,13 @@ bool FCompiler::HoistOperand(FArgIR& Operand, FBlueprintClass& BP, std::vector<F
 bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
     const std::string OuterType = TypeOf(ArgNode);
+    /* Format's pattern (include/Format.h): the literal it is built from, which clang has already checked. In Format's
+       body the parameter is that literal already (ExpandInline). */
+    if (StripTypeKeywords(OuterType).compare(0, 15, "TFormatPattern<") == 0 && FindLiteral(ArgNode, Out.S))
+    {
+        Out.K = FArgIR::Str;
+        return true;
+    }
     /* Memory through a pointer that is not read (no LValueToRValue above it) binds a reference parameter: the
        memory itself, so the callee's writes land there. */
     if (const Json* Bare = PeelLvalue(&ArgNode); Bare && IsDerefLvalue(*Bare))
@@ -6718,6 +6743,32 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.InnerType = R->CppName + " *";
             Out.Base = std::make_shared<FArgIR>();
             return LowerArg(*ClassArg, BP, *Out.Base, Err);
+        }
+        if (CalleeName == "__FormatPattern__" || CalleeName == "__FormatArgName__")
+        {
+            /* Format (include/Format.h): its pattern as text, or the name of the placeholder an argument fills, both
+               read out of the literal Format's pattern parameter is bound to (ExpandInline). */
+            const Json* Arg = Strip(Nth(*N, 1));
+            if (Arg && Kind(*Arg) == "MemberExpr") Arg = Strip(First(*Arg));     // Pattern.S
+            const auto Bound = Arg && Kind(*Arg) == "DeclRefExpr"
+                ? ParmConst.find((*Arg)["referencedDecl"].value("id", std::string())) : ParmConst.end();
+            if (Bound == ParmConst.end() || Bound->second.K != FArgIR::Str || InlineStack.empty())
+            { *Err = CalleeName + ": only Format's own pattern, in Format's body"; return false; }
+            const FArgIR& Pattern = Bound->second;
+            if (CalleeName == "__FormatPattern__") { Out.K = FArgIR::Text; Out.S = Pattern.S; return true; }
+            /* The argument's position among Format's parameters, after the pattern: the placeholder name it fills. */
+            const Json* Ref = Strip(Nth(*N, 2));
+            const std::string Id = Ref && Kind(*Ref) == "DeclRefExpr" ? (*Ref)["referencedDecl"].value("id", std::string()) : std::string();
+            std::vector<std::string> Ids;
+            ForEach(*InlineStack.back(), [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Ids.push_back(C.value("id", std::string())); });
+            const auto At = std::find(Ids.begin(), Ids.end(), Id);
+            const std::vector<std::string> Names = FormatPlaceholders(Pattern.S);
+            const size_t Index = size_t(At - Ids.begin()) - 1;
+            if (Id.empty() || At == Ids.end() || At == Ids.begin() || Index >= Names.size())
+            { *Err = "__FormatArgName__: the argument must be one of Format's own, and the pattern must name it"; return false; }
+            Out.K = FArgIR::Str;
+            Out.S = Names[Index];
+            return true;
         }
         if (CalleeName == "__ClassOf__")
         {
@@ -12231,7 +12282,9 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         ParmConst.erase(Id);
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
         Type = StripTypeKeywords(Type);
-        const std::string Local = Prefix + Name(*Parms[I]);
+        /* A pack's parameters all have the pack's name (`const A&... Args`): each gets its own local, by position. */
+        const bool bPack = std::count_if(Parms.begin(), Parms.end(), [&](const Json* P) { return Name(*P) == Name(*Parms[I]); }) > 1;
+        const std::string Local = Prefix + Name(*Parms[I]) + (bPack ? std::to_string(I) : std::string());
         if (Aliased(I))
         {
             for (FStmtIR& P : Pins[I]) B.Body->push_back(std::move(P));
@@ -12242,6 +12295,8 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         Bind.Value = std::move(Values[I]);
         /* A constant the body only reads is used in place: no local, no copy. */
         if (IsFoldableConst(Bind.Value) && OnlyRead(*Body, Id)) { ParmConst[Id] = Bind.Value; continue; }
+        /* So is Format's pattern, which __FormatArgName__ reads at build time and no local could hold. */
+        if (Type.compare(0, 15, "TFormatPattern<") == 0) { ParmConst[Id] = Bind.Value; continue; }
         if (InPlace[I] && Canon(Bind.Value.InnerType) == Canon(Type) && (OnlyRead(*Body, Id) || OnlyReadValue(*Body, Id)))
         { ParmConst[Id] = Bind.Value; continue; }
         if (!AddLocal(Local, Type)) return false;
