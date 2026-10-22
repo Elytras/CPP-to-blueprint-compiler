@@ -892,7 +892,10 @@ def write_mod(run, mod, outs, out_dir):
         rel = rel_file(mod, o.a, '.h')
         path = os.path.join(root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        open(path, 'w', encoding='utf-8-sig', newline='\n').write(o.header)
+        # Each header includes the umbrella, so an editor opening it alone sees every type it names. In the build the
+        # umbrella is already open when it reaches the header, and #pragma once skips the repeat.
+        own = '#include "%s"\n' % ('../' * rel.count(os.sep) + umbrella)
+        open(path, 'w', encoding='utf-8-sig', newline='\n').write(o.header.replace('#pragma once\n', '#pragma once\n' + own, 1))
         lines.append('#include "%s"\n' % rel.replace(os.sep, '/'))
         if o.cpp:
             cpath = os.path.join(root, rel_file(mod, o.a, '.cpp'))
