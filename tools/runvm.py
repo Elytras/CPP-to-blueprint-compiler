@@ -20,12 +20,12 @@ def _ref(s):
 def _node(s):
     """runscript's parser plus what latent / async / spawn bodies use. Nodes runscript already read keep its val."""
     op, mem = s.b[s.o], s.mem
-    if op not in (0, 0x48, 0x19, 0x20, 0x2E, 0x2F, 0x30, 0x4B, 0x5B, 0x5C, 0x63, 0x64, 0x44, 0x5D, 0x61, 0x62):
+    if op not in (0, 0x48, 0x12, 0x19, 0x20, 0x2E, 0x2F, 0x30, 0x4B, 0x5B, 0x5C, 0x63, 0x64, 0x44, 0x5D, 0x61, 0x62):
         return _parse(s)                                                     # final calls too: runscript marks an export callee own
     s.u8()
     n = Node(op, mem)
     if op in (0, 0x48, 0x64): n.val, n.owner = s.fieldpath().split('@')
-    if op == 0x19: n.kids.append(s.node()); s.i32(); n.rvalue, n.rvalue_owner = s.fieldpath().split('@'); n.kids.append(s.node())
+    if op in (0x12, 0x19): n.kids.append(s.node()); s.i32(); n.rvalue, n.rvalue_owner = s.fieldpath().split('@'); n.kids.append(s.node())
     elif op in (0x20, 0x2E, 0x2F): n.val = _ref(s)
     elif op == 0x63: n.val = _ref(s); s.args(n.kids)                        # the signature, the dispatcher, its args
     elif op == 0x4B: n.val = s.name()
@@ -139,6 +139,11 @@ class VM:
 
     def new(s, **vars): return Obj(s.self.cls, **vars)
 
+    def defaults(s, cls):
+        """The class default object of class `cls` (a class value is its name): the object `objects` holds under
+        Default__<cls>, made on first use."""
+        return s.objects.setdefault('Default__' + cls, Obj(cls))
+
     def peer(s, cls):
         """The VM of the package of class `cls` (one of `classes`), sharing this one's objects, bindings, latent actions,
         log and Accessed None list: a call on an object of that class runs that class's function, as a broadcast or a
@@ -222,7 +227,7 @@ class VM:
             o = n.op
             if o in (0, 0x48): return env.get(local(n), 0)
             if o == 1: return ctx.vars.get(n.val, 0)
-            if o == 0x17: return me
+            if o == 0x17: return ctx                       # P_THIS: a context's object when it is the context's expression
             if o == 0x2A: return None
             if o == 0x20: return s.objects.get(n.val, n.val)
             if o in (0x1D, 0x1E, 0x1F, 0x34, 0x24, 0x2C, 0x35, 0x21, 0x5B): return n.val
@@ -240,6 +245,11 @@ class VM:
             if o == 0x38:                                   # CST_ObjectToBool / CST_InterfaceToBool: GetObject() != null
                 if n.val not in (0x47, 0x49): raise SystemExit('vm: PrimitiveCast %#x' % n.val)
                 return ev(n.kids[0]) not in (None, 0)
+            if o == 0x12:                                   # EX_ClassContext: the expression runs on the class's default
+                cls = ev(n.kids[0])                         # object (execClassContext, ScriptCore.cpp 2209-2256)
+                if cls is None: s.accessed_none.append((fn, n.mem))
+                if cls is None and s.null_rvalues: return s.none_context(n, keep)
+                return None if cls is None else ev(n.kids[1], s.defaults(cls), keep)
             if o == 0x19:
                 obj = ev(n.kids[0])
                 if obj is None: s.accessed_none.append((fn, n.mem))  # ProcessContextOpcode, ScriptCore.cpp 2904-2937
@@ -325,6 +335,12 @@ class VM:
                 return vals[0] not in (None, 0) if name == 'IsValid' else None
             raise SystemExit('vm: unsupported expression %02x in %s' % (o, fn))
 
+        def held(t, ctx=me):
+            """The object an EX_Context / EX_ClassContext t runs its expression on: its object, or the default object of
+            its class; None for a None one."""
+            o = ev(t.kids[0], ctx)
+            return s.defaults(o) if t.op == 0x12 and o is not None else o
+
         def store(dest, v, ctx=me):
             if dest.op in (0, 0x48): env[local(dest)] = v
             elif dest.op == 1: ctx.vars[dest.val] = v; s.log.append(('set', ctx, dest.val))
@@ -332,15 +348,15 @@ class VM:
             elif dest.op == 0x42:
                 if not isinstance(ev(dest.kids[0]), (dict, runscript.Slot, runscript.Free)): store(dest.kids[0], {})
                 ev(dest.kids[0])[dest.val] = v
-            elif dest.op == 0x19:
-                obj = ev(dest.kids[0])
+            elif dest.op in (0x12, 0x19):
+                obj = held(dest)
                 if obj is not None: store(dest.kids[1], v, obj)
             else: raise SystemExit('vm: unsupported destination %02x' % dest.op)
 
         def locate(dest, ctx=me):
             # execLet steps the destination (a context's object, an array and its index) before the value.
-            if dest.op == 0x19:
-                obj = ev(dest.kids[0], ctx)
+            if dest.op in (0x12, 0x19):
+                obj = held(dest, ctx)
                 return lambda v: obj is not None and store(dest.kids[1], v, obj)
             if dest.op == 0x6B and dest.kids[0].op == 0x42 and runscript.view_of(dest.kids[0].val):
                 at = ev(dest.kids[0].kids[0], ctx).get('Data', 0)
@@ -381,7 +397,7 @@ class VM:
                 s.frame(me, uber)[n.val] = by_value(ev(n.kids[0]))
             elif o == 0x5C:                                 # AddMulticastDelegate(Obj.Prop, delegate)
                 t = n.kids[0]
-                obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
+                obj, prop = (held(t), t.kids[1].val) if t.op in (0x12, 0x19) else (me, t.val)
                 if obj is None:                             # Accessed None, and no address: nothing added (ScriptCore.cpp 3098)
                     s.accessed_none.append((fn, t.mem)); continue
                 _, dfn, dobj = ev(n.kids[1])
@@ -390,7 +406,7 @@ class VM:
                 if dobj is not None and (obj, prop, dfn, dobj) not in s.binds: s.binds.append((obj, prop, dfn, dobj))
             elif o in (0x62, 0x5D):                         # Remove(Obj.Prop, delegate): one match; Clear(Obj.Prop): all
                 t = n.kids[0]
-                obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
+                obj, prop = (held(t), t.kids[1].val) if t.op in (0x12, 0x19) else (me, t.val)
                 drop = [b for b in s.binds if b[0] is obj and b[1] == prop]
                 if o == 0x62:
                     _, dfn, dobj = ev(n.kids[1])
@@ -400,7 +416,7 @@ class VM:
             elif o == 0x61: locate(n.kids[0])(('delegate', n.val, ev(n.kids[1])))   # BindDelegate(name, var, obj)
             elif o == 0x63:                                # CallMulticastDelegate: the dispatcher, then its arguments
                 t = n.kids[0]
-                obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
+                obj, prop = (held(t), t.kids[1].val) if t.op in (0x12, 0x19) else (me, t.val)
                 vals = [ev(a) for a in n.kids[1:]]
                 for bobj, bprop, dfn, dobj in list(s.binds):     # each IsBound one (ScriptDelegates.h 479-502)
                     if bobj is obj and bprop == prop and dobj is not None: s.call(dfn, *vals, on=dobj)

@@ -3155,6 +3155,32 @@ def mod_enum():
     print('ok  TypesTest: int32 / int64 enums cook as EnumProperty over Int / Int64Property')
 
 
+def enum_labels():
+    """`__UeEnumNames`: an enumerator keeps its C++ name, takes a cooked one, or a label: the DisplayNameMap holds the
+    labelled and renamed ones (keyed by cooked name), and nothing for the rest."""
+    import struct
+    path = os.path.join(os.path.dirname(asset('EnumLabels')), 'ELabel')
+    names = dumpexp.load(path)[3]
+    proves('mod-enums-ue.static-constexpr-const-char-emood-ueenumnames')
+    for n in ('ELabel::None_', 'ELabel::Hit_Override', 'ELabel::Plain', 'ELabel::NewEnumerator7'):
+        assert n in names, (n, names)
+    tags = dump('dumptags.py', path, '0')
+    raw = bytes.fromhex(tags.split('value=TextProperty:')[1].split()[0])
+    count, at, shown = struct.unpack_from('<i', raw, 4)[0], 8, {}
+
+    def fstr(at):
+        n = struct.unpack_from('<i', raw, at)[0]
+        return raw[at + 4:at + 4 + n - 1].decode() if n > 0 else '', at + 4 + max(n, 0)
+    for _ in range(count):
+        key = names[struct.unpack_from('<i', raw, at)[0]]
+        at += 8 + 4 + 1                     # FName, the text's flags, its history type (Base)
+        _ns, at = fstr(at)
+        _key, at = fstr(at)
+        shown[key], at = fstr(at)
+    assert shown == {'None_': 'None', 'Hit_Override': 'Hit Override', 'NewEnumerator7': 'Old'}, shown
+    print('ok  EnumLabels: __UeEnumNames labels and renames enumerators; the rest keep their C++ names')
+
+
 def fnv(s):
     h = 2166136261
     for c in s.encode(): h = ((h ^ c) * 16777619) & 0xFFFFFFFF
@@ -3754,6 +3780,7 @@ def pointer_more():
 
 
 mod_enum()
+enum_labels()
 constants()
 types_behaviour()
 types_defaults()
@@ -7927,6 +7954,52 @@ def ctx_null_call():
     vmsem_holds(base, 'context_rvalue')
 
 
+def class_ctx():
+    """GetDefault<T>(Class): a member read and a call on a class's default object run in EX_ClassContext(Class), which
+    steps them with that object as the context (execClassContext, ScriptCore.cpp 2209-2256), and the object itself is
+    EX_Self run there, which writes P_THIS (execSelf, 2846-2863). A None class clears the destination, as EX_Context's
+    r-value does. Class must be known to hold a T: a bare UClass * is refused unless T is UObject."""
+    base = asset('ClassCtx')
+    vm = VM(base, Score=1, Calls=0, Seen=3, Kind=None, Held=None)
+    own = vm.objects['Default__ClassCtx_C'] = Obj('ClassCtx_C', Score=5, Calls=0)
+    kid = vm.objects['Default__ClassCtxKid_C'] = Obj('ClassCtxKid_C', Score=9)
+    proves('properties-of-other.getdefault-amyenemy-kind-health')
+    got = vm.call('ScoreOf', 'ClassCtx_C'), vm.call('ScoreOf', 'ClassCtxKid_C'), vm.call('OwnScore'), vm.call('RawScore', 'ClassCtxKid_C')
+    assert got == (5, 9, 5, 9), got
+    vm.self.vars['Kind'] = 'ClassCtxKid_C'
+    vm.call('Remember')
+    assert vm.self.vars['Seen'] == 9, vm.self.vars
+    assert (vm.call('BumpDefaults', 'ClassCtx_C'), vm.call('BumpDefaults', 'ClassCtx_C')) == (1, 2), own.vars
+    assert own.vars['Calls'] == 2 and vm.self.vars['Calls'] == 0, (own.vars, vm.self.vars)
+    proves('properties-of-other.uobject-defaults')
+    assert vm.call('DefaultsOf', 'ClassCtxKid_C') is kid
+    vm.call('Hold')
+    assert vm.self.vars['Held'] is kid, vm.self.vars
+    proves('properties-of-other.getmutabledefault-amyenemy-kind')
+    vm.call('SetDefaultScore', 'ClassCtxKid_C', 77)
+    assert kid.vars['Score'] == 77 and vm.self.vars['Score'] == 1, (kid.vars, vm.self.vars)
+    proves('properties-of-other.getmutabledefault-amyenemy-kind-2')
+    vm.call('BindDefaults', 'ClassCtxKid_C')
+    vm.call('BindDefaults', 'ClassCtxKid_C')
+    assert vm.binds == [(kid, 'OnPing', 'Pinged', vm.self)], vm.binds
+    vm.call('PingDefaults', 'ClassCtxKid_C', 13)
+    assert vm.self.vars['Seen'] == 13, vm.self.vars
+    vm.call('UnbindDefaults', 'ClassCtxKid_C')
+    assert vm.binds == [], vm.binds
+    vm.null_rvalues = True
+    vm.self.vars['Kind'] = None
+    vm.call('Remember')
+    vm.call('Hold')
+    assert (vm.self.vars['Seen'], vm.self.vars['Held']) == (0, None), vm.self.vars
+    assert (vm.call('ScoreOf', None), vm.call('DefaultsOf', None)) == (0, None)
+    assert len(vm.accessed_none) == 4, vm.accessed_none
+    vmsem_holds(base, *(set(vmsem_rules.VMSEM_RULES) - set(KNOWN_RULES)))
+    refused('CcRaw', '  int32 Hp = 3;\n  int32 Of(UClass *C) { return GetDefault<CcRaw>(C)->Hp; }\n',
+            "GetDefault<CcRaw>(Class) reads Class's default object as a CcRaw, and Class may hold any class")
+    refused('CcWide', '  int32 Hp = 3;\n  int32 Of(TSubclassOf<AActor> C) { return GetDefault<CcWide>(C)->Hp; }\n',
+            'and Class may hold AActor, which is not one')
+
+
 def drop_result():
     """A call whose FString / TArray result a statement throws away needs a local to land in: the statement buffer is
     64 raw bytes nothing constructs or destroys (ScriptCore.cpp 1058, 1120). The calls still run, each once."""
@@ -8051,6 +8124,9 @@ def derived_literal(fn, struct):
 
 ctx_null_call()
 print('ok  CtxNullCall: a call through a None object zeroes its Let destination (the context names its r-value)')
+class_ctx()
+print("ok  ClassCtx: GetDefault<T>(Class) reads and calls in EX_ClassContext, its object is EX_Self there; a None class "
+      "reads zero; a class not known to hold a T is refused")
 
 CTX_STRUCT_ARG_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/CtxStructArg");
 class CtxStructArg final : public AActor {
@@ -8458,9 +8534,11 @@ print('ok  StaticClassOf: StaticClassOf<X>() on a class only declared names X_C,
 
 NATIVE_FORMS_SRC = EDIT_HEAD + '''#include "UeApi/Niagara.h"
 UE_MOD_PACKAGE("/Game/_ElytrasMods/NativeForms");
+namespace Sub { class NfSub : public AActor { public: int32 N = 2; }; }
 class NfFx : public AActor {
 public:
   UE_COMPONENT(UNiagaraComponent, Fx);
+  Sub::NfSub *Peer;
   TArray<FTerrainPlacementBox> Boxes = {FTerrainPlacementBox(FVector(1, 2, 3), FVector(4, 5, 6), ETerrainPlacementBoxType::Terrain, UE_KEEP)};
   UE_DEFAULTS {
     Fx->OverrideParameters.UserParameterRedirects = {{FNiagaraVariable("Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), {}),
@@ -8513,6 +8591,11 @@ def native_struct_forms():
                  'ETerrainPlacementBoxType::Terrain, UE_KEEP)'):
         proves('struct-defaults.fterrainplacementbox-min-max', 'struct-defaults.fx-overrideparameters')
         assert want in src, (want, proc.stdout[-2000:] + proc.stderr[-2000:], src)
+    # The defaults come back as a constructor; a class whose namespace gives its package has no UE_CLASS, and the
+    # umbrella's using-directive lets its name go unqualified.
+    for want in ('    NfTags() {\n', 'using namespace Sub;\n', '    NfSub* Peer;\n'):
+        assert want in src, (want, src)
+    assert 'UE_DEFAULTS' not in src and 'UE_CLASS' not in src, src
 
 
 GAME_STRUCT_SRC = EDIT_HEAD + '''#include "UeApi/Game/ENE_EnemySpawner_C.h"
