@@ -379,7 +379,9 @@ Watch for:
 - A function outside a class is a static of `BPL_<source>`, a function library the compiler generates beside the
   mod's classes, unless it is `inline`. Its body must be in the source or a header it includes, or the call is
   refused with `call to an unknown function: Helper`. Two such functions of one name are refused: rename one, or make
-  it `inline`. A lambda is expanded where it is called (`[&]`, `[=]`, `mutable`, init-captures, passed to an inline
+  it `inline`. A function template without `inline` is one such static per instantiation, named by its arguments
+  (`Max2__float`), and a class or struct template one cooked class or struct per instantiation; see
+  [Templates](REFERENCE.md#templates). A lambda is expanded where it is called (`[&]`, `[=]`, `mutable`, init-captures, passed to an inline
   template; see [Lambdas](REFERENCE.md#lambdas)); function pointers are refused.
 
 Full rules: [Functions](REFERENCE.md#functions), [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls),
