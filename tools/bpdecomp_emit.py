@@ -831,6 +831,27 @@ def rel_file(mod, a, ext):
     return os.path.join(*(a.path[len(mod.root) + 1:].split('/'))) + ext
 
 
+def file_stems(run, mod, seq):
+    """{asset path: where its .h and .cpp go in the mod's folder, without the extension}. The mod's own files keep the
+    names they are known by: <Mod>.h, the umbrella another mod includes; <Mod>.cpp, the file mods.yaml lists; Assets.h.
+    An asset at the mod's root spelled like one of them (a mod named after its main class) takes its kind as a suffix
+    instead, or the umbrella would overwrite its declaration and include itself. The file name is free: the package a
+    class cooks at comes from its namespaces and name, not from where its source sits. Compared without case, as
+    Windows opens them."""
+    taken = {(mod.name + '.h').lower(), (mod.name + '.cpp').lower(), 'assets.h'}
+    stems = {o.a.path: rel_file(mod, o.a, '') for o in seq}
+    used = {s.lower() for s in stems.values()}
+    for o in seq:
+        stem = stems[o.a.path]
+        if (stem + '.h').lower() in taken or (stem + '.cpp').lower() in taken:
+            new = stem + '_' + o.a.kind.capitalize()
+            while new.lower() in used: new += '_'
+            used.add(new.lower())
+            stems[o.a.path] = new
+            run.notes.append('%s: written as %s.h, since %s.h and .cpp are the mod\'s own' % (o.a.path, new, stem))
+    return stems
+
+
 def implied_path(a):
     """The package a class with no UE_CLASS cooks at: the mod's root (a Game:: namespace is rooted at /Game), its
     namespaces, its name."""
@@ -933,8 +954,9 @@ def write_mod(run, mod, outs, out_dir):
         for o in seq:
             o.header, o.cpp = unqualify(o.header), o.cpp and unqualify(o.cpp)
     lines.append('\n#include "Assets.h"\n\n')
+    stems = file_stems(run, mod, seq)
     for o in seq:
-        rel = rel_file(mod, o.a, '.h')
+        rel = stems[o.a.path] + '.h'
         path = os.path.join(root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # Each header includes the umbrella, so an editor opening it alone sees every type it names. In the build the
@@ -943,7 +965,7 @@ def write_mod(run, mod, outs, out_dir):
         open(path, 'w', encoding='utf-8-sig', newline='\n').write(o.header.replace('#pragma once\n', '#pragma once\n' + own, 1))
         lines.append('#include "%s"\n' % rel.replace(os.sep, '/'))
         if o.cpp:
-            cpath = os.path.join(root, rel_file(mod, o.a, '.cpp'))
+            cpath = os.path.join(root, stems[o.a.path] + '.cpp')
             depth = rel.count(os.sep)
             inc = '../' * depth + umbrella
             open(cpath, 'w', encoding='utf-8-sig', newline='\n').write(o.cpp.replace('{UMBRELLA}', inc))
@@ -958,7 +980,7 @@ def write_mod(run, mod, outs, out_dir):
     for ns, items in sorted(by_ns.items()):
         al.append('%s%s\n%s' % (ns_open(list(ns)), '\n'.join(items), ns_close(list(ns))))
     open(os.path.join(root, 'Assets.h'), 'w', encoding='utf-8-sig', newline='\n').write(unqualify(''.join(al)))
-    cpps = sorted(rel_file(mod, o.a, '.cpp').replace(os.sep, '/') for o in seq if o.cpp and not o.cooked)
+    cpps = sorted((stems[o.a.path] + '.cpp').replace(os.sep, '/') for o in seq if o.cpp and not o.cooked)
     open(os.path.join(root, mod.name + '.cpp'), 'w', encoding='utf-8-sig', newline='\n').write(
         '// The mod\'s package and its one translation unit: mods.yaml lists this file, which takes in every other source.\n'
         '#include "%s"\n\nUE_MOD_PACKAGE("%s");\n\n%s' % (umbrella, mod.root, ''.join('#include "%s"\n' % c for c in cpps)))
