@@ -8488,9 +8488,11 @@ print('ok  StaticClassOf: StaticClassOf<X>() on a class only declared names X_C,
 
 NATIVE_FORMS_SRC = EDIT_HEAD + '''#include "UeApi/Niagara.h"
 UE_MOD_PACKAGE("/Game/_ElytrasMods/NativeForms");
+namespace Sub { class NfSub : public AActor { public: int32 N = 2; }; }
 class NfFx : public AActor {
 public:
   UE_COMPONENT(UNiagaraComponent, Fx);
+  Sub::NfSub *Peer;
   TArray<FTerrainPlacementBox> Boxes = {FTerrainPlacementBox(FVector(1, 2, 3), FVector(4, 5, 6), ETerrainPlacementBoxType::Terrain, UE_KEEP)};
   UE_DEFAULTS {
     Fx->OverrideParameters.UserParameterRedirects = {{FNiagaraVariable("Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), {}),
@@ -8543,6 +8545,11 @@ def native_struct_forms():
                  'ETerrainPlacementBoxType::Terrain, UE_KEEP)'):
         proves('struct-defaults.fterrainplacementbox-min-max', 'struct-defaults.fx-overrideparameters')
         assert want in src, (want, proc.stdout[-2000:] + proc.stderr[-2000:], src)
+    # The defaults come back as a constructor; a class whose namespace gives its package has no UE_CLASS, and the
+    # umbrella's using-directive lets its name go unqualified.
+    for want in ('    NfTags() {\n', 'using namespace Sub;\n', '    NfSub* Peer;\n'):
+        assert want in src, (want, src)
+    assert 'UE_DEFAULTS' not in src and 'UE_CLASS' not in src, src
 
 
 GAME_STRUCT_SRC = EDIT_HEAD + '''#include "UeApi/Game/ENE_EnemySpawner_C.h"

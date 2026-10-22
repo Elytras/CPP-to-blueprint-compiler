@@ -44,7 +44,7 @@ def is_zero(v):
 def field_assigns(lhs, v, partial=False, skip_zero=False):
     """`lhs = v;` as statements; a native struct's designated initializer (an aggregate to the compiler only for a
     mod struct) becomes one assignment per field. `partial`: a mod struct's too - a value read over an archetype's
-    (an inherited default, a component template) holds only the members that differ from it, which UE_DEFAULTS says
+    (an inherited default, a component template) holds only the members that differ from it, which the constructor says
     member by member; braces would give the others the struct's own defaults instead."""
     if partial and re.fullmatch(r'[\w:]+\{\}', v): return []     # a struct tag holding no member: nothing differs
     d = designated(v)
@@ -153,12 +153,12 @@ class ClassEmit:
         s.members = []        # (access, text)
         s.extra_members = []
         s.ucs = []            # statements for UserConstructionScript (components the mod declares)
-        s.defaults = []       # UE_DEFAULTS lines
+        s.defaults = []       # the default constructor's statements
         s.markers = []        # UeMarkers lines
         s.const_dropped = []  # Const functions declared without const
         s.notes = run.notes
         s.notes_from = len(run.notes)
-        s.inst_locals = {}    # an instanced object's export -> the UE_DEFAULTS local holding it
+        s.inst_locals = {}    # an instanced object's export -> the constructor's local holding it
         s.cx.instanced = s.instanced
 
     def run_all(s):
@@ -178,7 +178,6 @@ class ClassEmit:
         s.functions(funcs, ug, dispatchers)
         s.class_defaults()
         if s.a.kind != 'widget': s.defaults += s.component_bindings()
-        if s.ctor: s.members.append(('public', '%s() {\n%s    }' % (a.cpp, ''.join('        %s\n' % l for l in s.ctor))))
         return s.write()
 
     # -- members
@@ -313,7 +312,7 @@ class ClassEmit:
             if v is not None: s.defaults += field_assigns('%s->%s' % (cpp, ident(t['name'])), v, partial=True)
 
     def instanced(s, i):
-        """Export i, an object instanced in the defaults, as the UE_DEFAULTS local holding it: its UE_INSTANCED line and
+        """Export i, an object instanced in the defaults, as the constructor's local holding it: its UE_INSTANCED line and
         its own tags go in first, before the default that points at it, and an object under it before its own line that
         does. Its outer is `this`, the component whose template holds it, or another such local."""
         if i in s.inst_locals: return s.inst_locals[i]
@@ -413,7 +412,7 @@ class ClassEmit:
 
     def component_bindings(s):
         """The class's ComponentDelegateBinding, one `Comp->Delegate.Add(this, &C::F);` per entry: the line of a widget's
-        layout, or of an actor's UE_DEFAULTS (the editor's component-bound events)."""
+        layout, or of an actor's constructor (the editor's component-bound events)."""
         pkg, ci = s.pkg, s.a.export + 1
         cdb = next((i for i, e in enumerate(pkg.exports) if e['outer'] == ci and pkg.class_of(i + 1) == 'ComponentDelegateBinding'), None)
         return ['%s->%s.Add(this, &%s::%s);' % (ident(b['ComponentPropertyName']), ident(b['DelegatePropertyName']), s.a.cpp,
@@ -749,14 +748,18 @@ class ClassEmit:
             lines.append('class %s%s {\npublic:\n    UE_INTERFACE;\n' % (a.cpp, ' : public ' + iparent[0] if iparent else ''))
         else:
             lines.append('class %s : %s {\n' % (a.cpp, ', '.join('public ' + b for b in bases)))
-        if s.defaults and not is_iface:
+        # The defaults are the default constructor's body. A widget's layout is a constructor already, after the members:
+        # they go first in it (AssetGen reads a UE_DEFAULTS block before the constructor); otherwise it heads public.
+        if (s.defaults or s.ctor) and not is_iface:
             defaults = s.defaults
             if o.cooked:    # nothing reads them; one naming another mod class would order the umbrella around it
                 own = {x.cpp for x in s.run.model.assets.values()}
                 defaults = ['// %s   (UE_COOKED: the cooked package holds it)' % d
                             if any(n.split('::')[-1] in own for n in re.findall(r'([\w:]+)::StaticClass\(\)', d)) else d
                             for d in defaults]
-            lines.append('    UE_DEFAULTS {\n%s    }\n' % ''.join('        %s\n' % d for d in defaults))
+            ctor = ('public', '%s() {\n%s    }' % (a.cpp, ''.join('        %s\n' % l for l in defaults + s.ctor)))
+            if s.ctor: s.members.append(ctor)
+            else: s.members.insert(0, ctor)
         for access in ('public', 'protected', 'private'):
             ms = [m for acc, m in s.members if acc == access]
             fs = [f for f in s.methods if f[0] == access]
@@ -827,9 +830,18 @@ def rel_file(mod, a, ext):
     return os.path.join(*(a.path[len(mod.root) + 1:].split('/'))) + ext
 
 
+def implied_path(a):
+    """The package a class with no UE_CLASS cooks at: the mod's root (a Game:: namespace is rooted at /Game), its
+    namespaces, its name."""
+    if a.ns and a.ns[0] == 'Game': return '/' + '/'.join(a.ns + [a.cpp])
+    return '/'.join([a.mod.root] + a.ns + [a.cpp])
+
+
 def link_mods(run, model, per_mod):
-    """A mod whose code names another's classes includes that mod's umbrella; every class says with UE_CLASS where
-    it is cooked, or the other mod would cook it a second time and a kept asset of it would load as null."""
+    """A mod whose code names another's classes includes that mod's umbrella; each class of such a mod says with
+    UE_CLASS where it is cooked, or the other mod would cook it a second time and a kept asset of it would load as
+    null. A class of any other mod needs one only where its namespace and name do not give its package, or where a
+    parent and an interface each bring a StaticClass, which X::StaticClass() would find ambiguous."""
     run.mod_needs = defaultdict(list)
     texts = {m.name: ''.join(o.header + (o.cpp or '') for o in per_mod[m.name]) for m in model.mods}
     for m in model.mods:
@@ -839,9 +851,13 @@ def link_mods(run, model, per_mod):
             if not any(re.search(r'(?<![\w:])(?:::)?%s\b' % re.escape('::'.join(o.a.ns + [o.a.cpp])), texts[m.name])
                        for o in classes): continue
             run.mod_needs[m.name].append(n.name)
-    for m in model.mods:            # every class says where it is cooked: kept assets of it and other mods name it so
+    needed = {n for ns in run.mod_needs.values() for n in ns}
+    for m in model.mods:
         for o in [o for o in per_mod[m.name] if o.a.kind in ('class', 'widget')]:
             name = o.a.pkg.exports[o.a.export]['name']
+            if m.name not in needed and not o.cooked and name == o.a.cpp + '_C' and implied_path(o.a) == o.a.path and \
+                    not o.a.pkg.struct(o.a.export).interfaces:
+                continue
             line = '    UE_CLASS("%s", "%s");\n' % (o.a.path, name)
             if o.cooked:
                 line += ('    UE_COOKED;   // bpdecomp: %s. The package ships as it was cooked (mods.yaml kept:),\n'
@@ -851,6 +867,23 @@ def link_mods(run, model, per_mod):
             if not n:               # a class with no members has no public: section yet
                 o.header = re.sub(r'(\nclass %s\b[^\n]*\{\n(?:.*\n)*?)(\};\n)' % re.escape(o.a.cpp),
                                   lambda mm: mm.group(1) + 'public:\n' + line + mm.group(2), o.header, count=1)
+
+
+def unqualifier(run, seq):
+    """A function dropping the namespaces from the mod's own type names, which the umbrella's using-directives find.
+    A name keeps them where a variable spelled like it would hide it (`EEE_Manager*& EEE_Manager`, a member
+    `SpawnControl SpawnControl`), where two of the mod's namespaces declare it, or where UeApi has it too."""
+    text = ''.join(o.header + (o.cpp or '') for o in seq)
+    count = defaultdict(int)
+    for o in seq: count[o.a.cpp] += 1
+    hidden = run.model.var_names() | set(re.findall(r'UE_(?:COMPONENT|WIDGET|ANIMATION)\(\s*[\w:<>]+,\s*(\w+)', text)) | \
+        set(re.findall(r'UE_DISPATCHER\((\w+)', text)) | \
+        set(re.findall(r'^ +[\w:<>,*& ]*?[\w>*&] [*&]?(\w+)(?: = [^\n]*)?;$', text, re.M))
+    full = {'::'.join(o.a.ns + [o.a.cpp]): o.a.cpp for o in seq if o.a.ns and count[o.a.cpp] == 1
+            and o.a.cpp not in hidden and run.api.header_of(o.a.cpp) is None}
+    if not full: return lambda t: t
+    rx = re.compile(r'(?<![\w:])::(%s)\b' % '|'.join(sorted(map(re.escape, full), key=len, reverse=True)))
+    return lambda t: rx.sub(lambda m: full[m.group(1)], t)
 
 
 def write_mod(run, mod, outs, out_dir):
@@ -878,6 +911,15 @@ def write_mod(run, mod, outs, out_dir):
     lines.append('\n')
     for ns, items in sorted(fwd.items()):
         lines.append('%s%s\n%s' % (ns_open(list(ns)), '\n'.join(items), ns_close(list(ns))))
+    # A mod that another includes has no using-directives: they would pour its names into that mod.
+    spaces = sorted({'::'.join(o.a.ns) for o in seq if o.a.ns})
+    unqualify = lambda t: t
+    if spaces and mod.name not in {n for ns in run.mod_needs.values() for n in ns}:
+        lines.append("\n// The mod's namespaces set its package paths; its sources name their types without them.\n")
+        lines += ['namespace %s {}\n' % ns for ns in spaces] + ['using namespace %s;\n' % ns for ns in spaces]
+        unqualify = unqualifier(run, seq)
+        for o in seq:
+            o.header, o.cpp = unqualify(o.header), o.cpp and unqualify(o.cpp)
     lines.append('\n#include "Assets.h"\n\n')
     for o in seq:
         rel = rel_file(mod, o.a, '.h')
@@ -903,7 +945,7 @@ def write_mod(run, mod, outs, out_dir):
         by_ns[tuple(ns)].append('UE_ASSET_AT(%s, %s, "%s");' % (cls, name, path))
     for ns, items in sorted(by_ns.items()):
         al.append('%s%s\n%s' % (ns_open(list(ns)), '\n'.join(items), ns_close(list(ns))))
-    open(os.path.join(root, 'Assets.h'), 'w', encoding='utf-8-sig', newline='\n').write(''.join(al))
+    open(os.path.join(root, 'Assets.h'), 'w', encoding='utf-8-sig', newline='\n').write(unqualify(''.join(al)))
     cpps = sorted(rel_file(mod, o.a, '.cpp').replace(os.sep, '/') for o in seq if o.cpp and not o.cooked)
     open(os.path.join(root, mod.name + '.cpp'), 'w', encoding='utf-8-sig', newline='\n').write(
         '// The mod\'s package and its one translation unit: mods.yaml lists this file, which takes in every other source.\n'
