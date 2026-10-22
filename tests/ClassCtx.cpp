@@ -33,6 +33,15 @@ public:
   UObject *DefaultsOf(UClass *C) { return GetMutableDefault<UObject>(C); }
   ClassCtx *Held;
   void Hold() { Held = GetMutableDefault<ClassCtx>(Kind); }
+
+  /* Written and bound in place: EX_InstanceVariable run in EX_ClassContext leaves the address in the default object
+     (execInstanceVariable, ScriptCore.cpp 2075-2098), which EX_Let and EX_AddMulticastDelegate use. */
+  void SetDefaultScore(TSubclassOf<ClassCtx> C, int32 V) { GetMutableDefault<ClassCtx>(C)->Score = V; }
+  UE_DISPATCHER(OnPing, int32 N);
+  void Pinged(int32 N) { Seen = N; }
+  void BindDefaults(TSubclassOf<ClassCtx> C) { GetMutableDefault<ClassCtx>(C)->OnPing.Add(this, &ClassCtx::Pinged); }
+  void UnbindDefaults(TSubclassOf<ClassCtx> C) { GetMutableDefault<ClassCtx>(C)->OnPing.Remove(this, &ClassCtx::Pinged); }
+  void PingDefaults(TSubclassOf<ClassCtx> C, int32 N) { GetMutableDefault<ClassCtx>(C)->OnPing.Broadcast(N); }
 };
 
 /* A class whose default object is not the one a call runs on: what reads it reads another object. */

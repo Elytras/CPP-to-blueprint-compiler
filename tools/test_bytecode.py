@@ -7929,6 +7929,17 @@ def class_ctx():
     assert vm.call('DefaultsOf', 'ClassCtxKid_C') is kid
     vm.call('Hold')
     assert vm.self.vars['Held'] is kid, vm.self.vars
+    proves('properties-of-other.getmutabledefault-amyenemy-kind')
+    vm.call('SetDefaultScore', 'ClassCtxKid_C', 77)
+    assert kid.vars['Score'] == 77 and vm.self.vars['Score'] == 1, (kid.vars, vm.self.vars)
+    proves('properties-of-other.getmutabledefault-amyenemy-kind-2')
+    vm.call('BindDefaults', 'ClassCtxKid_C')
+    vm.call('BindDefaults', 'ClassCtxKid_C')
+    assert vm.binds == [(kid, 'OnPing', 'Pinged', vm.self)], vm.binds
+    vm.call('PingDefaults', 'ClassCtxKid_C', 13)
+    assert vm.self.vars['Seen'] == 13, vm.self.vars
+    vm.call('UnbindDefaults', 'ClassCtxKid_C')
+    assert vm.binds == [], vm.binds
     vm.null_rvalues = True
     vm.self.vars['Kind'] = None
     vm.call('Remember')
