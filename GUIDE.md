@@ -1262,7 +1262,8 @@ mod shares in one fixed folder (see [Containers](REFERENCE.md#containers)).
 
 A cooked package carries no asset-registry data of its own. So every compile also writes rows into an
 `AssetRegistry.bin` for everything it cooked, each with its class, and bpbuild packs it with the mod so that the
-game's asset registry lists the mod's assets.
+game's asset registry lists the mod's assets. A class's row also carries the tags the editor's cooker writes, among
+them `NativeParentClass` (see [the row](REFERENCE.md#the-mod-package.a-class-s-registry-tags)).
 
 - When the out dir ends in `/Content/<package path without /Game>` (compared ignoring case), the registry goes to
   `<root>/AssetRegistry.bin`, beside `Content`, which is where a cooked pak keeps it. Any other out dir gets its own
@@ -1271,8 +1272,9 @@ game's asset registry lists the mod's assets.
   package's old rows, so several sources compiled into one pak share one registry.
 
 `assetgen registry <out> <in>...` merges registries that AssetGen wrote into `<out>`, and creates `<out>` when it is
-missing. Each input's rows replace the rows `<out>` already had for the same packages. It refuses a registry that has
-tags or dependencies, such as an editor-cooked one, rather than read half of it. bpbuild uses this command for `embed`.
+missing. Each input's rows replace the rows `<out>` already had for the same packages, tags and all. It refuses a
+registry with what AssetGen never writes, such as an editor-cooked one with its chunks and dependencies, rather than
+read half of it. bpbuild uses this command for `embed`.
 
 ### Reproducible output
 
@@ -1834,7 +1836,7 @@ and `dumpedl.py` lists every export with its index.
 | `dumpexp.py` | `dumpexp.py <base> <export-index> [count]` | The export's class, super and outer, then its payload as 4-byte words, each annotated with the name or import it may stand for. Reads cooked packages and single-file uncooked ones, such as editor stubs. |
 | `walk5.py` | `walk5.py <base> [function-name...]` | Every script function of a UE 5.6 package, or those whose names contain one of the words, with the memory offset of each expression: `walkscript.py` with the 5.6 operands. |
 | `pakx.py` | `pakx.py <file.pak> <out-dir> <path-part>... [--oodle <dll>]` | Extracts the files whose pak paths contain one of the parts from a v11 `.pak` written by UE 5, which UE 4.27's UnrealPak refuses to extract. Oodle-compressed files need `oo2core_9_win64.dll`: pass `--oodle`, or put it on PATH. |
-| `dumpar.py` | `dumpar.py <AssetRegistry.bin>` | Every row of a registry, AssetGen's or the game's, then `OK - consumed the whole file`. It exits with an error unless the whole file parses. |
+| `dumpar.py` | `dumpar.py <AssetRegistry.bin>` | Every row of a registry, AssetGen's or the game's, with its tags, then `OK - consumed the whole file`. It exits with an error unless the whole file parses. |
 | `genenums.py` | `genenums.py <UE_4.27/Engine/Source/Runtime>` | Regenerates the compiler's `UeEnums.h` (bytecode tokens and flag values) from the engine source. For compiler development only. |
 
 To read one function, find its index with `dumpedl.py`, then walk it. For `Half` above, export 3:
@@ -1856,13 +1858,17 @@ and the mod's registry:
 ```
 > python tools\dumpar.py mods\build\RunDemo\FSD\AssetRegistry.bin
 version 8
-1 asset(s), 5 name(s)
+1 asset(s), 12 name(s)
   /Game/_MyMods/RunDemo/RunDemo.RunDemo_C              BlueprintGeneratedClass
      package /Game/_MyMods/RunDemo/RunDemo   path /Game/_MyMods/RunDemo   asset RunDemo_C
-     flags 0x80000000  tagmap 0x0  bundles 0  chunks 0
+     flags 0x80000000  tags 4  bundles 0  chunks 0
+     tag ParentClass = Class'/Script/Engine.Actor'
+     tag NativeParentClass = Class'/Script/Engine.Actor'
+     tag NumReplicatedProperties = 0
+     tag ModuleName = RunDemo
 dependencies: 0 node(s)
 package data: 0 entr(y/ies)
-OK - consumed the whole file (323 bytes)
+OK - consumed the whole file (540 bytes)
 ```
 
 The bytecode's exact shape changes as the compiler improves, so compare what a function does, not its opcodes. When you

@@ -104,6 +104,7 @@ the one its `UE_CLASS` names. The others import it.
 | <a id="the-mod-package.ue-mod-package-2"></a>a second `UE_MOD_PACKAGE` in one source | Refused by clang: "redefinition of 'UeModPackage'". The macro declares a variable. | Refused |
 | <a id="the-mod-package.a-source-with-nothing-to"></a>a source with nothing to cook | Refused: "the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit". A class with no base does not count. | Refused |
 | <a id="the-mod-package.class-hello-public-aactor"></a>`class Hello : public AActor {};` | One package per class, named after it: `/Game/_MyMods/Hello/Hello`. The class inside is `Hello_C`, as the editor names a Blueprint's generated class, and the asset registry lists `/Game/_MyMods/Hello/Hello.Hello_C`. The name is the C++ name as written, prefix included: `UTurretDef` becomes `UTurretDef_C`. | Yes |
+| <a id="the-mod-package.a-class-s-registry-tags"></a>a class's asset registry row | Carries the tags the editor's cooker writes for a Blueprint class: `ParentClass` (`Class'/Script/Engine.Actor'`, or `BlueprintGeneratedClass'<path>_C'` for a Blueprint parent), `NativeParentClass` (the nearest native ancestor, always `Class'/Script/...'`), `NumReplicatedProperties` and `ModuleName` (the package's short name). In game, `FAssetData::GetTagValue("NativeParentClass")` reads it, so a registry query filtered on the native parent finds the mod's classes. | Yes |
 | <a id="the-mod-package.several-classes-in-one-source"></a>several classes in one source | Each class is its own package in the mod folder. The classes can name each other's types and share [global variables](#global-variables). | Yes |
 | <a id="the-mod-package.two-declarations-that-land-on"></a>two declarations that land on one package | Refused, naming both: "would both be cooked as". Package names are compared ignoring case. | Refused |
 
@@ -7539,8 +7540,8 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 - `<Path>: cannot read`: `assetgen registry` was given an input that does not exist or cannot be opened. Fix: pass a
   registry that assetgen wrote, such as a mod's `build/<mod>/FSD/AssetRegistry.bin`.
 - `<Path>: not an AssetRegistry.bin`, `<Path>: not a UE 4.27 AssetRegistry.bin`, `<Path>: a malformed tag store`,
-  `<Path>: asset tags - not a registry assetgen wrote, so not one it can merge`,
-  `<Path>: asset tags, bundles or chunks, which assetgen never writes` and `<Path>: truncated`: AssetGen merges its
+  `<Path>: localized tags - not a registry assetgen wrote, so not one it can merge`,
+  `<Path>: asset bundles or chunks, which assetgen never writes` and `<Path>: truncated`: AssetGen merges its
   rows into an AssetRegistry.bin that is already there, and that file is not one AssetGen wrote: the game's own
   registry, an editor-cooked one, one from another engine version, or a damaged file. `assetgen compile` merges into
   `<root>/AssetRegistry.bin` when the out dir is `<root>/Content/<package path>`, so compiling into an extracted game
