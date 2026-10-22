@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include <algorithm>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -67,6 +68,10 @@ public:
     /* Replication: the CDO's bReplicates, set when the class replicates a variable or declares an RPC. The class's
        NumReplicatedProperties tag is counted from the CPF_Net variables. */
     void SetReplicates(bool bValue) { bReplicates = bValue; }
+    int32 NumReplicatedVars() const
+    {
+        return int32(std::count_if(Vars.begin(), Vars.end(), [](const FPropertyDef& V) { return (V.PropertyFlags & CPF_Net) != 0; }));
+    }
     /* ExecuteUbergraph_<Class>: written as the class's UberGraphFunction tag. */
     void SetUberGraphFunction(FIndex Function) { UberGraphFunction = Function; }
 
