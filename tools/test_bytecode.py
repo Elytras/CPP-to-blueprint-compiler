@@ -9626,13 +9626,39 @@ def dispatch_native_callable():
     assert parent.vars['Heard'] == 1, parent.vars
 
 
+def dispatch_force_broadcast():
+    """UE_FORCE_BROADCAST opts out of the editor's BlueprintCallable rule on a native dispatcher: AActor's sparse
+    OnDestroyed on this actor, UEnemySpawnManager's inline OnEnemySpawned on another object, both BlueprintAssignable
+    only. execCallMulticastDelegate does not check the flag (ScriptCore.cpp 3029-3075), so the broadcast compiles, with a
+    warning naming the dispatcher, and the bound handler runs. Only Broadcast takes the marker."""
+    base = asset('DispatchForceBroadcast')
+    keeps_invariants(base)
+    proves('broadcast.ue-force-broadcast-ondestroyed')
+    log = LOGS['DispatchForceBroadcast']
+    for d in ('AActor::OnDestroyed', 'UEnemySpawnManager::OnEnemySpawned'):
+        assert any('warning' in l and d + ' is not BlueprintCallable' in l and 'editor' in l for l in log.splitlines()), log
+    vm = VM(base, {}, Heard=0, Spawned=0)
+    assert vm.call('Fire') == 1 and vm.self.vars['Heard'] == 1 and vm.binds == [], (vm.self.vars, vm.binds)
+    spawner = Obj('EnemySpawnManager')
+    vm.self.vars['Spawner'] = spawner
+    vm.call('HookSpawner')
+    vm.call('FireSpawner')
+    vm.call('FireSpawner')
+    assert vm.self.vars['Spawned'] == 2, vm.self.vars
+    refused('DispatchForceAdd', '  void Gone(AActor *A) {}\n'
+            '  void F() { UE_FORCE_BROADCAST(OnDestroyed).Add(this, &DispatchForceAdd::Gone); }\n',
+            'UE_FORCE_BROADCAST is for Broadcast only')
+
+
 def native_dispatcher_refusals():
     """What the editor's nodes refuse on a native dispatcher (K2Node_MCDelegate.cpp 36-46, 453-462): Call on one that is
     not BlueprintCallable, none of Engine's being (OnDestroyed), and Add on one that is not BlueprintAssignable (AGameEvent's
-    EventTriggeredDelegate, one of FSD's 17)."""
+    EventTriggeredDelegate, one of FSD's 17). The Call refusal names the opt-in, UE_FORCE_BROADCAST."""
     proves('broadcast.ondestroyed-broadcast-this')
     refused('DispatchNativeFire', '  void F() { OnDestroyed.Broadcast(this); }\n',
             'OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable')
+    refused('DispatchNativeFire', '  void F() { OnDestroyed.Broadcast(this); }\n',
+            'UE_FORCE_BROADCAST(OnDestroyed).Broadcast(...) broadcasts it anyway')
     proves('binding-handlers.e-eventtriggereddelegate-add')
     refused('DispatchNotAssignable', '  AGameEvent *E = nullptr;\n  void Ping() {}\n'
             '  void F() { E->EventTriggeredDelegate.Add(this, &DispatchNotAssignable::Ping); }\n',
@@ -9667,9 +9693,11 @@ print('ok  DelegateParmKeys: an enum spelled short, qualified or from the global
       'types C++ keeps apart get a signature function each, and a value stored into a parent\'s TArray or TMap names '
       'its element\'s')
 dispatch_native_callable()
+dispatch_force_broadcast()
 native_dispatcher_refusals()
 print('ok  native dispatchers: Broadcast on a BlueprintCallable one names a signature of the class\'s own with its '
-      'parameters and reaches its handler; one the editor\'s nodes refuse is refused')
+      'parameters and reaches its handler; one the editor\'s nodes refuse is refused, and UE_FORCE_BROADCAST broadcasts '
+      'it with a warning')
 # A bound name the object's class does not have: the broadcast or the timer skips it (ScriptDelegates.h 38-49,
 # 479-502). The editor binds only a BlueprintCallable function, never a pure or latent one (K2Node_CreateDelegate.cpp
 # 156-164 -> EdGraphSchema_K2.cpp 929-985): AActor::ReceiveTick is a BlueprintEvent only.

@@ -4944,11 +4944,18 @@ const FRecord* FCompiler::DispatcherOwner(const Json& Dispatcher)
    object, as the editor's Bind / Add / Remove / Clear and Call nodes (K2Node_MCDelegate.cpp). A Blueprint's dispatcher -
    this class's, a mod's, a game Blueprint's - takes them all; a native one takes the first four only when the engine
    marks it BlueprintAssignable, and Call only when BlueprintCallable (36-46, 453-462), which UeApi's <D>__UeDispatcher
-   says. */
-bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const Json& Obj, FBlueprintClass& BP,
+   says. UE_FORCE_BROADCAST(D).Broadcast(...) opts out of the BlueprintCallable rule: the VM does not check the flag
+   (ScriptCore.cpp 3029-3075), so it compiles with a warning. */
+bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const Json& Written, FBlueprintClass& BP,
                                     FArgIR& Out, std::string* Err)
 {
     const std::string Method = Name(Callee);
+    const Json* ForceFn = Kind(Written) == "CallExpr" ? Strip(First(Written)) : nullptr;
+    const bool bForced = ForceFn && Kind(*ForceFn) == "DeclRefExpr" && ForceFn->contains("referencedDecl")
+                         && Name((*ForceFn)["referencedDecl"]) == "__ForceBroadcast__";
+    const Json& Obj = bForced ? *Strip(Nth(Written, 1)) : Written;
+    if (bForced && Method != "Broadcast")
+    { *Err = "UE_FORCE_BROADCAST(" + Name(Obj) + ")." + Method + ": UE_FORCE_BROADCAST is for Broadcast only"; return false; }
     std::vector<const Json*> Args;
     ForEach(Call, [&](const Json& A) { Args.push_back(&A); });
     Args.erase(Args.begin());               // the callee
@@ -5011,18 +5018,25 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
         C.Fn = Own->second;
     else if (Owner && !bNative)
         C.Fn = BP.EngineFunction(PackageOf(*Owner), ClassOf(*Owner), C.Args[0].S + "__DelegateSignature");
-    else if (bNative && Has("Callable"))
+    else if (bNative && (Has("Callable") || (bForced && bMarked)))
     {
         if (DelegateType.empty() || !DelegateSignature(DelegateType, Disp, BP, &C.Fn, Err)) return false;
-        printf("  warning: %s::%s: %s.Broadcast names a signature function of this class with %s's parameters, as UeApi does not "
-               "name the engine's; the handlers get the same arguments\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(),
-               Disp.c_str(), Where.c_str());
+        if (Has("Callable"))
+            printf("  warning: %s::%s: %s.Broadcast names a signature function of this class with %s's parameters, as UeApi does not "
+                   "name the engine's; the handlers get the same arguments\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(),
+                   Disp.c_str(), Where.c_str());
+        else
+            printf("  warning: %s::%s: UE_FORCE_BROADCAST(%s).Broadcast: %s is not BlueprintCallable, so the editor's Call node "
+                   "would refuse it; it broadcasts through a signature function of this class with its parameters, and the "
+                   "handlers run as when the engine broadcasts it\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(),
+                   Disp.c_str(), Where.c_str());
     }
     else if (bNative)
     {
         *Err = Disp + ".Broadcast: " + Disp + " is a native dispatcher (" + Where + ") " + (bMarked
                    ? std::string("that is not BlueprintCallable, and the editor's Call node refuses one (\"Event Dispatcher is "
-                                 "not 'BlueprintCallable'\"): only the engine's own code broadcasts it")
+                                 "not 'BlueprintCallable'\"); UE_FORCE_BROADCAST(" + Disp + ").Broadcast(...) broadcasts it "
+                                 "anyway, with a warning")
                    : std::string("and the editor's Call node takes one only when it is BlueprintCallable, which this UeApi does "
                                  "not say (regenerate it with genueapi)"));
         return false;

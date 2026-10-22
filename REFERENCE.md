@@ -4242,7 +4242,8 @@ Notes:
 | <a id="broadcast.onhit-broadcast-1"></a>`OnHit.Broadcast(1);` on a dispatcher a mod parent declares | Broadcasts through the parent's signature function, as the editor's node on a child does. | Yes |
 | <a id="broadcast.t-onhit-broadcast-p"></a>`T->OnHit.Broadcast(P);`, `Burrow->OnBurrowComplete.Broadcast(true);` | The Call node with another object as Target: a dispatcher another mod class declares, or a game Blueprint's (every Blueprint dispatcher is BlueprintCallable). It broadcasts through that class's signature function, imported from its package. | Yes |
 | <a id="broadcast.state-onterraingenerated"></a>`State->OnTerrainGenerated.Broadcast();` | A native dispatcher the engine marks BlueprintCallable (41 of the game's). UeApi does not say which signature function the engine gives it, so the broadcast names one of the class's own with the same parameters and warns that it does; the handlers get the same arguments. | Warns |
-| <a id="broadcast.ondestroyed-broadcast-this"></a>`OnDestroyed.Broadcast(this);` | Refused: "OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable". The editor's Call node refuses a native dispatcher without BlueprintCallable ("Event Dispatcher is not 'BlueprintCallable'"), and none of the engine's has it; only the engine's own code broadcasts it. With a UeApi from before genueapi marked them, every native dispatcher is refused this way, the message saying the UeApi does not tell. | Refused |
+| <a id="broadcast.ondestroyed-broadcast-this"></a>`OnDestroyed.Broadcast(this);` | Refused: "OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable". The editor's Call node refuses a native dispatcher without BlueprintCallable ("Event Dispatcher is not 'BlueprintCallable'"), and none of the engine's has it. The message names the opt-in, `UE_FORCE_BROADCAST` (next row). With a UeApi from before genueapi marked them, every native dispatcher is refused this way, the message saying the UeApi does not tell. | Refused |
+| <a id="broadcast.ue-force-broadcast-ondestroyed"></a>`UE_FORCE_BROADCAST(OnDestroyed).Broadcast(this);`, `UE_FORCE_BROADCAST(Spawner->OnEnemySpawned).Broadcast(P, D);` | Broadcasts a native dispatcher that is not BlueprintCallable anyway, and warns: "UE_FORCE_BROADCAST(OnDestroyed).Broadcast: AActor::OnDestroyed is not BlueprintCallable, so the editor's Call node would refuse it". The flag is the editor's rule only: the VM's broadcast does not check it, so every bound handler runs with the arguments, as when the engine broadcasts it. Inline and sparse dispatchers both work. Only Broadcast takes the marker; `UE_FORCE_BROADCAST(D).Add(...)` is refused. | Warns |
 
 ```cpp
 class PBase : public AActor {
@@ -5987,6 +5988,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_ENUM(Enum)` | Cooks an `enum class` based on `uint8`, `int32` or `int64` as a UserDefinedEnum (an Enumeration asset). | [Enums](#enums) |
 | `UE_ENUM_IN(Enum, Package)` | UE_ENUM for an enum in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Enums](#enums) |
 | `UE_ENUM_MAP(Key, Value, Name)`, `UE_ENUM_MAP(Enum)` | A TMap member from each enumerator to its name, or back, filled in at build time: declared by the three-argument form, the default alone by the one-argument form. | [Enums](#enums) |
+| `UE_FORCE_BROADCAST(Dispatcher)` | `.Broadcast(...)` on it broadcasts a native dispatcher that is not BlueprintCallable, which the editor refuses, with a warning. | [Event dispatchers](#event-dispatchers) |
 | `UE_FINAL_AS(Base, Leaf)` | Declares `class Leaf final : public Base {}`, Base's one subclass: Base is compiled as final and cooked Abstract. | [Classes and variables](#classes-and-variables) |
 | `UE_GAME_STRUCT(Package, Name)` | genueapi's marker on a game Blueprint's struct: imported from Package as the UserDefinedStruct Name, never cooked. | [Structs](#structs) |
 | `UE_FLOAT_CURVE(Name, Keys...)` | A UCurveFloat asset of the mod's own, at namespace scope, keys `(time, value)` as a track's. `&Name` points at it. | [Timelines](#timelines) |
@@ -6915,9 +6917,13 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   Add, Remove or a delegate value names an inline method. An inline method is copied into each caller and never
   becomes a function of the class. Fix: drop `inline` from the handler. See [Event dispatchers](#event-dispatchers).
 - `<Dispatcher>.Broadcast: <Dispatcher> is a native dispatcher (<Class>::<Dispatcher>) that is not BlueprintCallable,
-  and the editor's Call node refuses one ("Event Dispatcher is not 'BlueprintCallable'"): only the engine's own code
-  broadcasts it`: `OnDestroyed.Broadcast(this)` and the like; none of the engine's dispatchers is BlueprintCallable, 41
-  of the game's are. Fix: none; call what the engine calls to make the event happen (`K2_DestroyActor()`).
+  and the editor's Call node refuses one ("Event Dispatcher is not 'BlueprintCallable'");
+  UE_FORCE_BROADCAST(<Dispatcher>).Broadcast(...) broadcasts it anyway, with a warning`: `OnDestroyed.Broadcast(this)`
+  and the like; none of the engine's dispatchers is BlueprintCallable, 41 of the game's are. Fix: call what the engine
+  calls to make the event happen (`K2_DestroyActor()`), or, to run the bound handlers without the event, write
+  `UE_FORCE_BROADCAST(<Dispatcher>).Broadcast(...)`. See [Broadcast](#broadcast).
+- `UE_FORCE_BROADCAST(<Dispatcher>).<Method>: UE_FORCE_BROADCAST is for Broadcast only`: the marker on Add, Remove or
+  Clear. Fix: drop it there.
 - `<Dispatcher>.Broadcast: <Dispatcher> is a native dispatcher (<Class>::<Dispatcher>) and the editor's Call node takes
   one only when it is BlueprintCallable, which this UeApi does not say (regenerate it with genueapi)`: the UeApi
   headers have no `<Dispatcher>__UeDispatcher` mark for it, which genueapi writes for every native dispatcher (since
