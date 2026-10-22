@@ -1651,7 +1651,7 @@ Notes:
 
 - A variable declared in a condition or an init-statement stays a function-wide local afterwards; see
   [Locals](#locals). Correct C++ cannot tell.
-- A member template has no function of its own. Each instantiation a call names is inlined; see
+- A member template that is not static has no function of its own. Each instantiation a call names is inlined; see
   [Inline functions and templates](#inline-functions-and-templates).
 
 ### switch
@@ -2754,9 +2754,10 @@ Notes:
 
 ## Inline functions and templates
 
-`inline` is the editor's macro: the body is copied into each call, and no function exists at run time. A template is
-always expanded this way, `inline` or not. The rule to remember: an inline method expands only on `this`. For a helper
-that takes an object, write a free function.
+`inline` is the editor's macro: the body is copied into each call, and no function exists at run time. An inline
+template is expanded this way, and so is a member template that is not static. A free or static template without
+`inline`, and a class or struct template, is compiled once per instantiation instead; see [Templates](#templates). The
+rule to remember: an inline method expands only on `this`. For a helper that takes an object, write a free function.
 
 ### Inline functions
 
@@ -2832,11 +2833,19 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| <a id="templates.spawnactor-aactor-aactor"></a>`SpawnActor<AActor>(AActor::StaticClass(), Where)` from `Objects.h` | Each instantiation clang makes is expanded at its call like any inline function. No function exists per instantiation; see [Creating objects](#creating-objects). | Yes |
-| <a id="templates.template-class-t-inline-t"></a>`template <class T> inline T Max2(T A, T B)` | A free function template is expanded at each call, like a member template. | Yes |
-| <a id="templates.template-class-t-t-max2"></a>`template <class T> T Max2(T A, T B)` without `inline` | Expanded at each call all the same: a template is never a function of the source's library. | Yes |
-| <a id="templates.template-class-t-int32-widthof"></a>`template <class T> int32 WidthOf()` in a class | A member template is expanded at its call, with or without `inline`. No Blueprint function is made, and only calls on `this` expand. Its body is its own class's code, as an inline method's is: a call in it is read there, wherever it is copied. | Yes |
-| <a id="templates.inline-auto-twicen-number-auto"></a>`inline auto TwiceN(Number auto V)`, or `int32 AutoP(auto V)` in a class | An `auto` parameter makes the function a template, expanded at each call. | Yes |
+| <a id="templates.spawnactor-aactor-aactor"></a>`SpawnActor<AActor>(AActor::StaticClass(), Where)` from `Objects.h` | An inline template: each instantiation clang makes is expanded at its call like any inline function, and no function exists per instantiation; see [Creating objects](#creating-objects). | Yes |
+| <a id="templates.template-class-t-inline-t"></a>`template <class T> inline T Max2(T A, T B)` | A free function template marked `inline` is expanded at each call, like a member template. | Yes |
+| <a id="templates.template-class-t-t-max2"></a>`template <class T> T Max2(T A, T B)` without `inline` | One function of the source's library per instantiation a call reaches, named by its arguments: `Max2(1, 2)` calls `Max2__int32`, `Max2(1.0f, 2.0f)` calls `Max2__float`. Each is then a [free function](#free-functions) like any other: it may call itself, and has the hidden world context. | Yes |
+| <a id="templates.instance-names"></a>`Max2<float>`, `FPair<int32, FVector>`, `Times<-3>`, `Pick<true>`, `FTagged<EMood::Calm>` | The name of an instantiation that is compiled: the template's name, `__`, then its arguments in order joined by `_`. A type argument is its names' leaves joined by `_` (`TArray<FVector>` is TArray_FVector, `Game::Turrets::AGun` is AGun), a builtin by its UE name (`int`, `int32` and an alias of either are all int32), with const, `*` and `&` dropped. A value is its digits with `m` for a minus sign, `true` / `false`, or an enum's enumerator (`EMood::Calm` is Calm). So Max2__float, FPair__int32_FVector, Times__m3, Pick__true, FTagged__Calm. The name follows from the C++ alone and is the same in every build. Callers in other mods, saved games and other packages hold it, so changing a template's arguments renames the function or type. | Yes |
+| <a id="templates.instance-name-clash"></a>`Id<AActor>()` beside `Id<AActor *>()`, or `FTag<AActor>` beside `FTag<AActor *>` | Refused (`would be cooked as`, `would both be cooked as`): two instantiations whose arguments spell one name. Use only one of them, or make the function template `inline`. | Refused |
+| <a id="templates.pack-instance"></a>`template <class... T> int32 Count(T... V)` without `inline`, called as `Count(1, 2.0f, true)` | Count__int32_float_bool, with one parameter per argument, V_0, V_1 and V_2; `sizeof...(V)` is 3 in it. `Count()` calls Count__. | Yes |
+| <a id="templates.lambda-argument"></a>`Apply(5, [&](int32 A) { ... })`, where `Apply` is a template without `inline` | Expanded at the call, as an inline template is: a lambda's type has no name to give an instantiation, and a lambda is no value a function can take; see [Lambdas](#lambdas). | Yes |
+| <a id="templates.static-member-template"></a>`template <class T> static T Get(T V)` in a class of the mod's own, without `inline` | A static of the class per instantiation, `Get__int32`, called as any static of it is. A call from another mod names that function in the class's package, which has it only if a source of the class's own mod instantiates it: by calling it, or with an explicit instantiation such as `template float UMyLib::Get<float>(float);`, which makes Get__float with no call. A static member template of a UE_STRUCT or of an engine or game class is still expanded at the call. | Yes |
+| <a id="templates.struct-template"></a>`template <class T> struct FRange { UE_STRUCT; T Lo; T Hi; };` used as `FRange<float>` | One cooked struct per instantiation the source uses, FRange__float, in the mod's package as any UE_STRUCT, with its members under the same rules. Every spelling of the type is that struct: `FRange<int32>` and `FRange<int>`, `const FRange<float> &`, an alias of it, `TArray<FRange<float>>`, a member of another template's instantiation. | Yes |
+| <a id="templates.class-template"></a>`template <class T> class ATurret : public AActor { ... };` with `template class ATurret<float>;` | One cooked class per instantiation, ATurret__float_C, its methods Blueprint functions and its overrides events, as any class's are. The explicit instantiation makes C++ compile every method. | Yes |
+| <a id="templates.class-template-not-instantiated"></a>`ATurret<float>` used without `template class ATurret<float>;` | Refused where a method of the template has no body in the instantiation (`is not instantiated`): C++ compiles a class template's method only where the source calls it, while the engine calls an event such as ReceiveBeginPlay by name. Cooked without it, the class would run the parent's. The message gives the line to add. | Refused |
+| <a id="templates.template-class-t-int32-widthof"></a>`template <class T> int32 WidthOf()` in a class | A member template that is not static is expanded at its call, with or without `inline`. No Blueprint function is made, and only calls on `this` expand. Its body is its own class's code, as an inline method's is: a call in it is read there, wherever it is copied. | Yes |
+| <a id="templates.inline-auto-twicen-number-auto"></a>`inline auto TwiceN(Number auto V)`, or `int32 AutoP(auto V)` in a class | An `auto` parameter makes the function a template, expanded at each call. Without `inline`, a free function with an `auto` parameter is compiled per instantiation, as any template is. | Yes |
 | <a id="templates.template-class-t-concept-number"></a>`template <class T> concept Number = requires(T A) { A + A; };` | Concepts and requires-clauses are checked by clang and cost nothing at run time. A wrong type is a "constraints not satisfied" error on the calling line. | Yes |
 | <a id="templates.template-class-t-inline-int32"></a>`template <class... T> inline int32 Fwd(T... V) { return Sum2(V...); }` | Pack expansion into a call works. | Yes |
 | <a id="templates.sizeof-v"></a>`sizeof...(V)`, `sizeof...(T)` | The number of arguments in the pack, of a parameter pack or of a template's type pack, as a constant; 0 for an empty pack. | Yes |
@@ -2860,8 +2869,35 @@ public:
 };
 ```
 
+Without `inline`, each instantiation is a function or a type of its own:
+
+```cpp
+template <class T> T Clamp01(T V) { return V < T(0) ? T(0) : V > T(1) ? T(1) : V; }   // Clamp01__float in BPL_MyMod
+template <class T> struct FRange {
+  UE_STRUCT;
+  T Lo;
+  T Hi;
+};
+template <class T> class ATurret : public AActor {
+public:
+  T Heat;
+  void ReceiveBeginPlay() { Heat = T(0); }
+};
+template class ATurret<float>;   // ATurret__float_C, ReceiveBeginPlay included
+
+class AMyActor : public AActor {
+public:
+  FRange<float> Spread;   // FRange__float
+  float Use(float V) { return Clamp01(V) * (Spread.Hi - Spread.Lo); }
+};
+```
+
 Notes:
 
+- Only the instantiations the source uses are compiled. A function template in a header is compiled into the library of
+  each source that calls it, as a free function is; a class or struct template is cooked by each source that uses it,
+  as a UE_STRUCT is.
+- An error in an instantiation's body is prefixed with its name, `BPL_MyMod::Clamp01__float: `.
 - A mod has no C++ standard library, so use clang builtins such as `__is_base_of(Base, T)` and `__is_same(A, B)`
   rather than `<concepts>` or `<type_traits>`. They compile where clang decides them at build time (`if constexpr`,
   `static_assert`). As a value only `__is_same` is read; any other is refused ("unimplemented argument TypeTraitExpr").
@@ -6059,7 +6095,7 @@ listed here is refused with "unimplemented intrinsic".
 | `if (Obj)`, `!Obj` | Is Valid: false for null and for an object that is being destroyed. | [Working with other objects](#working-with-other-objects) |
 | `if (X)` on a value that is not a bool | An int32 goes through ToBool (integer), a float, int64 or byte is compared with zero, and an FName is tested against None. | [Statements and control flow](#statements-and-control-flow) |
 | `InitCave`, `InitSpacerig` | The class names the game spawns from a mod: InitSpacerig in the Space Rig, InitCave in a mission. | [Running in the game](GUIDE.md#running-in-the-game) |
-| `inline` functions and templates | Expanded at each call like an editor macro, with no Blueprint function of its own. A template is expanded, `inline` or not. | [Inline functions and templates](#inline-functions-and-templates) |
+| `inline` functions and templates | Expanded at each call like an editor macro, with no Blueprint function of its own, an inline template too. A template without `inline` is a function or a type per instantiation, `Max2__float`. | [Inline functions and templates](#inline-functions-and-templates) |
 | Free function, `int32 Twice(int32 V) { ... }` | Without `inline`, a Blueprint function of `BPL_<source>`, the function library the compiler generates for the source. | [Free functions](#free-functions) |
 | `(int64)Obj`, `(uint8 *)Obj` | The object's address, as an int64 or as a pointer. | [Pointers and memory](#pointers-and-memory) |
 | Lambdas | Expanded where they are called, with no closure object: a capture by reference is the variable itself, one by value a snapshot local. | [Lambdas](#lambdas) |

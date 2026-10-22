@@ -1233,6 +1233,169 @@ std::vector<std::string> SplitTemplateArgs(const std::string& S)
     return Out;
 }
 
+/*
+A template instantiation the mod compiles (a non-inline function template's, a class or struct template's) is named
+by its template arguments, and the name is asset API: what callers in other mods, saved games and other packages hold.
+So it is one fixed rule of the C++ alone (REFERENCE.md#templates.instance-names): the template's name, `__`, then its
+arguments in order joined by `_`, each spelled by TemplateArgText. `Max2<float>` is Max2__float, `FPair<int32, FVector>`
+FPair__int32_FVector, `Times<-3>` Times__m3.
+*/
+
+/* One template argument as it goes into an instantiation's name: every name in it by its leaf (`Game::Turrets::AGun` is
+   AGun), a builtin by its UE name (`int`, `int32` and an alias of either are all int32), the names joined by `_`, a
+   minus sign as `m`; const, volatile, `*`, `&` and the class / struct / enum keywords dropped: `TArray<const FVector *>`
+   is TArray_FVector. Empty for a type with no such spelling, a lambda's or a function's. Resolve gives an alias's
+   target, or "" for a name that is none. */
+std::string TemplateArgText(const std::string& T, const std::function<std::string(const std::string&)>& Resolve, int32 Depth = 0)
+{
+    static const std::map<std::string, std::string> Builtins = {
+        { "int", "int32" }, { "signed", "int32" }, { "signed int", "int32" }, { "long", "int32" }, { "long int", "int32" },
+        { "unsigned", "uint32" }, { "unsigned int", "uint32" }, { "unsigned long", "uint32" }, { "unsigned long int", "uint32" },
+        { "long long", "int64" }, { "long long int", "int64" }, { "__int64", "int64" },
+        { "unsigned long long", "uint64" }, { "unsigned long long int", "uint64" }, { "unsigned __int64", "uint64" },
+        { "short", "int16" }, { "short int", "int16" }, { "unsigned short", "uint16" }, { "unsigned short int", "uint16" },
+        { "signed char", "int8" }, { "unsigned char", "uint8" } };
+    static const std::set<std::string> Dropped = { "const", "volatile", "class", "struct", "enum", "typename" };
+    if (Depth > 16 || T.find('(') != std::string::npos) return std::string();
+    std::vector<std::string> Parts;
+    std::string Words;      // the run of words read so far: a builtin can take several (`unsigned char`)
+    bool bOk = true;
+    auto Flush = [&] {
+        if (Words.empty()) return;
+        if (const auto B = Builtins.find(Words); B != Builtins.end()) Parts.push_back(B->second);
+        else if (const std::string A = Words.find(' ') == std::string::npos ? Resolve(Words) : std::string(); !A.empty() && A != Words)
+        {
+            const std::string Of = TemplateArgText(A, Resolve, Depth + 1);
+            bOk = bOk && !Of.empty();
+            Parts.push_back(Of);
+        }
+        else
+        {
+            for (char& C : Words) if (C == ' ') C = '_';
+            Parts.push_back(Words);
+        }
+        Words.clear();
+    };
+    for (size_t I = 0; I < T.size();)
+    {
+        if (std::isalnum(uint8(T[I])) || T[I] == '_' || (T[I] == '-' && I + 1 < T.size() && std::isdigit(uint8(T[I + 1]))))
+        {
+            size_t E = I + 1;
+            while (E < T.size() && (std::isalnum(uint8(T[E])) || T[E] == '_')) ++E;
+            const std::string W = T[I] == '-' ? "m" + T.substr(I + 1, E - I - 1) : T.substr(I, E - I);
+            I = E;
+            if (Dropped.count(W)) continue;
+            /* `A::B` is B: a qualifier drops what was read of the name. */
+            if (T.compare(I, 2, "::") == 0) { I += 2; continue; }
+            Words += (Words.empty() ? "" : " ") + W;
+            continue;
+        }
+        if (T.compare(I, 2, "::") == 0) { I += 2; continue; }      // a leading `::`
+        if (T[I] != ' ') Flush();
+        ++I;
+    }
+    Flush();
+    std::string Out;
+    for (const std::string& P : Parts) if (!P.empty()) Out += (Out.empty() ? "" : "_") + P;
+    return bOk ? Out : std::string();
+}
+
+/* The suffix of Inst's name (an instantiation, holding clang's TemplateArgument nodes), its arguments joined by `_`:
+   false where one has no spelling (a lambda's type, a template's name, a pointer value). Tmpl, the template, says which
+   value parameters are bool, which clang's dump writes as -1 and 0, and which are enums, whose value Enumerator names
+   as a type's spelling does (`FTagged<EMood::Calm>` is FTagged__Calm). Shown gets the C++ spelling, `Max2<float>`. */
+bool InstanceSuffix(const Json& Inst, const Json& Tmpl, const std::function<std::string(const std::string&)>& Resolve,
+                    std::string* Out, std::string* Shown = nullptr,
+                    const std::function<std::string(const std::string&, int64)>& Enumerator = {})
+{
+    std::vector<const Json*> Parms;
+    ForEach(Tmpl, [&](const Json& P) {
+        const std::string K = Kind(P);
+        if (K == "TemplateTypeParmDecl" || K == "NonTypeTemplateParmDecl" || K == "TemplateTemplateParmDecl") Parms.push_back(&P);
+    });
+    std::vector<std::string> Parts, Spelled;
+    bool bOk = true;
+    std::function<void(const Json&, const Json*)> Arg = [&](const Json& A, const Json* P) {
+        if (A.value("isPack", false))
+        {
+            ForEach(A, [&](const Json& E) { if (Kind(E) == "TemplateArgument") Arg(E, P); });
+            return;
+        }
+        if (A.contains("type"))
+        {
+            const Json& T = A["type"];
+            const std::string S = TemplateArgText(T.value("desugaredQualType", T.value("qualType", std::string())), Resolve);
+            bOk = bOk && !S.empty();
+            Parts.push_back(S);
+            Spelled.push_back(T.value("qualType", std::string()));
+            return;
+        }
+        const bool bBool = P && Kind(*P) == "NonTypeTemplateParmDecl" && StripTypeKeywords(TypeOf(*P)) == "bool";
+        const auto V = A.find("value");
+        if (V != A.end() && (V->is_number_integer() || V->is_boolean()))
+        {
+            const int64 N = V->is_boolean() ? int64(V->get<bool>()) : V->is_number_unsigned() ? int64(V->get<uint64>()) : V->get<int64>();
+            const std::string E = !bBool && P && Kind(*P) == "NonTypeTemplateParmDecl" && Enumerator
+                                      ? Enumerator(StripTypeKeywords(TypeOf(*P)), N) : std::string();
+            Parts.push_back(!E.empty() ? E : bBool ? (N ? "true" : "false") : N < 0 ? "m" + std::to_string(uint64(0) - uint64(N)) : std::to_string(N));
+            Spelled.push_back(bBool || !E.empty() ? Parts.back() : std::to_string(N));
+            return;
+        }
+        bOk = false;
+    };
+    size_t At = 0;
+    ForEach(Inst, [&](const Json& A) {
+        if (Kind(A) != "TemplateArgument") return;
+        Arg(A, At < Parms.size() ? Parms[At] : nullptr);
+        ++At;
+    });
+    if (!bOk) return false;
+    Out->clear();
+    for (const std::string& P : Parts) *Out += (Out->empty() ? "" : "_") + P;
+    if (Shown)
+    {
+        *Shown = Name(Inst) + "<";
+        for (size_t I = 0; I < Spelled.size(); ++I) *Shown += (I ? ", " : "") + Spelled[I];
+        *Shown += ">";
+    }
+    return true;
+}
+
+/* Whether N is a template's instantiation, which clang dumps with the arguments it was made for. */
+bool IsInstance(const Json& N)
+{
+    bool bArgs = false;
+    ForEach(N, [&](const Json& A) { bArgs = bArgs || Kind(A) == "TemplateArgument"; });
+    return bArgs;
+}
+
+/* A function parameter pack's instantiation has a parameter per argument, each of the pack's name (`V`, `V`), and a
+   Blueprint function's parameters need names of their own: they become V_0, V_1, ..., and so do the body's references
+   to them. Each keeps the pack's name in "packName" for `sizeof...(V)` (FoldConst). */
+void NamePackParms(Json& Fn)
+{
+    std::map<std::string, int32> Count, Next;
+    ForEach(Fn, [&](const Json& P) { if (Kind(P) == "ParmVarDecl" && !Name(P).empty()) ++Count[Name(P)]; });
+    std::map<std::string, std::string> Renamed;     // a parameter's id -> its name
+    for (Json& P : Fn["inner"])
+        if (Kind(P) == "ParmVarDecl" && Count[Name(P)] > 1)
+        {
+            const std::string Pack = Name(P);
+            P["packName"] = Pack;
+            P["name"] = Pack + "_" + std::to_string(Next[Pack]++);
+            Renamed[P.value("id", std::string())] = Name(P);
+        }
+    if (Renamed.empty()) return;
+    std::function<void(Json&)> Fix = [&](Json& N) {
+        if (!N.is_structured()) return;
+        if (N.is_object())
+            if (const auto R = N.find("referencedDecl"); R != N.end() && R->is_object())
+                if (const auto It = Renamed.find(R->value("id", std::string())); It != Renamed.end()) (*R)["name"] = It->second;
+        for (Json& C : N) Fix(C);
+    };
+    Fix(Fn);
+}
+
 struct FStructInfo
 {
     std::string Package, UeName;
@@ -2075,8 +2238,36 @@ private:
                                                                         // an address in clang, so the map's order is not fixed
     /* A free function that is not inline and has a body here: its first declaration (the default arguments are on it),
        its definition, and its qualified name. */
-    struct FFreeFn { const Json* Decl = nullptr; const Json* Def = nullptr; std::string Qual; };
+    struct FFreeFn { const Json* Decl = nullptr; const Json* Def = nullptr; std::string Qual, Shown; };
     std::map<std::string, FFreeFn> FreeFns;                             // any of its declarations' ids -> the function
+    /* Non-inline templates (InstanceSuffix): a static member template's instantiation by its decl id -> the name it is a
+       function of its class under; a class or struct template of the mod's own by its qualified name -> its
+       ClassTemplateDecl, and their leaves, which NameTemplateUses looks for in a type's spelling. */
+    std::map<std::string, std::string> InstanceNames;
+    std::map<std::string, const Json*> ModClassTemplates;
+    std::set<std::string> ModTemplateLeaves;
+    struct FInstanceType { std::string Id, Shown; const Json* Tmpl = nullptr; };
+    std::map<std::string, FInstanceType> InstanceTypes;     // a record's name -> its node's id, `FBox<float>`, its template
+    std::string AliasOf(const std::string& Name) const
+    {
+        const auto A = Aliases.find(Name);
+        return A == Aliases.end() ? std::string() : A->second;
+    }
+    /* The enumerator of enum Enum (as a template parameter spells it) whose value is V, or "": an enum value argument's
+       part of an instantiation's name, as a type spells it (`EMood::Calm` reads Calm). */
+    std::string EnumeratorOf(const std::string& Enum, int64 V) const
+    {
+        auto It = EnumDecls.find(Enum);
+        if (It == EnumDecls.end())
+            if (const auto B = Bare.find(LeafOf(Enum)); B != Bare.end()) It = EnumDecls.find(B->second);
+        if (It == EnumDecls.end())
+            for (auto E = EnumDecls.begin(); E != EnumDecls.end() && It == EnumDecls.end(); ++E)
+                if (LeafOf(E->first) == LeafOf(Enum)) It = E;
+        if (It != EnumDecls.end())
+            for (const auto& [Name, Value] : It->second) if (Value == V) return Name;
+        return std::string();
+    }
+    std::string NameTemplateUses(const std::string& Q, bool* bUnresolved) const;
     FRecord FreeLib;                                                    // the source's function library, see FreeLibrary
     bool FreeLibrary(const FFreeFn& F, std::string* Err);
     std::map<std::string, const Json*> MemberTemplates;                 // decl id -> a member template's instantiation,
@@ -3074,6 +3265,8 @@ bool FCompiler::Collect(std::string* Err)
     std::map<std::string, std::string> EnumUnderlying;
     std::vector<std::pair<std::string, std::string>> EnumMarks;      // enum, owning mod ("" for this one)
     std::map<std::string, std::string> GlobalAliases;                // a global `using A = B;` / typedef: A -> B
+    struct FStaticTemplate { std::string Owner; const Json* Inst; const Json* Tmpl; uint32 Access; };
+    std::vector<FStaticTemplate> StaticTemplates;                    // a static member template's instantiations
 
     /* UeApi headers put Blueprint classes in namespaces mirroring their /Game path. */
     std::function<void(const Json&, const std::string&)> Walk =
@@ -3204,8 +3397,54 @@ bool FCompiler::Collect(std::string* Err)
             Walk(N, Ns);
             return;
         }
+        /* A class or struct template of the mod's own, one whose pattern derives a class or is a UE_STRUCT: each
+           instantiation is a record of its own, named by its arguments (InstanceSuffix), and cooked as any class or
+           struct is. The pattern is none. An explicit specialization or instantiation is defined at namespace scope;
+           the template holds only a reference to it. */
+        if (Kind(N) == "ClassTemplateDecl")
+        {
+            bool bMod = false;
+            ForEach(N, [&](const Json& P) {
+                if (Kind(P) != "CXXRecordDecl" || P.value("isImplicit", false)) return;
+                bMod = bMod || P.contains("bases");
+                ForEach(P, [&](const Json& C) { bMod = bMod || (Kind(C) == "VarDecl" && Name(C) == "UeStructMeta"); });
+            });
+            if (!bMod) return;
+            ModClassTemplates[Ns + Name(N)] = &N;
+            ModTemplateLeaves.insert(Name(N));
+            Walk(N, Ns);
+            return;
+        }
+        if (Kind(N) == "CXXRecordDecl" && Scope.contains("kind") && Kind(Scope) == "ClassTemplateDecl"
+            && ModClassTemplates.count(Ns + Name(Scope))) return;
+        bool bInstance = false;
+        if (const auto T = Kind(N) == "ClassTemplateSpecializationDecl" && N.contains("inner") ? ModClassTemplates.find(Ns + Name(N))
+                                                                                                : ModClassTemplates.end();
+            T != ModClassTemplates.end())
+        {
+            std::string Suffix, Shown;
+            if (!InstanceSuffix(N, *T->second, [&](const std::string& A) { return AliasOf(A); }, &Suffix, &Shown,
+                       [&](const std::string& E, int64 V) { return EnumeratorOf(E, V); }))
+            {
+                *Err = Ns + Name(N) + "<...>: a template argument has no name to give the instantiation (a lambda's type, "
+                       "a template, a pointer value), and each instantiation is a type cooked under its arguments' names";
+                bMetaOk = false;
+                return;
+            }
+            const std::string Inst = Name(N) + "__" + Suffix, Id = N.value("id", std::string());
+            const auto [Was, bNew] = InstanceTypes.emplace(Ns + Inst, FInstanceType{ Id, Shown, T->second });
+            if (!bNew && Was->second.Id != Id)
+            {
+                *Err = Shown + " and " + Was->second.Shown + " would both be cooked as " + Inst + ", the name their "
+                       "arguments give an instantiation (REFERENCE.md#templates.instance-names): use only one of them";
+                bMetaOk = false;
+                return;
+            }
+            const_cast<Json&>(N)["name"] = Inst;
+            bInstance = true;
+        }
         if ((Kind(N) != "CXXRecordDecl" && (Kind(N) != "ClassTemplateSpecializationDecl" || !Scope.contains("kind")
-                                           || Kind(Scope) != "ClassTemplateDecl"))
+                                           || (Kind(Scope) != "ClassTemplateDecl" && !bInstance)))
             || !N.contains("name") || !N.contains("inner")) return;
         /* A forward declaration is no record, though it may carry an attribute: `&AActor::F` gives every declaration of
            AActor an implicit MSInheritanceAttr, the `class AActor;` a header has after the definition too, which would
@@ -3497,7 +3736,12 @@ bool FCompiler::Collect(std::string* Err)
                 R.bFinal = true;
             else if (Kind(C) == "FunctionTemplateDecl")
                 ForEach(C, [&](const Json& M) {
-                    if (Kind(M) == "CXXMethodDecl") TemplateOwner[M.value("id", std::string())] = R.CppName;
+                    if (Kind(M) != "CXXMethodDecl") return;
+                    TemplateOwner[M.value("id", std::string())] = R.CppName;
+                    bool bBody = false;
+                    ForEach(M, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+                    if (bBody && IsInstance(M) && M.value("storageClass", std::string()) == "static" && !M.value("inline", false))
+                        StaticTemplates.push_back({ R.CppName, &M, &C, Access });
                 });
         };
         ForEach(N, Member);
@@ -3531,6 +3775,97 @@ bool FCompiler::Collect(std::string* Err)
     };
     Walk(Doc, std::string());
     if (!bMetaOk) return false;
+    /* Every spelling of an instantiation of a mod's class template, `FBox<float>`, `const FBox<int32> &`, `FBox<Real>`,
+       becomes its record's name (FBox__float) before anything reads a type: a member, a parameter, `this` and a base
+       then name the record as they would any class. A spelling that leaves an argument to its default, or names an
+       alias only the desugared type sees through, is read from clang's desugared type. A template argument stays as
+       clang wrote it: InstanceSuffix reads it. */
+    if (!ModTemplateLeaves.empty())
+    {
+        auto Rename = [&](Json& T) {
+            if (!T.is_object() || !T.contains("qualType") || !T["qualType"].is_string()) return;
+            bool bUnresolved = false;
+            std::string Q = NameTemplateUses(T["qualType"].get<std::string>(), &bUnresolved);
+            if (bUnresolved && T.contains("desugaredQualType") && T["desugaredQualType"].is_string())
+                Q = NameTemplateUses(T["desugaredQualType"].get<std::string>(), &bUnresolved);
+            T["qualType"] = Q;
+            if (T.contains("desugaredQualType") && T["desugaredQualType"].is_string())
+                T["desugaredQualType"] = NameTemplateUses(T["desugaredQualType"].get<std::string>(), &bUnresolved);
+        };
+        std::function<void(Json&)> Walk2 = [&](Json& N) {
+            if (!N.is_structured()) return;
+            if (N.is_object())
+            {
+                if (Kind(N) == "TemplateArgument") return;
+                if (auto T = N.find("type"); T != N.end()) Rename(*T);
+            }
+            for (Json& C : N) Walk2(C);
+        };
+        Walk2(const_cast<Json&>(Doc));
+        bool bIgnored = false;
+        for (auto& [Cpp, R] : Records)
+        {
+            R.Base = NameTemplateUses(R.Base, &bIgnored);
+            for (std::string& I : R.Interfaces) I = NameTemplateUses(I, &bIgnored);
+            for (auto& [A, T] : R.TypeAliases) T = NameTemplateUses(T, &bIgnored);
+        }
+        for (auto& [A, T] : Aliases) T = NameTemplateUses(T, &bIgnored);
+        for (auto& [A, T] : GlobalAliases) T = NameTemplateUses(T, &bIgnored);
+    }
+    /* A static member template's instantiation that is not inline is a static of its class, named by its arguments
+       (InstanceSuffix), on a class of the mod's own: this source's, or another mod's it includes, whose package has the
+       function if a source of that mod instantiates it too. A struct holds no functions, and an engine or game class
+       none of a template's, so theirs stay expanded at the call, as does one whose arguments have no name. */
+    for (const FStaticTemplate& S : StaticTemplates)
+    {
+        FRecord& R = Records[S.Owner];
+        if (R.bIsStruct || !(R.IsGenerated() || (R.IsNative() && R.UePackage.compare(0, 6, "/Game/") == 0))) continue;
+        std::string Suffix, Shown;
+        if (!InstanceSuffix(*S.Inst, *S.Tmpl, [&](const std::string& A) { return AliasOf(A); }, &Suffix, &Shown,
+                       [&](const std::string& E, int64 V) { return EnumeratorOf(E, V); })) continue;
+        const std::string Fn = Name(*S.Inst) + "__" + Suffix, Id = S.Inst->value("id", std::string());
+        if (const auto M = R.Methods.find(Fn); M != R.Methods.end() && M->second != S.Inst)
+        {
+            *Err = R.CppName + "::" + Shown + " would be cooked as " + Fn + ", which " + R.CppName + " already has: the name "
+                   "its arguments give an instantiation (REFERENCE.md#templates.instance-names); rename one, or make the "
+                   "template inline";
+            return false;
+        }
+        const_cast<Json&>(*S.Inst)["name"] = Fn;
+        NamePackParms(const_cast<Json&>(*S.Inst));
+        InstanceNames[Id] = Fn;
+        R.Methods[Fn] = S.Inst;
+        R.AllMethods.push_back(S.Inst);
+        R.MethodAccess[Fn] = S.Access;
+        MethodOwner[Id] = R.CppName;
+    }
+    /* C++ instantiates a class template's method only where it is called, and an event a class overrides is called by
+       the engine, by name: an instantiation cooked without its ReceiveBeginPlay would run the parent's, silently. An
+       explicit instantiation (`template class ATurret<float>;`) instantiates every member. */
+    for (const auto& [Inst, T] : InstanceTypes)
+    {
+        const FRecord& R = Records[Inst];
+        if (R.bIsStruct) continue;
+        std::set<std::string> Defined;
+        ForEach(*T.Tmpl, [&](const Json& P) {
+            if (Kind(P) != "CXXRecordDecl" || P.value("isImplicit", false)) return;
+            ForEach(P, [&](const Json& M) {
+                bool bBody = false;
+                ForEach(M, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+                if (Kind(M) == "CXXMethodDecl" && bBody) Defined.insert(Name(M));
+            });
+        });
+        for (const Json* M : R.AllMethods)
+        {
+            bool bBody = false;
+            ForEach(*M, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+            if (bBody || !Defined.count(Name(*M))) continue;
+            *Err = T.Shown + "::" + Name(*M) + " is not instantiated: C++ compiles a class template's method only where "
+                   "this source calls it, and the engine calls an event or another mod's call by name. Write `template "
+                   "class " + T.Shown + ";` after the template, which instantiates every member";
+            return false;
+        }
+    }
     /* A global alias of a template or a class (`using TargetRef = TScriptInterface<...>;`, `using Gun =
        Game::...::Gun_C;`) is written out in every use, out-of-line method bodies included. Find resolved one of
        a class but nothing one of a template, and clang desugars only a type's outer layer, so `Gun *` kept its alias
@@ -8421,6 +8756,8 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         DeclId = Ref.value("id", std::string());
         MethodName = Name(Ref);
     }
+    /* A static member template's instantiation is its class's function under the name its arguments give it. */
+    if (const auto Inst = InstanceNames.find(DeclId); Inst != InstanceNames.end()) MethodName = Inst->second;
     /* SpawnActor returns None while a construction script runs (bIsRunningConstructionScript, LevelActor.cpp), and the
        editor keeps spawning out of the construction script graph. */
     const bool bSpawn = MethodName == "BeginDeferredActorSpawnFromClass" || MethodName == "BeginSpawningActorFromClass"
@@ -15469,7 +15806,8 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
        at its place, a function parameter pack the parameters it gave the pack's name (none for an empty pack). */
     if (K == "SizeOfPackExpr")
     {
-        const Json* Def = InlineStack.empty() ? nullptr : InlineStack.back();
+        /* Or the instantiation being compiled, a non-inline template's function. */
+        const Json* Def = InlineStack.empty() ? CurFnDef : InlineStack.back();
         const auto T = Def ? TemplateOf.find(Def->value("id", std::string())) : TemplateOf.end();
         if (T == TemplateOf.end()) return false;
         const std::string Pack = E.value("name", std::string());
@@ -15495,7 +15833,7 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
         if (Count < 0 && bFunctionPack)
         {
             Count = 0;
-            ForEach(*Def, [&](const Json& P) { Count += Kind(P) == "ParmVarDecl" && Name(P) == Pack; });
+            ForEach(*Def, [&](const Json& P) { Count += Kind(P) == "ParmVarDecl" && P.value("packName", Name(P)) == Pack; });
         }
         if (Count < 0) return false;
         Out = {};
@@ -15982,14 +16320,62 @@ library's default object. The editor gives every function of a function library 
 to its self (UK2Node_FunctionEntry::AllocateDefaultPins), and so does this: a function that declares no WorldContext
 parameter gets one, so what it calls finds the caller's world, as it would from an inline body.
 */
+/* Q with each instantiation of a mod's class template it spells, `FBox<float>` or `Ns::FBox<int32>`, as its record's
+   name, `FBox__float` (Collect). bUnresolved is set where one names no instantiation this source has, under a
+   spelling InstanceSuffix would not give: an argument left to its default, or an alias Aliases does not know. */
+std::string FCompiler::NameTemplateUses(const std::string& Q, bool* bUnresolved) const
+{
+    if (Q.find('<') == std::string::npos) return Q;
+    auto IsWord = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+    std::string Out;
+    for (size_t I = 0; I < Q.size();)
+    {
+        if (!std::isalpha(uint8(Q[I])) && Q[I] != '_') { Out += Q[I++]; continue; }
+        size_t E = I;
+        for (;;)
+        {
+            while (E < Q.size() && IsWord(Q[E])) ++E;
+            if (Q.compare(E, 2, "::") != 0 || E + 2 >= Q.size() || !(std::isalpha(uint8(Q[E + 2])) || Q[E + 2] == '_')) break;
+            E += 2;
+        }
+        const std::string Spelled = Q.substr(I, E - I);
+        size_t Lt = E;
+        while (Lt < Q.size() && Q[Lt] == ' ') ++Lt;
+        size_t Gt = Lt;
+        if (ModTemplateLeaves.count(LeafOf(Spelled)) && Lt < Q.size() && Q[Lt] == '<')
+            for (int32 Depth = 0; Gt < Q.size(); ++Gt)
+                if (Q[Gt] == '<') ++Depth;
+                else if (Q[Gt] == '>' && --Depth == 0) break;
+        if (Gt == Lt || Gt >= Q.size()) { Out += Spelled; I = E; continue; }
+        std::string Suffix;
+        bool bNamed = true;
+        for (const std::string& A : SplitTemplateArgs(Q.substr(Lt + 1, Gt - Lt - 1)))
+        {
+            const std::string S = TemplateArgText(A, [&](const std::string& X) { return AliasOf(X); });
+            bNamed = bNamed && !S.empty();
+            Suffix += (Suffix.empty() ? "" : "_") + S;
+        }
+        const FRecord* R = bNamed ? Find(Spelled + "__" + Suffix) : nullptr;
+        if (!R || !InstanceTypes.count(R->CppName)) { *bUnresolved = true; Out += Spelled; I = E; continue; }
+        Out += R->CppName;
+        I = Gt + 1;
+    }
+    return Out;
+}
+
 bool FCompiler::FreeLibrary(const FFreeFn& F, std::string* Err)
 {
     const std::string Fn = Flatten(F.Qual);
     if (auto M = FreeLib.Methods.find(Fn); M != FreeLib.Methods.end())
     {
         if (M->second == F.Decl) return true;
-        *Err = F.Qual + " is overloaded, and a function library has one function per name: give each non-inline overload "
-               "a name of its own, or make all but one inline";
+        if (!F.Shown.empty())
+            *Err = F.Shown + " would be cooked as " + Fn + ", which the library already has: the name its arguments give "
+                   "an instantiation (REFERENCE.md#templates.instance-names). Call only one of them, rename the other "
+                   "function, or make the template inline";
+        else
+            *Err = F.Qual + " is overloaded, and a function library has one function per name: give each non-inline "
+                   "overload a name of its own, or make all but one inline";
         return false;
     }
     Json& Decl = const_cast<Json&>(*F.Decl);
@@ -22700,7 +23086,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
        the first, which is inside the function's namespace. `inline` on any of them, or being a template's
        instantiation (a call names its own FunctionDecl), expands the body at the call; any other function with a body
        is a static of the source's function library (FreeLibrary). Class bodies are skipped; their methods are the records'. */
-    struct FChain { Json* First = nullptr; Json* Def = nullptr; std::string Qual; bool bInline = false; std::vector<std::string> Ids; };
+    struct FChain { Json* First = nullptr; Json* Def = nullptr; std::string Qual, Shown; bool bInline = false, bInstance = false; std::vector<std::string> Ids; };
     std::map<std::string, FChain> Chains;           // the first declaration's id -> its function
     std::map<std::string, std::string> ChainOf;     // any declaration's id -> the first's
     std::vector<const FChain*> ChainOrder;          // Chains in document order: an id is an address in clang
@@ -22708,7 +23094,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (!N.is_object()) return;
         const std::string K = Kind(N);
         if (K == "FunctionTemplateDecl") IndexTemplate(N);
-        if (K == "CXXRecordDecl")
+        if (K == "CXXRecordDecl" || (K == "ClassTemplateSpecializationDecl" && InstanceTypes.count(Ns + Name(N))))
         {
             /* Class bodies are the records', except member templates: no UFunction per instantiation, so each
                one a call names is inlined. The dependent pattern sits beside them and no call names it. */
@@ -22720,7 +23106,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
                 {
                     bool bBody = false;
                     ForEach(M, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
-                    if (Kind(M) == "CXXMethodDecl" && bBody)
+                    if (Kind(M) == "CXXMethodDecl" && bBody && !InstanceNames.count(M.value("id", std::string())))
                     {
                         NormalizePointers(M);
                         MemberTemplates[M.value("id", std::string())] = &M;
@@ -22732,12 +23118,25 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (K == "FunctionDecl")
         {
             const std::string Id = N.value("id", std::string());
+            /* A non-inline template's instantiation is a function of its own, named by its arguments, unless one has
+               no name (a lambda's type), which leaves it expanded. A redeclaration of the template lists it again by
+               id, with no arguments. */
+            std::string Suffix, Shown;
+            const auto Tmpl = bTemplate && !N.value("inline", false) && IsInstance(N) ? TemplateOf.find(Id) : TemplateOf.end();
+            const bool bCompiled = Tmpl != TemplateOf.end()
+                && InstanceSuffix(N, *Tmpl->second, [&](const std::string& A) { return AliasOf(A); }, &Suffix, &Shown,
+                       [&](const std::string& E, int64 V) { return EnumeratorOf(E, V); });
+            if (bCompiled)
+            {
+                N["name"] = Name(N) + "__" + Suffix;
+                NamePackParms(N);
+            }
             const auto Prev = ChainOf.find(N.value("previousDecl", std::string()));
             const std::string Head = ChainOf[Id] = Prev == ChainOf.end() ? Id : Prev->second;
             FChain& C = Chains[Head];
-            if (!C.First) { C.First = &N; C.Qual = Ns + Name(N); ChainOrder.push_back(&C); }
+            if (!C.First) { C.First = &N; C.Qual = Ns + Name(N); C.Shown = Ns + Shown; C.bInstance = bCompiled; ChainOrder.push_back(&C); }
             C.Ids.push_back(Id);
-            C.bInline = C.bInline || bTemplate || N.value("inline", false);
+            C.bInline = C.bInline || (bTemplate && !C.bInstance) || N.value("inline", false);
             ForEach(N, [&](const Json& B) { if (Kind(B) == "CompoundStmt") C.Def = &N; });
             return;
         }
@@ -22756,7 +23155,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         }
         for (const std::string& Id : C->Ids)
             if (C->bInline) FreeInlines[Id] = C->Def;
-            else FreeFns[Id] = { C->First, C->Def, C->Qual };
+            else FreeFns[Id] = { C->First, C->Def, C->Qual, C->bInstance ? C->Shown : std::string() };
     }
     FreeLib.CppName = "BPL_" + std::filesystem::path(SourcePath).stem().string();
     FreeLib.Base = "UBlueprintFunctionLibrary";

@@ -3,7 +3,8 @@ FreeTest.cpp - free functions that are not inline.
 
 A Blueprint has no free functions. Each one a function calls is a static of the one function library the compiler
 generates for the source, BPL_FreeTest, called on its default object. Like a function of the editor's function library,
-it gets a hidden world context the caller fills in with its self. A template is expanded at the call, inline or not.
+it gets a hidden world context the caller fills in with its self. A template without `inline` is one function per
+instantiation, named by its arguments: Max2__int32.
 */
 #include "UeApi/Types.h"
 
@@ -22,7 +23,7 @@ inline int32 Pick(int32 V) { return V + 1; } // expanded; the bool overload is t
 int32        Pick(bool B) { return B ? 100 : 200; }
 /* No WorldContext parameter: the hidden one is what GetPlayerPawn gets, the caller's self. */
 APawn *FirstPawn() { return UGameplayStatics::GetPlayerPawn(0); }
-template <class T> T Max2(T A, T B) { return A > B ? A : B; }
+template <class T> T Max2(T A, T B) { return A > B ? A : B; } // Max2__int32, the instantiation UseMax calls
 constexpr int32 Sq(int32 X) { return X * X; } // not run at build time: a library function like any other
 /* A world context it declares replaces the hidden one. */
 APawn *TheirPawn(UObject *WorldContextObject = nullptr) { return UGameplayStatics::GetPlayerPawn(WorldContextObject, 0); }

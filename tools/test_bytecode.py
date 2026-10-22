@@ -4772,11 +4772,12 @@ def patch_members(comp_game):
 def free_functions():
     """FreeTest: each free function a call reaches that is not inline is a static of BPL_FreeTest, the one function
     library generated for the source, called on its default object. Each takes a hidden world context the call fills in
-    with its self, as a function of the editor's function library does, unless it declares its own. A template is
-    expanded, inline or not."""
+    with its self, as a function of the editor's function library does, unless it declares its own. A template without
+    inline is one function per instantiation: Max2__int32."""
     lib = os.path.join(os.path.dirname(asset('FreeTest')), 'BPL_FreeTest')
     fns = sorted(e for e in exports_of(lib) if not e.endswith('_C'))
-    assert fns == ['Fact', 'FirstPawn', 'Later', 'Pick', 'Sq', 'TheirPawn', 'Twice', 'Util__Clamp', 'Util__Twice'], fns  # no Max2
+    assert fns == ['Fact', 'FirstPawn', 'Later', 'Max2__int32', 'Pick', 'Sq', 'TheirPawn', 'Twice', 'Util__Clamp',
+                   'Util__Twice'], fns
     for fn in fns:
         flags = int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', lib, export_index(lib, fn))).group(1), 16)
         assert flags & 0x04022001 == 0x04022001, (fn, hex(flags))      # BlueprintCallable | Public | Static | Final
@@ -4801,7 +4802,7 @@ def free_functions():
     assert vm.call('UseTheirs', other) is other and vm.call('UseTheirsDefault') is vm.self
     assert vm.log and all(ctx is cdo for _fn, ctx, _a in vm.log), vm.log
     print('ok  FreeTest: a free function is a static of the source\'s library, called on its default object with the '
-          'caller as its world context; recursion, namespaces, defaults, constexpr and a template expanded')
+          'caller as its world context; recursion, namespaces, defaults, constexpr and a template instantiation')
     proves('free-functions.int32-ov-int32-v')
     refused('FreeOverload', '  int32 F() { return Ov(1) + Ov(2.0f); }\n', 'Ov is overloaded',
             top='int32 Ov(int32 V) { return V; }\nint32 Ov(float V) { return 1; }\n')
@@ -5342,6 +5343,86 @@ ue_assets()
 asset_elsewhere()
 globals_()
 free_functions()
+
+
+def template_instances():
+    """TemplateInst: a template without inline is compiled once per instantiation, named by its arguments
+    (REFERENCE.md#templates.instance-names): a free one is a function of BPL_TemplateInst, a static member one a static
+    of its class, a class or struct template one cooked class or struct each. Each runs as the C++ does; an inline
+    template is still expanded at its call."""
+    at = lambda n: os.path.join(os.path.dirname(asset('TemplateInst')), n)
+    lib, til, holder = at('BPL_TemplateInst'), at('UTiLib'), at('ATiHolder__int32')
+    for base in (lib, til, holder, at('FTiPair__float'), at('FTiPair__int32'), at('FTiTagged__Angry'), asset('TemplateInst')):
+        keeps_invariants(base)
+    fns = sorted(e for e in exports_of(lib) if not e.endswith('_C'))
+    proves('templates.template-class-t-t-max2', 'templates.instance-names', 'templates.pack-instance',
+           'templates.template-class-t-inline-t')
+    assert fns == ['Count__', 'Count__int32_float_bool', 'Fact__int32', 'Max2__float', 'Max2__int32', 'ModeOf__Angry',
+                   'ModeOf__Calm', 'Pick__false', 'Pick__true', 'Times__3', 'Times__m2', 'Util__Twice__int32',
+                   'Width__float'], fns     # no Min2
+    assert runscript.params_of(lib, 'Count__int32_float_bool') == ['V_0', 'V_1', 'V_2', 'WorldContextObject']
+    proves('templates.static-member-template')
+    assert sorted(e for e in exports_of(til) if not e.endswith('_C')) == ['Get__float', 'Get__int32']
+    flags = int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', til, export_index(til, 'Get__int32'))).group(1), 16)
+    assert flags & 0x00002000, hex(flags)                                              # Static
+    # One struct per instantiation used; that FTiPair<float>'s members are floats is UseBox's 2.5 below.
+    assert all(os.path.exists(at(i) + '.uasset') for i in ('FTiPair__float', 'FTiPair__int32', 'FTiTagged__Angry'))
+    proves('templates.class-template')
+    assert {'Doubled', 'ReceiveBeginPlay'} <= set(exports_of(holder)), exports_of(holder)
+    # Run: the class's calls land in the library's (or UTiLib's) VM, as a static call does.
+    cdo = Obj('BPL_TemplateInst_C')
+    lib_vm, til_vm = VM(lib, objects={'Default__BPL_TemplateInst_C': cdo}), VM(til)
+    natives = {fn: (lambda fn: lambda _vm, ctx, *a: lib_vm.call(fn, *a))(fn) for fn in fns}
+    natives['Get__int32'] = lambda _vm, ctx, *a: til_vm.call('Get__int32', *a)
+    vm = VM(asset('TemplateInst'), objects={'Default__BPL_TemplateInst_C': cdo}, natives=natives)
+    proves('templates.struct-template')
+    got = [vm.call('UseMax', 3, 9), vm.call('UseMaxF', 2.5, 1.0), vm.call('UseFact', 5), vm.call('UseTimes', 7),
+           vm.call('UsePick'), vm.call('UseCount'), vm.call('UseTwice', 4), vm.call('UseMin', 3, 9),
+           vm.call('UseBox', 1.5, 4.0), vm.call('UseIntBox', 6), vm.call('UseGet', 5), vm.call('UseMode')]
+    assert got == [9, 2.5, 120, 7 * 3 * 100 - 14, 12, 30, 8, 3, 2.5, 6, 15, 21], got
+    assert til_vm.call('Get__float', 1.5) == 4.5
+    h = VM(holder, Value=4)
+    h.call('ReceiveBeginPlay')
+    assert h.self.vars['Value'] == 5 and h.call('Doubled') == 10, h.self.vars
+    print('ok  TemplateInst: each instantiation of a template without inline is a function, static or cooked type of '
+          'its own, named by its arguments, and runs as C++ does')
+
+
+template_instances()
+
+
+def template_instance_refusals():
+    """Two instantiations whose arguments spell one name are refused, whichever kind; so is a class template's
+    instantiation missing a method C++ did not instantiate. A lambda argument keeps a template expanded."""
+    proves('templates.instance-name-clash')
+    refused('TiFnClash', '  int32 F() { return Id<AActor>() + Id<AActor *>(); }\n', 'would be cooked as Id__AActor',
+            top='template <class T> int32 Id() { return 1; }\n')
+    refused('TiStaticClash', '  int32 F() { return ULibC::Id<AActor>() + ULibC::Id<AActor *>(); }\n',
+            'would be cooked as Id__AActor, which ULibC already has',
+            top='class ULibC : public UBlueprintFunctionLibrary {\npublic:\n  template <class T> static int32 Id() { return 1; }\n};\n')
+    refused('TiTypeClash', '  FTag<AActor> A;\n  FTag<AActor *> B;\n', 'would both be cooked as FTag__AActor',
+            top='template <class T> struct FTag {\n  UE_STRUCT;\n  int32 N;\n};\n')
+    proves('templates.class-template-not-instantiated')
+    refused('TiNotInst', '  int32 F(ATiHold<int32> *H) { return H->Get(); }\n',
+            'ATiHold<int>::ReceiveBeginPlay is not instantiated',
+            top='template <class T> class ATiHold : public AActor {\npublic:\n  T V;\n  T Get() { return V; }\n'
+                '  void ReceiveBeginPlay() { V = 1; }\n};\n')
+    proves('templates.lambda-argument')
+    tmp, out, _log = compile_to('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n'
+                                'UE_MOD_PACKAGE("/Game/_ElytrasMods/TiLambda");\n'
+                                'template <class F> int32 Apply(int32 V, F Fn) { return Fn(V) + 1; }\n'
+                                'class TiLambda : public AActor {\npublic:\n'
+                                '  int32 Use(int32 X) { return Apply(X, [&](int32 A) { return A * 2; }); }\n};\n', 'TiLambda')
+    try:
+        assert not os.path.exists(os.path.join(out, 'BPL_TiLambda.uasset'))      # expanded: no library function
+        assert VM(os.path.join(out, 'TiLambda')).call('Use', 5) == 11
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  TemplateInst: a name two instantiations share, and a class template method C++ did not instantiate, are '
+          'refused; a lambda argument keeps the template expanded')
+
+
+template_instance_refusals()
 asset_values()
 edits()
 path_edits()
