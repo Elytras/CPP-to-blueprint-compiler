@@ -241,14 +241,14 @@ def stage_bundle(files, stage_fsd):
         shutil.copy2(src, to)
 
 
-def kept_source(mod, bp):
-    """The Content folder a mod's `kept` packages come from: `kept.from` itself, or, for a .pak, its extraction under
-    build/<mod>/kept, made once and again only when the pak changes."""
-    src = os.path.abspath(os.path.join(bp, os.path.expandvars(mod["kept"]["from"])))
+def kept_source(entry, mod, bp, i):
+    """The Content folder a `kept` entry's packages come from: its `from` itself, or, for a .pak, its extraction under
+    build/<mod>/kept (kept<i> for the i-th entry after the first), made once and again only when the pak changes."""
+    src = os.path.abspath(os.path.join(bp, os.path.expandvars(entry["from"])))
     if os.path.isdir(src):
         root = src
     else:
-        root = os.path.join(bp, "build", mod["name"], "kept")
+        root = os.path.join(bp, "build", mod["name"], "kept" + (str(i) if i else ""))
         stamp = os.path.join(root, ".pak")
         want = "%s %d %d" % (src, os.path.getsize(src), int(os.path.getmtime(src)))
         if read_text(stamp) != want:
@@ -267,14 +267,22 @@ def kept_source(mod, bp):
 
 def place_kept(mod, bp, stage_fsd):
     """A mod's `kept` packages - assets it ships as they were cooked, which no source of it builds (textures, fonts,
-    a data asset no source fills) - into its FSD tree for the pak. `paths` lists /Game package paths or folders. Hard
-    links where the volume allows: a texture folder runs to gigabytes. Returns how many files it placed."""
+    a data asset no source fills) - into its FSD tree for the pak. `kept` is one `{from, paths}` entry or a list of
+    them; `paths` lists /Game package paths or folders. Hard links where the volume allows: a texture folder runs to
+    gigabytes. Returns how many files it placed."""
     kept = mod.get("kept")
     if not kept:
         return 0
-    content = kept_source(mod, bp)
     n = 0
-    for path in kept.get("paths") or []:
+    for i, entry in enumerate(kept if isinstance(kept, list) else [kept]):
+        n += place_kept_entry(entry, mod, bp, i, stage_fsd)
+    return n
+
+
+def place_kept_entry(entry, mod, bp, i, stage_fsd):
+    content = kept_source(entry, mod, bp, i)
+    n = 0
+    for path in entry.get("paths") or []:
         rel = path[len("/Game/"):] if path.startswith("/Game/") else path.lstrip("/")
         base = os.path.join(content, *rel.split("/"))
         files = [os.path.join(r, f) for r, _d, fs in os.walk(base) for f in fs] if os.path.isdir(base) else \
