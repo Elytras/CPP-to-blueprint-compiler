@@ -1218,7 +1218,7 @@ hundreds of MB; it streams from clang through a pipe and is never written to dis
 | `<Ns>__<Name>`, a class whose default object holds a namespace-scope variable | when a function uses the variable |
 | `FDeref`, the scratch struct that raw pointer reads go through | when the source reads through a pointer and does not declare `FDeref` itself |
 | `FDerefView_<Struct>`, the view a whole struct is read and written through | when the source reads or writes that struct whole through a pointer |
-| two structs per map type walked in place, `FMapSlot_TMap_<K>_<V>` and `FMapSlots_TMap_<K>_<V>`, and a wrapper struct per container nested in another container | when the code needs one |
+| four structs per map or set type a range-for walks, such as `FMapSlot_TMap_<K>_<V>`, `FMapSlots_TMap_<K>_<V>` and their `_Free_` twins, and a wrapper struct per container nested in another container | when the code needs one |
 | each game package an edit names, at its own path, printed as `edit -> <package>.uasset (the game's, edited: ...)` | when the source has a `UE_ASSET_EDIT`, `UE_ASSET_EDITS` or `UE_PATCH` |
 | nothing; a line `value <- <package> (<path> = <value>, read when the mod is built)` for each game asset's value read | when the source reads one, `ED_Grunt.SpawnSpread`; bpbuild keeps the list in `build/<mod>/reads.txt` |
 
@@ -2052,8 +2052,6 @@ A few mistakes also compile without a message, because the construct itself work
   dump's properties of it and the game's Blueprints are reflected, and 240 of the SDK's 1445 enums have none (the
   enum's own form is not in the dump yet); a variable of one is a Byte, which differs from the editor's Enum variable
   only in type, and only if the enum is an `enum class`. See [Enums](REFERENCE.md#enums).
-- Walking a `TSet` in place. A range-for over a `TSet` walks a copy, while a `TMap` walks its own slots. Only the cost
-  differs. See [Loops](REFERENCE.md#loops).
 - Reusing a repeated pure call. It is evaluated each time it appears. To compute it once, keep the result in a local.
   See [The optimizer](REFERENCE.md#the-optimizer).
 - Game members the SDK generator cannot map. genueapi leaves out every function and property with a type it has no
