@@ -1043,6 +1043,11 @@ Watch for:
 - Extract the pak again after a game update. bpbuild then rebuilds the mod, so the edit starts from the new package.
 - Two paks that edit the same asset each carry the whole package, and the game loads only one. Keep the edits of an
   asset in one mod.
+- A patch can edit another mod's Blueprint the same way: give the patch's entry in `mods.yaml` a `game_content` of its
+  own, the other mod's pak or its mod.io URL (see [mods.yaml](#modsyaml)), and include the class from a `UeApi`
+  generated off a dump taken with that mod loaded. The patch's pak then carries a copy of the mod's package, so the mod manager must load it in
+  place of the mod's own: MINT keeps the copy of the mod listed first, so list the patch above the mod. Rebuild the
+  patch, and check that the functions it replaces kept their shape, when the mod updates.
 
 Full rules: [Editing game packages](REFERENCE.md#editing-game-packages).
 
@@ -1339,6 +1344,7 @@ Keys of a mod:
 | `bundle` | none | A list of folders, relative to the mods dir, each laid out like a staged FSD tree (`Content/...`). Every file in them is copied unchanged into the mod's pak at its path under the folder: `MyMod/Bundle/Content/_Shared/Lib.uasset` ships as `FSD/Content/_Shared/Lib.uasset`. It is for assets the mod calls but must not cook, such as a shared framework that other mods ship the same copy of. Nothing reads or rewrites the bytes. A listed entry that is not an existing folder stops the build with ``mods.yaml: a `bundle` entry is not a folder: <entry>``. `embed` does not carry a dependency's bundle: a mod that needs those files lists the folder in its own `bundle`. |
 | `generate_api` | `false` | Also writes the editor stubs for this mod's classes, interfaces, structs and enums (see [Editor API stubs](#editor-api-stubs)). |
 | `api_dir` | top-level `api_dir`, else `<mods dir>/out/api/Content` | Where the stubs go: the `Content` folder of a UE project. A mod's stubs land in `<api_dir>/<package path without /Game>/`. Only read when `generate_api` is set. |
+| `game_content` | top-level `game_content` | Where this mod's edits read their packages from, for a `UE_PATCH` of another mod's Blueprint rather than the game's: a `Content` folder, that mod's `.pak`, a `.zip` holding one, or its mod.io URL as a MINT profile lists it (`https://mod.io/g/drg/m/<mod>#<id>`, pinned to one file with `#<id>/<modfile id>`), which names the download MINT cached for it ([the row](REFERENCE.md#building-edits.game-content-https-mod-io)). A pak or zip is extracted once into `build/<name>/game/`, and again when the file changes. |
 
 `api_dir` takes any of these forms:
 

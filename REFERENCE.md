@@ -4217,6 +4217,7 @@ Notes:
 |---|---|---|
 | <a id="building-edits.assetgen-compile-source-ueapi"></a>`assetgen compile <source> <UeApi> <out-dir> --game <extracted pak>/FSD/Content` | Reads each package an edit names from that folder and writes the edited copy at the same path under the `Content` folder the out dir sits in, as for a class in a `Game::` namespace (see [Building mods](GUIDE.md#building-mods)). It prints one line per package: `edit -> <package>.uasset (the game's, edited: ...)`. | Yes |
 | <a id="building-edits.game-content-extracted-pak-fsd"></a>`game_content: <extracted pak>/FSD/Content` in `mods.yaml` | bpbuild passes it to every compile as `--game`. An edited package counts as the mod's output, so a newer copy of it in `game_content`, from a new extract after a game update, rebuilds the mod. | Yes |
+| <a id="building-edits.game-content-https-mod-io"></a>`game_content: https://mod.io/g/drg/m/<mod>#<id>` on a mod's entry, a mod.io mod as a MINT profile lists it | Builds the patch from the download MINT cached for that mod: its latest file, the one a profile listing the same URL installs, or with `#<id>/<modfile id>` that file, with a `note:` when MINT knows a newer one. bpbuild prints `extracted <mod> <version> (modfile <id>)` when it extracts a new one, and a newer download rebuilds the mod as a new game extract does. A mod or file MINT has not fetched stops the build: "MINT has not fetched this mod" / "MINT has not downloaded ...". `MINT_CACHE` names the cache folder when it is not MINT's default. | Yes |
 
 Notes:
 
