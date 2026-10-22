@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""usage: bpdecomp.py <Content dir> <out dir> --mod </Game/root>=<ModName> [--mod ...] [--names <uncooked Content dir>]
-                      [--only <package path prefix>]
+"""usage: bpdecomp_emit.py <Content dir> <out dir> --mod </Game/root>=<ModName> [--mod ...] [--names <uncooked Content dir>]
+                           [--raw <dir>] [--keep <package path>]... [--cook <package path>=<why>]...
 
 A decompiler from cooked UE 4.27 Blueprint packages back to AssetGen C++: every UserDefinedEnum, UserDefinedStruct,
 Blueprint interface, Blueprint class and widget Blueprint (its tree, event bindings and render-transform animations
