@@ -4895,6 +4895,56 @@ def edits():
     print('ok  EditTest: an edit of a mod\'s own asset, a patch of a native class, a replicated member of a patch\'s own, '
           'one named like the game\'s, and no --game are refused')
 
+    # A package another mod's editor cooked versioned (without -unversioned, as Custom Difficulty 2 ships its own) is
+    # patched like the game's when it was saved at UE 4.27's versions, and written back unversioned; saved at other
+    # versions it is refused. UMoodDef, given the versioned summary here, stands in for one.
+    def versioned(src, dst, ue4):
+        h, exp = bytearray(open(src + '.uasset', 'rb').read()), open(src + '.uexp', 'rb').read()
+        i32 = lambda o: struct.unpack_from('<i', h, o)[0]
+        assert h[8:24] == bytes(16) and i32(45) == 193, 'not the unversioned summary'     # the names follow it
+        engine = struct.pack('<HHHIi', 4, 27, 2, 0, 19) + b'++UE4+Release-4.27\0'
+        custom = struct.pack('<i', 1) + bytes(range(16)) + struct.pack('<i', 3)
+        delta = len(custom) - 4 + 2 * (len(engine) - 14)
+        for o in (24, 45, 61, 69, 73, 165) + ((189,) if i32(185) else ()):
+            struct.pack_into('<i', h, o, i32(o) + delta)
+        struct.pack_into('<q', h, 169, struct.unpack_from('<q', h, 169)[0] + delta)        # BulkDataStartOffset
+        for e in range(i32(57)):                                                            # each export's SerialOffset
+            at = i32(61) - delta + 104 * e + 36
+            struct.pack_into('<q', h, at, struct.unpack_from('<q', h, at)[0] + delta)
+        struct.pack_into('<ii', h, 8, 864, ue4)
+        out = bytes(h[:20]) + custom + bytes(h[24:121]) + engine + engine + bytes(h[149:])
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        open(dst + '.uasset', 'wb').write(out)
+        open(dst + '.uexp', 'wb').write(exp)
+
+    proves('patching-a-game.versioned-4-27-package')
+    for ue4, why in ((522, None), (521, 'versioned, not at UE 4.27\'s versions')):
+        with tempfile.TemporaryDirectory() as tmp:
+            other = os.path.join(tmp, 'other', 'Content')
+            versioned(game('UMoodDef'), os.path.join(other, '_ElytrasMods', 'AssetTest', 'UMoodDef'), ue4)
+            path = os.path.join(tmp, 'MoodPatch.cpp')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MoodPatch");\n'
+                        'class UMoodDef : public UPrimaryDataAsset {\npublic:\n'
+                        '  UE_CLASS("/Game/_ElytrasMods/AssetTest/UMoodDef", "UMoodDef_C");\n  int32 Count;\n};\n'
+                        'class MoodPatch : public UMoodDef {\n  UE_PATCH;\n  UE_DEFAULTS { Count = 7; }\n};\n')
+            out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'MoodPatch')
+            os.makedirs(out)
+            proc = assetgen_compile([path, UEAPI, out, '--game', other])
+            if why:
+                assert proc.returncode != 0 and why in proc.stdout, (ue4, proc.stdout)
+                continue
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            a, b = game('UMoodDef'), os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetTest', 'UMoodDef')
+            assert open(b + '.uasset', 'rb').read()[8:24] == bytes(16), 'written back versioned'
+            ua, ub = dumpexp.load(a), dumpexp.load(b)
+            after = tags(b, cdo)
+            assert after['Count'].endswith(': 7') and after['Title'] == tags(a, cdo)['Title'], after
+            assert all(i == cdo or blob(ua, x) == blob(ub, y) for i, (x, y) in enumerate(zip(ua[5], ub[5]))), \
+                'another export changed'
+    print('ok  EditTest: UE_PATCH edits a package cooked versioned at UE 4.27\'s versions, written back unversioned; '
+          'one at other versions is refused')
+
     # A component's defaults. CompTest stands in for a game Blueprint, declared as UeApi declares one, and Lamp for one of
     # its own SCS components: the patch lands in the Lamp's template. A parent Blueprint's component the class does not
     # override has no template in its package, and a member UeApi gives no SCS node is not a component: both refused.
