@@ -16,6 +16,8 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dumpexp import load as load_package
+import mintcache
+from mintcache import MINT_CACHE, MODIO_URL   # MINT's download cache: what a mod.io `game_content` names
 
 MOD_PACKAGE = re.compile(r'UE_MOD_PACKAGE\s*\(\s*"([^"]+)"')
 
@@ -242,44 +244,17 @@ def stage_bundle(files, stage_fsd):
         shutil.copy2(src, to)
 
 
-# MINT's download cache (drg-mod-integration): cache.json maps each mod.io mod MINT has fetched to its files, and each
-# file to a blob, the download as mod.io serves it (a .zip holding the mod's .pak). MINT_CACHE overrides the folder.
-MINT_CACHE = os.environ.get("MINT_CACHE") or (
-    os.path.join(os.environ.get("LOCALAPPDATA", ""), "drg-mod-integration", "cache") if os.name == "nt" else
-    os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "drg-mod-integration"))
-
-# A mod.io mod as a MINT profile lists it: https://mod.io/g/drg/m/<name>, then MINT's `#<mod id>`, then `/<modfile id>`
-# when the profile pins one version.
-MODIO_URL = re.compile(r"(?:https?://)?(?:www\.)?mod\.io/g/drg/m/([^#/?]+)/?(?:#(\d+)(?:/(\d+))?)?$")
-
-
 def mint_blob(url, cache):
     """The file MINT downloaded for `url`, a MODIO_URL, out of the MINT cache folder `cache`: (its path, what it is,
     a note or None). Unpinned, it is the mod's latest file MINT knows, the one a profile that lists the same URL
     installs; pinned, that file, with a note when MINT knows a newer one. Stops the build when MINT has not fetched
-    it. content_of calls it for a `game_content` or a `kept` `from` that is a mod.io URL."""
-    m = MODIO_URL.match(url)
-    index = os.path.join(cache, "cache.json")
-    if not os.path.exists(index):
-        sys.exit("%s: no MINT cache at %s (set MINT_CACHE to the folder that holds cache.json)" % (url, cache))
-    modio = json.load(io.open(index, encoding="utf-8"))["cache"]["modio"]
-    mod_id = m.group(2) or modio["mod_id_map"].get(m.group(1))
-    mod = modio["mods"].get(str(mod_id)) if mod_id is not None else None
-    if not mod:
-        sys.exit("%s: MINT has not fetched this mod; add it to a MINT profile and let MINT update" % url)
-    latest = str(mod["latest_modfile"])
-    want = m.group(3) or latest
-    versions = dict((str(f["id"]), f.get("version") or "?") for f in mod.get("modfiles") or [])
-    what = "%s %s (modfile %s)" % (mod.get("name_id", m.group(1)), versions.get(want, "?"), want)
-    blob = modio["modfile_blobs"].get(want)
-    path = os.path.join(cache, "blobs", blob) if blob else None
-    if not path or not os.path.exists(path):
-        sys.exit("%s: MINT has not downloaded %s; let MINT update a profile that lists it" % (url, what))
-    note = None
-    if want != latest:
-        note = "%s is pinned; MINT knows %s %s (modfile %s): recheck the patch against it" % (
-            what, mod.get("name_id", m.group(1)), versions.get(latest, "?"), latest)
-    return path, what, note
+    it. content_of calls it for a `game_content` or a `kept` `from` that is a mod.io URL; the cache reading itself
+    is mintcache.lookup, shared with tools/mintlib.py."""
+    try:
+        hit = mintcache.lookup(url, cache)
+    except mintcache.Miss as e:
+        sys.exit(str(e))
+    return hit["path"], hit["what"], hit["note"] and hit["note"] + ": recheck the patch against it"
 
 
 def content_of(src, bp, root):
