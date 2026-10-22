@@ -35,7 +35,7 @@ Each piece of C++ becomes the Blueprint construct the editor would have made:
 | An `inline` method or function | No function at all: each call pastes the body in, like a macro |
 | A local, `int32 Sum = 0;` | A local variable of the function |
 | A `T&` parameter, `void Around(int32 A, int32 &Lo, int32 &Hi)` | A pass-by-reference pin: the function writes the caller's variable |
-| `UE_PURE int32 Doubled() const { ... }` | A pure function, drawn without exec pins |
+| `int32 Doubled() const { ... }`, `UE_PURE static int32 Tripled(int32 V)` | A pure function, drawn without exec pins |
 | Static methods of a class deriving `UBlueprintFunctionLibrary` | A Blueprint Function Library |
 | A variable at namespace scope, `int32 Total = 0;` | No Blueprint has globals: a class that AssetGen generates holds it in its default object |
 | `if`, `switch`, `for`, `while` | The Branch node, Switch on Int / Enum (one jump through a table), the ForLoop and WhileLoop macros, compiled to jumps |
@@ -334,7 +334,8 @@ body is copied in. A call that stays a call is bound only to a function the fina
 overrides or inherits is called by name, as the editor calls a function that is not Final, which with no subclass
 reaches the same body.
 
-`UE_PURE` makes a pure function, drawn without exec pins. A `T&` parameter is an output, a pass-by-reference pin. A
+A `const` method that returns a value is a pure function, drawn without exec pins, as UHT makes one; `UE_PURE` makes a
+static one pure, and also promises no side effects, so an unused call of it is dropped. A `T&` parameter is an output, a pass-by-reference pin. A
 `static` method runs on the class default object (the instance that holds Class Defaults), which has no world, so give
 it a `UObject *WorldContextObject` parameter if it calls the engine. A static of a function library
 (`UBlueprintFunctionLibrary`) is always called, as the editor's library nodes are, unless you mark it
@@ -449,10 +450,11 @@ Full rules: [Calling engine and game functions](REFERENCE.md#calling-engine-and-
 
 ### Components and spawning
 
-`UE_COMPONENT(Type, Name)` adds a component, as Add Component in the Components panel does. `Name` is an object
-variable, and each spawned actor gets its own instance, in place by the time its construction script and BeginPlay
+A pointer member the constructor sets with `CreateDefaultSubobject`, as in UE C++, adds a component, as Add Component
+in the Components panel does: `UStaticMeshComponent *Mesh;` and `Mesh = CreateDefaultSubobject<UStaticMeshComponent>("Mesh");`
+(the older `UE_COMPONENT(Type, Name)` says the same). `Mesh` is an object variable, and each spawned actor gets its own instance, in place by the time its construction script and BeginPlay
 run. The first scene component is the root, and every later scene component attaches to it. To place one elsewhere,
-write `Tip->SetupAttachment(Glow);` in `UE_DEFAULTS`, as a C++ constructor does: under another of the class's
+write `Tip->SetupAttachment(Glow);` in the constructor, as UE C++ does: under another of the class's
 components, at a socket with `SetupAttachment(Glow, FName("Muzzle"))`, or under a component the class inherits, from
 a mod or game Blueprint parent or a native one (`SetupAttachment(Mesh)` in an `ACharacter` or `APlayerCharacter`
 child), or under the actor's root, whichever that is (`SetupAttachment(RootComponent)`). A component that is not a
@@ -460,7 +462,7 @@ scene component, such as a movement component, attaches to nothing. `SetupAttach
 keeping the relative transform, with a warning: the engine's own does nothing once the actor is constructed, so write
 `AttachToComponent` there.
 
-Set a component's defaults in `UE_DEFAULTS`, one `Comp->Field = value;` each, as you would in its Details panel.
+Set a component's defaults in the constructor (or `UE_DEFAULTS`), one `Comp->Field = value;` each, as you would in its Details panel.
 Assign a struct whole (`FVector(...)`, `FColor(R, G, B)`), and an asset with `&Asset`
 (see [Data assets and game assets](#data-assets-and-game-assets)). The class can be an engine or game component
 class, or a component class your mod declares
@@ -482,12 +484,15 @@ UE_ASSET_AT(UStaticMesh, SM_Crate_B, "/Game/Art/Environments/SpaceRig/SM_Crate_B
 
 class Crate : public AActor {
 public:
-  UE_COMPONENT(USceneComponent, Root);        // the first scene component is the root
-  UE_COMPONENT(UStaticMeshComponent, Mesh);   // attached to Root
-  UE_COMPONENT(UPointLightComponent, Lamp);   // attached to Root
+  USceneComponent *Root;                      // the first scene component is the root
+  UStaticMeshComponent *Mesh;                 // attached to Root
+  UPointLightComponent *Lamp;                 // attached to Root
 
-  UE_DEFAULTS {                               // what the Details panel would set
-    Mesh->StaticMesh = &SM_Crate_B;
+  Crate() {                                   // read as the defaults, never run
+    Root = CreateDefaultSubobject<USceneComponent>("Root");
+    Mesh = CreateDefaultSubobject<UStaticMeshComponent>("Mesh");
+    Lamp = CreateDefaultSubobject<UPointLightComponent>("Lamp");
+    Mesh->StaticMesh = &SM_Crate_B;           // what the Details panel would set
     Lamp->Intensity = 1500.0f;
     Lamp->LightColor = FColor(255, 128, 0);
     Lamp->RelativeLocation = FVector(0.0f, 0.0f, 80.0f);
@@ -774,15 +779,16 @@ variables, and the editor's Make Struct when one computes something (`FVector2D(
 its own statement, left to right. Braces, positional or with designated members, are the editor's Make Struct:
 `FHitResult Hit = { .Time = 0.5f };`. Members the braces leave out keep their defaults; a member given `{}` is a fresh
 value of its type, as in C++: zero, empty, None. Member reads and writes, nested to any depth, act on the struct in
-place. A struct of your own carries `UE_STRUCT;` in its body. It is cooked as a Structure asset in the mod package, and
-its members' initializers are its default values. `==` and `!=` on two vectors compare every component exactly, as
+place. A struct of your own is cooked as a Structure asset in the mod package once a member, parameter, local or
+container of a mod class names it, and its members' initializers are its default values; one only C++ reads (a
+constexpr table) stays plain, and `UE_STRUCT;` in its body cooks it anyway. `==` and `!=` on two vectors compare every component exactly, as
 in UE C++, not with the editor node's 1e-4 tolerance; on two rotators they compare rotations, with a warning.
 `FTransform(Rotation, Translation, Scale)`, UE's order with an FRotator, and `FTransform(Location, Rotation, Scale)`,
 the Make Transform node's, are both that node.
 
-An enum of your own is an `enum class` with a `uint8`, `int32` or `int64` underlying type, followed by `UE_ENUM(Name);`.
-It is cooked as an Enumeration asset and then works like any Blueprint enum: variables, parameters, constants and
-`switch`. Without `UE_ENUM` its constants still fold to numbers, but a variable of it is refused.
+An enum of your own is an `enum class : uint8`, cooked as an Enumeration asset once a reflected position names it, as a
+struct is. It then works like any Blueprint enum: variables, parameters, constants and `switch`. An `int32` or `int64`
+one needs `UE_ENUM(Name);` after it; without that its constants still fold to numbers, but a variable of it is refused.
 `UE_ENUM_MAP(E, FName, Names);` declares a `TMap<E, FName>` member and fills in a name table at build time, and
 `UE_ENUM_MAP(FString, E, ByName);` the way back. For enum to name, declare the variable as `TEnum<E>`: it is still an
 E, and `.Name()` / `.String()` ask the engine. The game's enum fields and return values already come as `TEnum<E>` in
@@ -804,11 +810,9 @@ array one: a `TArray<APawn *>` for a `const TArray<AActor *>&` or by-value param
 upcast. Interfaces, downcasts and other element types are refused, and so is a non-const `TArray<AActor *>&`.
 
 ```cpp
-enum class ERank : uint8 { Rookie, Veteran, Legend };
-UE_ENUM(ERank);
+enum class ERank : uint8 { Rookie, Veteran, Legend };      // cooked: FEntry names it
 
-struct FEntry {
-  UE_STRUCT;
+struct FEntry {                                             // cooked: Tally's members name it
   FName Player;
   int32 Kills = 0;
   ERank Rank = ERank::Rookie;
@@ -980,11 +984,12 @@ Watch for:
   has these markers. Without one, the override is refused: "... its header does not say which SCS node it is -
   re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi".
 - A property that holds an object made for the class, such as a status effect's `StatusEffects` or a projectile
-  attack's `Projectiles`, takes `UE_INSTANCED(Type, Outer, "Name")`. Hold it in a local to set its fields, and give it
+  attack's `Projectiles`, takes `NewObject<Type>(Outer, "Name")` in the constructor (`UE_INSTANCED(Type, Outer,
+  "Name")` is its old spelling). Hold it in a local to set its fields, and give it
   the name the parent's object has to change that one rather than add another:
 
   ```cpp
-  UNormalProjectileAttack *Shot = UE_INSTANCED(UNormalProjectileAttack, ProjectileAttack, "NormalProjectileAttack_0");
+  UNormalProjectileAttack *Shot = NewObject<UNormalProjectileAttack>(ProjectileAttack, "NormalProjectileAttack_0");
   Shot->RandomAngle = 5.0f;                    // the rest of the game's NormalProjectileAttack_0 stays as it is
   ProjectileAttack->Projectiles = {Shot};
   ```
@@ -1040,8 +1045,12 @@ Full rules: [Editing game packages](REFERENCE.md#editing-game-packages).
 
 ### Several mods and shared code
 
-Every mod that includes a header compiles what is in it. Without an owner, a class, struct or enum declared in a shared
-header is cooked by each of those mods, as separate copies that do not match. Name the one mod that cooks it:
+Every mod that includes a header compiles what is in it, and the folder the header sits in says whose it is. A class,
+struct or enum declared in a mod's own folder (the folder of the source holding its `UE_MOD_PACKAGE`, or one below it)
+is that mod's: it cooks it, and every other mod that includes the header, `#include "../Core/Shared.h"`, imports it.
+A header in no mod's folder, or in a folder several mods' sources share, has no owner: a class, struct or enum in it
+would be cooked by each mod that includes it, as separate copies that do not match. There, name the one mod that cooks
+it:
 `UE_CLASS("<package>", "<Name>_C")` inside a class, `UE_STRUCT_IN("<owner's UE_MOD_PACKAGE>")` inside a struct, and
 `UE_ENUM_IN(Enum, "<owner's UE_MOD_PACKAGE>")` after an enum. Every other mod imports it.
 

@@ -681,6 +681,23 @@ bool CallsFunction(const Json& N, const char* Fn)
     return bFound;
 }
 
+/* A reference to UeMeta.h's NewObject<T>(Outer, "Name"), the object instanced in a default (UE_INSTANCED is its old
+   spelling). Objects.h's NewObject<T>(Outer[, Class]), Construct Object at run time, takes a class second. */
+bool IsInstancedRef(const Json& N)
+{
+    return Kind(N) == "DeclRefExpr" && N.contains("referencedDecl") && Name(N["referencedDecl"]) == "NewObject"
+        && TypeOf(N).find("const char *)") != std::string::npos;
+}
+
+/* Does this subtree make an instanced object (IsInstancedRef)? */
+bool CallsInstanced(const Json& N)
+{
+    if (IsInstancedRef(N)) return true;
+    bool bFound = false;
+    ForEach(N, [&](const Json& C) { if (!bFound) bFound = CallsInstanced(C); });
+    return bFound;
+}
+
 /* A variable's braced initializer, or null. A temporary inside the braces (a container's list) wraps them in cleanups. */
 const Json* BracedInit(const Json& Var)
 {
@@ -753,6 +770,16 @@ bool IsPureDecl(const Json& Decl)
     bool bPure = false;
     ForEach(Decl, [&](const Json& C) { bPure = bPure || Kind(C) == "PureAttr"; });
     return bPure;
+}
+
+/* A mod method UHT would make BlueprintPure: UE_PURE, or `const` and returning a value (a const BlueprintCallable is
+   pure, HeaderParser.cpp). Only the flag: the optimizer drops an unused call of a UE_PURE method alone, the promise of
+   no side effects, which `const` does not make (it may log, spawn or call others). */
+bool IsModPureDecl(const Json& Decl)
+{
+    const std::string T = TypeOf(Decl);
+    return IsPureDecl(Decl) || (Kind(Decl) == "CXXMethodDecl" && !IsStaticDecl(Decl) && T.size() > 6
+                                && T.compare(T.size() - 6, 6, " const") == 0 && T.compare(0, 5, "void ") != 0);
 }
 
 std::vector<std::string> ParmNames(const Json& Decl)
@@ -1773,7 +1800,7 @@ private:
     struct FInstSpec
     {
         enum EOuter { This, OwnComponent, InheritedComponent, NativeSubobject, InInstanced } Outer = This;
-        std::string Call, Local;            // the UeInstanced__ call's node id; the local holding it (VarDecl id), or ""
+        std::string Call, Local;            // the NewObject call's node id; the local holding it (VarDecl id), or ""
         const FRecord* Class = nullptr;
         std::string Name, Root, Path;
         std::string Component;              // the outer component's member, as C++ names it
@@ -1951,6 +1978,10 @@ private:
        includes by a quoted path beside it, transitively, UeApi headers left out. Empty when the macro is written
        nowhere these reach. */
     std::vector<bool> FinalAsSites(const std::string& Base, const std::string& Leaf, const std::string& Owner) const;
+    /* What a mod's own type no longer has to say: whose it is, by the folder that declares it, and that a plain struct or
+       uint8 enum a reflected position uses is a UE_STRUCT / UE_ENUM. Collect's, after its walk. */
+    void InferFromSources(std::vector<std::pair<std::string, std::string>>& EnumMarks,
+                          const std::map<std::string, std::string>& EnumUnderlying);
     bool IsMulticast(const FRecord& R, const std::string& Method) const;
     /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class, and an
        inline class variable, `static inline const TArray<FName> Tags = {...};`: decl id -> its VarDecl. It has no
@@ -2957,6 +2988,8 @@ void BadClassMeta(const FRecord& R, std::string* Err, bool* bOk)
     *bOk = false;
 }
 
+static void TakeSubobjectInits(FRecord& R);
+
 bool FCompiler::Collect(std::string* Err)
 {
     bool bMetaOk = true;
@@ -3430,6 +3463,7 @@ bool FCompiler::Collect(std::string* Err)
     for (const auto& [A, T] : GlobalAliases)
         if (T.find('<') != std::string::npos || Records.count(StripTypeKeywords(T))) Expand[A] = T;
     if (!Expand.empty()) ExpandAliases(const_cast<Json&>(Doc), Expand);
+    InferFromSources(EnumMarks, EnumUnderlying);
     /* UE_FINAL_AS: the leaf's base is final in all but name. Its own code runs only on the leaf, which brings nothing
        of its own, so the base is compiled as `final` (FinalOwner, FUNC_Final) and cooked Abstract; a second subclass,
        here or in a mod that includes the header, would break that, so it is refused. */
@@ -3567,6 +3601,7 @@ bool FCompiler::Collect(std::string* Err)
     for (auto& It : Records)
     {
         FRecord& R = It.second;
+        if (!R.bIsStruct) TakeSubobjectInits(R);
         /* Only the replicating class's own CPF_Net properties enter its replication list; a struct variable is sent
            whole, so a marker on one of its members has no effect. */
         if (R.bIsStruct && !R.Replicated.empty() && !R.IsNative())
@@ -3665,6 +3700,50 @@ bool FCompiler::Collect(std::string* Err)
     return true;
 }
 
+/* UE C++'s `Mesh = CreateDefaultSubobject<UStaticMeshComponent>("Mesh");`, in the constructor or UE_DEFAULTS, or as
+   Mesh's own initializer: Mesh, a pointer member of the class's own, is a component, as UE_COMPONENT declares one. The
+   statement is no default, so it is taken out of the tree before LowerCtor and the UE_DEFAULTS reader see it. The
+   component is named after its member, as the SCS names its variable; a text that differs is warned about. */
+static void TakeSubobjectInits(FRecord& R)
+{
+    auto Created = [&](const Json* E, const std::string& Field) {
+        E = Strip(E);
+        const Json* Fn = E && Kind(*E) == "CallExpr" ? Strip(First(*E)) : nullptr;
+        if (!Fn || Kind(*Fn) != "DeclRefExpr"
+            || Fn->value("referencedDecl", Json::object()).value("name", std::string()) != "CreateDefaultSubobject") return false;
+        std::string Text;
+        if (Nth(*E, 1) && FindLiteral(*Nth(*E, 1), Text) && Text != Field)
+            printf("  warning: %s::%s: the component is named %s, after its member; CreateDefaultSubobject's \"%s\" is not "
+                   "used\n", R.CppName.c_str(), Field.c_str(), Field.c_str(), Text.c_str());
+        R.Components.insert(Field);
+        return true;
+    };
+    for (const Json* F : R.Fields)
+        if (F->value("hasInClassInitializer", false) && Created(First(*F), Name(*F)))
+        {
+            Json& Own = const_cast<Json&>(*F);
+            Own["inner"].erase(Own["inner"].begin());
+            Own["hasInClassInitializer"] = false;
+        }
+    auto Body = [&](const Json* Fn) {
+        if (Fn) ForEach(*Fn, [&](const Json& B) {
+            if (Kind(B) != "CompoundStmt" || !B.contains("inner")) return;
+            Json& In = const_cast<Json&>(B)["inner"];
+            for (size_t I = 0; I < In.size();)
+            {
+                const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
+                const bool bOwn = DefaultAssignment(In[I], Lhs, Rhs, Through) && !Through
+                                  && std::any_of(R.Fields.begin(), R.Fields.end(), [&](const Json* F) {
+                                         return F->value("id", std::string()) == Lhs->value("referencedMemberDecl", std::string()); });
+                if (bOwn && Created(Rhs, Name(*Lhs))) In.erase(In.begin() + I);
+                else ++I;
+            }
+        });
+    };
+    for (const Json* C : R.Ctors) Body(C);
+    Body(R.Defaults);
+}
+
 /* A cooked class's constructor, which the engine never runs: a Blueprint object is a copy of its class's default object.
    So the default constructor is read as that object's values, as in-class initializers and UE_DEFAULTS are. A member
    initializer, or an assignment to one of the class's own variables, becomes that variable's initializer, the last one
@@ -3742,7 +3821,7 @@ bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
         std::vector<const Json*> SlotPart;
         if (!bAssign && !AttachmentCall(S, Callee, Child, Parent, Socket) && !R.bIsPatch     // a patch's may set part of one
             && !(!R.Widgets.empty() && (WidgetLayoutStatement(S) || LocalMemberAssignment(S, Lhs, Rhs, SlotPart)))
-            && !CallsFunction(S, "UeInstanced__") && !LocalMemberAssignment(S, Lhs, Rhs, SlotPart)     // UE_INSTANCED, its local's
+            && !CallsInstanced(S) && !LocalMemberAssignment(S, Lhs, Rhs, SlotPart)     // UE_INSTANCED, its local's
             && !(R.Widgets.empty() && ComponentEventCall(S)))
         {
             *Err = Where + ": a constructor never runs in the game, so its statements are read as the class's defaults: each "
@@ -3960,7 +4039,7 @@ uint32 FCompiler::ModMethodFlags(const FRecord& Owner, const std::string& Method
     uint32 Flags = Inherited ? Inherited & kOverrideInherits : kPlainMethodFlags;
     if (auto A = Owner.MethodAccess.find(Method); !Inherited && A != Owner.MethodAccess.end())
         Flags = (Flags & ~uint32(FUNC_Public | FUNC_Protected | FUNC_Private)) | A->second;
-    if (IsPureDecl(Def)) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
+    if (IsPureDecl(Def) || (!Inherited && IsModPureDecl(Decl))) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
     const std::string DeclType = TypeOf(Decl);
     if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;
     return Flags | NetFlagsOf(Decl) | NetFlagsOf(Def) | AccessFlagsOf(Decl) | AccessFlagsOf(Def);
@@ -7331,6 +7410,245 @@ const std::vector<std::string>& FCompiler::ModSources() const
     return SourceTexts;
 }
 
+/* The path a source's UE_MOD_PACKAGE("...") names, or empty. Its text, comments and all: a caller that must not read
+   one written in a comment passes WithoutComments of it. */
+static std::string ModPackageIn(const std::string& Text)
+{
+    auto IsIdent = [](char C) { return isalnum(uint8(C)) || C == '_'; };
+    for (size_t At = 0; (At = Text.find("UE_MOD_PACKAGE", At)) != std::string::npos; At += 14)
+    {
+        if ((At > 0 && IsIdent(Text[At - 1])) || (At + 14 < Text.size() && IsIdent(Text[At + 14]))) continue;
+        const size_t Open = Text.find_first_not_of(" \t", At + 14);
+        if (Open == std::string::npos || Text[Open] != '(') continue;
+        const size_t Quote = Text.find_first_not_of(" \t", Open + 1);
+        const size_t End = Quote == std::string::npos || Text[Quote] != '"' ? std::string::npos : Text.find('"', Quote + 1);
+        if (End != std::string::npos) return Text.substr(Quote + 1, End - Quote - 1);
+    }
+    return std::string();
+}
+
+/* T with each comment turned to spaces; a string or character literal is kept as it is, `//` inside one included. */
+static std::string WithoutComments(std::string T)
+{
+    for (size_t I = 0; I < T.size(); ++I)
+    {
+        if (T[I] == '"' || T[I] == '\'')
+        {
+            for (const char Q = T[I++]; I < T.size() && T[I] != Q && T[I] != '\n'; ++I) if (T[I] == '\\') ++I;
+        }
+        else if (T.compare(I, 2, "//") == 0)
+            for (; I < T.size() && T[I] != '\n'; ++I) T[I] = ' ';
+        else if (T.compare(I, 2, "/*") == 0)
+        {
+            const size_t End = std::min(T.find("*/", I + 2), T.size() - 2) + 2;
+            for (; I < End; ++I) if (T[I] != '\n') T[I] = ' ';
+            --I;
+        }
+    }
+    return T;
+}
+
+/* The names of the types T defines, comments gone: `struct X {`, `class X final : public Y {`, `enum class X : uint8 {`.
+   A forward declaration, a template's parameter (`class T>`) and an elaborated type (`class UObject *O;`) are none. */
+static std::vector<std::string> DefinedTypes(const std::string& T)
+{
+    auto IsIdent = [](char C) { return isalnum(uint8(C)) || C == '_'; };
+    auto Word = [&](size_t& At) {
+        while (At < T.size() && isspace(uint8(T[At]))) ++At;
+        const size_t Begin = At;
+        while (At < T.size() && IsIdent(T[At])) ++At;
+        return T.substr(Begin, At - Begin);
+    };
+    std::vector<std::string> Out;
+    for (size_t At = 0; At < T.size(); ++At)
+    {
+        if (!IsIdent(T[At]) || (At > 0 && IsIdent(T[At - 1]))) continue;
+        size_t P = At;
+        std::string Key = Word(P);
+        if (Key == "enum")
+        {
+            const size_t Q = P;
+            if (const std::string W = Word(P); W != "class" && W != "struct") P = Q;
+        }
+        else if (Key != "struct" && Key != "class") { At = P - 1; continue; }
+        std::string Name = Word(P);
+        size_t Q = P;
+        if (Word(Q) == "final") P = Q;
+        while (P < T.size() && isspace(uint8(T[P]))) ++P;
+        if (P < T.size() && T[P] == ':' && T.compare(P, 2, "::") != 0) P = std::min(T.find_first_of("{;", P), T.size());
+        if (!Name.empty() && P < T.size() && T[P] == '{') Out.push_back(Name);
+        At = P - 1;
+    }
+    return Out;
+}
+
+/* Who owns a type a mod's source declares, by where it is written (the AST keeps no file, DroppedAstKey; the text does):
+   the mod whose UE_MOD_PACKAGE the file itself holds, else the one of the nearest folder above it holding sources with a
+   UE_MOD_PACKAGE, if they all name one (a folder of several mods, BpMods/ or the tests', owns nothing it does not say).
+   The search stops at the checkout's root. Each type is looked up in the files the compiled source reaches by quoted
+   includes (ReachedByIncludes); one defined in two of them is nobody's here.
+   Then, with the owner known:
+   - a class of another mod's folder that names no package is that mod's, as UE_CLASS_IN would say;
+   - a plain struct (no base, no marker, members of value types) or `: uint8` enum of a mod's folder is a UE_STRUCT /
+     UE_ENUM of its owner when a reflected position names it: a member, parameter, return value or local of a mod class
+     or a function, a namespace variable, a container's element, a member of another struct so made. A struct only C++
+     reads (a constexpr table, a helper no reflected position names) stays plain. The explicit forms still say it,
+     and stay the only way for a header outside every mod's folder, or a type nothing here uses that another mod will. */
+void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>>& EnumMarks,
+                                 const std::map<std::string, std::string>& EnumUnderlying)
+{
+    namespace fs = std::filesystem;
+    std::string Mine = ModPackage;
+    while (!Mine.empty() && Mine.back() == '/') Mine.pop_back();
+    if (Mine.empty()) return;
+
+    /* First the owners: each type the reached files define, by name, and each of those files' mod. */
+    std::map<std::string, std::string> TypeFile;        // name -> canonical file, empty when two files define it
+    std::map<std::string, std::string> FileText;
+    for (const auto& [Key, Entry] : ReachedByIncludes(fs::path(SourceFile)))
+    {
+        FileText[Key] = WithoutComments(Entry.second);
+        for (const std::string& N : DefinedTypes(FileText[Key]))
+            if (auto [It, bNew] = TypeFile.emplace(N, Key); !bNew && It->second != Key) It->second.clear();
+    }
+    std::map<std::string, std::string> FileOwner, DirOwner;
+    auto OwnerOfDir = [&](fs::path Dir) {
+        std::vector<std::string> Seen;
+        std::string Owner;
+        for (std::error_code Ec;; Dir = Dir.parent_path())
+        {
+            const std::string Key = CanonicalPath(Dir);
+            if (auto It = DirOwner.find(Key); It != DirOwner.end()) { Owner = It->second; break; }
+            Seen.push_back(Key);
+            std::set<std::string> Packages;
+            for (const auto& E : fs::directory_iterator(Dir, Ec))
+            {
+                const std::string Ext = E.path().extension().string();
+                if (E.is_regular_file(Ec) && (Ext == ".cpp" || Ext == ".h" || Ext == ".hpp"))
+                    if (std::string P = ModPackageIn(WithoutComments(ReadText(E.path().string()))); !P.empty())
+                    {
+                        while (P.back() == '/') P.pop_back();
+                        Packages.insert(P);
+                    }
+            }
+            if (!Packages.empty()) { Owner = Packages.size() == 1 ? *Packages.begin() : std::string(); break; }
+            if (fs::exists(Dir / ".git", Ec) || Dir == Dir.parent_path()) break;
+        }
+        for (const std::string& K : Seen) DirOwner[K] = Owner;
+        return Owner;
+    };
+    auto OwnerOf = [&](const std::string& Leaf) -> std::string {
+        auto T = TypeFile.find(Leaf);
+        if (T == TypeFile.end() || T->second.empty()) return std::string();
+        auto [It, bNew] = FileOwner.emplace(T->second, std::string());
+        if (bNew)
+        {
+            std::string P = ModPackageIn(FileText[T->second]);
+            while (!P.empty() && P.back() == '/') P.pop_back();
+            It->second = !P.empty() ? P : OwnerOfDir(fs::path(T->second).parent_path());
+        }
+        return It->second;
+    };
+
+    /* A class of another mod's folder is imported from it. */
+    for (auto& [Key, R] : Records)
+        if (R.UePackage.empty() && !R.bIsStruct && !R.bIsPatch && !R.bCooked && (!R.Base.empty() || R.bIsInterface))
+            if (const std::string O = OwnerOf(LeafOf(R.CppName)); !O.empty() && O != Mine)
+            {
+                R.UePackage = PathIn(O, R.CppName);
+                R.UeName = LeafOf(R.CppName) + "_C";
+                R.bClassIn = true;
+            }
+
+    /* The candidates: a plain struct, its members values a struct holds (no text pointer, array or reference), and a
+       uint8 enum, of a mod's folder. */
+    std::map<std::string, std::vector<FRecord*>> Plain;      // by name, the last segment
+    for (auto& [Key, R] : Records)
+    {
+        if (!R.UePackage.empty() || R.bIsStruct || R.bIsInterface || R.bIsPatch || R.bCooked || !R.Base.empty()
+            || R.Defaults || R.Fields.empty() || OwnerOf(LeafOf(R.CppName)).empty())
+            continue;
+        if (std::none_of(R.Fields.begin(), R.Fields.end(), [](const Json* F) {
+                const std::string T = TypeOf(*F);
+                return T.find("char") != std::string::npos || T.find('[') != std::string::npos || T.find('&') != std::string::npos;
+            }))
+            Plain[LeafOf(R.CppName)].push_back(&R);
+    }
+    std::set<std::string> Marked;
+    for (const auto& M : EnumMarks) Marked.insert(M.first);
+    std::map<std::string, std::vector<std::string>> PlainEnums;     // by name, the last segment -> the C++ names
+    for (const auto& [Enum, Values] : EnumDecls)
+        if (auto U = EnumUnderlying.find(Enum); !Values.empty() && !Marked.count(Enum) && U != EnumUnderlying.end()
+            && U->second == "uint8" && !OwnerOf(LeafOf(Enum)).empty())
+            PlainEnums[LeafOf(Enum)].push_back(Enum);
+    if (Plain.empty() && PlainEnums.empty()) return;
+
+    /* Then the uses. A name is taken from a type's text by its last segment, `const Ns::FStats &` and `TArray<FStats>`
+       alike; one a `*` follows is a raw pointer (IsRawPointer), no struct. A constexpr variable or function is C++'s
+       alone. */
+    std::set<std::string> Used;
+    auto Names = [&](const std::string& Type) {
+        for (size_t At = 0; At < Type.size();)
+        {
+            if (!isalnum(uint8(Type[At])) && Type[At] != '_') { ++At; continue; }
+            size_t End = At;
+            while (End < Type.size() && (isalnum(uint8(Type[End])) || Type[End] == '_')) ++End;
+            const size_t Next = Type.find_first_not_of(' ', End);
+            if (Type.compare(End, 2, "::") != 0 && (Next == std::string::npos || Type[Next] != '*'))
+                Used.insert(Type.substr(At, End - At));
+            At = End;
+        }
+    };
+    std::function<void(const Json&)> Body = [&](const Json& N) {
+        if (!N.is_object()) return;
+        const std::string K = Kind(N);
+        if ((K == "VarDecl" || K == "FunctionDecl") && N.value("constexpr", false)) return;
+        if (K == "VarDecl" || K == "CXXTemporaryObjectExpr" || K == "CXXUnresolvedConstructExpr") Names(TypeOf(N));
+        ForEach(N, Body);
+    };
+    for (const auto& [Key, R] : Records)
+    {
+        if (TypeFile.find(LeafOf(R.CppName)) == TypeFile.end()) continue;      // only C++ of the mods' own
+        if (auto S = Plain.find(LeafOf(R.CppName)); S != Plain.end()
+            && std::find(S->second.begin(), S->second.end(), &R) != S->second.end()) continue;
+        for (const Json* F : R.Fields) Names(TypeOf(*F));
+        for (const Json* M : R.AllMethods) { Names(TypeOf(*M)); Body(*M); }
+        for (const auto& [Method, Def] : R.MethodDefs) Body(*Def);
+        for (const Json* C : R.Ctors) Body(*C);
+        if (R.Defaults) Body(*R.Defaults);
+    }
+    for (const auto& [Id, V] : NsVars) if (!V->value("constexpr", false)) Names(TypeOf(*V));
+    std::function<void(const Json&)> Free = [&](const Json& N) {
+        const std::string K = Kind(N);
+        if (K == "TranslationUnitDecl" || K == "NamespaceDecl" || K == "LinkageSpecDecl") ForEach(N, Free);
+        else if (K == "FunctionDecl" && !N.value("constexpr", false)) { Names(TypeOf(N)); Body(N); }
+    };
+    Free(Doc);
+
+    /* A struct so made makes its members' types used too, until nothing more is. */
+    for (bool bMore = true; bMore;)
+    {
+        bMore = false;
+        for (auto& [Leaf, Of] : Plain)
+            if (Used.count(Leaf))
+                for (FRecord* R : Of)
+                    if (!R->bIsStruct)
+                    {
+                        R->bIsStruct = bMore = true;
+                        for (const Json* F : R->Fields) Names(TypeOf(*F));
+                        if (const std::string O = OwnerOf(Leaf); O != Mine)
+                        {
+                            R->UePackage = PathIn(O, R->CppName);
+                            R->UeName = Leaf;
+                        }
+                    }
+    }
+    for (const auto& [Leaf, Of] : PlainEnums)
+        if (Used.count(Leaf))
+            for (const std::string& Enum : Of)
+                EnumMarks.push_back({ Enum, OwnerOf(Leaf) == Mine ? std::string() : OwnerOf(Leaf) });
+}
+
 /* The AST keeps no file of a declaration (DroppedAstKey), and the leaf UE_FINAL_AS declares is spelled in UeMeta.h, so
    the text says where the macro was written: the compiled source and the files it includes by a quoted path that
    resolves beside the including one (bpbuild's unity file includes each .cpp of a mod by its absolute path), read as
@@ -7354,19 +7672,7 @@ std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::st
     };
     auto Canonical = CanonicalPath;
     auto Reach = ReachedByIncludes;
-    /* The path a source's UE_MOD_PACKAGE names, or empty. */
-    auto PackageIn = [&](const std::string& Text) {
-        for (size_t At = 0; (At = Text.find("UE_MOD_PACKAGE", At)) != std::string::npos; At += 14)
-        {
-            if ((At > 0 && IsIdent(Text[At - 1])) || (At + 14 < Text.size() && IsIdent(Text[At + 14]))) continue;
-            const size_t Open = Text.find_first_not_of(" \t", At + 14);
-            if (Open == std::string::npos || Text[Open] != '(') continue;
-            const size_t Quote = Text.find_first_not_of(" \t", Open + 1);
-            const size_t End = Quote == std::string::npos || Text[Quote] != '"' ? std::string::npos : Text.find('"', Quote + 1);
-            if (End != std::string::npos) return Text.substr(Quote + 1, End - Quote - 1);
-        }
-        return std::string();
-    };
+    auto PackageIn = ModPackageIn;
     const auto Unit = Reach(fs::path(SourceFile));
     auto SharedByOwner = [&](const fs::path& Header) {
         std::error_code Ec;
@@ -15422,7 +15728,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         return bOk;
     }
     /* UE_INSTANCED, or a local of UE_DEFAULTS holding one: the object's export, made with the class (Generate). */
-    if (bool bFailed = false; PD.Type == "ObjectProperty" && (CallsFunction(*Init, "UeInstanced__") || K == "DeclRefExpr"))
+    if (bool bFailed = false; PD.Type == "ObjectProperty" && (CallsInstanced(*Init) || K == "DeclRefExpr"))
     {
         if (InstancedValue && InstancedValue(*Init, PD.Default, bFailed)) return true;
         if (bFailed) return false;
@@ -18395,7 +18701,7 @@ bool FCompiler::ScanInstanced(const FRecord& A, std::vector<FInstSpec>& Out, std
         if (!bOk) return;
         const std::string K = Kind(N);
         const Json* Fn = K == "CallExpr" ? Strip(First(N)) : nullptr;
-        if (!Fn || Kind(*Fn) != "DeclRefExpr" || Fn->value("referencedDecl", Json::object()).value("name", std::string()) != "UeInstanced__")
+        if (!Fn || !IsInstancedRef(*Fn))
         {
             const bool bPass = K == "VarDecl" || K == "ImplicitCastExpr" || K == "ExprWithCleanups" || K == "CStyleCastExpr";
             ForEach(N, [&](const Json& C) { Walk(C, K == "VarDecl" ? N.value("id", std::string()) : bPass ? Local : std::string()); });
@@ -19145,7 +19451,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 if (const Json* N = Strip(&S); N && Kind(*N) == "DeclStmt")
                     if (const Json* Var = First(*N); Var && Kind(*Var) == "VarDecl" && InstLocal(Var->value("id", std::string())) >= 0)
                         return;
-                if (CallsFunction(S, "UeInstanced__") && Kind(*Strip(&S)) == "CallExpr")
+                if (CallsInstanced(S) && Kind(*Strip(&S)) == "CallExpr")
                 { *Err = Where + ": UE_INSTANCED makes an object a default points at: `StatusEffects = {UE_INSTANCED(...)};`, or a "
                          "local that one does"; bOk = false; return; }
                 if (!R.Widgets.empty() && WidgetLayoutStatement(S))
@@ -20592,7 +20898,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            nothing, and clang has already refused what C++ forbids. */
         if (auto A = R.MethodAccess.find(Fn.Name); !Inherited && A != R.MethodAccess.end())
             Flags = (Flags & ~uint32(FUNC_Public | FUNC_Protected | FUNC_Private)) | A->second;
-        if (IsPureDecl(M)) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
+        if (IsPureDecl(M) || (!Inherited && IsModPureDecl(Decl))) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
         const std::string DeclType = TypeOf(Decl);
         if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;
         /* ProcessEvent only lists a script function's out-parms for EX_LocalOutVariable when this is set

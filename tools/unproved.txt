@@ -70,7 +70,6 @@ inline-class-variables.khold-1-0f
 game-enums.ecreaturesize-size
 mod-enums-ue.ue-enum-emissing
 mod-enums-ue.ue-enum-in-esystems-game
-mod-enums-ue.elocal-l
 enum-conversions-and.emood-x
 tenum.name
 tenummask.a-native-enum-whose-values
@@ -215,7 +214,6 @@ instanced-objects.ue-instanced-3
 instanced-objects.ue-instanced-getowner
 instanced-objects.ue-instanced-4
 instanced-objects.ue-instanced-5
-instanced-objects.ue-instanced-6
 instanced-objects.an-object-under-a-game
 objects-and-widgets.newobject-uobject-this-kind
 objects-and-widgets.newobject-aactor-this
