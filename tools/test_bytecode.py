@@ -6743,13 +6743,15 @@ def infer_meta():
 
     # bpdecomp reads the cooked mod back in these forms.
     content = base.replace(os.sep, '/').split('/FSD/Content/')[0] + '/FSD/Content'
+    decompile = lambda dec, name: subprocess.run(
+        [sys.executable, '-I', '-c',
+         'import sys; sys.path.insert(0, %r); import bpdecomp_model; '
+         'bpdecomp_model.Api.__init__.__defaults__ = (%r,); import bpdecomp_emit; bpdecomp_emit.main()'
+         % (HERE, os.path.abspath(UEAPI)), content, dec, '--mod', '/Game/_ElytrasMods/InferMeta=' + name],
+        capture_output=True, text=True)
     dec = tempfile.mkdtemp()
     try:
-        proc = subprocess.run([sys.executable, '-I', '-c',
-                               'import sys; sys.path.insert(0, %r); import bpdecomp_model; '
-                               'bpdecomp_model.Api.__init__.__defaults__ = (%r,); import bpdecomp_emit; bpdecomp_emit.main()'
-                               % (HERE, os.path.abspath(UEAPI)), content, dec,
-                               '--mod', '/Game/_ElytrasMods/InferMeta=IM'], capture_output=True, text=True)
+        proc = decompile(dec, 'IM')
         mod = os.path.join(dec, 'IM')
         src = ''.join(open(os.path.join(r, f), encoding='utf-8-sig').read() for r, _, fs in os.walk(mod) for f in fs
                       if f.endswith(('.h', '.cpp')))
@@ -6757,6 +6759,23 @@ def infer_meta():
                      'NewObject<UDotStatusEffectItem>(this, "Burn")', 'struct FInferScore {\n', 'enum class EInferRank : uint8 {'):
             assert want in src, (want, proc.stdout[-2000:] + proc.stderr[-2000:], src)
         assert 'UE_STRUCT' not in src and 'UE_ENUM(' not in src and 'UE_COMPONENT' not in src and 'UE_INSTANCED' not in src, src
+    finally:
+        shutil.rmtree(dec, ignore_errors=True)
+    # A mod named after its class: InferMeta.h stays the umbrella and InferMeta.cpp the mod's file, and the class's own
+    # pair takes another name, rather than the umbrella overwriting its declaration and including itself.
+    dec = tempfile.mkdtemp()
+    try:
+        proc = decompile(dec, 'InferMeta')
+        mod = os.path.join(dec, 'InferMeta')
+        files = {f: open(os.path.join(mod, f), encoding='utf-8-sig').read() for f in os.listdir(mod) if f.endswith(('.h', '.cpp'))}
+        log = proc.stdout[-2000:] + proc.stderr[-2000:]
+        assert 'the umbrella header' in files.get('InferMeta.h', '') and \
+            'UE_MOD_PACKAGE' in files.get('InferMeta.cpp', ''), (log, sorted(files))
+        own = [f for f, t in files.items() if f.endswith('.h') and re.search(r'^class InferMeta\b[^;\n]*\{', t, re.M)]
+        assert len(own) == 1 and own[0] != 'InferMeta.h' and '#include "%s"' % own[0] in files['InferMeta.h'], (log, own)
+        body = own[0][:-2] + '.cpp'
+        assert 'UStaticMeshComponent* Mesh;' in files[own[0]] and body in files and \
+            '#include "%s"' % body in files['InferMeta.cpp'], (own, sorted(files))
     finally:
         shutil.rmtree(dec, ignore_errors=True)
 
