@@ -124,8 +124,6 @@ statements-and-blocks.void-unused
 statements-and-blocks.try-risky-catch-recover
 while-and-do.do-r-1-if-x
 range-for-over.for-auto-x-y-points
-range-for-over.for-const-fname-tag-tags
-range-for-over.for-auto-pair-scores
 range-for-over.goto
 what-a-range.for-int32-x-1-2
 declaring-locals.const-int32-three-3

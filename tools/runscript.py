@@ -538,6 +538,18 @@ def _set_filter(keep):
     return op
 
 
+def _resize(arr, n):
+    """Array_Resize: new elements are the inner type's default, here 0 / False."""
+    del arr[max(n, 0):]
+    arr.extend([0] * (n - len(arr)))
+
+
+def _set(arr, i, v, size_to_fit):
+    """Array_Set: past the end it grows the array only with bSizeToFit, else it logs and does nothing."""
+    if i >= len(arr) and size_to_fit: _resize(arr, i + 1)
+    if 0 <= i < len(arr): arr[i] = copy.deepcopy(v)
+
+
 def _has(c, v):
     """Contains: an FName or FString compares case-insensitively, as its == does (and a cooked name that differs
     from an earlier one only in case is that one's entry)."""
@@ -563,8 +575,17 @@ class Slot:
         s.m[s.k] = v
 
 
+class SetSlot(Slot):
+    """A TSet element in the same view: its element is the slot's Key, and const. A Slot, so every view site takes it."""
+    def __init__(s, v): s.v = v
+    def __getitem__(s, f):
+        if f != 'Key': raise SystemExit('a read of set slot member ' + f)
+        return s.v
+    def __setitem__(s, f, v): raise SystemExit('a store to set slot member ' + f)
+
+
 class Free:
-    """A free slot of a map's sparse array: the memory of an element it lost. Reading or writing it is a bug."""
+    """A free slot of a sparse array: the memory of an element it lost. Reading or writing it is a bug."""
     def __getitem__(s, f): raise SystemExit('a read of a free map slot')
     def __setitem__(s, f, v): raise SystemExit('a store to a free map slot')
 
@@ -576,11 +597,41 @@ class Holey(dict):
     def __deepcopy__(s, memo): return copy.deepcopy(dict(s), memo)
 
 
+class HoleySet(list):
+    """A set that lost elements, as Holey is a map."""
+    def __init__(s, items, holes): super().__init__(items); s.holes = holes
+    def __deepcopy__(s, memo): return copy.deepcopy(list(s), memo)
+
+
 def slots_of(m):
-    """The __Slots__ view of a map: its elements in order, with a Holey one's free slots among them."""
-    slots = [Slot(m, k) for k in m] if isinstance(m, dict) else []
+    """The __Slots__ view of a map or set: its elements in order, with a holey one's free slots among them."""
+    slots = [Slot(m, k) for k in m] if isinstance(m, dict) else [SetSlot(v) for v in m] if isinstance(m, list) else []
     for i in sorted(getattr(m, 'holes', ())): slots.insert(i, Free())
     return slots
+
+
+class Link:
+    """A slot in the compiler's __Free__ view: a free one's FFreeListLink, whose Next names the next free slot."""
+    def __init__(s, nxt): s.nxt = nxt
+    def __getitem__(s, f):
+        if s.nxt is None: raise SystemExit('a free-list read of a live slot')
+        if f != 'Next': raise SystemExit('a read of free slot member ' + f)
+        return s.nxt
+    def __setitem__(s, f, v): raise SystemExit('a store to free slot member ' + f)
+
+
+def view_member(m, name):
+    """A member of the compiler's views of a map or set's storage (SlotView): its slots, its free count and first free
+    slot, and each free slot's link, the holes chained in ascending order; None for any other name."""
+    holes = sorted(getattr(m, 'holes', ()))
+    if name == '__Slots__': return slots_of(m)
+    if name == '__NumFree__': return len(holes)
+    if name == '__FirstFree__': return holes[0] if holes else -1
+    if name == '__Free__':
+        links = [Link(None) for _ in slots_of(m)]
+        for i, h in enumerate(holes): links[h] = Link(holes[i + 1] if i + 1 < len(holes) else -1)
+        return links
+    return None
 
 
 CONTAINERS = {
@@ -599,6 +650,8 @@ CONTAINERS = {
     'Map_Add': lambda ev, store, a: _made(ev, store, a[0], {}).__setitem__(ev(a[1]), copy.deepcopy(ev(a[2]))),
     'Map_Remove': lambda ev, store, a: _made(ev, store, a[0], {}).pop(ev(a[1]), None) is not None,
     'Array_Clear': lambda ev, store, a: store(a[0], []),
+    'Array_Resize': lambda ev, store, a: _resize(_made(ev, store, a[0], []), ev(a[1])),
+    'Array_Set': lambda ev, store, a: _set(_made(ev, store, a[0], []), ev(a[1]), ev(a[2]), ev(a[3])),
     'Set_Clear': lambda ev, store, a: store(a[0], []),
     'Map_Clear': lambda ev, store, a: store(a[0], {}),
     'Array_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], []), ev(a[1])),
@@ -677,9 +730,9 @@ def run(base, function, self_vars=None, **parms):
         if o in (0x1D, 0x1E, 0x24, 0x2C, 0x35, 0x21): return n.val
         if o == 0x42:
             s = ev(n.kids[0])
-            if isinstance(s, (Slot, Free)): return s[n.val]
+            if isinstance(s, (Slot, Free, Link)): return s[n.val]
             if n.val == 'Value': return s                            # a nested container's wrapper is its Value
-            if n.val == '__Slots__': return slots_of(s)
+            if (v := view_member(s, n.val)) is not None: return v
             # A donor member at offset 0 reads the operand's own 4 bytes: Vector.X an int32's as a float, IntPoint.X a
             # float's as an int32 (the compiler's __AsFloat__ / __FloatBits__).
             if n.val == 'X' and "'Vector'" in n.owner and isinstance(s, int) and not isinstance(s, bool):

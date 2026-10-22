@@ -644,7 +644,7 @@ if '--cases' in sys.argv:
 
     def _plain(v):
         """v as JSON; a dict whose keys are not all strings (a map's) as {"__pairs__": [[k, v], ...]}."""
-        if isinstance(v, runscript.Holey): raise ValueError('a map with free slots')
+        if isinstance(v, (runscript.Holey, runscript.HoleySet)): raise ValueError('a container with free slots')
         if isinstance(v, float) and not math.isfinite(v): raise ValueError('a non-finite float')
         if v is None or isinstance(v, (bool, int, float, str)): return v
         if isinstance(v, (list, tuple)): return [_plain(x) for x in v]
@@ -2190,7 +2190,7 @@ def walk_self(**kw):
 
 
 n = 0
-proves('range-for-over.for-auto-key-value-scores', 'range-for-over.scores-remove-key')
+proves('range-for-over.for-auto-key-value-scores')
 for fn, oracle, parms, cases in (
         ('ListsInPlace', lists_in_place, [dict(D=d) for d in (0, 3, -2)], [dict(Lists=m) for m in ({}, {1: []}, {1: [5], 4: [2, 9]})]),
         ('ConstSeesStore', const_sees_store, [{}], [dict(Lists=m) for m in ({}, {3: []}, {1: [5], 4: [2, 9]})]),
@@ -2220,6 +2220,78 @@ assert (run(asset('RangeTest'), 'ListsInPlace', self_vars=mine, D=3)[0], mine) =
 assert 'Blueprint has no reference to it' not in LOGS['RangeTest'], LOGS['RangeTest']
 print("ok  RangeTest: `auto& [K, V]` over a TMap walks its slots in place, a container value and a T& to V included;"
       " `Lists[K].Add(X)` runs on a copy stored back, X first  (%d cases)" % (n + 1))
+
+
+def pair_const(f):
+    s = 0
+    for v in f['Scores'].values(): s = i32(i32(s * 2) + v)
+    return s
+
+
+def by_value_store(f):
+    s = 0
+    for k, v in f['Scores'].items():
+        f['Scores'][k] = i32(v * 2)
+        s = i32(s + v)
+    return s
+
+
+def fold_set(f):
+    s = 0
+    for x in f['Seen']: s = i32(i32(s * 3) + x)
+    for x in f['Seen']: s = i32(s + x)
+    return s
+
+
+# `auto& P` is the walk `auto& [K, V]` is: P.Key, P.Value and the references bound to them name the slot. By value, the
+# walk is the same, each pass copying the slot out: P / Value is a copy, while `Scores[Key]` is the map's own value. A
+# container that lost elements has free slots, on its free list: every walk skips them, an emptied one's too, and never
+# copies or moves the container.
+n = 0
+proves('range-for-over.for-auto-pair-scores', 'range-for-over.scores-key', 'range-for-over.for-auto-key-value-scores-2')
+maps = ({}, {'a': 1}, {'a': 1, 'b': -20, 'c': 3}, {'a': -5})
+walks = (('PairInPlace', seen_in_body, [dict(D=d) for d in (0, 2, -7)]), ('PairConst', pair_const, [{}]),
+         ('PairCopy', lambda f: sum(i32(v + 1000) for v in f['Scores'].values()), [{}]),
+         ('ByValueStore', by_value_store, [{}]))
+for fn, oracle, parms in walks:
+    for p in parms:
+        for m in maps:
+            mine, theirs = range_self(Scores=m), range_self(Scores=m)
+            got = run(asset('RangeTest'), fn, self_vars=mine, **p)[0]
+            assert (got, mine) == (oracle(theirs, *p.values()), theirs), (fn, m, p, got, mine)
+            n += 1
+    for m, holes in (({'a': 1, 'b': 20, 'c': 3}, (0, 2)), ({'a': 5}, (1,)), ({}, (0,)), ({}, (0, 1)), ({'a': 1, 'b': 2}, (0, 1, 3))):
+        mine, theirs = range_self(), range_self(Scores=m)
+        mine['Scores'] = runscript.Holey(m, holes)
+        got = run(asset('RangeTest'), fn, self_vars=mine, **parms[0])[0]
+        assert (got, mine) == (oracle(theirs, *parms[0].values()), theirs), (fn, m, holes, got, mine)
+        n += 1
+proves('range-for-over.for-const-int32-x-seen')
+check_self('RangeTest', 'FoldSet', fold_set, [dict(Seen=s) for s in ([], [4], [1, 5, 9])])
+for fn, oracle in (('FoldSet', fold_set), ('SumSet', lambda f: sum(f['Seen']))):
+    for s, holes in (([1, 5, 9], (1,)), ([7], (0, 2)), ([], (0,))):
+        mine = range_self()
+        mine['Seen'] = runscript.HoleySet(s, holes)
+        assert run(asset('RangeTest'), fn, self_vars=mine)[0] == oracle(range_self(Seen=s)) and mine == range_self(Seen=s), (fn, s, holes, mine)
+        n += 1
+print("ok  RangeTest: a TMap / TSet range-for walks its own slots, by reference or by value, `auto& P` as `auto& [K, V]`;"
+      " free slots are skipped, never read  (%d cases)" % n)
+
+# Changing the container a walk is over is the iterator contract's to forbid: each such change is warned, with one message,
+# and nothing else is. Another map of the same type is another container, changed directly.
+for m in maps:
+    mine = range_self(Scores=m)
+    mine['Positive'] = {}
+    want = {k: v for k, v in m.items() if v > 0}
+    got = run(asset('RangeTest'), 'CopyPositive', self_vars=mine)[0]
+    assert (got, mine['Positive'], mine['Scores']) == (len(want), want, m), (m, got, mine)
+proves('range-for-over.seen-remove-x', 'range-for-over.scores-remove-key')
+warned = sorted(l.strip() for l in LOGS['RangeTest'].splitlines() if 'unsafe to mutate' in l)
+assert warned == sorted('warning: RangeTest::%s: unsafe to mutate iterated container (%s)' % w for w in (
+    ('WarnRemove', 'Scores.Remove'), ('WarnByValue', 'Scores.Remove'), ('WarnStore', 'Scores[] ='), ('WarnSetAdd', 'Seen.Add'), ('WarnArrayAdd', 'Items.Add'),
+    ('WarnPassed', 'Prune()'), ('WarnPassed', 'Prune(Scores)'), ('WarnCalls', 'DropAll()'))), warned
+print('ok  RangeTest: a change to the container a range-for walks is warned, and only that; another map of its type is'
+      ' changed directly  (%d cases)' % len(maps))
 
 
 def range_members():
