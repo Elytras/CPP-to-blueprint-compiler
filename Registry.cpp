@@ -2,7 +2,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 
 #include "Package.h"
@@ -138,15 +140,97 @@ void WriteNameBatch(const std::vector<std::string>& Names, std::vector<uint8>& O
     Out.insert(Out.end(), Batch.B.begin(), Batch.B.end());
 }
 
-void WriteEmptyStore(std::vector<uint8>& Out)
+/* FValueId's type, its low 3 bits (AssetDataTagMap.cpp EValueType); the rest is the index into that type's view. */
+enum EValueType : uint32 { AnsiString, WideString, NumberlessName, NumberedName, NumberlessPath, NumberedPath, LocalizedText };
+
+bool IsNumberless(const std::string& Name)
 {
-    FBin Store;
-    Store.U32(kStoreBeginMagic);
-    for (int32 I = 0; I < kStoreViewCount; ++I) Store.I32(0);
-    Store.I32(0);                                               // FText data block, in bytes
-    Store.U32(kStoreEndMagic);
-    Out.insert(Out.end(), Store.B.begin(), Store.B.end());
+    std::string Base;
+    int32 Number = 0;
+    SplitName(Name, Base, Number);
+    return Number == 0;
 }
+
+/* Every row's tags as one 4.27 tag store, as FStoreBuilder lays it out (AssetDataTagMap.cpp): each distinct value once
+   in its type's view, each row's pairs contiguous, in the numberless view when every key of the row is numberless.
+   A value spelled <Class>'<Package>.<Object>' is an export path, which is how the cooker stores ParentClass and
+   NativeParentClass (measured on FSD/AssetRegistry.bin); any other an ANSI string, or UTF-16 when it is not ASCII. */
+class FTagStore
+{
+public:
+    /* The row's FPartialMapHandle::ToInt: numberless bit, pair count, first pair; 0 for no tags. */
+    uint64 AddMap(const std::vector<std::pair<std::string, std::string>>& Tags)
+    {
+        if (Tags.empty()) return 0;
+        bool bNumberless = true;
+        for (const auto& Tag : Tags) bNumberless &= IsNumberless(Tag.first);
+        std::vector<std::pair<std::string, uint32>>& To = Pairs[bNumberless ? 0 : 1];
+        const uint64 Handle = uint64(bNumberless) << 63 | uint64(Tags.size()) << 32 | uint64(To.size());
+        for (const auto& Tag : Tags) To.push_back({ Tag.first, Value(Tag.second) });
+        return Handle;
+    }
+
+    /* SaveStore, text-first: the view counts in member order, the (empty) text block, then the rest. */
+    void Write(FBin& Out) const
+    {
+        Out.U32(kStoreBeginMagic);
+        for (int32 Count : { 0, 0, int32(Paths[0].size()), int32(Paths[1].size()), 0, int32(AnsiOffsets.size()),
+                             int32(WideOffsets.size()), int32(Ansi.size()), int32(Wide.size()),
+                             int32(Pairs[0].size()), int32(Pairs[1].size()) })
+            Out.I32(Count);
+        Out.I32(0);                                             // FText data block, in bytes
+        for (const auto& View : Paths)
+            for (const FPath& P : View) { Out.Name(P.Class); Out.Name(P.Object); Out.Name(P.Package); }
+        for (uint32 O : AnsiOffsets) Out.U32(O);
+        for (uint32 O : WideOffsets) Out.U32(O);
+        Out.Raw(Ansi.data(), Ansi.size());
+        Out.Raw(Wide.data(), Wide.size() * 2);
+        for (const auto& View : Pairs)
+            for (const auto& Pair : View) { Out.Name(Pair.first); Out.U32(Pair.second); }
+        Out.U32(kStoreEndMagic);
+    }
+
+private:
+    struct FPath
+    {
+        std::string Class, Object, Package;
+        bool operator<(const FPath& O) const { return std::tie(Class, Object, Package) < std::tie(O.Class, O.Object, O.Package); }
+    };
+
+    uint32 Value(const std::string& V)
+    {
+        const size_t Quote = V.find('\'');
+        if (Quote != std::string::npos && V.size() > Quote + 2 && V.back() == '\'')
+        {
+            const std::string Path = V.substr(Quote + 1, V.size() - Quote - 2);
+            const size_t Dot = Path.find('.');
+            FPath P{ V.substr(0, Quote), Dot == std::string::npos ? "None" : Path.substr(Dot + 1), Path.substr(0, Dot) };
+            const int32 View = IsNumberless(P.Class) && IsNumberless(P.Object) && IsNumberless(P.Package) ? 0 : 1;
+            auto [It, bNew] = PathIds[View].emplace(P, uint32(Paths[View].size()));
+            if (bNew) Paths[View].push_back(P);
+            return (View ? NumberedPath : NumberlessPath) | It->second << 3;
+        }
+        if (IsAscii(V))
+        {
+            auto [It, bNew] = AnsiIds.emplace(V, uint32(AnsiOffsets.size()));
+            if (bNew) { AnsiOffsets.push_back(uint32(Ansi.size())); Ansi.append(V).push_back('\0'); }
+            return AnsiString | It->second << 3;
+        }
+        auto [It, bNew] = WideIds.emplace(V, uint32(WideOffsets.size()));
+        if (bNew) { WideOffsets.push_back(uint32(Wide.size())); Wide.append(Utf8To16(V)).push_back(u'\0'); }
+        return WideString | It->second << 3;
+    }
+
+    std::vector<FPath> Paths[2];                                // numberless, numbered
+    std::map<FPath, uint32> PathIds[2];
+    std::string Ansi;
+    std::vector<uint32> AnsiOffsets;
+    std::map<std::string, uint32> AnsiIds;
+    std::u16string Wide;
+    std::vector<uint32> WideOffsets;
+    std::map<std::string, uint32> WideIds;
+    std::vector<std::pair<std::string, uint32>> Pairs[2];       // numberless keys, numbered
+};
 }   // namespace
 
 bool SaveAssetRegistry(const std::vector<FRegistryAsset>& Assets, const std::string& OutPath,
@@ -154,17 +238,22 @@ bool SaveAssetRegistry(const std::vector<FRegistryAsset>& Assets, const std::str
 {
     auto Fail = [&](const char* Msg) { if (Err) *Err = Msg; return false; };
 
-    // The body is written first because it is what registers the names the batch must precede it with.
+    // The tag store and body are written first because they are what registers the names the batch must precede them with.
+    FTagStore Tags;
+    std::vector<uint64> Handles;
+    for (const FRegistryAsset& A : Assets) Handles.push_back(Tags.AddMap(A.Tags));
     FBin Body;
+    Tags.Write(Body);
     Body.I32(int32(Assets.size()));
-    for (const FRegistryAsset& A : Assets)
+    for (size_t I = 0; I < Assets.size(); ++I)
     {
+        const FRegistryAsset& A = Assets[I];
         Body.Name(A.PackageName + "." + A.AssetName);           // ObjectPath
         Body.Name(PackagePathOf(A.PackageName));                // PackagePath
         Body.Name(A.AssetClass);
         Body.Name(A.PackageName);
         Body.Name(A.AssetName);
-        Body.U64(0);                                            // tag map handle: the empty map
+        Body.U64(Handles[I]);
         Body.I32(0);                                            // tagged asset bundles
         Body.I32(0);                                            // ChunkIDs
         Body.U32(A.PackageFlags);
@@ -181,7 +270,6 @@ bool SaveAssetRegistry(const std::vector<FRegistryAsset>& Assets, const std::str
     File.insert(File.end(), Header.B.begin(), Header.B.end());
 
     WriteNameBatch(Body.Names(), File);
-    WriteEmptyStore(File);
     File.insert(File.end(), Body.B.begin(), Body.B.end());
 
     FILE* F = fopen(OutPath.c_str(), "wb");
@@ -244,17 +332,66 @@ bool LoadAssetRegistry(const std::string& Path, std::vector<FRegistryAsset>& Out
         }
     }
 
-    if (U32() != kStoreBeginMagic) return Fail("a malformed tag store");
-    for (int32 I = 0; I <= kStoreViewCount; ++I)                // the views, then the FText block
-        if (U32() != 0) return Fail("asset tags - not a registry assetgen wrote, so not one it can merge");
-    if (U32() != kStoreEndMagic) return Fail("a malformed tag store");
-
     auto Name = [&]() -> std::string {
         const uint32 Index = U32();
         const uint32 Base = Index & ~kNumberedNameBit;
         if (!bOk || Base >= Names.size()) { bOk = false; return std::string(); }
         return Index & kNumberedNameBit ? Names[Base] + "_" + std::to_string(int64(U32()) - 1) : Names[Base];
     };
+
+    /* The tag store FTagStore writes, read back to the strings it was given. Texts, which it never writes, are refused. */
+    if (U32() != kStoreBeginMagic) return Fail("a malformed tag store");
+    uint32 Counts[kStoreViewCount] = {};
+    for (uint32& C : Counts) C = U32();
+    if (Counts[4] != 0 || U32() != 0) return Fail("localized tags - not a registry assetgen wrote, so not one it can merge");
+    std::vector<std::string> Values[4];                         // names, numbered names, paths, numbered paths
+    for (int32 V = 0; V < 2; ++V)
+        for (uint32 I = 0; I < Counts[V] && bOk; ++I) Values[V].push_back(Name());
+    for (int32 V = 2; V < 4; ++V)
+        for (uint32 I = 0; I < Counts[V] && bOk; ++I)
+        {
+            const std::string Class = Name(), Object = Name(), Package = Name();
+            const std::string Path = Package + (Object == "None" ? "" : "." + Object);
+            Values[V].push_back(Class == "None" ? Path : Class + "'" + Path + "'");
+        }
+    std::vector<uint32> AnsiOffsets(Counts[5]), WideOffsets(Counts[6]);
+    for (uint32& O : AnsiOffsets) O = U32();
+    for (uint32& O : WideOffsets) O = U32();
+    std::string Ansi(Counts[7], '\0');
+    std::u16string Wide(Counts[8], u'\0');
+    if (!Ansi.empty()) Take(&Ansi[0], Ansi.size());
+    if (!Wide.empty()) Take(&Wide[0], Wide.size() * 2);
+    std::vector<std::pair<std::string, std::string>> Pairs[2];  // numberless keys, numbered
+    for (int32 V = 0; V < 2; ++V)
+        for (uint32 I = 0; I < Counts[9 + V] && bOk; ++I)
+        {
+            std::string Key = Name();
+            const uint32 Id = U32(), Index = Id >> 3;
+            std::string Value;
+            switch (Id & 7)
+            {
+            case AnsiString:
+                if (Index >= AnsiOffsets.size() || AnsiOffsets[Index] >= Ansi.size()) return Fail("a malformed tag store");
+                Value = Ansi.c_str() + AnsiOffsets[Index];
+                break;
+            case WideString:
+                if (Index >= WideOffsets.size() || WideOffsets[Index] >= Wide.size()) return Fail("a malformed tag store");
+                Value = Utf16To8(Wide.c_str() + WideOffsets[Index]);
+                break;
+            case NumberlessName: case NumberedName: case NumberlessPath: case NumberedPath:
+            {
+                const std::vector<std::string>& From = Values[(Id & 7) - NumberlessName];
+                if (Index >= From.size()) return Fail("a malformed tag store");
+                Value = From[Index];
+                break;
+            }
+            default:
+                return Fail("a malformed tag store");
+            }
+            Pairs[V].push_back({ std::move(Key), std::move(Value) });
+        }
+    if (U32() != kStoreEndMagic) return Fail("a malformed tag store");
+
     const uint32 Count = U32();
     for (uint32 I = 0; I < Count && bOk; ++I)
     {
@@ -264,7 +401,12 @@ bool LoadAssetRegistry(const std::string& Path, std::vector<FRegistryAsset>& Out
         A.AssetClass = Name();
         A.PackageName = Name();
         A.AssetName = Name();
-        if (U64() != 0 || U32() != 0 || U32() != 0) return Fail("asset tags, bundles or chunks, which assetgen never writes");
+        const uint64 Handle = U64();
+        const std::vector<std::pair<std::string, std::string>>& From = Pairs[Handle >> 63 ? 0 : 1];
+        const size_t Begin = uint32(Handle), Num = Handle >> 32 & 0xFFFF;
+        if (Begin + Num > From.size()) return Fail("a malformed tag store");
+        A.Tags.assign(From.begin() + Begin, From.begin() + Begin + Num);
+        if (U32() != 0 || U32() != 0) return Fail("asset bundles or chunks, which assetgen never writes");
         A.PackageFlags = U32();
         Out.push_back(A);
     }

@@ -630,8 +630,7 @@ void FBlueprintClass::Finish()
     /* UBlueprintGeneratedClass::GetLifetimeBlueprintReplicationList stops after this many CPF_Net properties: without
        the tag nothing the class declares replicates. Measured on BP_LiftPod: the first tag. */
     const int32 NumOverrides = int32(ComponentOverrides.size());
-    const int32 NumReplicated = int32(std::count_if(Vars.begin(), Vars.end(),
-                                                    [](const FPropertyDef& V) { return (V.PropertyFlags & CPF_Net) != 0; }));
+    const int32 NumReplicated = NumReplicatedVars();
     const std::vector<FPropertyBinding> WidgetBindings = PropertyBindings;
     const std::vector<std::string> SlotNames = NamedSlots;
     Class.Serialize = [=](FArc& Ar) {
