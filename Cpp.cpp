@@ -60,8 +60,8 @@ std::string ModFieldName(const std::string& StructPkg, const std::string& Field)
 }
 
 /* FDeref and FDerefTextView are the compiler's own read-hoist plumbing, and FMapSlot_* / FMapSlots_* its view of a
-   TMap walked in place: their fields are referenced by fixed names from hardcoded emit sites (ViewFieldOf, the
-   __DerefScratch__ prologue, LowerMapWalk), never through user field access, so they must keep their plain C++ names
+   TMap or TSet walked in place: their fields are referenced by fixed names from hardcoded emit sites (ViewFieldOf, the
+   __DerefScratch__ prologue, LowerRangeFor), never through user field access, so they must keep their plain C++ names
    on both the cooked layout and every reference. */
 bool IsInternalViewStruct(const std::string& CppName)
 {
@@ -1874,7 +1874,13 @@ private:
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     bool LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                        std::vector<FPropertyDef>& Locals, std::string* Err);
-    bool ChangesMapCount(const Json& Body, const std::string& MapType) const;
+    bool SameContainer(const Json& A, const Json& B) const;
+    bool MutatesType(const Json& Body, const std::string& Type, std::set<std::string>* Seen) const;
+    void CollectMutations(const Json& N, bool bWrite, const std::function<bool(const Json&)>& Hit, const std::string& Type,
+                          const std::set<std::string>& KeyNames, std::set<std::string>& Seen, std::vector<std::string>& Out) const;
+    void WarnIteratedMutation(const Json& Body, const Json& Walked, const std::string& Type,
+                              const std::set<std::string>& KeyNames);
+    std::set<std::string> WarnedMutation;             // function + what, of the iterated-container changes warned about
     bool LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                             std::vector<FPropertyDef>& Locals, std::string* Err);
     int32 HoistComma(const Json& Stmt, FBlueprintClass& BP, Json* Seq, std::string* Err);
@@ -2413,13 +2419,14 @@ private:
         NestedWrappers.emplace(Name, StripTypeKeywords(ContainerType));
         return Name;
     }
-    /* A TMap walked in place (LowerMapWalk): per map type, its element as a struct, FMapSlot_<map>, whose Key, Value
-       and the set's two hash links give it the sparse array's stride, and FMapSlots_<map>, whose one member __Slots__
-       reads the map's storage as a TArray of those. Like FDeref, made on first use and cooked after lowering. */
+    /* A TMap or TSet walked in place (LowerRangeFor): per container type, its element as a struct, FMapSlot_<type>,
+       whose Key (a set's element), Value (a map's) and the set's two hash links give it the sparse array's stride, and
+       FMapSlots_<type>, whose one member __Slots__ reads the container's storage as a TArray of those. Like FDeref, made
+       on first use and cooked after lowering. */
     std::map<std::string, Json> SlotAst;              // struct name -> the FieldDecl nodes its record's Fields point into
     std::map<std::string, FRecord> SlotStructs;
-    bool MapSlotView(const std::string& MapType, const std::string& Key, const std::string& Value, FBlueprintClass& BP,
-                     FIndex* View, FIndex* Slot, std::string* Err);
+    bool SlotView(const std::string& ContainerType, const std::string& Key, const std::string& Value, FBlueprintClass& BP,
+                  FIndex* View, FIndex* Slot, FIndex* FreeView, FIndex* FreeSlot, std::string* Err);
     FIndex NestedWrapperImport(const std::string& ContainerType, FBlueprintClass& BP)
     {
         const std::string Name = NestedWrapper(ContainerType);
@@ -5523,37 +5530,61 @@ bool FCompiler::HasDerefStruct(std::string* Err) const
     return true;
 }
 
-/* FScriptMap starts with its sparse array's element array, and an element is TSetElement<TPair<K, V>>: the pair, then
-   HashNextId and HashIndex. The same members laid out by UStruct::Link give the same offsets and stride, while no member
-   is aligned past 8 (FScriptSetLayout aligns the hash links past the whole pair). A container value is its own type
-   here, not the wrapper struct the map's value property is: the wrapper has the container's layout. */
-bool FCompiler::MapSlotView(const std::string& MapType, const std::string& Key, const std::string& Value, FBlueprintClass& BP,
-                            FIndex* View, FIndex* Slot, std::string* Err)
+/* FScriptMap and FScriptSet start with their sparse array's element array, and an element is TSetElement<TPair<K, V>>
+   or TSetElement<T>: the pair or the element, then HashNextId and HashIndex (TScriptSet::GetScriptLayout). The same
+   members laid out by UStruct::Link give the same offsets and stride, while no member is aligned past 8
+   (FScriptSetLayout aligns the hash links past the whole pair). A container value is its own type here, not the wrapper
+   struct the map's value property is: the wrapper has the container's layout. A set's slot has no Value.
+   The view reads on past the element array: the sparse array is Data (16), AllocationFlags (a TScriptBitArray, 32:
+   four inline words, the heap pointer, NumBits, MaxBits), FirstFreeIndex @48, NumFreeIndices @52 (SparseArray.h,
+   BitArray.h, ContainerAllocationPolicies.h). A free slot's first 8 bytes are its FFreeListLink {PrevFreeIndex,
+   NextFreeIndex}, read through a second pair, FMapSlot_Free_<type> padded to the slot's stride and its view
+   FMapSlots_Free_<type>. */
+bool FCompiler::SlotView(const std::string& ContainerType, const std::string& Key, const std::string& Value, FBlueprintClass& BP,
+                         FIndex* View, FIndex* Slot, FIndex* FreeView, FIndex* FreeSlot, std::string* Err)
 {
-    const std::string Tag = TypeTag(MapType), SlotName = "FMapSlot_" + Tag, ViewName = "FMapSlots_" + Tag;
+    const std::string Tag = TypeTag(ContainerType), SlotName = "FMapSlot_" + Tag, ViewName = "FMapSlots_" + Tag,
+                      FreeSlotName = "FMapSlot_Free_" + Tag, FreeViewName = "FMapSlots_Free_" + Tag;
+    auto Field = [](const std::string& Name, const std::string& Type)
+    { return Json{ { "kind", "FieldDecl" }, { "name", Name }, { "type", Json{ { "qualType", Type } } } }; };
+    auto Record = [&](const std::string& Name) {
+        FRecord& R = SlotStructs[Name];
+        R.CppName = R.UeName = Name;
+        R.UePackage = ModPackage + "/" + Name;
+        R.bIsStruct = R.bIsLocal = true;
+        for (const Json& F : SlotAst[Name]) R.Fields.push_back(&F);
+    };
     if (!SlotStructs.count(SlotName))
     {
-        auto Field = [](const char* Name, const std::string& Type)
-        { return Json{ { "kind", "FieldDecl" }, { "name", Name }, { "type", Json{ { "qualType", Type } } } }; };
-        SlotAst[SlotName] = Json::array({ Field("Key", Key), Field("Value", Value), Field("HashNextId", "int32"),
-                                          Field("HashIndex", "int32") });
-        SlotAst[ViewName] = Json::array({ Field("__Slots__", "TArray<" + SlotName + ">") });
-        for (const std::string& Name : { SlotName, ViewName })
-        {
-            FRecord& R = SlotStructs[Name];
-            R.CppName = R.UeName = Name;
-            R.UePackage = ModPackage + "/" + Name;
-            R.bIsStruct = R.bIsLocal = true;
-            for (const Json& F : SlotAst[Name]) R.Fields.push_back(&F);
-        }
+        SlotAst[SlotName] = Json::array({ Field("Key", Key) });
+        if (!Value.empty()) SlotAst[SlotName].push_back(Field("Value", Value));
+        SlotAst[SlotName].push_back(Field("HashNextId", "int32"));
+        SlotAst[SlotName].push_back(Field("HashIndex", "int32"));
+        SlotAst[ViewName] = Json::array({ Field("__Slots__", "TArray<" + SlotName + ">"), Field("__Flags0__", "int64"),
+                                          Field("__Flags1__", "int64"), Field("__Flags2__", "int64"), Field("__Flags3__", "int64"),
+                                          Field("__FirstFree__", "int32"), Field("__NumFree__", "int32") });
+        Record(SlotName);
+        Record(ViewName);
     }
     int32 Size = 0, Align = 0;
     if (!StructLayout(SlotStructs[SlotName], &Size, &Align, Err)) return false;
-    if (Align > 8) { *Err = "internal: a TMap walked in place with an element aligned past 8 bytes"; return false; }
+    if (Align > 8) { *Err = "internal: a TMap or TSet walked in place with an element aligned past 8 bytes"; return false; }
+    if (!SlotStructs.count(FreeSlotName))
+    {
+        SlotAst[FreeSlotName] = Json::array({ Field("Prev", "int32"), Field("Next", "int32") });
+        for (int32 I = 8; I < Size; I += 4) SlotAst[FreeSlotName].push_back(Field("__Pad" + std::to_string(I) + "__", "int32"));
+        SlotAst[FreeViewName] = Json::array({ Field("__Free__", "TArray<" + FreeSlotName + ">") });
+        Record(FreeSlotName);
+        Record(FreeViewName);
+    }
     *Slot = BP.ScriptStruct(ModPackage + "/" + SlotName, SlotName);
     *View = BP.ScriptStruct(ModPackage + "/" + ViewName, ViewName);
+    *FreeSlot = BP.ScriptStruct(ModPackage + "/" + FreeSlotName, FreeSlotName);
+    *FreeView = BP.ScriptStruct(ModPackage + "/" + FreeViewName, FreeViewName);
     KeepStructLoaded(*Slot, SlotName, Size);
-    KeepStructLoaded(*View, ViewName, 16);
+    KeepStructLoaded(*View, ViewName, 56);
+    KeepStructLoaded(*FreeSlot, FreeSlotName, Size);
+    KeepStructLoaded(*FreeView, FreeViewName, 16);
     return true;
 }
 
@@ -13047,31 +13078,156 @@ std::string AssignedNoVar(const Json& Target)
    [init, __range1, __begin1, __end1, cond, inc, loop variable, body].
      TArray: in place, by index. `T& E` is another name for `Range[Idx]`, so writes land in the array;
              a by-value `T E` is a copy made each iteration. The length is read once, as C++ reads end() once.
-     TSet:   over a Set_ToArray copy; elements are copies.
+     TSet:   a by-value `T X` over a Set_ToArray copy, X a copy.
      TMap:   over a Map_Keys copy, each value fetched with Map_Find. `auto [K, V]` binds K to a copy of the key and
              V to a local. `auto& [K, V]` writes V back with Map_Add after each iteration, `break` included, so the
              body changes values in place - unless the body only reads V (`V->X = 1` included: that writes the
-             object, not the map); `auto [K, V]` is a copy, as in C++, and writes nothing back.
-   `auto& [K, V]` and `const auto& [K, V]` over a TMap walk its slots in place instead (see below).
-   ponytail: a TSet iterates a copy: its elements are const, so walking it in place would only save the copy. */
+             object, not the map); `auto [K, V]` is a copy, as in C++, and writes nothing back. A pair variable
+             `auto P` / `auto& P` is the same loop, its P.Key and P.Value the two bindings.
+   A reference loop variable over a TMap (`auto& [K, V]`, `const auto& [K, V]`, `auto& P`) or a TSet (`const T& X`)
+   walks the container's slots in place instead (see below); only an element aligned past 8 takes the copy above. A
+   body that changes the container it walks is warned, never worked around (WarnIteratedMutation). */
 
-/* Whether Body adds to, removes from or reorders a TMap of MapType, or assigns a whole one: a walk over such a map's slots
-   in place would lose its place. The map called on is not told apart from another of the same type; one written through
-   a call the body makes is not seen, as C++'s own ensure sees it only at run time. */
-bool FCompiler::ChangesMapCount(const Json& Body, const std::string& MapType) const
+/* The methods that change a container's element count, a TArray's length: Containers.h's, and the native TArray /
+   TSet / TMap ones the SDK spells the same, by kind ('A'rray, else a hashed TSet / TMap). A set operation changes its
+   Result, an argument, which is caught as one. */
+static bool CountMethod(char Which, const std::string& M)
 {
-    static const std::set<std::string> Moving = { "Add", "Emplace", "FindOrAdd", "Remove", "RemoveAndCopyValue",
-        "FindAndRemoveChecked", "Empty", "Reset", "Append", "Compact", "CompactStable", "Shrink", "KeySort", "ValueSort",
-        "KeyStableSort", "ValueStableSort" };
-    const std::string K = Kind(Body);
-    auto Of = [&](const Json* N) { return N && TypeTag(TypeOf(*N)) == TypeTag(MapType); };
-    if (K == "MemberExpr" && Moving.count(Body.value("name", std::string())) && Of(First(Body))) return true;
+    static const std::set<std::string> Array = { "Add", "AddUnique", "Append", "Clear", "Empty", "Insert", "Remove",
+        "RemoveItem", "Reset", "Resize", "Set" };
+    static const std::set<std::string> Hashed = { "Add", "AddItems", "Append", "Clear", "Compact", "CompactStable",
+        "Emplace", "Empty", "FindAndRemoveChecked", "FindOrAdd", "KeySort", "KeyStableSort", "Remove", "RemoveAndCopyValue",
+        "RemoveItems", "Reset", "Shrink", "ValueSort", "ValueStableSort" };
+    return (Which == 'A' ? Array : Hashed).count(M) != 0;
+}
+
+/* The short name a warning gives a container expression: `Scores`, `Cur->Scores` as Scores, `Lists[K]` as Lists[]. */
+static std::string ContainerName(const Json* N)
+{
+    N = Strip(N);
+    if (!N) return "?";
+    if (Kind(*N) == "MemberExpr") return N->value("name", std::string("?"));
+    if (Kind(*N) == "DeclRefExpr") return Name((*N)["referencedDecl"]);
+    if (IsTArrayElement(*N) || IsTMapElement(*N)) return ContainerName(Nth(*N, 1)) + "[]";
+    return "?";
+}
+
+/* Whether A and B name the same container: the same local, parameter or member, down the same path. Only names are
+   compared; two pointers to one object are two containers here. */
+bool FCompiler::SameContainer(const Json& A, const Json& B) const
+{
+    std::function<bool(const Json*, const Json*)> Same = [&](const Json* X, const Json* Y) {
+        X = Strip(X);
+        Y = Strip(Y);
+        if (!X || !Y || Kind(*X) != Kind(*Y)) return false;
+        const std::string K = Kind(*X);
+        if (K == "CXXThisExpr") return true;
+        if (K == "DeclRefExpr") return (*X)["referencedDecl"].value("id", std::string()) == (*Y)["referencedDecl"].value("id", std::string());
+        return K == "MemberExpr" && X->value("referencedMemberDecl", std::string()) == Y->value("referencedMemberDecl", std::string())
+            && X->value("isArrow", false) == Y->value("isArrow", false) && Same(First(*X), First(*Y));
+    };
+    const Json UA = Unalias(A), UB = Unalias(B);
+    return Same(&UA, &UB);
+}
+
+/* Each place in N that may change a container Hit picks, as Out names it (`Scores.Remove`, `Scores[] =`,
+   `Prune(Scores)`, `Shrink()`): a count-changing method called on it, a whole assignment to it, a TMap store `M[k] = v`
+   (Map_Add, which inserts a key the map lacks) unless k is one of KeyNames, it passed to a non-const reference parameter,
+   or a call to one of the class's own methods whose body may change a container of Type. bWrite: N is written. */
+bool FCompiler::MutatesType(const Json& Body, const std::string& Type, std::set<std::string>* Seen) const
+{
+    std::vector<std::string> Hits;
+    CollectMutations(Body, false, [&](const Json& E) { return TypeTag(TypeOf(E)) == TypeTag(Type); }, Type, {}, *Seen, Hits);
+    return !Hits.empty();
+}
+
+void FCompiler::CollectMutations(const Json& N, bool bWrite, const std::function<bool(const Json&)>& Hit, const std::string& Type,
+                                 const std::set<std::string>& KeyNames, std::set<std::string>& Seen, std::vector<std::string>& Out) const
+{
+    const std::string K = Kind(N);
+    auto Visit = [&](const Json* X, bool bW) { if (X) CollectMutations(*X, bW, Hit, Type, KeyNames, Seen, Out); };
+    auto KindOf = [](const Json& E) { const std::string T = StripTypeKeywords(TypeOf(E)); return T.size() > 1 ? T[1] : '?'; };
+    /* An argument passed to a non-const reference stays a bare lvalue: a const one is a NoOp cast, a value a copy. */
+    auto Args = [&](size_t From, const std::string& Callee) {
+        for (size_t I = From; N.contains("inner") && I < N["inner"].size(); ++I)
+        {
+            const Json& A = N["inner"][I];
+            const bool bRef = Kind(A) == "DeclRefExpr" || Kind(A) == "MemberExpr" || IsTArrayElement(A) || IsTMapElement(A);
+            if (bRef && Hit(A)) Out.push_back(Callee + "(" + ContainerName(&A) + ")");
+            Visit(&A, bRef);
+        }
+    };
+    if (IsTMapElement(N))
+    {
+        const Json* Key = Strip(Nth(N, 2));
+        const bool bCurrent = Key && Kind(*Key) == "DeclRefExpr" && KeyNames.count((*Key)["referencedDecl"].value("id", std::string()));
+        if (bWrite && Hit(*Nth(N, 1)) && !bCurrent) Out.push_back(ContainerName(Nth(N, 1)) + "[] =");
+        Visit(Nth(N, 1), bWrite);
+        Visit(Nth(N, 2), false);
+        return;
+    }
+    if (K == "CXXMemberCallExpr" && First(N) && Kind(*First(N)) == "MemberExpr")
+    {
+        const Json& Callee = *First(N);
+        const Json* Obj = First(Callee);
+        const std::string M = Callee.value("name", std::string());
+        const bool bCounts = Obj && CountMethod(KindOf(*Obj), M);
+        if (bCounts && Hit(*Obj)) Out.push_back(ContainerName(Obj) + "." + M);
+        if (Cur && Obj && Kind(*Strip(Obj)) == "CXXThisExpr" && Seen.insert(M).second)
+        {
+            const auto D = Cur->MethodDefs.find(M);
+            const auto Decl = Cur->Methods.find(M);
+            const Json* Def = D != Cur->MethodDefs.end() ? D->second : Decl != Cur->Methods.end() ? Decl->second : nullptr;
+            const Json* FnBody = nullptr;
+            if (Def) ForEach(*Def, [&](const Json& X) { if (Kind(X) == "CompoundStmt") FnBody = &X; });
+            if (FnBody && MutatesType(*FnBody, Type, &Seen)) Out.push_back(M + "()");
+        }
+        Visit(Obj, bCounts || M == "Reverse" || M == "Shuffle" || M == "Swap");
+        Args(1, M);
+        return;
+    }
+    if (K == "CallExpr") { Args(1, ContainerName(First(N))); return; }
     if (K == "CXXOperatorCallExpr")
-        if (const Json* Callee = First(Body) ? Strip(First(Body)) : nullptr; Callee && Kind(*Callee) == "DeclRefExpr"
-            && Name((*Callee)["referencedDecl"]) == "operator=" && Of(Nth(Body, 1))) return true;
-    bool bFound = false;
-    ForEach(Body, [&](const Json& C) { bFound = bFound || ChangesMapCount(C, MapType); });
-    return bFound;
+    {
+        const Json* Op = Strip(First(N));
+        const std::string Name_ = Op && Op->contains("referencedDecl") ? Name((*Op)["referencedDecl"]) : std::string();
+        const bool bAssign = Name_ == "operator=" || (Name_.size() > 9 && Name_.back() == '=' && Name_ != "operator=="
+                                                      && Name_ != "operator!=" && Name_ != "operator<=" && Name_ != "operator>=");
+        if (Name_ == "operator=" && Nth(N, 1) && Hit(*Nth(N, 1))) Out.push_back(ContainerName(Nth(N, 1)) + " =");
+        for (size_t I = 1; N.contains("inner") && I < N["inner"].size(); ++I) Visit(&N["inner"][I], bAssign && I == 1);
+        return;
+    }
+    if (K == "BinaryOperator" || K == "CompoundAssignOperator")
+    {
+        const std::string Op = N.value("opcode", std::string());
+        Visit(Nth(N, 0), K == "CompoundAssignOperator" || Op == "=");
+        Visit(Nth(N, 1), false);
+        return;
+    }
+    if (K == "UnaryOperator")
+    {
+        const std::string Op = N.value("opcode", std::string());
+        Visit(Nth(N, 0), Op == "++" || Op == "--");
+        return;
+    }
+    const bool bPass = (K == "MemberExpr" && !N.value("isArrow", false)) || K == "ParenExpr" || K == "ExprWithCleanups"
+                    || (K == "ImplicitCastExpr" && N.value("castKind", std::string()) == "NoOp");
+    ForEach(N, [&](const Json& X) { Visit(&X, bPass && bWrite); });
+}
+
+/* Changing the container a range-for walks is the C++ iterator contract's to forbid: the walk stays as it is, and each
+   change the body makes to Walked, directly or through a call that may, is warned. `Map[K]` with K the current key is
+   the slot itself, no change. */
+void FCompiler::WarnIteratedMutation(const Json& Body, const Json& Walked, const std::string& Type,
+                                     const std::set<std::string>& KeyNames)
+{
+    std::vector<std::string> Hits;
+    std::set<std::string> Seen;
+    CollectMutations(Body, false, [&](const Json& E) { return SameContainer(E, Walked); }, Type, KeyNames, Seen, Hits);
+    for (const std::string& What : Hits)
+        if (WarnedMutation.insert(CurFnName + "|" + What).second)
+            printf("  warning: %s::%s: unsafe to mutate iterated container (%s)\n", Cur ? Cur->CppName.c_str() : "",
+                   CurFnName.c_str(), What.c_str());
 }
 
 bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
@@ -13099,6 +13255,7 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ *Init })} };
         if (!LowerBody(Wrap, BP, Out, Locals, Err)) return false;
     }
+    const Json Walked = Unalias(*RangeExpr);            // the container as the body names it, for WarnIteratedMutation
 
     /* C++ binds the range once: whatever locates it (`Pick()->Items`, `Cur->Items` with `Cur = Next` in the
        body) is evaluated into a local up front. */
@@ -13224,24 +13381,84 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         if (!LowerArg(*RangeExpr, BP, Range, Err)) return false;
     }
 
-    /* `auto& [K, V]` and `const auto& [K, V]` over a TMap walk the map's own slots (MapSlotView): V is the value where it
-       lives, so a write through it is what `Map[K]` reads next, a T& binds it, and a container value changes in place.
-       Each use re-reads the element array, so a map that grows under the walk is still read where it is. A map with free
-       slots (it lost elements) is packed first, by copying it out and back, as FMapProperty copies densely. A body that
-       adds to or removes from a map of this type would move the walk under it (C++ answers with an ensure): it walks a
-       copy of the keys below, as `auto [K, V]` does. */
-    std::vector<const Json*> Binds;
-    if (Which == 'M') ForEach(*LoopDecl, [&](const Json& C) { if (Kind(C) == "BindingDecl") Binds.push_back(&C); });
+    /* A TMap loop's two names, K and V: the bindings of `auto [K, V]`, or for a pair variable `auto& P`, P.Key and P.Value.
+       Those two are rewritten in the body to names of their own, so a pair loop is a `[K, V]` loop from here on, in place or
+       over a copy, and `const auto& K = P.Key` is another name for the slot's key, as for a binding. P itself is read only
+       through them: the VM has no pair to hand over whole. */
+    std::string KeyId, ValId;
+    Json PairBody;
+    if (Which == 'M' && Kind(*LoopDecl) == "DecompositionDecl")
+    {
+        std::vector<const Json*> Binds;
+        ForEach(*LoopDecl, [&](const Json& C) { if (Kind(C) == "BindingDecl") Binds.push_back(&C); });
+        if (Binds.size() != 2) { *Err = "a TMap range-for binds exactly `auto [Key, Value]`"; return false; }
+        KeyId = Binds[0]->value("id", std::string());
+        ValId = Binds[1]->value("id", std::string());
+    }
+    else if (Which == 'M')
+    {
+        const std::string PairId = LoopDecl->value("id", std::string());
+        KeyId = PairId + "/Key";
+        ValId = PairId + "/Value";
+        bool bBare = false;
+        std::function<Json(const Json&)> Split = [&](const Json& N) -> Json {
+            if (Kind(N) == "MemberExpr" && !N.value("isArrow", false))
+                if (const Json* Of = Strip(First(N)); Of && Kind(*Of) == "DeclRefExpr" && (*Of)["referencedDecl"].value("id", std::string()) == PairId)
+                {
+                    const std::string Field = N.value("name", std::string());
+                    if (Field != "Key" && Field != "Value") { bBare = true; return N; }
+                    return { {"kind", "DeclRefExpr"}, {"type", N.value("type", Json())}, {"valueCategory", "lvalue"},
+                             {"referencedDecl", {{"id", Field == "Key" ? KeyId : ValId}, {"kind", "BindingDecl"}, {"name", Field}}} };
+                }
+            if (Kind(N) == "DeclRefExpr" && N["referencedDecl"].value("id", std::string()) == PairId) bBare = true;
+            if (!N.is_object() || !N.contains("inner")) return N;
+            Json Up = N;
+            for (Json& C : Up["inner"]) C = Split(C);
+            return Up;
+        };
+        PairBody = Split(*Body);
+        if (bBare) { *Err = "a TMap range-for's pair variable is read only as P.Key and P.Value"; return false; }
+        Body = &PairBody;
+    }
+
+    /* The names of the current key: K (P.Key is K by now), and each reference the body binds to one of them
+       (`const auto& k = K`). `Map[k]` with one of them is the current slot. */
+    std::set<std::string> KeyNames;
+    if (Which == 'M')
+    {
+        KeyNames.insert(KeyId);
+        std::function<void(const Json&)> Bound = [&](const Json& N) {
+            if (Kind(N) == "VarDecl" && !TypeOf(N).empty() && TypeOf(N).back() == '&')
+                if (const Json* Init = Strip(First(N)); Init && Kind(*Init) == "DeclRefExpr"
+                    && KeyNames.count((*Init)["referencedDecl"].value("id", std::string())))
+                    KeyNames.insert(N.value("id", std::string()));
+            ForEach(N, Bound);
+        };
+        Bound(*Body);
+    }
+    /* Any walk is undefined once the body changes the container it walks, as a C++ iterator is: warned, never worked
+       around. */
     const std::string BoundAs = TypeOf(*LoopDecl);
+    WarnIteratedMutation(*Body, Walked, RangeTy, KeyNames);
+
+    /* A TSet / TMap is walked in place, over its own slots (SlotView), by reference or by value. By reference
+       (`auto& [K, V]`, `const auto& [K, V]`, `auto& P`, `const T& X`), K, V and X name the slot's members, re-read at
+       each use, so the walk keeps no local per name: V is the value where it lives, a write through it is what `Map[K]`
+       reads next, a T& binds it, and a container value changes in place; K and X are const (TPair<const K, V>, TSet's
+       const begin()). By value, each pass copies them into locals, as C++ copies the element out. Free slots are skipped
+       (below), so the container is never copied or moved. Only an element aligned past 8 walks a copy below. */
     int32 KeySize = 0, KeyAlign = 1, ValueSize = 0, ValueAlign = 1;
     std::string NoLayout;
-    if (Which == 'M' && Kind(*LoopDecl) == "DecompositionDecl" && Binds.size() == 2 && !BoundAs.empty() && BoundAs.back() == '&'
-        && LayoutOf(Args[0], &KeySize, &KeyAlign, &NoLayout) && LayoutOf(Args[1], &ValueSize, &ValueAlign, &NoLayout)
-        && std::max(KeyAlign, ValueAlign) <= 8 && !ChangesMapCount(*Body, RangeTy))
+    if ((Which == 'M' || (Which == 'S' && Kind(*LoopDecl) == "VarDecl"))
+        && LayoutOf(Args[0], &KeySize, &KeyAlign, &NoLayout)
+        && (Which == 'S' || LayoutOf(Args[1], &ValueSize, &ValueAlign, &NoLayout))
+        && std::max(KeyAlign, ValueAlign) <= 8)
     {
-        FIndex View, Slot;
-        if (!MapSlotView(RangeTy, Args[0], Args[1], BP, &View, &Slot, Err)) return false;
-        const std::string SlotTy = "FMapSlot_" + TypeTag(RangeTy);
+        const bool bMap = Which == 'M';
+        const bool bByRef = !BoundAs.empty() && BoundAs.back() == '&';
+        FIndex View, Slot, FreeView, FreeSlot;
+        if (!SlotView(RangeTy, Args[0], bMap ? Args[1] : std::string(), BP, &View, &Slot, &FreeView, &FreeSlot, Err)) return false;
+        const std::string SlotTy = "FMapSlot_" + TypeTag(RangeTy), FreeSlotTy = "FMapSlot_Free_" + TypeTag(RangeTy);
         auto Member = [&](const char* Field, FIndex Owner, FArgIR Base, const std::string& Type) {
             FArgIR M;
             M.K = FArgIR::Member;
@@ -13262,53 +13479,126 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
             C.Sub->Args = { std::move(Of) };
             return C;
         };
+        auto IndexOf = [&](const FArgIR& Arr, const std::string& ElemTy, FArgIR I) {
+            FArgIR E;
+            E.K = FArgIR::Index;
+            E.Base = std::make_shared<FArgIR>(Arr);
+            E.Sub = std::make_shared<FCallIR>();
+            E.Sub->Args = { std::move(I) };
+            E.S = Arr.S;
+            E.Owner = Arr.Owner;
+            E.LetOp = LetOpFor(ElemTy);
+            E.InnerType = ElemTy;
+            return E;
+        };
         const FArgIR Slots = Member("__Slots__", View, Range, "TArray<" + SlotTy + ">");
-        const std::string Packed = "__RangePack" + N + "__", Idx = "__RangeIdx" + N + "__", Key = "__RangeKey" + N + "__";
-        if (!AddLocal(Packed, RangeTy) || !AddLocal(Idx, "int32") || !AddLocal(Key, Args[0])) return false;
-
-        /* if (slots != elements) { Packed = Map; Map.Empty(); Map = Packed; Packed.Empty(); } - the Empty between keeps
-           the two copies from ever becoming `Map = Map`, which empties it. */
-        FArgIR SlotCount = Count("KismetArrayLibrary", "Array_Length", Slots);
-        FArgIR ElemCount = Count("BlueprintMapLibrary", "Map_Length", Range);
-        FStmtIR Pack;
-        Pack.K = FStmtIR::If;
-        Pack.Cond = Math("NotEqual_IntInt", std::move(SlotCount), std::move(ElemCount));
-        Pack.Then = std::make_shared<std::vector<FStmtIR>>();
-        Pack.Then->push_back(AssignStmt(Packed, RangeTy, Range));
-        Pack.Then->push_back(CallStmt("BlueprintMapLibrary", "Map_Clear", { Range }));
-        FStmtIR Back;
-        Back.K = FStmtIR::Assign;
-        Back.Var = Range;
-        Back.Var.LetOp = LetOpFor(RangeTy);
-        Back.bAssignLocal = Range.K == FArgIR::Local;
-        Back.bAssignOutParm = Range.K == FArgIR::LocalOut;
-        Back.Value = LocalArg(Packed);
-        Pack.Then->push_back(std::move(Back));
-        Pack.Then->push_back(CallStmt("BlueprintMapLibrary", "Map_Clear", { LocalArg(Packed) }));
-        Out.push_back(std::move(Pack));
-
-        FArgIR Zero, One;
+        const std::string Idx = "__RangeIdx" + N + "__", Len = "__RangeLen" + N + "__", Holes = "__RangeHoles" + N + "__",
+                          Free = "__RangeFree" + N + "__", Link = "__RangeLink" + N + "__", Left = "__RangeLeft" + N + "__";
+        if (!AddLocal(Idx, "int32") || !AddLocal(Len, "int32") || !AddLocal(Holes, "bool") || !AddLocal(Free, "TArray<bool>")
+            || !AddLocal(Link, "int32") || !AddLocal(Left, "int32")) return false;
+        FArgIR Zero, One, True, False;
         Zero.K = One.K = FArgIR::Int;
         One.I = 1;
+        True.K = False.K = FArgIR::Bool;
+        True.B = true;
+
+        /* The slot count is read once, as C++ reads end() once: the body must not change the container (the iterator
+           contract, warned above). A container that lost elements has free slots, and their indices are on the sparse
+           array's free list: NumFreeIndices of them from FirstFreeIndex, each free slot's NextFreeIndex (its
+           FFreeListLink, over the element's first 8 bytes) naming the next. They are marked once, here, in Free; a
+           container with none, the usual case, skips all of it and pays one test of Holes per pass. */
+        Out.push_back(AssignStmt(Len, "int32", Count("KismetArrayLibrary", "Array_Length", Slots)));
+        Out.push_back(AssignStmt(Holes, "bool", Math("NotEqual_IntInt", Member("__NumFree__", View, Range, "int32"), Zero)));
+        FStmtIR Mark;
+        Mark.K = FStmtIR::If;
+        Mark.Cond = LocalArg(Holes);
+        Mark.Then = std::make_shared<std::vector<FStmtIR>>();
+        Mark.Then->push_back(CallStmt("KismetArrayLibrary", "Array_Clear", { LocalArg(Free) }));
+        Mark.Then->push_back(CallStmt("KismetArrayLibrary", "Array_Resize", { LocalArg(Free), LocalArg(Len) }));
+        Mark.Then->push_back(AssignStmt(Link, "int32", Member("__FirstFree__", View, Range, "int32")));
+        Mark.Then->push_back(AssignStmt(Left, "int32", Member("__NumFree__", View, Range, "int32")));
+        FStmtIR Chain;
+        Chain.K = FStmtIR::While;
+        Chain.Cond = Math("Greater_IntInt", LocalArg(Left), Zero);
+        Chain.Body = std::make_shared<std::vector<FStmtIR>>();
+        Chain.Body->push_back(CallStmt("KismetArrayLibrary", "Array_Set", { LocalArg(Free), LocalArg(Link), True, False }));
+        const FArgIR Links = Member("__Free__", FreeView, Range, "TArray<" + FreeSlotTy + ">");
+        Chain.Body->push_back(AssignStmt(Link, "int32", Member("Next", FreeSlot, IndexOf(Links, FreeSlotTy, LocalArg(Link)), "int32")));
+        Chain.Body->push_back(AssignStmt(Left, "int32", Math("Subtract_IntInt", LocalArg(Left), One)));
+        Mark.Then->push_back(std::move(Chain));
+        Out.push_back(std::move(Mark));
+
         Out.push_back(AssignStmt(Idx, "int32", Zero));
         FStmtIR Loop;
         Loop.K = FStmtIR::While;
-        FArgIR Trips = Count("KismetArrayLibrary", "Array_Length", Slots);
-        Loop.Cond = Math("Less_IntInt", LocalArg(Idx), std::move(Trips));
+        Loop.Cond = Math("Less_IntInt", LocalArg(Idx), LocalArg(Len));
         Loop.Body = std::make_shared<std::vector<FStmtIR>>();
         Loop.Inc = std::make_shared<std::vector<FStmtIR>>();
-        FArgIR At;
-        At.K = FArgIR::Index;
-        At.Base = std::make_shared<FArgIR>(Slots);
-        At.Sub = std::make_shared<FCallIR>();
-        At.Sub->Args = { LocalArg(Idx) };
-        At.S = Slots.S;
-        At.Owner = Slots.Owner;
-        At.LetOp = LetOpFor(SlotTy);
-        At.InnerType = SlotTy;
-        Loop.Body->push_back(AssignStmt(Key, Args[0], Member("Key", Slot, At, Args[0])));
-        RefAlias[Binds[0]->value("id", std::string())] = RefToLocal(Key, Args[0]);
-        RefPlace[Binds[1]->value("id", std::string())] = Member("Value", Slot, At, Args[1]);
+        /* if (Holes) if (Free[Idx]) continue; - nested, as Kismet's BooleanAND evaluates both sides. */
+        FStmtIR Skip, SkipFree, Next;
+        Next.K = FStmtIR::Continue;
+        SkipFree.K = FStmtIR::If;
+        SkipFree.Cond = IndexOf(LocalArg(Free), "bool", LocalArg(Idx));
+        SkipFree.Then = std::make_shared<std::vector<FStmtIR>>(1, Next);
+        Skip.K = FStmtIR::If;
+        Skip.Cond = LocalArg(Holes);
+        Skip.Then = std::make_shared<std::vector<FStmtIR>>(1, std::move(SkipFree));
+        Loop.Body->push_back(std::move(Skip));
+        const FArgIR At = IndexOf(Slots, SlotTy, LocalArg(Idx));
+        if (!bMap)
+        {
+            /* X is a binding as K is: its uses name the slot, never a local of its own. */
+            KeyId = LoopDecl->value("id", std::string());
+            std::function<void(Json&)> Retag = [&](Json& N) {
+                if (Kind(N) == "DeclRefExpr" && N["referencedDecl"].value("id", std::string()) == KeyId) N["referencedDecl"]["kind"] = "BindingDecl";
+                if (N.is_object() && N.contains("inner")) for (Json& C : N["inner"]) Retag(C);
+            };
+            Json Tagged = *Body;
+            Retag(Tagged);
+            PairBody = std::move(Tagged);
+            Body = &PairBody;
+        }
+        else
+        {
+            /* `Map[K]` on the walked map, K a name of the current key, is the slot's value, read and written in place, with
+               no Map_Find or Map_Add, as no element is added or removed: V itself by reference, the map's own value (not
+               the copy V is) by value. */
+            std::function<void(Json&)> Slotted = [&](Json& N) {
+                if (IsTMapElement(N) && SameContainer(*Nth(N, 1), Walked))
+                    if (const Json* Key = Strip(Nth(N, 2)); Key && Kind(*Key) == "DeclRefExpr"
+                        && KeyNames.count((*Key)["referencedDecl"].value("id", std::string())))
+                    {
+                        N = { {"kind", "DeclRefExpr"}, {"type", N.value("type", Json())}, {"valueCategory", "lvalue"},
+                              {"referencedDecl", {{"id", ValId + "/Slot"}, {"kind", "BindingDecl"}, {"name", "Value"}}} };
+                        return;
+                    }
+                if (N.is_object() && N.contains("inner")) for (Json& C : N["inner"]) Slotted(C);
+            };
+            Json Rewritten = *Body;
+            Slotted(Rewritten);
+            PairBody = std::move(Rewritten);
+            Body = &PairBody;
+            RefPlace[ValId + "/Slot"] = Member("Value", Slot, At, Args[1]);
+        }
+        if (bByRef)
+        {
+            RefPlace[KeyId] = Member("Key", Slot, At, Args[0]);
+            if (bMap) RefPlace[ValId] = Member("Value", Slot, At, Args[1]);
+        }
+        else
+        {
+            /* By value, as C++ copies the element out of the container: K and V (X) are locals, each pass a copy of the
+               slot's members. */
+            const std::string KeyL = "__RangeKey" + N + "__", ValL = "__RangeVal" + N + "__";
+            if (!AddLocal(KeyL, Args[0]) || (bMap && !AddLocal(ValL, Args[1]))) return false;
+            Loop.Body->push_back(AssignStmt(KeyL, Args[0], Member("Key", Slot, At, Args[0])));
+            RefAlias[KeyId] = RefToLocal(KeyL, Args[0]);
+            if (bMap)
+            {
+                Loop.Body->push_back(AssignStmt(ValL, Args[1], Member("Value", Slot, At, Args[1])));
+                RefAlias[ValId] = RefToLocal(ValL, Args[1]);
+            }
+        }
         const Json BodyWrap = Kind(*Body) == "CompoundStmt" ? *Body : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Body })} };
         ++LoopDepth;
         const bool bBodyOk = LowerBody(BodyWrap, BP, *Loop.Body, Locals, Err);
@@ -13397,23 +13687,19 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
     }
     else
     {
-        if (Kind(*LoopDecl) != "DecompositionDecl") { *Err = "a TMap range-for binds `auto [Key, Value]`"; --LoopDepth; return false; }
-        std::vector<const Json*> Bindings;
-        ForEach(*LoopDecl, [&](const Json& C) { if (Kind(C) == "BindingDecl") Bindings.push_back(&C); });
-        if (Bindings.size() != 2) { *Err = "a TMap range-for binds exactly `auto [Key, Value]`"; --LoopDepth; return false; }
         const std::string Key = "__RangeKey" + N + "__", Val = "__RangeVal" + N + "__";
         if (!AddLocal(Key, Args[0])) { --LoopDepth; return false; }
         FArgIR KeyAt;
         if (!LowerArg(Elem, BP, KeyAt, Err)) { --LoopDepth; return false; }
         Loop.Body->push_back(AssignStmt(Key, Args[0], std::move(KeyAt)));
-        RefAlias[Bindings[0]->value("id", std::string())] = RefToLocal(Key, Args[0]);
+        RefAlias[KeyId] = RefToLocal(Key, Args[0]);
         const std::string PairTy = TypeOf(*LoopDecl);
         const bool bByRef = !PairTy.empty() && PairTy.back() == '&' && StripTypeKeywords(PairTy) == PairTy;   // `auto& [K, V]`
         /* `auto& [K, V]` names the map's own value: V is `Map[K]`, each read a Map_Find and each store a Map_Add, so
            a write through either name is what the other reads next. A container value stays a copy written back at
            the end of each pass (below): every operation on it through the map would copy it whole. */
         if (bByRef && !IsContainerType(StripTypeKeywords(Args[1])))
-            RefAlias[Bindings[1]->value("id", std::string())] =
+            RefAlias[ValId] =
                 { {"kind", "CXXOperatorCallExpr"}, {"type", {{"qualType", Args[1]}}},
                   {"inner", Json::array({ Json{ {"kind", "DeclRefExpr"}, {"referencedDecl", {{"kind", "CXXMethodDecl"}, {"name", "operator[]"}}} },
                                           *RangeExpr, RefToLocal(Key, Args[0]) })} };
@@ -13431,8 +13717,8 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
                 Find = Call.Sub->Inline->front();
             }
             Loop.Body->push_back(std::move(Find));
-            RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Val, Args[1]);
-            if (bByRef && !OnlyRead(*Body, Bindings[1]->value("id", std::string())))
+            RefAlias[ValId] = RefToLocal(Val, Args[1]);
+            if (bByRef && !OnlyRead(*Body, ValId))
             {
                 FStmtIR Back = CallStmt("BlueprintMapLibrary", "Map_Add", { Range, LocalArg(Key), LocalArg(Val) });
                 Loop.Inc->push_back(Back);
@@ -21588,7 +21874,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (!GenerateStruct(SynthDeref, OutDir, Err)) return false;
         ++Generated;
     }
-    for (const auto& Entry : SlotStructs)       // the TMap walks lowering made; see MapSlotView
+    for (const auto& Entry : SlotStructs)       // the TMap / TSet walks lowering made; see SlotView
     {
         if (!GenerateStruct(Entry.second, OutDir, Err)) return false;
         ++Generated;

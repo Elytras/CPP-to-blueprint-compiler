@@ -1794,50 +1794,87 @@ void Double() {
 ```
 
 Note: the length is read once, before the loop, as C++ reads `end()` once. Elements added in the body are not visited,
-and after a removal the walk runs past the new end. Do not change the array's length inside the loop.
+and after a removal the walk runs past the new end. Do not change the array's length inside the loop; see
+[Changing the container a loop walks](#changing-the-container-a-loop-walks).
 
 ### Range-for over a TSet
 
 | You write | What it does | Status |
 |---|---|---|
-| <a id="range-for-over.for-int32-x-seen"></a>`for (int32 X : Seen)`, `for (const int32 &X : Seen)` | The set is copied into an array (To Array) and the loop walks the copy. The loop variable is a value or a const reference: `int32 &` is a clang error, because the SDK's TSet is read-only in a loop. Since the walk is over the copy, adding to or removing from the set in the body does not disturb it. | Yes |
-| <a id="range-for-over.for-const-fname-tag-tags"></a>`for (const FName &Tag : Tags)` without the copy | A TSet loop always walks a copy today. The loop works either way; only the cost of the copy differs. | Not yet |
+| <a id="range-for-over.for-const-int32-x-seen"></a>`for (const int32 &X : Seen)`, `for (auto &X : Seen)` | Walks the set where it lives, with no copy. X is the element in the set, and const: `int32 &` is a clang error, because a set element is its own key. | Yes |
+| <a id="range-for-over.for-int32-x-seen"></a>`for (int32 X : Seen)` | By value: the same walk over the set itself, each pass copying the element into X. | Yes |
+| <a id="range-for-over.seen-remove-x"></a>`Seen.Remove(X)` in the body | Unsafe, as in C++, by value too: the walk stays as it is, and the compiler warns. To remove while walking, walk a copy you take: `TArray<int32> All; Seen.ToArray(All); for (int32 X : All) ...`. See [Changing the container a loop walks](#changing-the-container-a-loop-walks). | Warns |
+
+The set walk follows the TMap notes below: an element aligned past 8 bytes walks a To Array copy, free slots are
+skipped, and it cooks the same four helper structs, named after the set type.
 
 ### Range-for over a TMap
 
 | You write | What it does | Status |
 |---|---|---|
-| <a id="range-for-over.for-auto-key-value-scores"></a>`for (auto &[Key, Value] : Scores)` | Walks the map where it lives. Value is the value in the map: a write through it is what `Scores[Key]` reads next, a `T&` binds it with no copy, and a container value changes in place. Key is a copy. `const auto &[Key, Value]` reads the same way. The 4.27 editor has no map ForEach; this replaces Keys, ForEachLoop and Find. | Yes |
-| <a id="range-for-over.for-auto-key-value-scores-2"></a>`for (auto [Key, Value] : Scores)` | By value: the keys are copied (Keys) and each value is fetched into a local (Find). Value is a copy and nothing is written back, as in C++. | Yes |
-| <a id="range-for-over.scores-remove-key"></a>`Scores.Remove(Key)` in the body | A body that adds to or removes from the map walks a copy of the keys instead, so removing the current key is safe. Each read of Value is then a Find and each store an Add. A container value is copied, and stored back at the end of each pass and before a `break` or `return`. | Yes |
-| <a id="range-for-over.for-auto-pair-scores"></a>`for (auto &Pair : Scores)` | Refused ("a TMap range-for binds `auto [Key, Value]`"): a map loop binds exactly two names. | Refused |
-| <a id="range-for-over.goto"></a>`goto` inside a TMap loop that writes values back | Refused ("a goto inside a TMap range-for that writes its value back would skip the write"), even when the label is inside the loop. A loop writes values back when it walks a copy of the keys and the body changes a container value through `auto &[Key, Value]`. Leave with `break`, or bind `const auto&`. | Refused |
+| <a id="range-for-over.for-auto-key-value-scores"></a>`for (auto &[Key, Value] : Scores)` | Walks the map where it lives, with no copy and no local per name. Value is the value in the map: a write through it is what `Scores[Key]` reads next, a `T&` binds it with no copy, and a container value changes in place. Key is the key in the map, and const (`TPair<const K, V>`); a key that is an object pointer is a const pointer, so `Key->Hits += 1` still writes the object. `const auto &[Key, Value]` reads the same way. The 4.27 editor has no map ForEach; this replaces Keys, ForEachLoop and Find. | Yes |
+| <a id="range-for-over.for-auto-pair-scores"></a>`for (auto &Pair : Scores)` | The same walk: `Pair.Key` and `Pair.Value` are the two names `auto &[Key, Value]` binds, and `const auto &K = Pair.Key; auto &V = Pair.Value;` are other names for them, with no copy. `const auto &Pair` and a by-value `auto Pair` work as their `[Key, Value]` forms do. Pair itself is used only through `.Key` and `.Value`: passing it whole is refused ("a TMap range-for's pair variable is read only as P.Key and P.Value"). | Yes |
+| <a id="range-for-over.scores-key"></a>`Scores[Key]`, Key the current key | The current slot, as Value is: a read or a store (`Scores[Key] = 5`, `Scores[Key].Add(7)`) goes to the value in place, with no Find or Add. Key may be the binding, `Pair.Key`, or a reference to either (`const auto &K = Pair.Key`). | Yes |
+| <a id="range-for-over.for-auto-key-value-scores-2"></a>`for (auto [Key, Value] : Scores)` | By value: the same walk over the map itself, each pass copying the key and the value into Key and Value, as C++ copies the element out. Value is a copy and nothing is written back; `Scores[Key]` is still the map's own value, in place. | Yes |
+| <a id="range-for-over.scores-remove-key"></a>`Scores.Remove(Key)`, `Scores[Other] = 1` in the body | Unsafe, as in C++, by value too: the walk stays as it is, and the compiler warns. To remove while walking, walk a copy of the keys you take (below). See [Changing the container a loop walks](#changing-the-container-a-loop-walks). | Warns |
+| <a id="range-for-over.goto"></a>`goto` inside a TMap loop that writes values back | Refused ("a goto inside a TMap range-for that writes its value back would skip the write"), even when the label is inside the loop. Only a reference loop over a pair aligned past 8 bytes writes values back: it walks a copy of the keys, and the body changes a container value through `auto &[Key, Value]`. Leave with `break`, or bind `const auto&`. | Refused |
 
 ```cpp
 TMap<FName, int32> Scores;
 void Update() {
   for (auto &[Key, Value] : Scores) Value += 10;    // in place
   for (auto [Key, Value] : Scores) Value += 1000;   // a copy: the map keeps its values
-  for (auto &[Key, Value] : Scores) {               // removes: walks a copy of the keys
-    if (Value < 0) { Scores.Remove(Key); continue; }
-    Value += 1;
+  TArray<FName> Keys;                               // removes: walks a copy of the keys, taken here
+  Scores.Keys(Keys);
+  for (const FName &Key : Keys) {
+    if (Scores[Key] < 0) { Scores.Remove(Key); continue; }
+    Scores[Key] += 1;
   }
 }
 ```
 
 Notes:
 
-- The in-place walk needs a key and a value that align to 8 bytes or less. Otherwise, or when the body changes the
-  map, the loop walks a copy of the keys as described above.
-- A map that has lost elements has free slots. The in-place walk first compacts it by copying it out and back.
+- The walk needs a key and a value that align to 8 bytes or less. Otherwise the loop walks a copy of the keys, each
+  read of Value a Find and each store an Add, a container value copied and stored back at the end of each pass and
+  before a `break` or `return`.
+- A map that has lost elements has free slots. The walk reads the map's free list once, before the first pass, and
+  skips those slots; a map with none, the usual case, costs one test per pass. The map is never copied or moved.
+- The number of slots is read once, before the first pass, as C++ reads `end()` once.
 - `break`, `continue` and `return` work in a map loop, and so does a `return` in an inline function the body expands.
-- A change is recognised by the map's type, not by the map itself: Add, Emplace, FindOrAdd, Remove,
-  RemoveAndCopyValue, FindAndRemoveChecked, Empty, Reset, Append, Compact, CompactStable, Shrink, a sort, or assigning
-  a whole map. A body that changes another map of the same type also switches to the copy walk. A change made inside
-  a function the body calls is not seen, so do not change the map that way.
-- Writing Value after removing its key puts the key back through Add. C++ would call that a dangling reference.
-- An in-place walk cooks two helper structs into the mod's own folder, named after the map type, such as
-  `FMapSlot_TMap_FName_int` and `FMapSlots_TMap_FName_int`. They ship with the mod like its other packages.
+- A walk cooks four helper structs into the mod's own folder, named after the map type, such as
+  `FMapSlot_TMap_FName_int`, `FMapSlots_TMap_FName_int`, `FMapSlot_Free_TMap_FName_int` and
+  `FMapSlots_Free_TMap_FName_int`. They ship with the mod like its other packages.
+
+### Changing the container a loop walks
+
+Every range-for follows the C++ iterator contract, by reference or by value: the body must not add to or remove from
+the container it walks. The compiler compiles such a body as written, does not work around it,
+and warns, with one message for every form:
+
+```
+warning: RangeTest::WarnRemove: unsafe to mutate iterated container (Scores.Remove)
+```
+
+| The body does | Warned as |
+|---|---|
+| a count-changing method on the walked container: Add, AddItems, AddUnique, Append, Clear, Emplace, Empty, FindAndRemoveChecked, FindOrAdd, Insert, Remove, RemoveAndCopyValue, RemoveItem, RemoveItems, Reset, Resize, Set, Shrink, Compact, a sort | `(Scores.Remove)` |
+| a whole assignment to it | `(Scores =)` |
+| a TMap store with any key but the current one, `Scores[Other] = 1`, which adds the key when the map lacks it | `(Scores[] =)` |
+| the container passed to a non-const reference parameter | `(Prune(Scores))` |
+| a call to one of the class's own methods whose body may change a container of that type, followed through the calls it makes | `(Prune())` |
+
+What happens if you do it anyway: every walk reads its length, and a TSet or TMap walk its free slots, once, before the
+first pass. An added element is not visited. In a TSet or TMap walk, a removed element leaves a free slot that a later
+pass reads as an element (a crash for a string key); in a TArray walk, a removal walks past the end. To change the
+container while walking it, walk a copy you take first: `Scores.Keys(Keys)`, `Seen.ToArray(All)`, or a TArray copy.
+
+Not warned, and safe:
+
+- `Scores[Key]` with the current key, which is the slot itself, and any write through Value.
+- A change to another container, even one of the same type: `Positive.Add(Key, Value)` while walking Scores. Only the
+  names are compared, so a reference or pointer that turns out to be the walked container is not seen.
+- A change made by an engine function, which the compiler cannot see into.
 
 ### What a range-for walks
 
@@ -5958,7 +5995,7 @@ listed here is refused with "unimplemented intrinsic".
 | `FinishSpawning(Actor, Transform)` | Finishes an actor that SpawnActorDeferred began: its construction script and BeginPlay run. | [Creating objects](#creating-objects) |
 | `FKey{"F5"}`, `FKey("F5")` | A key for the player controller's key queries, such as IsInputKeyDown. | [Timers and input](#timers-and-input) |
 | `FLatentActionInfo` | Leave it out of a latent call. The compiler supplies it. | [Latent calls](#latent-calls) |
-| `for (auto &X : Items)`, `for (auto &[Key, Value] : Map)` | Range-for: a TArray by index, a TSet through a copy, a TMap by key and value. | [Loops](#loops) |
+| `for (auto &X : Items)`, `for (auto &[Key, Value] : Map)`, `for (auto &P : Map)` | Range-for: a TArray by index, a TSet and a TMap over their own slots, a TMap by key and value or as a pair. | [Loops](#loops) |
 | FString methods, `S.Len()` | UKismetStringLibrary statics as methods, the string first: `S.Len()` is `UKismetStringLibrary::Len(S)`. | [Strings and text](#strings-and-text) |
 | `GetClass()`, `GetName()` | Get Class and Get Object Name, on this or any object. | [Working with other objects](#working-with-other-objects) |
 | `GetOuter()` | The object's outer, read from memory. Not on a null object. | [Working with other objects](#working-with-other-objects) |
@@ -6382,16 +6419,22 @@ and where the feature is described. In each group, the messages you are most lik
   `for (int32 X : GetItems())`. An inline function's result, and a property reached through a call,
   `PickPeer()->Items`, work. Fix: `TArray<int32> Items = GetItems();` and then `for (int32 X : Items)`. See
   [Loops](#loops).
-- `` a TMap range-for binds `auto [Key, Value]` ``: a TMap loop with a plain loop variable, `for (auto &Pair : Scores)`.
-  Fix: bind `auto [Key, Value]` for copies, `auto& [Key, Value]` to walk the map's own slots with Value writable, or
-  `const auto& [Key, Value]`. See [Loops](#loops).
+- `a TMap range-for's pair variable is read only as P.Key and P.Value`: a `for (auto &Pair : Scores)` body that uses
+  Pair whole, such as passing it to a function or copying it. Fix: read `Pair.Key` and `Pair.Value`, or bind
+  `auto& [Key, Value]`. See [Loops](#loops).
+- `warning: <Class>::<Function>: unsafe to mutate iterated container (<What>)`: a range-for body adds to or removes
+  from the container it walks, or may through a call (`<What>` names it: `Scores.Remove`, `Scores[] =`,
+  `Prune(Scores)`, `Prune()`). It compiles as written, and the walk is undefined, as a C++ iterator's is. Fix: walk a
+  copy you take first (`Scores.Keys(Keys)`, then `for (const FName &Key : Keys)`), or collect the changes in a local
+  and apply them after the loop. See
+  [Changing the container a loop walks](#changing-the-container-a-loop-walks).
 - `TODO: a structured binding over a <Type>`: a structured binding over a TArray or TSet,
   `for (auto [X, Y] : Points)`. Fix: bind the element and read its members, `for (const FIntPoint &P : Points)` and
   `P.X`. See [Loops](#loops).
 - `` a goto inside a TMap range-for that writes its value back would skip the write: bind `const auto& [Key, Value]`,
   or leave with break ``: a goto inside `for (auto& [Key, Value] : Map)` in the form that copies Value out and writes
-  it back after each pass. AssetGen uses that form when Value is a container the body changes, and the body also adds
-  to, removes from or sorts a map of that type. Fix: bind `const auto&` when the body only reads Value, or leave with
+  it back after each pass. AssetGen uses that form when Value is a container the body changes, and the map's key or
+  value aligns past 8 bytes. Fix: bind `const auto&` when the body only reads Value, or leave with
   `break`, which runs the write-back, and jump from after the loop. See [Loops](#loops).
 - `` `~` on a float ``, `TODO: unimplemented unary operator <Op>`, `` a `case` needs one constant value `` and
   `TODO: assignment to an operator call that is not an array element`: checks behind clang's own, which a source

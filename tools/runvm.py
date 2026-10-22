@@ -257,8 +257,8 @@ class VM:
                 return None if obj is None else ev(n.kids[1], obj, keep)
             if o == 0x42:                                   # a struct member; raw-pointer reads land here too
                 base = ev(n.kids[0])
-                if isinstance(base, (runscript.Slot, runscript.Free)): return base[n.val]
-                if n.val == '__Slots__': return runscript.slots_of(base)
+                if isinstance(base, (runscript.Slot, runscript.Free, runscript.Link)): return base[n.val]
+                if (v := runscript.view_member(base, n.val)) is not None: return v
                 if isinstance(base, Obj): s.mem[base.addr] = base; return base.addr     # an object slot as an int64
                 if isinstance(base, dict) and n.val not in base and 'Data' in base:      # an array view of an address:
                     return [s.mem[base['Data'] - 0x20].outer]                          # UObjectBase::OuterPrivate
