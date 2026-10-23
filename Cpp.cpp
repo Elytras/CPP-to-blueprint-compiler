@@ -2365,6 +2365,7 @@ private:
         return It == LocalRename.end() ? Name(Decl) : It->second;
     }
     std::map<std::string, std::string> LocalRename;                     // decl id -> an inlined local's unique name
+    std::map<std::string, std::string> LocalNameOwner;                  // a function's lower-cased local name -> its decl id
     std::map<std::string, FArgIR> ParmConst;                            // decl id -> the constant an inlined parameter is
     std::vector<std::pair<std::string, std::string>> InlineResults;     // per expansion in progress: result local, type
     std::vector<const Json*> InlineStack;                               // the inline functions being expanded (their
@@ -10811,7 +10812,18 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                     LambdaOf[D.value("id", std::string())] = Lam;
                     return;
                 }
-                const std::string VarName = LocalName(D);
+                std::string VarName = LocalName(D);
+                /* A Blueprint local has no scope, and a function finds one by its FName, which ignores case: a second
+                   declaration of a name the function already has (a sibling block's, an outer one it shadows, a
+                   parameter, `v` beside `V`) would read and write the first one's property, of the first one's type.
+                   It takes a name no C++ local has. */
+                if (const std::string Id = D.value("id", std::string());
+                    !LocalNameOwner.try_emplace(Lower(VarName), Id).second && LocalNameOwner[Lower(VarName)] != Id)
+                {
+                    VarName = "__Local" + std::to_string(ReadTmpCounter++) + "_" + Name(D);
+                    LocalRename[Id] = VarName;
+                    LocalNameOwner[Lower(VarName)] = Id;
+                }
                 std::string VarType = TypeOf(D);
                 FStmtIR Ds;
                 const Json* RefInit = First(D) ? PeelLvalue(First(D)) : nullptr;
@@ -13728,6 +13740,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         Binds.push_back(Local);
         BindIds.push_back(Id);
         LocalRename[Id] = Local;
+        LocalNameOwner[Lower(Local)] = Id;
     }
     for (FStmtIR& S : LamStmts) B.Body->push_back(std::move(S));
 
@@ -21927,6 +21940,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         RefAlias.clear();
         RefPlace.clear();
         LocalRename.clear();
+        LocalNameOwner.clear();
+        if (Fn.Def)
+            ForEach(*Fn.Def, [&](const Json& C) {
+                if (Kind(C) == "ParmVarDecl") LocalNameOwner[Lower(Name(C))] = C.value("id", std::string());
+            });
         ParmConst.clear();
         LambdaOf.clear();
         CurFnBody = Fn.Body;

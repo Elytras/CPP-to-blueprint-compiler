@@ -1945,7 +1945,8 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| <a id="names-and-scope.for-int32-i-0-i"></a>`for (int32 I = 0; I < 2; ++I)` after another loop over I | Locals of the same name and type in different blocks or loops are one variable. Correct C++ cannot observe this. | Yes |
+| <a id="names-and-scope.for-int32-i-0-i"></a>`for (int32 I = 0; I < 2; ++I)` after another loop over I | Each I is a variable of its own, as in C++: the second takes a name no C++ local has (`__Local<N>_I`). | Yes |
+| <a id="names-and-scope.tarray-fstring-keys-tarray-float"></a>`{ TArray<FString> Keys; } { TArray<float> Keys; }`, an inner `int32 X` shadowing an outer X, `float v` beside `int32 V` | Different variables, whatever their types, in a method or an inline function. A Blueprint local has no scope and its FName ignores case, so each later one is renamed; one shared property would read and write the first one's type. | Yes |
 | <a id="names-and-scope.int32-total-0"></a>`int32 Total = 0;` with a member Total | The local shadows the member, and the member is left alone. | Yes |
 | <a id="names-and-scope.if-int32-rest-v-3"></a>`if (int32 Rest = V % 3)` | A variable declared in a condition or an init-statement stays a function-wide local afterwards. | Yes |
 
@@ -1954,15 +1955,12 @@ int32 Total;
 int32 Names(int32 N) {
   int32 S = 0;
   for (int32 I = 0; I < N; ++I) S += I;
-  for (int32 I = 0; I < 2; ++I) S += 100;   // the same I
+  for (int32 I = 0; I < 2; ++I) S += 100;   // a second I, its own variable
   int32 Total = 0;                          // shadows the member Total: fine
   Total += S;
   return Total;
 }
 ```
-
-Note: give locals of different types different names. `{ int32 X; } { FString X; }` in one function compiles, but the
-function then has two properties both named X.
 
 ### Reference locals
 

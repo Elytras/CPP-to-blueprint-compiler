@@ -10012,6 +10012,27 @@ def delegate_sigs(base):
     return out
 
 
+def sibling_locals():
+    """SiblingLocals: locals of one name in different scopes are different variables, as in C++. The sibling Keys of
+    two types give each branch its own array (in a method and in an inline function's expansion), an inner X leaves the
+    outer one alone, and v beside V, which one FName would merge, are two; no function has two properties of one name
+    (invariants.unique_names, which caught the two Keys after they crashed DRG's Array_Add)."""
+    base = asset('SiblingLocals')
+    keeps_invariants(base)
+    for which, want in ((0, 22), (1, 103)):
+        for fn in ('Sibling', 'Inlined'):
+            got = run(base, fn, Which=which)[0]
+            assert got == want, (fn, which, got)
+    for a in (0, 5, -3):
+        got = run(base, 'Shadow', A=a)[0]
+        assert got == a, (a, got)
+    for a in (0, 3):
+        got = run(base, 'CaseOnly', A=a)[0]
+        assert got == a * 10 + (a >= 2), (a, got)
+    proves('names-and-scope.tarray-fstring-keys-tarray-float', 'names-and-scope.for-int32-i-0-i')
+    print('ok  SiblingLocals: same-named locals of other scopes, types or case are variables of their own')
+
+
 def iface_delegate_store():
     """IfaceDelegateStore.Store sets Impl->OnIt, a mod interface's TDelegate variable that IdsImpl holds as its own
     property: the value bound on H is typed with IdsImpl's OnIt signature function, imported, as the editor's Set node
@@ -10317,6 +10338,7 @@ print('ok  DelegateParmSpell: a delegate type spelled with int32 and with int is
       'through another object names its variable\'s')
 delegate_parm_keys()
 iface_delegate_store()
+sibling_locals()
 print('ok  DelegateParmKeys: an enum spelled short, qualified or from the global namespace is one delegate type, the '
       'types C++ keeps apart get a signature function each, and a value stored into a parent\'s TArray or TMap names '
       'its element\'s')
