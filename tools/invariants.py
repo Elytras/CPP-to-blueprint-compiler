@@ -416,6 +416,21 @@ def params_lead(pkg):
         if flags != sorted(flags, reverse=True): yield i, 'a local precedes a parameter: %s' % [p.name for p in st.props]
 
 
+@rule
+def unique_names(pkg):
+    """No two properties of a function, class or struct share an FName, which ignores case: a local or member operand is a
+    field path the VM resolves by name to the first match (FFieldPath::ResolveField walks ChildProperties), so a second
+    property of the name is never itself. Two locals both named Keys, a TArray<FString> and a TArray<float>, had the
+    float branch write floats into the string array, and DRG crashed in Array_Add."""
+    for i in range(len(pkg.exports)):
+        st = pkg.struct(i)
+        if not st: continue
+        seen = set()
+        for p in st.props:
+            if p.name.lower() in seen: yield i, 'two properties named %s' % p.name
+            seen.add(p.name.lower())
+
+
 def callee(pkg, i, n):
     """The Struct of the function a call node reaches when this package holds it: EX_LocalFinalFunction /
     EX_FinalFunction / EX_CallMath by export, EX_LocalVirtualFunction / EX_VirtualFunction by name among the calling
