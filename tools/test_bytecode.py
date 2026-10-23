@@ -10012,6 +10012,20 @@ def delegate_sigs(base):
     return out
 
 
+def iface_delegate_store():
+    """IfaceDelegateStore.Store sets Impl->OnIt, a mod interface's TDelegate variable that IdsImpl holds as its own
+    property: the value bound on H is typed with IdsImpl's OnIt signature function, imported, as the editor's Set node
+    on the implementer's property types it, and IfaceDelegateStore makes no lookalike of its own."""
+    base = asset('IfaceDelegateStore')
+    impl = os.path.join(os.path.dirname(base), 'IdsImpl')
+    for b in (base, impl):
+        keeps_invariants(b)
+    held = delegate_sigs(impl)[('IdsImpl_C', 'OnIt')]
+    proves('delegate-values.void-use-tdelegate-void-d')
+    assert delegate_sigs(base).get(('Store', None)) == {held}, (delegate_sigs(base), held)
+    assert not [e for e in exports_of(base) if e.endswith('__DelegateSignature')], exports_of(base)
+
+
 def delegate_parm_sig():
     """DelegateParmSig and DelegateParmZKid override DelegateParmTop's Use(TDelegate D) and Out(TDelegate &O): each
     override's parameter names the parent parameter's own signature function, imported, as the editor's override copies
@@ -10302,6 +10316,7 @@ delegate_parm_spell()
 print('ok  DelegateParmSpell: a delegate type spelled with int32 and with int is one signature function, and a value set '
       'through another object names its variable\'s')
 delegate_parm_keys()
+iface_delegate_store()
 print('ok  DelegateParmKeys: an enum spelled short, qualified or from the global namespace is one delegate type, the '
       'types C++ keeps apart get a signature function each, and a value stored into a parent\'s TArray or TMap names '
       'its element\'s')

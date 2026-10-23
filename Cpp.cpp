@@ -11084,6 +11084,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                                                                     : FieldOwner.end();
             const FRecord* Declarer = Of != FieldOwner.end() && StripTypeKeywords(TypeOf(*Lhs)).compare(0, 10, "TDelegate<") == 0
                                     ? Find(Of->second) : nullptr;
+            /* A mod interface's variable is a property of the class that implements it (InterfaceVarHolder). */
+            if (Declarer && Declarer->bIsInterface) Declarer = InterfaceVarHolder(*Declarer, RecordOfFieldAccess(*Holder));
             const auto FieldSig = [this, &BP, Declarer, Field = Declarer ? Name(*Holder) : std::string(), bElement] {
                 FIndex Sig;
                 return ImportedFieldSignature(*Declarer, Field, bElement, BP, &Sig) ? Sig : Null();
@@ -17723,8 +17725,15 @@ bool FCompiler::ImportedFieldSignature(const FRecord& Owner, const std::string& 
                                        FIndex* Sig)
 {
     if (&Owner == Cur || Owner.IsNative() || !Owner.IsGenerated() || Owner.bIsStruct || Owner.bIsInterface) return false;
-    const auto F = std::find_if(Owner.Fields.begin(), Owner.Fields.end(), [&](const Json* Decl) { return Name(*Decl) == Field; });
-    std::string Type = F == Owner.Fields.end() ? std::string() : StripTypeKeywords(TypeOf(**F)), Inner;
+    auto Named = [&](const Json* Decl) { return Name(*Decl) == Field; };
+    const Json* FieldDecl = nullptr;
+    if (auto F = std::find_if(Owner.Fields.begin(), Owner.Fields.end(), Named); F != Owner.Fields.end()) FieldDecl = *F;
+    /* A variable of an interface Owner implements is Owner's property too (InterfaceVarHolder). */
+    for (const std::string& I : Owner.Interfaces)
+        for (const FRecord* Link : InterfaceChain(Find(I)))
+            if (!FieldDecl)
+                if (auto F = std::find_if(Link->Fields.begin(), Link->Fields.end(), Named); F != Link->Fields.end()) FieldDecl = *F;
+    std::string Type = FieldDecl ? StripTypeKeywords(TypeOf(*FieldDecl)) : std::string(), Inner;
     if (bElement)
         Type = TemplateArg(Type, "TArray", &Inner) || TemplateArg(Type, "TMap", &Inner)
              ? StripTypeKeywords(SplitTemplateArgs(Inner).back()) : std::string();
