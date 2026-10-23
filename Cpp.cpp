@@ -6995,10 +6995,21 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Sub->RefParms.push_back(bSpill ? C : std::string());
             bool bFirst = true, bOk = true;
             std::string LastType;
+            /* A member container of another mod class (`Peer->Picks.Add({H, &F})`, Insert, a TMap's Add): a delegate
+               value is typed with its element's signature, imported, as an element's store is (ImportedFieldSignature). */
+            const Json* Held = PeelLvalue(Obj);
+            const auto HeldOf = Held && Kind(*Held) == "MemberExpr" ? FieldOwner.find(Held->value("referencedMemberDecl", std::string()))
+                                                                     : FieldOwner.end();
+            const FRecord* HeldBy = HeldOf != FieldOwner.end() ? Find(HeldOf->second) : nullptr;
             ForEach(*N, [&](const Json& A) {
                 if (bFirst) { bFirst = false; return; }
                 if (!bOk) return;
                 FArgIR V;
+                const bool bElement = HeldBy && StripTypeKeywords(TypeOf(A)).compare(0, 10, "TDelegate<") == 0;
+                FSigValueScope SigScope(*this, bElement ? Strip(&A) : nullptr, [this, &BP, HeldBy, Field = Name(*Held)] {
+                    FIndex Sig;
+                    return ImportedFieldSignature(*HeldBy, Field, true, BP, &Sig) ? Sig : Null();
+                });
                 bOk = LowerArg(A, BP, V, Err);
                 if (bOk) Out.Sub->Args.push_back(V);
                 LastType = TypeOf(A);

@@ -10130,7 +10130,7 @@ def delegate_parm_keys():
     global namespace is one type: DelegateParmKeysTop makes one signature function for it, which its variable, its
     functions' parameters - Take declared short and defined qualified -, the overrides' parameters (DelegateParmKeys is
     generated before Top, DelegateParmKeysZKid after), the values handed to Take, the one set through Peer and those
-    stored into an element of Top's TArray and TMap, on this object and on Peer, all name, the subclasses importing it
+    stored into an element of Top's TArray and TMap, on this object and on Peer, or added to them (Add, Insert), all name, the subclasses importing it
     from a Top that exports it (keeps_invariants: imports_resolve, func_override_params);
     `Held = D` across two spellings compiles, and the comma value handed to Take is held in a local of that signature,
     if one at all. Neither subclass makes a signature of its own. DelegateParmKeysKinds keeps what C++ keeps apart apart,
@@ -10149,7 +10149,7 @@ def delegate_parm_keys():
     assert {theirs[('Use', 'D')], theirs[('Take', 'T')]} == {held}, theirs
     assert [e for e in exports_of(top) if e.endswith('__DelegateSignature')] == [held.rsplit(':', 1)[1]], exports_of(top)
     want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}, ('SetPicks', None): {held},
-            ('SetByKey', None): {held}}
+            ('SetByKey', None): {held}, ('AddPicks', None): {held}}
     proves('delegate-values.void-use-tdelegate-void-d')
     assert {k: mine.get(k) for k in want} == want, (mine, want)
     assert mine.get(('CommaTake', None), {held}) == {held}, mine
