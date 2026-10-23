@@ -18134,12 +18134,14 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
            are the ones a caller dispatches through. */
         const bool bOut = std::any_of(Params.begin(), Params.end(),
                                       [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
-        BP.AddFunction(Entry.first, Null(), Params,
+        /* Named as its implementations and callers name it: by its `__UeName` marker where it has one. */
+        const std::string UeFn = UeNameOf(&R, Entry.first);
+        BP.AddFunction(UeFn, Null(), Params,
                        [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
                        FUNC_Public | FUNC_BlueprintCallable | FUNC_BlueprintEvent
                            | (bOut ? FUNC_HasOutParms : 0));
-        if (auto Cat = R.Categories.find(Entry.first); Cat != R.Categories.end()) BP.ApiCategory[Entry.first] = Cat->second;
-        if (auto Doc = R.Docs.find(Entry.first); Doc != R.Docs.end()) BP.ApiDocs[Entry.first] = Doc->second;
+        if (auto Cat = R.Categories.find(Entry.first); Cat != R.Categories.end()) BP.ApiCategory[UeFn] = Cat->second;
+        if (auto Doc = R.Docs.find(Entry.first); Doc != R.Docs.end()) BP.ApiDocs[UeFn] = Doc->second;
     }
 
     BP.Finish();
