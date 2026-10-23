@@ -9784,6 +9784,20 @@ def delegate_var():
     vm.call('HookBox')
     proves('handler-functions.const-fhitresult-hit')
     assert [b[1:3] for b in vm.binds] == [('OnComponentHit', 'Bumped')], vm.binds
+    # Execute runs the value it is given, once, with the argument: a parameter, a variable, a map's value; nothing
+    # when unbound or when the key is missing; the second of two values alone; a delegate that calls itself to the end.
+    proves('delegate-values.d-execute-points')
+    for steps, got in (([('Run', ('delegate', 'Take', None), 4)], 4),([('RunHeld', 4)], 0), ([('Register',), ('RunHeld', 4)], 4),
+                       ([('Register',), ('RunKey', 'take', 5)], 5), ([('Register',), ('RunKey', 'none', 5)], 0),
+                       ([('RunUnbound',)], 0), ([('RunTwo',)], 21), ([('RunDown', 3)], 4)):
+        vm = VM(base, {}, Fired=0, Got=0, Handlers={})
+        for fn, *args in steps:
+            vm.call(fn, *[(a[0], a[1], vm.self) if isinstance(a, tuple) else a for a in args])
+        assert vm.self.vars['Got'] == got, (steps, vm.self.vars)
+    proves('delegate-values.int32-r-d-execute')
+    compiled_with_flag('ExecRet', '  TDelegate<int32()> D;\n  void Go() { int32 R = D.Execute(); }\n', 'returns nothing')
+    compiled_with_flag('ExecRef', '  TDelegate<void(TArray<int32> &)> D;\n  void Go(TArray<int32> Items) { D.Execute(Items); }\n',
+                       'never writes back')
 
 
 def inherited_fire():
