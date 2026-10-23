@@ -2413,7 +2413,8 @@ private:
     std::map<std::string, FStructView> StructViews;     // pointee -> its view
     bool LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Out, std::string* Pointee, std::string* Err);
     bool ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
-    bool RefThrough(FArgIR Addr, const std::string& Pointee, FArgIR& Out, std::string* Err);
+    bool RefThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool ArrayThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool ScaleIndex(const Json& IndexNode, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool HoistOperand(FArgIR& Operand, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                       std::vector<FStmtIR>& OutPre, std::string* Err, bool bAlways = false);
@@ -2426,6 +2427,7 @@ private:
     bool HasDerefStruct(std::string* Err) const;
     bool LowerPtrCastSource(const Json& Call, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     std::map<std::string, std::string> RefAddr;     // VarDecl id -> pointee: `T& R = *P` keeps the address in an int64 local R
+    std::map<std::string, std::string> ArrayView;   // such an R's local -> the FDeref scratch its declaration points at a TArray
     std::map<std::string, Json> RefAlias;           // VarDecl id -> the variable `T& R = V` is another name for; a copy,
                                                     // since a for-init is lowered out of a temporary Json
     std::map<std::string, FArgIR> RefPlace;         // BindingDecl id -> the place it names: V of a TMap walked in place
@@ -5396,7 +5398,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
             FArgIR Addr;
             std::string Pointee;
             return (bArrow ? LowerArg(*ObjRaw, BP, Addr, Err) : LowerAddress(*Bare, BP, Addr, &Pointee, Err))
-                && RefThrough(std::move(Addr), "int64", *Out.Base, Err);
+                && RefThrough(std::move(Addr), "int64", BP, *Out.Base, Err);
         }
         return LowerArg(*ObjRaw, BP, *Out.Base, Err);
     }
@@ -6371,6 +6373,7 @@ const char* IsWideScalar(const std::string& P)
 /* The value at Addr: a __Read*__, which the hoist pass loads into a temp. */
 bool FCompiler::ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
+    if (StripTypeKeywords(Pointee).compare(0, 7, "TArray<") == 0) return ArrayThrough(std::move(Addr), Pointee, BP, Out, Err);
     const FReadViewSpec* V = ViewFor(Pointee);
     const std::string P = StripTypeKeywords(Pointee);
     /* No engine struct starts with a TArray of these, and Kismet has neither type: a 16-bit value is two byte reads, a
@@ -6420,8 +6423,9 @@ bool FCompiler::ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintC
 }
 
 /* The memory at Addr as an lvalue: a __RefAt__, whose hoist types its view by the Pointee. */
-bool FCompiler::RefThrough(FArgIR Addr, const std::string& Pointee, FArgIR& Out, std::string* Err)
+bool FCompiler::RefThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
+    if (StripTypeKeywords(Pointee).compare(0, 7, "TArray<") == 0) return ArrayThrough(std::move(Addr), Pointee, BP, Out, Err);
     if (!IsWideScalar(StripTypeKeywords(Pointee)) && !ViewFor(Pointee))
     { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
     Out = FArgIR();
@@ -6430,6 +6434,51 @@ bool FCompiler::RefThrough(FArgIR Addr, const std::string& Pointee, FArgIR& Out,
     Out.Sub = std::make_shared<FCallIR>();
     Out.Sub->Intrinsic = "__RefAt__";
     Out.Sub->Args.push_back(std::move(Addr));
+    return true;
+}
+
+/* A TArray<T> at an address, in place: a struct whose first member is a TArray<T> (the read views, or FDerefView_<T> for
+   a struct) laid over the memory, as `P->Member` lays its struct over it. The array is then a real FArrayProperty of T
+   where it lies, so `R[I]` is one ArrayGetByRef into its data, and `R.Num()`, a copy or an array function take it as
+   any array. A reference bound to it (ArrayView) points its own scratch there once, at its declaration; any other use
+   points a scratch per use (HoistRefAt). The element type must be the one the view holds: a view of other elements
+   would read them at the wrong size, so the TArray must really hold T, and a reinterpretation is the caller's bet. */
+bool FCompiler::ArrayThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    const std::string P = StripTypeKeywords(Pointee);
+    std::string Elem = P.size() > 8 && P.back() == '>' ? P.substr(7, P.size() - 8) : std::string();
+    while (!Elem.empty() && Elem.back() == ' ') Elem.pop_back();
+    Elem = StripTypeKeywords(Elem);
+    for (const auto& [Alias, Canon] : { std::pair{ "long long", "int64" }, std::pair{ "int", "int32" },
+                                        std::pair{ "unsigned char", "uint8" } })
+        if (Elem == Alias) Elem = Canon;
+    const FReadViewSpec* V = ViewFor(Elem);
+    /* Object pointers, FName and UClass* share the int64 view, whose elements are int64: no view holds them. */
+    if (!V || StripTypeKeywords(V->ResultType) != Elem
+        || (std::strcmp(V->DerefIntrinsic, "__DerefReadI64__") == 0 && Elem != "int64"))
+    { *Err = "TODO: a " + P + " through a pointer: no view struct holds " + Elem + " elements; reach them through the "
+             "array's Data pointer"; return false; }
+    FArgIR Place;
+    if (auto It = Addr.K == FArgIR::Local ? ArrayView.find(Addr.S) : ArrayView.end(); It != ArrayView.end())
+    {
+        const FReadViewSpec* I64 = FindReadView("__Read64__");
+        Place.K = FArgIR::Call;
+        Place.S = It->second;
+        Place.InnerType = "int64";
+        Place.Sub = std::make_shared<FCallIR>();
+        Place.Sub->Intrinsic = "__RefAtInline__";
+        Place.Sub->Extra = BP.ScriptStruct(I64->ViewStructPkg, I64->ViewStructName);
+        Place.Sub->View = ViewFieldOf(I64->DerefIntrinsic);
+    }
+    else if (!RefThrough(std::move(Addr), "int64", BP, Place, Err)) return false;
+    Out = FArgIR();
+    Out.K = FArgIR::Member;
+    Out.S = V->ViewField ? V->ViewField : ViewFieldOf(V->DerefIntrinsic);
+    Out.Owner = BP.ScriptStruct(V->ViewStructPkg, V->ViewStructName);
+    if (std::strncmp(V->ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(Out.Owner, V->ViewStructName, 16);
+    Out.LetOp = LetOpFor(P);
+    Out.InnerType = P;
+    Out.Base = std::make_shared<FArgIR>(std::move(Place));
     return true;
 }
 
@@ -6658,7 +6707,7 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     {
         FArgIR Addr;
         std::string Pointee;
-        return LowerAddress(*Bare, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, Out, Err)
+        return LowerAddress(*Bare, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, BP, Out, Err)
             && ConvertArg(OuterType, BP, Out, Err);
     }
     /* A consteval call: clang ran it and left the answer on the ConstantExpr around it, which Strip would drop. */
@@ -10962,6 +11011,34 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (InlineStack.empty()) SourceLocals[VarName] = VarType;
                 Locals.push_back(PD);
                 Out.push_back(Ds);
+                /* A reference to a TArray in memory points a scratch of its own at it here, once: R cannot be reseated,
+                   so every R[I] after reads through it with no store of its own (ArrayThrough). */
+                if (const auto R = RefAddr.find(DeclId);
+                    R != RefAddr.end() && StripTypeKeywords(R->second).compare(0, 7, "TArray<") == 0)
+                {
+                    if (!HasDerefStruct(Err)) { bOk = false; return; }
+                    const FIndex DerefStruct = BP.ScriptStruct(ModPackage + "/FDeref", "FDeref");
+                    const std::string Scratch = "__ArrayView" + std::to_string(ReadTmpCounter++) + "_" + VarName + "__";
+                    FPropertyDef SPD = StructParam(Scratch, DerefStruct, "FDeref", 16, 0);
+                    SPD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                    Locals.push_back(SPD);
+                    for (const char* Field : { "Num", "Data" })
+                    {
+                        FStmtIR St;
+                        St.K = FStmtIR::Assign;
+                        St.Var.K = FArgIR::Member;
+                        St.Var.S = Field;
+                        St.Var.Owner = DerefStruct;
+                        St.Var.LetOp = EX_Let;
+                        St.Var.Base = std::make_shared<FArgIR>();
+                        St.Var.Base->K = FArgIR::Local;
+                        St.Var.Base->S = Scratch;
+                        if (std::strcmp(Field, "Num") == 0) { St.Value.K = FArgIR::Int; St.Value.I = 1; }
+                        else { St.Value.K = FArgIR::Local; St.Value.S = VarName; St.Value.InnerType = "int64"; }
+                        Out.push_back(std::move(St));
+                    }
+                    ArrayView[VarName] = Scratch;
+                }
             });
             if (!bAny && bOk) { *Err = "a declaration statement declares nothing usable"; bOk = false; }
             return;
@@ -11123,7 +11200,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 FArgIR Addr;
                 std::string Pointee;
                 St.K = FStmtIR::Assign;
-                bOk = LowerAddress(*Lhs, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, St.Var, Err);
+                bOk = LowerAddress(*Lhs, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, BP, St.Var, Err);
                 /* A 16-bit or double store takes an int32 or a float (SplitWideWrite), which no Kismet type narrows or
                    widens to: the conversion C++ makes to the pointee is the store itself. */
                 const Json* Value = Rhs;
@@ -21937,6 +22014,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         ReadScratchAdded = false;
         ReadTmpCounter = 0;
         RefAddr.clear();
+        ArrayView.clear();
         RefAlias.clear();
         RefPlace.clear();
         LocalRename.clear();

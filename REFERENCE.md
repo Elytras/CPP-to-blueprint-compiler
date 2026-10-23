@@ -5700,6 +5700,7 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | <a id="references-to-memory.int32-r-p"></a>`int32 &R = *P;`, `int32 &R = P[2];` | Keeps the address in a hidden int64 local. Reads and writes through R go to that memory. | Yes |
+| <a id="references-to-memory.const-tarray-int32-r-p"></a>`const TArray<int32> &R = *P;`, `(*P)[I]` | The TArray whose header is at P, in place: `R[I]` reads and writes its elements where they lie, `R.Num()` counts them, and copying R copies them. The reference points a hidden view at the header once, where it is declared, so reading `R[I]` stores nothing first. The elements must be of a type a view holds exactly: int32, int64, float, uint8, FString, FText or a struct. A TArray of object pointers, FNames or classes is refused, since its only view would read them as int64. Viewing memory as a TArray of another element type than it holds (an FString's characters as int32, two per element) is a reinterpretation: its Num and bounds then count the wrong thing. | Yes |
 | <a id="references-to-memory.int32-alias-local"></a>`int32 &Alias = Local;` | Another name for the variable, with no storage of its own. Writes reach the original. | Yes |
 | <a id="references-to-memory.const-fstring-r-makename"></a>`const FString &R = MakeName();` | A `const T&` bound to a temporary is an ordinary local holding a copy. | Yes |
 | <a id="references-to-memory.bump-p"></a>`Bump(*P);` with `void Bump(int32 &V)` | Passes the memory itself, so the callee's writes land at the address. A T& parameter of a mod function is an out-parameter in the Blueprint. | Yes |
@@ -7387,11 +7388,15 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 
 ### Pointers, memory and intrinsics
 
-- `TODO: a whole <Type> through a pointer; P->Member reaches its members`: a whole container read, written or
-  passed through a raw pointer or a reference that keeps an address, as in `TArray<int32> A = *Pa;` or `R.Num()` with
-  `TArray<int32> &R = *Pa;`. Structs, integers, float, double, bool, enums, FName, FString, FText and pointers are
-  read whole. Fix: reach the elements through the container's data, or work on the container where it is a variable.
-  See [Pointers and memory](#pointers-and-memory).
+- `TODO: a whole <Type> through a pointer; P->Member reaches its members`: a whole set or map read, written or
+  passed through a raw pointer or a reference that keeps an address, as in `TSet<int32> S = *Ps;`. Structs, integers,
+  float, double, bool, enums, FName, FString, FText, pointers and TArrays are read whole. Fix: reach the elements
+  through the container's data, or work on the container where it is a variable. See
+  [Pointers and memory](#pointers-and-memory).
+- `TODO: a TArray<T> through a pointer: no view struct holds T elements; reach them through the array's Data
+  pointer`: a TArray of object pointers, FNames, classes, bools, enums or other element types no view struct holds
+  exactly. Fix: read the Data pointer (`*(T **)P`) and index that. See
+  [References to memory](#references-to-memory).
 - ``TODO: the address of <ExprKind>: a Blueprint variable has none the VM hands out; point into an object
   (`(uint8*)Obj`), a TArray element (`&Items[I]`) or memory through a pointer``: the address of a local, a parameter
   or a member of a local struct, as in `&Count` or `&V.X`. `<ExprKind>` is clang's name for the expression, such as

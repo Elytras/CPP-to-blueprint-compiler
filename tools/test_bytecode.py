@@ -3957,6 +3957,49 @@ pointer_behaviour()
 pointer_more()
 
 
+def array_through():
+    """ArrayThrough: a TArray whose header is in memory, in place, through a reference bound once or `(*P)[I]`."""
+    import runscript, struct
+    base, A, B, DA, DB = asset('ArrayThrough'), 0x7FF600001000, 0x7FF600001100, 0x7FF600002000, 0x7FF600003000
+
+    def put(a, fmt, *v):
+        for i, b in enumerate(struct.pack(fmt, *v)): runscript.MEM[a + i] = b
+
+    def array(at, data, fmt, items):
+        put(at, '<qii', data, len(items), len(items))      # Data, Num, Max, as FScriptArray lays them
+        for i, v in enumerate(items): put(data + i * struct.calcsize(fmt), fmt, *(v if isinstance(v, tuple) else (v,)))
+    runscript.MEM.clear()
+    array(A, DA, '<i', [3, -4, 10, 7])
+    array(B, DB, '<i', [9, 2])
+    proves('references-to-memory.const-tarray-int32-r-p')
+    assert run(base, 'Sum', P=A)[0] == 16
+    run(base, 'Bump', P=A, I=2)
+    assert struct.unpack('<iiii', bytes(runscript.MEM[DA + i] for i in range(16))) == (3, -4, 11, 7)
+    copied = run(base, 'CopyOf', P=A)[0]
+    put(DA, '<i', 99)                                       # a copy is the elements at the time, not the place
+    assert copied == [3, -4, 11, 7], copied
+    # Two references at once each keep their own view; one declared in a loop is bound again each round.
+    assert run(base, 'FirstsAndCounts', A=A, B=B)[0] == 99 * 1000 + 9 * 100 + 4 * 10 + 2
+    assert run(base, 'LastOfEach', A=A, B=B)[0] == 7 * 100 + 2
+    array(A, DA, '<f', [2.5, 1.0])
+    assert run(base, 'FirstFloat', P=A)[0] == 2.5
+    array(A, DA, '<fff', [(1.0, 2.0, 3.0), (4.0, 5.0, 6.5)])
+    assert run(base, 'SumZ', P=A)[0] == 9.5
+    runscript.MEM.clear()
+    # The reference's view is pointed once, at the declaration: a read of R[I] in the loop stores nothing first.
+    assert not any(n.op == 0x0F and n.kids[0].op == 0x42 and n.kids[0].val in ('Num', 'Data')
+                   for n in runscript.script_of(base, 'Sum')[2:]), 'a scratch store after the declaration'
+    # A TArray of object pointers has no view of its own element type: the int64 one would be a pun.
+    proves('references-to-memory.const-tarray-int32-r-p')
+    refused('ArrayOfObjects', '  int32 Count(const TArray<AActor *> *P) { const TArray<AActor *> &R = *P; return R.Num(); }\n',
+            'no view struct holds')
+    print('ok  ArrayThrough: a TArray in memory read, written, counted and copied in place; two views at once; one bound '
+          'per loop round; a TArray of structs; object-pointer arrays refused')
+
+
+array_through()
+
+
 def map_pairs(pkg, tag):
     """A TMap tag's (key, value) pairs in order, each FName (an enum's, as a ByteProperty in a container writes it, too)
     or FString as text; it lists no removals."""

@@ -449,6 +449,27 @@ def view_of(field):
     return None
 
 
+def scratch_view(n):
+    """A deref view's TArray field over the FDeref scratch: ArrayGetByRef of it reads the memory at the scratch's Data."""
+    return n.op == 0x42 and view_of(n.val) is not None and n.kids[0].op != 0x6B
+
+
+class MemArray:
+    """A TArray in MEM at an address, a view's TArray field laid over it (the compiler's ArrayThrough): its Data pointer
+    and Num where the header lies, its elements read and written there at the view's element size. An index outside
+    Num is the VM's out-of-bounds read, an error here."""
+    def __init__(s, at, view): s.at, (s.size, s.read, s.write) = at, view
+    def __len__(s): return mem_read(s.at + 8, 4, True)
+    def _addr(s, i):
+        if not 0 <= i < len(s): raise SystemExit('index %d of a TArray of %d in memory' % (i, len(s)))
+        return mem_read(s.at, 8, False) + i * s.size
+    def __getitem__(s, i): return s.read(s._addr(i))
+    def __setitem__(s, i, v): s.write(s._addr(i), v)
+    def __iter__(s): return (s[i] for i in range(len(s)))
+    def __eq__(s, o): return o != 0 and list(s) == list(o)
+    def __deepcopy__(s, memo): return list(s)
+
+
 # A native int32 / uint8 parameter receives the low bytes of whatever the VM copies into it, so a wider value
 # handed to an _IntInt / _ByteByte function is truncated, as it is in the engine.
 for _k, _f in list(MATH.items()):
@@ -728,6 +749,9 @@ def run(base, function, self_vars=None, **parms):
             return env.get(n.val, 0)
         if o == 1: return self_vars.get(n.val, 0)
         if o in (0x1D, 0x1E, 0x24, 0x2C, 0x35, 0x21): return n.val
+        if o == 0x42 and n.kids[0].op == 0x6B and scratch_view(n.kids[0].kids[0]) and view_of(n.val):
+            k = n.kids[0]                                            # a TArray at the address the view's element is at
+            return MemArray(ev(k.kids[0].kids[0])['Data'] + ev(k.kids[1]) * view_of(k.kids[0].val)[0], view_of(n.val))
         if o == 0x42:
             s = ev(n.kids[0])
             if isinstance(s, (Slot, Free, Link)): return s[n.val]
@@ -759,7 +783,7 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x26: return 1
         if o == 0x27: return True
         if o == 0x28: return False
-        if o == 0x6B and n.kids[0].op == 0x42 and view_of(n.kids[0].val):
+        if o == 0x6B and scratch_view(n.kids[0]):
             size, read, _ = view_of(n.kids[0].val)
             return read(ev(n.kids[0].kids[0])['Data'] + ev(n.kids[1]) * size)
         if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
@@ -815,7 +839,7 @@ def run(base, function, self_vars=None, **parms):
         elif dest.op == 0x42: _made(ev, store, dest.kids[0], {})[dest.val] = v
         elif dest.op in (0, 0x48): env[dest.val] = v
         elif dest.op == 1: self_vars[dest.val] = v
-        elif dest.op == 0x6B and dest.kids[0].op == 0x42 and view_of(dest.kids[0].val): locate(dest)(v)
+        elif dest.op == 0x6B and scratch_view(dest.kids[0]): locate(dest)(v)
         elif dest.op == 0x6B: ev(dest.kids[0])[ev(dest.kids[1])] = v
         else: raise SystemExit('unsupported destination op %02x' % dest.op)
 
@@ -830,7 +854,7 @@ def run(base, function, self_vars=None, **parms):
         if dest.op == 0x42:
             s = _made(ev, store, dest.kids[0], {})
             return lambda v: s.__setitem__(dest.val, copy.deepcopy(v))
-        if dest.op == 0x6B and dest.kids[0].op == 0x42 and view_of(dest.kids[0].val):
+        if dest.op == 0x6B and scratch_view(dest.kids[0]):
             size, _, write = view_of(dest.kids[0].val)
             at = ev(dest.kids[0].kids[0])['Data'] + ev(dest.kids[1]) * size
             return lambda v: write(at, v)
@@ -864,7 +888,8 @@ def run(base, function, self_vars=None, **parms):
         elif o == 4:
             r = n.kids[0]
             if r.op != 0xB: fits('ReturnValue', r)
-            return (ev(r) if r.op != 0xB else None), env
+            v = ev(r) if r.op != 0xB else None
+            return (list(v) if isinstance(v, MemArray) else v), env     # execReturn copies into the result buffer
         elif o == 0xB: pass
         elif o in (0x31, 0x39, 0x3B):                                # empties the variable, then adds each element
             elems = [ev(e) for e in n.kids[1:]]
