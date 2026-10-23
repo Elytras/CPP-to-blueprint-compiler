@@ -400,7 +400,9 @@ class VM:
                 obj, prop = (held(t), t.kids[1].val) if t.op in (0x12, 0x19) else (me, t.val)
                 if obj is None:                             # Accessed None, and no address: nothing added (ScriptCore.cpp 3098)
                     s.accessed_none.append((fn, t.mem)); continue
-                _, dfn, dobj = ev(n.kids[1])
+                d = ev(n.kids[1])
+                if not isinstance(d, tuple): continue       # a zeroed FScriptDelegate: bound to nothing, compacted at once
+                _, dfn, dobj = d
                 # AddUnique, then CompactInvocationList: a delegate bound to no object is compactable, so it is taken
                 # straight off again (ScriptDelegates.h 336-343, IsCompactable 100-103).
                 if dobj is not None and (obj, prop, dfn, dobj) not in s.binds: s.binds.append((obj, prop, dfn, dobj))

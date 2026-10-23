@@ -2389,6 +2389,8 @@ private:
                              FArgIR& Out, std::string* Err);
     bool LowerDelegateValue(const Json& Obj, const Json& Fn, const std::string& DelegateType, FIndex Sig, const std::string& Holder,
                             FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool LowerDelegateExecute(const Json& Call, const Json& Callee, const Json& Obj, FBlueprintClass& BP, FArgIR& Out,
+                              std::string* Err);
     const FRecord* DispatcherOwner(const Json& Dispatcher);
 
     /* Raw pointers: a pointer to anything but a UObject (void*, int32*, FName*, UObject**) is an address,
@@ -5692,6 +5694,91 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
     return true;
 }
 
+/* `D.Execute(...)` / `D.ExecuteIfBound(...)` on a TDelegate. Kismet has no opcode that calls a single delegate, so the
+   value goes into a dispatcher local of its signature, which is broadcast: Clear, Add, Call, the editor's nodes on a
+   dispatcher (execAddMulticastDelegate steps any delegate expression, ScriptCore.cpp 3085-3101). A local per call keeps
+   a recursive call off the outer one's list, and the broadcast runs a copy of the list (ScriptDelegates.h 479-502).
+   An unbound value is skipped by the broadcast, so Execute does what ExecuteIfBound does; nothing comes back from one,
+   so a return value or a reference written back is refused. */
+bool FCompiler::LowerDelegateExecute(const Json& Call, const Json& Callee, const Json& Obj, FBlueprintClass& BP,
+                                     FArgIR& Out, std::string* Err)
+{
+    const std::string Method = Name(Callee);
+    const std::string Type = StripTypeKeywords(TypeOf(Obj));
+    const std::string DelegateType = "TDelegate" + Type.substr(Type.find('<'));
+    if (Method != "Execute" && Method != "ExecuteIfBound") { *Err = "TDelegate has no method " + Method; return false; }
+    const size_t Open = Type.find('('), Close = Type.rfind(')');
+    if (Open == std::string::npos || Close == std::string::npos || Close < Open)
+    { *Err = "TODO: unimplemented delegate type " + Type; return false; }
+    std::string Ret = Type.substr(10, Open - 10);
+    while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
+    if (Ret != "void")
+    { *Err = Method + " on a " + Type + ": a Blueprint calls a delegate through a dispatcher, which returns nothing; "
+             "give the delegate a void signature and pass an object the handler writes its result into"; return false; }
+    if (!CurLocals) { *Err = "internal: " + Method + " outside a function body"; return false; }
+
+    /* The broadcast's reference parameters, as LowerDispatcherCall reads them off the type. */
+    std::vector<std::string> RefParms(1);
+    const std::string List = Type.substr(Open + 1, Close - Open - 1);
+    if (List.find_first_not_of(' ') != std::string::npos)
+        for (std::string T : SplitTemplateArgs(List))
+        {
+            while (!T.empty() && T.back() == ' ') T.pop_back();
+            const bool bRef = !T.empty() && T.back() == '&';
+            if (bRef && T.compare(0, 6, "const ") != 0)
+            { *Err = Method + " on a " + Type + ": " + T + " is a non-const reference, which a delegate called from a "
+                     "Blueprint never writes back to the caller; take it by value or by const reference"; return false; }
+            while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+            RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
+        }
+
+    FIndex Sig;
+    if (!DelegateSignature(DelegateType, Method, BP, &Sig, Err)) return false;
+    const std::string Tmp = "__Exec" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD = DispatcherParam(Tmp, Sig);
+    PD.PropertyFlags = 0;
+    CurLocals->push_back(PD);
+
+    auto Op = [&](const char* Intrinsic) {
+        FStmtIR S;
+        S.K = FStmtIR::StaticCall;
+        S.Call.Intrinsic = Intrinsic;
+        S.Call.bOnArg0 = true;
+        S.Call.Args.emplace_back();
+        S.Call.Args[0].K = FArgIR::Local;
+        S.Call.Args[0].S = Tmp;
+        return S;
+    };
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    Body->push_back(Op("__ClearDelegate__"));
+    FStmtIR Add = Op("__AddDelegate__");
+    Add.Call.Args.emplace_back();
+    if (!LowerArg(Obj, BP, Add.Call.Args[1], Err)) return false;
+    Body->push_back(std::move(Add));
+    FStmtIR Fire = Op("__Broadcast__");
+    Fire.Call.Fn = Sig;
+    bool bFirst = true;
+    bool bOk = true;
+    ForEach(Call, [&](const Json& A) {
+        if (bFirst) { bFirst = false; return; }        // the callee
+        Fire.Call.Args.emplace_back();
+        bOk = bOk && LowerArg(A, BP, Fire.Call.Args.back(), Err);
+    });
+    if (!bOk) return false;
+    if (RefParms.size() == Fire.Call.Args.size()) Fire.Call.RefParms = RefParms;
+    Body->push_back(std::move(Fire));
+
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out = FArgIR();
+    Out.K = FArgIR::Call;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = Block;
+    return true;
+}
+
 /* What a raw pointer expression points at ("int32" for an `int32 *`), from the spelling NormalizePointers kept. */
 std::string PointeeOf(const Json& N)
 {
@@ -6851,6 +6938,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         }
         const std::string ObjType = StripTypeKeywords(TypeOf(*Obj));
         if (ObjType.compare(0, 10, "TMulticast") == 0) return LowerDispatcherCall(*N, *Callee, *Obj, BP, Out, Err);
+        if (ObjType.compare(0, 10, "TDelegate<") == 0) return LowerDelegateExecute(*N, *Callee, *Obj, BP, Out, Err);
         std::string Iface;
         if (TemplateArg(ObjType, "TScriptInterface", &Iface))
         {
