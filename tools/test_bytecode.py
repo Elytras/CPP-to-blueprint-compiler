@@ -4000,6 +4000,43 @@ def array_through():
 array_through()
 
 
+def ue_name_marker():
+    """UeNameMarker: a function's `__UeName` marker is the name it cooks under. The interface's function, the class's
+    implementation of it and its own marked function are exports of the engine's names, a call names them so (a call
+    through the interface finds its function by name on the object), and no package names the C++ spellings."""
+    import dumpexp, invariants
+    base = asset('UeNameMarker')
+    iface = os.path.join(os.path.dirname(base), 'IOrdering')
+    proves('names.ue-name-marker')
+    assert 'Compare Function' in [e['name'] for e in invariants.load(iface).exports]
+    assert {'Compare Function', 'Twice Over'} <= {e['name'] for e in invariants.load(base).exports}
+    for b in (base, iface):
+        names = dumpexp.load(b)[3]
+        assert not {'Compare_Function', 'Twice_Over'} & set(names), b
+    assert run(base, 'Call')[0] == 6
+    # bpdecomp gives each function it respells its marker back, so the decompiled source cooks to the same names:
+    content = base.replace(os.sep, '/').split('/FSD/Content/')[0] + '/FSD/Content'
+    dec = tempfile.mkdtemp()
+    try:
+        proc = subprocess.run(
+            [sys.executable, '-I', '-c',
+             'import sys; sys.path.insert(0, %r); import bpdecomp_model; '
+             'bpdecomp_model.Api.__init__.__defaults__ = (%r,); import bpdecomp_emit; bpdecomp_emit.main()'
+             % (HERE, os.path.abspath(UEAPI)), content, dec, '--mod', '/Game/_ElytrasMods/UeNameMarker=UNM'],
+            capture_output=True, text=True)
+        src = ''.join(open(os.path.join(r, f), encoding='utf-8-sig').read() for r, _, fs in os.walk(dec) for f in fs
+                      if f.endswith('.h'))
+        for want in ('Compare_Function__UeName = "Compare Function";', 'Twice_Over__UeName = "Twice Over";'):
+            assert want in src, (want, proc.stdout[-2000:] + proc.stderr[-2000:])
+    finally:
+        shutil.rmtree(dec, ignore_errors=True)
+    print('ok  UeNameMarker: an interface function, its implementation and a class function cook, are called and '
+          'decompile under their __UeName names')
+
+
+ue_name_marker()
+
+
 def map_pairs(pkg, tag):
     """A TMap tag's (key, value) pairs in order, each FName (an enum's, as a ByteProperty in a container writes it, too)
     or FString as text; it lists no removals."""

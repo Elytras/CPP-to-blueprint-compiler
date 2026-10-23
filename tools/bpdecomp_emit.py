@@ -677,7 +677,15 @@ class ClassEmit:
             s.methods.append(('private', 'void %s();' % name, B.render(B.tidy(helper))))
         return list(extra_first) + decls + lines
 
+    def mark_function_name(s, i):
+        """A function the editor named with what C++ cannot spell (`Compare Function`) keeps that name through its
+        `__UeName` marker: callers find a Blueprint function by name, and an interface's implementations by its."""
+        name = s.pkg.exports[i]['name']
+        if ident(name) != name:
+            s.markers.append('static constexpr const char* %s__UeName = %s;' % (ident(name), B.cstring(name)))
+
     def plain_method(s, i, st):
+        s.mark_function_name(i)
         decl, retname, rettype = signature(s.run, s.a, i, st)
         access, pre, post = s.flags_decl(st, decl)
         stmts = s.pkg.script(i)
@@ -687,6 +695,7 @@ class ClassEmit:
 
     def event_method(s, i, st, ev, split, reached, shared):
         entry, copies = ev
+        s.mark_function_name(i)
         decl, retname, rettype = signature(s.run, s.a, i, st)
         access, pre, post = s.flags_decl(st, decl)
         frame, first = {}, []
