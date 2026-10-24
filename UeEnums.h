@@ -52,6 +52,7 @@ enum EExprToken : uint16
     EX_UnicodeStringConst        = 0x34,
     EX_Int64Const                = 0x35,
     EX_UInt64Const               = 0x36,
+    EX_DoubleConst               = 0x37,   // UE5 (S40): a Blueprint real is a double
     EX_PrimitiveCast             = 0x38,   // next byte is the ECastToken
     EX_SetSet                    = 0x39,
     EX_EndSet                    = 0x3A,
@@ -326,6 +327,7 @@ inline const char* ExprName(uint8 Op)
     case 0x34: return "EX_UnicodeStringConst";
     case 0x35: return "EX_Int64Const";
     case 0x36: return "EX_UInt64Const";
+    case 0x37: return "EX_DoubleConst";
     case 0x38: return "EX_PrimitiveCast";
     case 0x39: return "EX_SetSet";
     case 0x3A: return "EX_EndSet";

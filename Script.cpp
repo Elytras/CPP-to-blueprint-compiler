@@ -16,7 +16,14 @@ constexpr int32 kFNameSize = 12;    // sizeof(FScriptName): the in-memory byteco
 
 /* ---- properties ---- */
 
+/* A Blueprint real: a double under UE5's large world coordinates (S40), as the editor makes every float variable. */
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags)
+{
+    return FPropertyDef{ IsUE5() ? "DoubleProperty" : "FloatProperty", Name, RF_Public, 1, IsUE5() ? 8 : 4,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+}
+
+FPropertyDef SingleParam(const std::string& Name, uint64 ExtraFlags)
 {
     return FPropertyDef{ "FloatProperty", Name, RF_Public, 1, 4,
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
@@ -227,6 +234,62 @@ namespace
 void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D);
 void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P);
 
+/* A struct the engine serializes in a form of its own (WithSerializer), not as tags, whose form AssetGen knows; false for
+   any other. FGameplayTagContainer::Serialize writes its tags, each tag its FName; FNiagaraTypeDefinitionHandle the
+   definition it names, as tags; FNiagaraVariableBase its Name, then its handle, and FNiagaraVariable its VarData after
+   that, FNiagaraVariableWithOffset its Offset (each measured on EEE's cooked cloud stores). A member the value does not
+   give is its zero. */
+bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
+{
+    const std::string& S = P.StructName;
+    if (S != "GameplayTagContainer" && S != "NiagaraTypeDefinitionHandle" && S != "NiagaraVariableBase"
+        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset")
+        return false;
+    const auto& Members = D.Members ? D.Members : P.Members;
+    auto Member = [&](const char* Name) -> const FPropertyDef* {
+        if (D.K == FDefaultValue::Struct && Members)
+            for (const FPropertyDef& M : *Members) if (M.Name == Name) return &M;
+        return nullptr;
+    };
+    if (S == "GameplayTagContainer")
+    {
+        const FPropertyDef* Tags = Member("GameplayTags");
+        V.I32(Tags ? int32(Tags->Default.Items.size()) : 0);
+        if (Tags)
+            for (const FDefaultValue& Tag : Tags->Default.Items)
+            {
+                std::string Name = "None";
+                if (Tag.Members)
+                    for (const FPropertyDef& M : *Tag.Members)
+                        if (M.Name == "TagName" && M.Default.K == FDefaultValue::Str && !M.Default.S.empty()) Name = M.Default.S;
+                V.Name(Name);
+            }
+        return true;
+    }
+    if (S == "NiagaraTypeDefinitionHandle")
+    {
+        if (D.K == FDefaultValue::Struct && Members) for (const FPropertyDef& M : *Members) WriteDefaultTagInner(V, M);
+        TagEnd(V);
+        return true;
+    }
+    const FPropertyDef* Name = Member("Name");
+    V.Name(Name && Name->Default.K == FDefaultValue::Str && !Name->Default.S.empty() ? Name->Default.S : std::string("None"));
+    if (const FPropertyDef* H = Member("TypeDefHandle")) WriteValue(V, *H, H->Default);
+    else TagEnd(V);
+    if (S == "NiagaraVariable")
+    {
+        const FPropertyDef* Data = Member("VarData");
+        V.I32(Data ? int32(Data->Default.Items.size()) : 0);
+        if (Data) for (const FDefaultValue& B : Data->Default.Items) V.U8(uint8(B.I));
+    }
+    else if (S == "NiagaraVariableWithOffset")
+    {
+        const FPropertyDef* Offset = Member("Offset");
+        V.I32(Offset ? int32(Offset->Default.I) : 0);
+    }
+    return true;
+}
+
 void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
 {
     const bool bSet = D.K != FDefaultValue::None;
@@ -234,7 +297,9 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         if (P.Type == "IntProperty") V.I32(int32(D.I));
         else if (P.Type == "BoolProperty") V.U8(bSet && D.I != 0 ? 1 : 0);     // an element; a bool member is its tag
         else if (P.Type == "FloatProperty") { const float F = float(D.F); V.Raw(&F, 4); }
+        else if (P.Type == "DoubleProperty") V.Raw(&D.F, 8);
         else if (P.Type == "Int64Property") V.I64(D.I);
+        else if (P.Type == "UInt16Property") V.U16(uint16(D.I));
         else if (P.Type == "EnumProperty") V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero);
         else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(uint8(D.I)); else V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero); }   // an enum byte is its enumerator's name
         else if (P.Type == "StrProperty") WriteFStringValue(V, D.S);
@@ -285,6 +350,7 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
             }
             V.Append(Elements);
         }
+        else if (P.Type == "StructProperty" && WriteNativeForm(V, P, D)) {}
         else if (P.Type == "StructProperty")
         {
             const int32 Native = NativeStructSize(P.StructName);
@@ -342,6 +408,12 @@ int32 NativeStructSize(const std::string& StructName)
         { "Plane", 16 }, { "Matrix", 64 }, { "Color", 4 }, { "LinearColor", 16 }, { "IntPoint", 8 },
         { "IntVector", 12 }, { "Guid", 16 }, { "DateTime", 8 }, { "Timespan", 8 }, { "Box", 25 },
         { "Box2D", 17 }, { "FrameNumber", 4 } };
+    /* UE5's large world coordinates make the math structs' components doubles (S40): the rest keep their 4.27 size. */
+    static const std::map<std::string, int32> Lwc = {
+        { "Vector", 24 }, { "Vector2D", 16 }, { "Vector4", 32 }, { "Rotator", 24 }, { "Quat", 32 },
+        { "Plane", 32 }, { "Matrix", 128 }, { "Box", 49 }, { "Box2D", 33 } };
+    if (IsUE5())
+        if (const auto L = Lwc.find(StructName); L != Lwc.end()) return L->second;
     const auto N = Native.find(StructName);
     return N == Native.end() ? 0 : N->second;
 }
@@ -350,9 +422,9 @@ bool NativeUnwritten(const std::string& StructName)
 {
     // ponytail: the census's list; a native struct the pak holds no value of is not in it
     static const char* const Unwritten[] = {
-        "GameplayTagContainer", "SoftObjectPath", "SoftClassPath", "PerPlatformFloat", "PerPlatformInt", "RichCurveKey",
+        "SoftObjectPath", "SoftClassPath", "PerPlatformFloat", "PerPlatformInt", "RichCurveKey",
         "KeyHandleMap", "FontData", "FontCharacter", "ColorMaterialInput", "ScalarMaterialInput", "VectorMaterialInput",
-        "MaterialAttributesInput", "NiagaraVariable", "NiagaraVariableBase", "NiagaraVariableWithOffset",
+        "MaterialAttributesInput",
         "MovieSceneFloatChannel", "MovieSceneFrameRange", "MovieSceneEvaluationFieldEntityTree",
         "SkeletalMeshSamplingLODBuiltData", "LevelSequenceObjectReferenceMap", "UniqueNetIdRepl", "ModioUIColorRef" };
     return std::find(std::begin(Unwritten), std::end(Unwritten), StructName) != std::end(Unwritten);
@@ -364,7 +436,7 @@ int32 FixedValueSize(const FPropertyDef& P)
     if (T == "BoolProperty") return 1;
     if (T == "IntProperty" || T == "FloatProperty" || T == "ObjectProperty" || T == "ClassProperty" || T == "InterfaceProperty")
         return 4;
-    if (T == "Int64Property" || T == "EnumProperty" || T == "NameProperty") return 8;
+    if (T == "Int64Property" || T == "DoubleProperty" || T == "EnumProperty" || T == "NameProperty") return 8;
     if (T == "ByteProperty") return P.StructName.empty() ? 1 : 8;
     if (T == "StructProperty") return NativeStructSize(P.StructName);
     return 0;
@@ -619,7 +691,15 @@ void FScript::ThreadJumps()
     }
 }
 
-void FScript::FloatConst(float Value)
+void FScript::FloatConst(double Value)
+{
+    if (!IsUE5()) { SingleConst(float(Value)); return; }
+    Op(EX_DoubleConst);
+    Ar.Raw(&Value, 8);
+    Memory += 8;
+}
+
+void FScript::SingleConst(float Value)
 {
     Op(EX_FloatConst);
     Ar.Raw(&Value, 4);
@@ -748,9 +828,9 @@ void FScript::LetPath(EExprToken LetOp, const std::vector<std::string>& Path, FI
 
 void FScript::Context(const std::function<void(FScript&)>& ObjectExpr,
                       const std::function<void(FScript&)>& ContextExpr,
-                      const std::optional<FFieldRef>& RValue)
+                      const std::optional<FFieldRef>& RValue, EExprToken ContextOp)
 {
-    Op(EX_Context);
+    Op(ContextOp);
     ObjectExpr(*this);
 
     // Skip count is MEMORY bytes, so the inner expression is built and measured separately first.

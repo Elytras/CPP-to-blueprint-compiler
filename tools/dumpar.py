@@ -71,38 +71,61 @@ def skip_string(r):
     r.take(-2 * n if n < 0 else n)
 
 
-def read_store(r):
-    """The tag values (4.27 FixedTagPrivate::FStore), skipped: nothing here reads them. The counts are in the store's
-    member order, the data texts first, then the rest in that order."""
+def read_store(r, name):
+    """The tag values (4.27 FixedTagPrivate::FStore), as a function from a row's map handle to its tags. The counts are
+    in the store's member order, the data texts first, then the rest in that order. A value names its view in its low
+    3 bits (EValueType) and its index in the rest; a text value reads as <text>, as nothing here decodes them."""
     if r.u32() != BEGIN_MAGIC:
         sys.exit("tag store: bad begin magic")
     (numberless_names, names, numberless_paths, paths, _texts, ansi_offsets, wide_offsets, ansi_chars, wide_chars,
      numberless_pairs, pairs) = [r.i32() for _ in range(STORE_VIEWS)]
     r.take(r.i32())                             # the texts, sized so a reader can step over them
-    r.take(4 * numberless_names)
-    for _ in range(names):
-        skip_name(r)
-    r.take(12 * numberless_paths)
-    for _ in range(3 * paths):
-        skip_name(r)
-    r.take(4 * (ansi_offsets + wide_offsets) + ansi_chars + 2 * wide_chars + 8 * numberless_pairs)
-    for _ in range(pairs):
-        skip_name(r)
-        r.u32()
+
+    def path():
+        cls, obj, pkg = name(), name(), name()  # FAssetRegistryExportPath: Class, Object, Package
+        out = pkg + ("." + obj if obj != "None" else "")
+        return "%s'%s'" % (cls, out) if cls != "None" else out
+
+    value_names = [name() for _ in range(numberless_names + names)]
+    value_paths = [path() for _ in range(numberless_paths + paths)]
+    ansi_at = [r.u32() for _ in range(ansi_offsets)]
+    wide_at = [r.u32() for _ in range(wide_offsets)]
+    ansi = r.take(ansi_chars)
+    wide = r.take(2 * wide_chars)
+    keyed = [(name(), r.u32()) for _ in range(numberless_pairs)]
+    numbered = [(name(), r.u32()) for _ in range(pairs)]
     if r.u32() != END_MAGIC:
         sys.exit("tag store: bad end magic")
 
+    def value(v):
+        kind, i = v & 7, v >> 3
+        if kind == 0:
+            return ansi[ansi_at[i]:ansi.index(b"\0", ansi_at[i])].decode("latin-1")
+        if kind == 1:
+            end = next(k for k in range(2 * wide_at[i], len(wide), 2) if wide[k:k + 2] == b"\0\0")
+            return wide[2 * wide_at[i]:end].decode("utf-16-le")
+        if kind in (2, 3):
+            return value_names[i if kind == 2 else numberless_names + i]
+        if kind in (4, 5):
+            return value_paths[i if kind == 4 else numberless_paths + i]
+        return "<text>"
+
+    def tags(handle):
+        pairs_of = keyed if handle >> 63 else numbered
+        begin, num = handle & 0xFFFFFFFF, (handle >> 32) & 0xFFFF
+        return [(k, value(v)) for k, v in pairs_of[begin:begin + num]]
+    return tags
+
 
 def read(path):
-    """Every asset row of an AssetRegistry.bin, assetgen's or a cooked game's, as dicts; tags, bundles and chunks are
-    counted, not kept. Exits unless the whole file parses."""
+    """Every asset row of an AssetRegistry.bin, assetgen's or a cooked game's, as dicts; tags are kept as (key, value)
+    pairs, bundles and chunks are counted. Exits unless the whole file parses."""
     r = Reader(open(path, "rb").read())
     guid = tuple(r.u32() for _ in range(4))
     if guid != VERSION_GUID:
         sys.exit("not an asset registry: guid %s" % (guid,))
     version = r.i32()
     names = read_name_batch(r)
-    read_store(r)
 
     def name():
         idx = r.u32()
@@ -111,10 +134,11 @@ def read(path):
         base = names[idx & ~NUMBERED_BIT]
         return "%s_%d" % (base, r.u32() - 1)
 
+    tags = read_store(r, name)
     rows = []
     for _ in range(r.i32()):
         row = dict(object_path=name(), package_path=name(), asset_class=name(), package_name=name(),
-                   asset_name=name(), tags=r.u64(), bundles=r.i32())
+                   asset_name=name(), tags=tags(r.u64()), bundles=r.i32())
         for _ in range(row["bundles"]):
             skip_name(r)
             for _ in range(r.i32()):
@@ -148,7 +172,9 @@ def main():
     for a in rows:
         print("  %-52s %s" % (a["object_path"], a["asset_class"]))
         print("     package %s   path %s   asset %s" % (a["package_name"], a["package_path"], a["asset_name"]))
-        print("     flags 0x%08X  tagmap 0x%X  bundles %d  chunks %d" % (a["flags"], a["tags"], a["bundles"], a["chunks"]))
+        print("     flags 0x%08X  tags %d  bundles %d  chunks %d" % (a["flags"], len(a["tags"]), a["bundles"], a["chunks"]))
+        for key, value in a["tags"]:
+            print("     tag %s = %s" % (key, value))
     print("dependencies: %d node(s)" % dependencies)
     print("package data: %d entr(y/ies)" % packages)
     print("OK - consumed the whole file (%d bytes)" % size)

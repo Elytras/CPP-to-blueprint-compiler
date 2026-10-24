@@ -485,6 +485,9 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         if (bFunctionLibrary || Class.bInterface)
             Tag(Ar, "BlueprintType", "ByteProperty",
                 [&](FArc& V) { V.Name(Class.bInterface ? "BPTYPE_Interface" : "BPTYPE_FunctionLibrary"); }, "EBlueprintType");
+        /* UBlueprint::BlueprintDescription: FinishCompilingClass sets it as the class's Tooltip metadata. */
+        if (!Class.Description.empty())
+            Tag(Ar, "BlueprintDescription", "StrProperty", [&](FArc& V) { V.Str(Class.Description); });
         Tag(Ar, "BlueprintSystemVersion", "IntProperty", [](FArc& V) { V.I32(2); });
         if (!GraphRows.empty())
             Tag(Ar, "FunctionGraphs", "ArrayProperty", [=](FArc& V) {
@@ -690,6 +693,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         { "NumReplicatedProperties", "0" },
         { "IsDataOnly", "False" },
     };
+    if (!Class.Description.empty()) Row.Tags.push_back({ "BlueprintDescription", Class.Description });   // the content browser's tooltip
     P.SetRegistryObjects({ Row });
 
     return P.Save(OutDir + "/" + Class.AssetName, Err);

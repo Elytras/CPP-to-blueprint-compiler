@@ -9,7 +9,7 @@ import invariants
 import bpdecomp_flow as F
 import bpdecomp_body as B
 from bpdecomp_model import *
-from bpdecomp import Run, Ctx, Values, CallInfo
+from bpdecomp import Run, Ctx, Values, CallInfo, instanced_export
 from bpdecomp_emit_util import split_top
 
 HEADER_BANNER = '// Decompiled from %s by AssetGen/tools/bpdecomp.py; edit freely, it is source now.\n'
@@ -41,18 +41,22 @@ def is_zero(v):
     return v in ZERO or (d is not None and all(is_zero(x) for _f, x in d[1]))
 
 
-def field_assigns(lhs, v):
+def field_assigns(lhs, v, partial=False, skip_zero=False):
     """`lhs = v;` as statements; a native struct's designated initializer (an aggregate to the compiler only for a
-    mod struct) becomes one assignment per field."""
+    mod struct) becomes one assignment per field. `partial`: a mod struct's too - a value read over an archetype's
+    (an inherited default, a component template) holds only the members that differ from it, which the constructor says
+    member by member; braces would give the others the struct's own defaults instead."""
+    if partial and re.fullmatch(r'[\w:]+\{\}', v): return []     # a struct tag holding no member: nothing differs
     d = designated(v)
-    if d is None or '::' in d[0]: return ['%s = %s;' % (lhs, v)]
-    return [x for f, val in d[1] for x in field_assigns('%s.%s' % (lhs, f), val)]   # a tag holds only what differs
+    if d is None or ('::' in d[0] and not partial): return [] if skip_zero and is_zero(v) else ['%s = %s;' % (lhs, v)]
+    return [x for f, val in d[1] for x in field_assigns('%s.%s' % (lhs, f), val, partial, skip_zero)]   # a tag holds only what differs
 
 
 class Out:
     """One asset's output: its header text, its .cpp text (or None), the mod assets its declaration needs complete."""
     def __init__(s, a):
         s.a, s.header, s.cpp, s.deps, s.fwd = a, '', None, set(), set()
+        s.cooked = None         # why the class ships as its cooked package (UE_COOKED), or None
 
 
 def emit_enum(run, a):
@@ -66,6 +70,8 @@ def emit_enum(run, a):
         lines.append('    %s = %d,\n' % (name, v))
         if name != r or disp.get(r, r) != name:
             keep.append('%s=%s' % (name, r) + ('=' + disp[r] if r in disp and disp[r] != name else ''))
+    # the sentinel the engine adds, which a default may hold (EEE's ETemperature_MAX, its "unset")
+    lines.append('    %s_MAX = %d,\n' % (a.cpp, max([v for _, v in run.enum_entries(a)] + [-1]) + 1))
     lines.append('};\nUE_ENUM(%s);\n' % a.cpp)
     if keep:      # the names the editor cooked it with, which kept assets and saved games hold, and its display names
         lines.append('static constexpr const char* %s__UeEnumNames = %s;\n' % (a.cpp, B.cstring('|'.join(keep))))
@@ -116,8 +122,8 @@ def func_exports(a):
     for i, e in enumerate(pkg.exports):
         if e['outer'] != a.export + 1: continue
         k = pkg.class_of(i + 1)
-        if k in ('Function', 'DelegateFunction') and not e['name'].endswith('__DelegateSignature'):
-            out.append((i, k))        # a dispatcher's signature is its UE_DISPATCHER line
+        if k in ('Function', 'DelegateFunction') and not pkg.struct(i).function_flags & FUNC_Delegate:
+            out.append((i, k))        # a dispatcher's signature is its UE_DISPATCHER line; a bound event (BndEvt__) is a method
     return out
 
 
@@ -147,10 +153,13 @@ class ClassEmit:
         s.members = []        # (access, text)
         s.extra_members = []
         s.ucs = []            # statements for UserConstructionScript (components the mod declares)
-        s.defaults = []       # UE_DEFAULTS lines
+        s.defaults = []       # the default constructor's statements
         s.markers = []        # UeMarkers lines
         s.const_dropped = []  # Const functions declared without const
         s.notes = run.notes
+        s.notes_from = len(run.notes)
+        s.inst_locals = {}    # an instanced object's export -> the constructor's local holding it
+        s.cx.instanced = s.instanced
 
     def run_all(s):
         a, pkg, st = s.a, s.pkg, s.st
@@ -164,9 +173,11 @@ class ClassEmit:
         for p in st.props:
             if p.type in ('MulticastInlineDelegateProperty', 'MulticastDelegateProperty'): dispatchers[p.name] = p
         s.components()
+        s.widget_layout()
         s.member_props(dispatchers)
         s.functions(funcs, ug, dispatchers)
         s.class_defaults()
+        if s.a.kind != 'widget': s.defaults += s.component_bindings()
         return s.write()
 
     # -- members
@@ -176,7 +187,7 @@ class ClassEmit:
         vals = Values(s.cx)
         for p in s.st.props:
             if p.name == 'UberGraphFrame': continue
-            if p.name in s.component_vars: continue
+            if p.name in s.component_vars or p.name in s.widget_vars: continue
             if p.name in dispatchers:
                 sig = s.run.types.params(s.pkg, p.ref, s.a)
                 ps = ', '.join('%s %s' % (t, ident(n)) for t, n, _ in sig[1]) if sig else ''
@@ -189,7 +200,14 @@ class ClassEmit:
                 v = vals.tag(s.pkg, t, p, s.a)
                 d = designated(v) if v is not None else None
                 if v is None or is_zero(v): pass
-                elif d is not None and '::' not in d[0]: s.defaults += field_assigns(ident(p.name), v)
+                elif d is not None and d[0].split('::')[-1] not in {x.cpp for x in s.run.model.assets.values()
+                                                                    if x.kind == 'struct'}:
+                    # a native struct is no aggregate, and AssetGen takes a variable's own default as its initializer
+                    # only: what the cooked default sets past zero is the note's to check against the struct's own
+                    left = field_assigns(ident(p.name), v, skip_zero=True)
+                    if left:
+                        s.notes.append('%s: variable %s has a native struct default C++ cannot initialize, dropped: %s'
+                                       % (s.a.path, p.name, ' '.join(left)))
                 else: init = ' = ' + v
             cpp = ident(p.name)
             if cpp != p.name: s.markers.append('static constexpr const char* %s__UeName = %s;' % (cpp, B.cstring(p.name)))
@@ -202,22 +220,155 @@ class ClassEmit:
                 s.members.append(('public', '%s(%s)%s;' % (macro, ', '.join(args), init)))
             else:
                 s.members.append(('public', '%s %s%s;' % (ty, cpp, init)))
+        subs = {}                # a default subobject's export -> the inherited member that points at it
         for name, t in own_defaults.items():
             if name == 'UberGraphFrame': continue
+            sub = s.subobject_of(t)
+            if sub is not None:
+                subs.setdefault(sub, name)
+                continue
+            if s.a.kind == 'widget' and name in ('bHasScriptImplementedTick', 'bHasScriptImplementedPaint'):
+                continue                # AssetGen sets both from the class's own Tick and OnPaint, as the compiler does
             v = vals.tag(s.pkg, t, s.inherited_prop(name), s.a)
             if v is None: continue
-            s.defaults += field_assigns(ident(name), v)
+            cpp = s.member_cpp(name)
+            if cpp is None:     # the engine skips a tag of a property the class no longer has
+                s.notes.append('%s: inherited default %s, which no parent declares (to AssetGen) any more; dropped'
+                               % (s.a.path, name))
+                continue
+            s.defaults += field_assigns(cpp, v, partial=True)
+        s.inherited_components(subs)
 
-    def inherited_prop(s, name):
-        st = s.st
-        pkg = s.pkg
+    def member_cpp(s, name):
+        """An inherited member as the declaring class spells it: a tag carries the engine's name, which a UeApi header
+        may spell in another case (Temperature, `temperature`) or rename (`X__UeName`)."""
+        low = name.lower()
+        for cn in s.run.model.ancestors(s.a.cpp)[1:]:
+            mine = [x for x in s.run.model.assets.values() if x.cpp == cn and x.kind in ('class', 'widget')]
+            if mine:
+                x = mine[0]
+                st = x.pkg.struct(x.export)
+                names = [p.name for p in st.props] if st else []
+                for i, e in enumerate(x.pkg.exports):
+                    if x.pkg.class_of(i + 1) == 'SCS_Node':
+                        t = {tt['name']: tt for tt in x.pkg.tags(i)}.get('InternalVariableName')
+                        if t: names.append(x.pkg.names[struct.unpack('<i', bytes(t['value'])[:4])[0]])
+                hit = next((n for n in names if n.lower() == low), None)
+                if hit: return ident(hit)
+                continue
+            hit = s.run.api.members(cn).get(low)
+            if hit: return hit
+        return None
+
+    def subobject_of(s, t):
+        """The export a CDO's object tag points at when it is one of this class's own subobjects (a default subobject
+        under the CDO, a component template under the class), else None. The engine sets such a pointer itself as it
+        makes the object, so it is no default to restate."""
+        if t['type'] != 'ObjectProperty' or len(bytes(t['value'])) != 4: return None
+        idx = struct.unpack('<i', bytes(t['value']))[0]
+        if idx <= 0 or instanced_export(s.pkg, idx - 1): return None
+        outer = s.pkg.exports[idx - 1]['outer']
+        return idx - 1 if outer in (s.st.cdo, s.a.export + 1) and outer else None
+
+    def inherited_components(s, subs):
+        """The defaults of components this class inherits, as `Comp->Field = value;`: a native parent's default
+        subobject, under the CDO, named by the member that points at it; and a parent Blueprint's SCS component, an
+        override template `<Var>_GEN_VARIABLE` under the class (UInheritableComponentHandler's record)."""
+        pkg, cdo = s.pkg, s.st.cdo
+        for i, e in enumerate(pkg.exports):
+            if cdo and e['outer'] == cdo:
+                name = subs.get(i)
+                if name is None:
+                    if pkg.tags(i) and not instanced_export(pkg, i):     # an instanced one is written where it is pointed at
+                        s.notes.append('%s: default subobject %s has defaults but no member points at it; dropped'
+                                       % (s.a.path, e['name']))
+                    continue
+                s.object_defaults(i, s.member_cpp(name) or ident(name))
+            elif e['outer'] == s.a.export + 1 and e['name'].endswith('_GEN_VARIABLE') and i + 1 not in s.own_templates \
+                    and pkg.class_of(i + 1) not in ('SCS_Node', 'SimpleConstructionScript'):
+                var = e['name'][:-len('_GEN_VARIABLE')]
+                cpp = s.member_cpp(var)
+                if cpp is None:     # the engine skips a record whose parent node is gone: a game update removed it
+                    s.notes.append('%s: overrides inherited component %s, which no parent declares any more; dropped'
+                                   % (s.a.path, var))
+                    continue
+                s.object_defaults(i, cpp)
+
+    def object_defaults(s, i, cpp):
+        """Export i's tags, a component's values over its archetype, as `cpp->Field = value;` lines. A pointer to one
+        of the class's own subobjects (AttachParent) is the engine's, and CreationMethod is set as it makes the
+        component; neither is restated."""
+        vals = Values(s.cx)
+        cn = s.pkg.class_of(i + 1)
+        h = s.run.api.header_of(cn) if not any(x.cpp == cn[:-2] for x in s.run.model.assets.values()) else None
+        if h: s.run.extra_includes.setdefault(s.a.mod.name, set()).add(h)
+        for t in s.pkg.tags(i):
+            if t['name'] in ('CreationMethod', 'UCSSerializationIndex', 'UCSModifiedProperties'): continue
+            if t['type'] == 'ObjectProperty' and len(bytes(t['value'])) == 4:
+                idx = struct.unpack('<i', bytes(t['value']))[0]
+                if idx > 0 and s.pkg.exports[idx - 1]['outer'] in (s.st.cdo, s.a.export + 1) \
+                        and not instanced_export(s.pkg, idx - 1): continue
+            v = vals.tag(s.pkg, t, s.class_prop(s.pkg.exports[i]['cls'], t['name']), s.a)
+            if v is not None: s.defaults += field_assigns('%s->%s' % (cpp, ident(t['name'])), v, partial=True)
+
+    def instanced(s, i):
+        """Export i, an object instanced in the defaults, as the constructor's local holding it: its NewObject line and
+        its own tags go in first, before the default that points at it, and an object under it before its own line that
+        does. Its outer is `this`, the component whose template holds it, or another such local."""
+        if i in s.inst_locals: return s.inst_locals[i]
+        pkg, e = s.pkg, s.pkg.exports[i]
+        o = e['outer'] - 1
+        oe = pkg.exports[o]
+        if o + 1 == s.st.cdo: outer = 'this'
+        elif instanced_export(pkg, o): outer = s.instanced(o)
+        elif oe['name'].endswith('_GEN_VARIABLE'):
+            var = oe['name'][:-len('_GEN_VARIABLE')]
+            outer = ident(var) if var in s.component_vars else (s.member_cpp(var) or ident(var))
+        else:       # a default subobject: the member of the CDO that points at it
+            tag = next((t for t in pkg.tags(s.st.cdo - 1) if t['type'] == 'ObjectProperty' and len(bytes(t['value'])) == 4
+                        and struct.unpack('<i', bytes(t['value']))[0] == o + 1), None)
+            if tag is None: raise ValueError('instanced %s is under %s, which no member points at' % (e['name'], oe['name']))
+            outer = s.member_cpp(tag['name']) or ident(tag['name'])
+        cls = s.run.types.cls(pkg, e['cls'], s.a)
+        local, n = ident(e['name']), 2
+        while local in s.inst_locals.values(): local, n = '%s_%d' % (ident(e['name']), n), n + 1
+        s.inst_locals[i] = local
+        h = s.run.api.header_of(cls)
+        if h: s.run.extra_includes.setdefault(s.a.mod.name, set()).add(h)
+        s.defaults.append('%s *%s = NewObject<%s>(%s, %s);' % (cls, local, cls, outer, B.cstring(e['name'])))
+        s.object_defaults(i, local)
+        return local
+
+    def class_prop(s, cls, name):
+        """Property `name` of the Blueprint class the FPackageIndex cls names, or of a parent of it; None for a native
+        one, whose members the tags' own types render."""
+        at = s.pkg.resolve(cls)
+        st = at and at[0].struct(at[1])
+        if st is None: return None
+        p = next((q for q in st.props if q.name == name), None)
+        if p:
+            def mark(q):
+                q._tpkg = at[0]
+                for r in q.subs or []: mark(r)
+            mark(p)
+            return p
+        return s.inherited_prop(name, st, at[0])
+
+    def inherited_prop(s, name, st=None, pkg=None):
+        st = st or s.st
+        pkg = pkg or s.pkg
         while st is not None and st.super:
             at = pkg.resolve(st.super)
             if not at: return None
             pkg, k = at
             st = pkg.struct(k)
             p = next((q for q in st.props if q.name == name), None)
-            if p: return p
+            if p:       # its type's indices (a struct's, an enum's) are that parent's package's, as struct_members marks
+                def mark(q):
+                    q._tpkg = pkg
+                    for r in q.subs or []: mark(r)
+                mark(p)
+                return p
         return None
 
     def cdo_tags(s):
@@ -227,12 +378,12 @@ class ClassEmit:
 
     def components(s):
         s.component_vars = set()
+        s.own_templates = set()
         pkg = s.pkg
         scs = next((i for i, e in enumerate(pkg.exports) if pkg.class_of(i + 1) == 'SimpleConstructionScript'
                     and e['outer'] == s.a.export + 1), None)
         if scs is None: return
         nodes = [i for i, e in enumerate(pkg.exports) if pkg.class_of(i + 1) == 'SCS_Node']
-        vals = Values(s.cx)
         for i in nodes:
             tags = {t['name']: t for t in pkg.tags(i)}
             var = s.name_tag(tags.get('InternalVariableName'))
@@ -245,17 +396,164 @@ class ClassEmit:
             if var == 'DefaultSceneRoot' and cls == 'USceneComponent':
                 continue                       # AssetGen gives an actor with no scene component this same root
             if cpp != var: s.markers.append('static constexpr const char* %s__UeName = %s;' % (cpp, B.cstring(var)))
-            if is_mod:
-                s.members.append(('public', '%s* %s;   // a component (bpdecomp: made in UserConstructionScript)' % (cls, cpp)))
-                s.ucs.append('%s = AddComponentByType<%s>(this);' % (cpp, cls))
-                s.notes.append('%s: component %s of the mod class %s is added in UserConstructionScript: AssetGen '
-                               'declares UE_COMPONENT for engine component classes only' % (s.a.path, var, cls))
-            else:
-                s.members.append(('public', 'UE_COMPONENT(%s, %s);' % (cls, cpp)))
+            if 'VariableGuid' in tags:      # the node's guid, which a subclass's override record names it by
+                s.markers.append('static constexpr const char* %s__UeScsNode = "%s";'
+                                 % (cpp, bytes(tags['VariableGuid']['value'])[:16].hex()))
+            s.members.append(('public', '%s* %s;' % (cls, cpp)))
+            s.defaults.append('%s = CreateDefaultSubobject<%s>(%s);' % (cpp, cls, B.cstring(cpp)))
             if tmpl > 0:
-                for t in pkg.tags(tmpl - 1):
-                    v = vals.tag(pkg, t, None, s.a)
-                    if v is not None: s.defaults += field_assigns('%s->%s' % (cpp, ident(t['name'])), v)
+                s.own_templates.add(tmpl)
+                s.object_defaults(tmpl - 1, cpp)
+
+    # -- a widget class: its tree, its widgets' event bindings and its animations (S39)
+
+    LAYOUT_TAGS = {'Slot', 'Slots', 'bIsVariable', 'Parent', 'Content'}     # the tree's links, which the layout makes
+    CHANNELS = {('Translation', 0): 'Translation.X', ('Translation', 1): 'Translation.Y', ('Rotation', 0): 'Angle',
+                ('Scale', 0): 'Scale.X', ('Scale', 1): 'Scale.Y', ('Shear', 0): 'Shear.X', ('Shear', 1): 'Shear.Y'}
+
+    def component_bindings(s):
+        """The class's ComponentDelegateBinding, one `Comp->Delegate.Add(this, &C::F);` per entry: the line of a widget's
+        layout, or of an actor's constructor (the editor's component-bound events)."""
+        pkg, ci = s.pkg, s.a.export + 1
+        cdb = next((i for i, e in enumerate(pkg.exports) if e['outer'] == ci and pkg.class_of(i + 1) == 'ComponentDelegateBinding'), None)
+        return ['%s->%s.Add(this, &%s::%s);' % (ident(b['ComponentPropertyName']), ident(b['DelegatePropertyName']), s.a.cpp,
+                                                ident(b['FunctionNameToBind']))
+                for b in (s.struct_list(cdb, 'ComponentDelegateBindings') if cdb is not None else [])]
+
+    def widget_layout(s):
+        """A widget class as AssetGen's widget layout: a UE_WIDGET for each widget of the tree, the root first and each
+        panel before what it holds, and a UE_ANIMATION for each animation; a constructor that adds each widget to its
+        panel and sets the members of each widget and slot, binds the widgets' events and keys the animations. The
+        variables these are, are left out of member_props."""
+        s.widget_vars, s.ctor = set(), []
+        if s.a.kind != 'widget': return
+        pkg, a, ci = s.pkg, s.a, s.a.export + 1
+        ref = lambda t: struct.unpack('<i', bytes(t['value'])[:4])[0]
+        def refs(t):
+            v = bytes(t['value']) if t else b'\0\0\0\0'
+            return list(struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4))
+        vals = Values(s.cx)
+        decls = []
+        def assign(lhs, t):
+            v = vals.tag(pkg, t, None, a)
+            if v is not None: s.ctor.extend(field_assigns(lhs, v))
+        def uses(cls_idx):          # a mod widget class nested here: its header first, for its members
+            o = s.run.model.asset_of_object(pkg.path(cls_idx))
+            if o is not None: s.out.deps.add(o.path)
+        tree = next((i for i, e in enumerate(pkg.exports) if e['outer'] == ci and pkg.class_of(i + 1) == 'WidgetTree'), None)
+        placed = set()
+        def walk(w):
+            placed.add(w)
+            e = pkg.exports[w]
+            name = ident(e['name'])
+            uses(e['cls'])
+            decls.append('UE_WIDGET(%s, %s);' % (s.run.types.cls(pkg, e['cls'], a), name))
+            s.widget_vars.add(e['name'])
+            for t in pkg.tags(w):
+                if t['name'] not in s.LAYOUT_TAGS: assign('%s->%s' % (name, ident(t['name'])), t)
+            for sl in refs(pkg.tag(w, 'Slots')):
+                tags = pkg.tags(sl - 1)
+                child = ref(next(t for t in tags if t['name'] == 'Content')) - 1
+                cname = ident(pkg.exports[child]['name'])
+                own = [t for t in tags if t['name'] not in s.LAYOUT_TAGS]
+                if own:
+                    scls = s.run.types.cls(pkg, pkg.exports[sl - 1]['cls'], a)
+                    local = cname + '_Slot'
+                    s.ctor.append('%s *%s = Cast<%s>(%s->AddChild(%s));' % (scls, local, scls, name, cname))
+                    for t in own: assign('%s->%s' % (local, ident(t['name'])), t)
+                else:
+                    s.ctor.append('%s->AddChild(%s);' % (name, cname))
+                walk(child)
+        if tree is not None and pkg.tag(tree, 'RootWidget'):
+            walk(ref(pkg.tag(tree, 'RootWidget')) - 1)
+        for i, e in enumerate(pkg.exports):
+            if tree is not None and e['outer'] == tree + 1 and i not in placed:
+                s.notes.append('%s: widget %s is in no panel of the tree; left out' % (a.path, e['name']))
+        if pkg.tag(a.export, 'Bindings'):
+            s.notes.append('%s: property bindings (UE_BIND) not decompiled' % a.path)
+        s.ctor += s.component_bindings()
+        for inst in refs(pkg.tag(a.export, 'Animations')):
+            scene = ref(pkg.tag(inst - 1, 'MovieScene')) - 1
+            anim = pkg.exports[scene]['name']
+            s.widget_vars.add(anim)
+            lo_t, lo, hi_t, end = struct.unpack_from('<BiBi', bytes(pkg.tag(scene, 'PlaybackRange')['value']))
+            if (lo_t, lo, hi_t) != (1, 0, 0):
+                s.notes.append('%s: animation %s plays from frame %d, not 0; played from 0' % (a.path, anim, lo))
+            last = -1
+            for b in s.struct_list(scene, 'ObjectBindings'):
+                for track in b.get('Tracks', []):
+                    ti = track - 1
+                    prop = s.struct_list(ti, 'PropertyBinding', single=True)
+                    if pkg.class_of(track) != 'MovieScene2DTransformTrack' or prop.get('PropertyName') != 'RenderTransform':
+                        s.notes.append('%s: animation %s: a %s track of %s not decompiled; AssetGen keys RenderTransform only'
+                                       % (a.path, anim, pkg.class_of(track), b['BindingName']))
+                        continue
+                    for sec in refs(pkg.tag(ti, 'Sections')):
+                        for t in pkg.tags(sec - 1):
+                            if t.get('struct') != 'MovieSceneFloatChannel': continue
+                            keys = s.float_channel(bytes(t['value']), '%s %s.%s' % (anim, b['BindingName'], t['name']))
+                            if not keys: continue
+                            last = max(last, keys[-1][0])
+                            s.ctor.append('UE_KEYS(%s, %s->RenderTransform.%s, %s);' % (
+                                ident(anim), ident(b['BindingName']), s.CHANNELS[(t['name'], t['index'])],
+                                ', '.join(s.key_text(*k) for k in keys)))
+            decls.append('UE_ANIMATION(%s%s);' % (ident(anim), '' if end == last + 1 else ', %s' % B.cfloat(end / 60000)))
+        s.members[0:0] = [('public', d) for d in decls]
+
+    def float_channel(s, v, what):
+        """An FMovieSceneFloatChannel as its Serialize wrote it: [(frame, value, arrive, leave, interp, tangent mode)]
+        at 60000 ticks a second. What UE_KEYS cannot say is noted."""
+        pre, post = v[0], v[1]
+        _, n = struct.unpack_from('<ii', v, 2)
+        frames = struct.unpack_from('<%di' % n, v, 10)
+        at = 10 + 4 * n + 8
+        keys = []
+        for k in range(n):
+            value, arrive, leave, _aw, _lw, weight, interp, tmode = struct.unpack_from('<5fBxxxBB', v, at + 28 * k)
+            keys.append((frames[k], value, arrive, leave, interp, tmode))
+            if weight: s.notes.append('%s: %s: weighted tangents dropped' % (s.a.path, what))
+            if tmode == 2: s.notes.append('%s: %s: a broken tangent kept as its leave slope' % (s.a.path, what))
+        has_default = struct.unpack_from('<i', v, at + 28 * n + 4)[0]
+        if pre != 4 or post != 4 or has_default or struct.unpack_from('<ii', v, at + 28 * n + 8) != (60000, 1):
+            s.notes.append('%s: %s: extrapolation, default value or tick rate not decompiled' % (s.a.path, what))
+        return keys
+
+    @staticmethod
+    def key_text(frame, value, arrive, leave, interp, tmode):
+        """A UE_KEYS key, (time, value[, Constant | Cubic[, slope]]): the time the shortest that lands on the frame, the
+        slope (value per second) only where the tangent is not Auto."""
+        num = lambda x: B.cfloat(x)[:-1]
+        t = next(u for u in ('%.*g' % (d, frame / 60000) for d in range(1, 12)) if round(float(u) * 60000) == frame)
+        out = [t, num(value)]
+        if interp == 1: out.append('Constant')
+        elif interp == 2:
+            out.append('Cubic')
+            if tmode: out.append(num(leave * 60000))
+        return '(%s)' % ', '.join(out)
+
+    def struct_list(s, i, name, single=False):
+        """Export i's tag `name`, an array of structs (or with single, one struct), as [{member: value}]: names and
+        strings as str, object references and arrays of them as package indices, anything else as its bytes."""
+        t = s.pkg.tag(i, name)
+        if t is None: return {} if single else []
+        def read(at):
+            tl = s.pkg.tags(i, at)
+            out = {}
+            for x in tl:
+                v = bytes(x['value'])
+                if x['type'] == 'NameProperty': out[x['name']] = s.name_tag(x)
+                elif x['type'] == 'StrProperty': out[x['name']] = read_fstring(v, 0)[0]
+                elif x['type'] == 'ObjectProperty': out[x['name']] = struct.unpack('<i', v)[0]
+                elif x['type'] == 'ArrayProperty' and x['inner'] == 'ObjectProperty':
+                    out[x['name']] = list(struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4))
+                else: out[x['name']] = v
+            return out, tl.end
+        if single: return read(t['at'])[0]
+        at, out = t['at'] + 4 + 49, []      # past the count and the elements' one inner StructProperty tag
+        for _ in range(struct.unpack_from('<i', bytes(t['value']))[0]):
+            e, at = read(at)
+            out.append(e)
+        return out
 
     def name_tag(s, t):
         if t is None: return None
@@ -332,7 +630,10 @@ class ClassEmit:
             f |= FUNC_Static              # a library's private helper is cooked without Static; nothing instances one
         pre = ''
         if f & FUNC_BlueprintPure and not decl.startswith('void '): pre += 'UE_PURE '
-        if f & FUNC_Net and not st.super:      # an override takes its parent's replication
+        if f & FUNC_Net and not st.super and not {'AActor', 'UActorComponent'} & set(s.run.model.ancestors(s.a.cpp)):
+            s.notes.append('%s.%s: an RPC on a class that does not replicate, which runs where it is called: '
+                           'declared a plain function' % (s.a.path, decl.split('(')[0].split()[-1]))
+        elif f & FUNC_Net and not st.super:      # an override takes its parent's replication
             pre += 'UE_SERVER ' if f & FUNC_NetServer else 'UE_CLIENT ' if f & FUNC_NetClient else 'UE_MULTICAST '
             if f & FUNC_NetReliable: pre += 'UE_RELIABLE '
         if f & FUNC_Static: pre += 'static '
@@ -345,6 +646,7 @@ class ClassEmit:
         try:
             tree = body.build()
         except Exception as ex:
+            if os.environ.get('BPDECOMP_TRACE'): import traceback; traceback.print_exc()
             s.notes.append('%s.%s: not decompiled (%s: %s)' % (s.a.path, body.method, type(ex).__name__, ex))
             return ['    // bpdecomp: not decompiled (%s)' % ex] + (['    return {};'] if rettype != 'void' else [])
         rv = ident(retname) if retname else None
@@ -357,20 +659,33 @@ class ClassEmit:
                     elif isinstance(x, B.CWhile): fix(x.body)
             fix(tree)
         decls = []
+        lines = B.render(tree)
+        text = '\n'.join(lines)
         for name in sorted(body.locals_used):
             if name in body.frame: continue
             p = local_props.get(name)
             if p is None or (p.flags & CPF_Parm and not p.flags & CPF_ReturnParm): continue
+            # The return value is a local only where the body names it: `return X;` alone needs none.
+            if p.flags & CPF_ReturnParm and not re.search(r'\b%s\b' % re.escape(s.cx.local_ident(body, name)), text):
+                continue
             ty = s.run.types.of(s.pkg, p, s.a)
             for d in [set()]:
                 deps_of_type(s.run, s.pkg, p, d)
             decls.append('    %s %s;' % (ty, s.cx.local_ident(body, name)))
         for n in body.notes: s.notes.append('%s: %s' % (s.a.path, n))
-        for name, lines in body.latent_helpers:
-            s.methods.append(('private', 'void %s();' % name, B.render(B.tidy(lines))))
-        return list(extra_first) + decls + B.render(tree)
+        for name, helper in body.latent_helpers:
+            s.methods.append(('private', 'void %s();' % name, B.render(B.tidy(helper))))
+        return list(extra_first) + decls + lines
+
+    def mark_function_name(s, i):
+        """A function the editor named with what C++ cannot spell (`Compare Function`) keeps that name through its
+        `__UeName` marker: callers find a Blueprint function by name, and an interface's implementations by its."""
+        name = s.pkg.exports[i]['name']
+        if ident(name) != name:
+            s.markers.append('static constexpr const char* %s__UeName = %s;' % (ident(name), B.cstring(name)))
 
     def plain_method(s, i, st):
+        s.mark_function_name(i)
         decl, retname, rettype = signature(s.run, s.a, i, st)
         access, pre, post = s.flags_decl(st, decl)
         stmts = s.pkg.script(i)
@@ -380,6 +695,7 @@ class ClassEmit:
 
     def event_method(s, i, st, ev, split, reached, shared):
         entry, copies = ev
+        s.mark_function_name(i)
         decl, retname, rettype = signature(s.run, s.a, i, st)
         access, pre, post = s.flags_decl(st, decl)
         frame, first = {}, []
@@ -394,6 +710,13 @@ class ClassEmit:
         s.methods.append((access, pre + decl + post + ';', lines, decl, post))
 
     def class_defaults(s):
+        # AssetGen turns bReplicates on for a class with a replicated variable or an RPC of its own; the editor does
+        # that for an actor only, and a cooked CDO without the tag holds its native parent's false (EEE_BaseComponent)
+        replicates = any('UE_REPLICATED' in m for _, m in s.members) or \
+            any(re.search(r'\bUE_(SERVER|CLIENT|MULTICAST) ', m[1]) for m in s.methods)
+        if replicates and 'bReplicates' not in s.cdo_tags() and s.st.super < 0 and \
+                s.pkg.path(s.st.super).startswith('/Script/'):
+            s.defaults.insert(0, 'bReplicates = false;')
         if s.ucs:
             has = any(m[1].split('(')[0].endswith(' UserConstructionScript') for m in s.methods)
             if has:
@@ -410,6 +733,16 @@ class ClassEmit:
     def write(s):
         a, st, pkg = s.a, s.st, s.pkg
         o = s.out
+        mine = s.notes[s.notes_from:]
+        if any('has defaults but no member points at it' in n for n in mine):
+            o.cooked = 'its defaults hold a subobject no member points at, which AssetGen cannot write'
+        elif any(' not rendered (' in n or ': inherited default ' in n for n in mine):
+            # dropping it would ship the class without it (a Niagara component's parameter store: the user parameters
+            # read as unset)
+            o.cooked = 'a default of it bpdecomp cannot render yet (NOTES.md names it)'
+        elif a.path in s.run.cook:      # --cook: what its source needs that AssetGen cannot compile yet
+            o.cooked = s.run.cook[a.path]
+        if o.cooked: s.notes.append('%s: shipped as its cooked package (UE_COOKED): %s' % (a.path, o.cooked))
         parent = s.run.types.cls(pkg, st.super, a)
         pa = s.run.model.asset_of_object(pkg.path(st.super))
         if pa: o.deps.add(pa.path)
@@ -425,12 +758,18 @@ class ClassEmit:
             lines.append('class %s%s {\npublic:\n    UE_INTERFACE;\n' % (a.cpp, ' : public ' + iparent[0] if iparent else ''))
         else:
             lines.append('class %s : %s {\n' % (a.cpp, ', '.join('public ' + b for b in bases)))
-        partial = [d for d in s.defaults if re.match(r'^[\w>-]+\.\w', d)]
-        for d in partial:          # UE_DEFAULTS sets a member whole; a native struct's single field has no spelling
-            s.notes.append('%s: default `%s` dropped: UE_DEFAULTS cannot set one field of a native struct' % (a.path, d))
-        s.defaults = [d for d in s.defaults if d not in partial]
-        if s.defaults and not is_iface:
-            lines.append('    UE_DEFAULTS {\n%s    }\n' % ''.join('        %s\n' % d for d in s.defaults))
+        # The defaults are the default constructor's body. A widget's layout is a constructor already, after the members:
+        # they go first in it (AssetGen reads a UE_DEFAULTS block before the constructor); otherwise it heads public.
+        if (s.defaults or s.ctor) and not is_iface:
+            defaults = s.defaults
+            if o.cooked:    # nothing reads them; one naming another mod class would order the umbrella around it
+                own = {x.cpp for x in s.run.model.assets.values()}
+                defaults = ['// %s   (UE_COOKED: the cooked package holds it)' % d
+                            if any(n.split('::')[-1] in own for n in re.findall(r'([\w:]+)::StaticClass\(\)', d)) else d
+                            for d in defaults]
+            ctor = ('public', '%s() {\n%s    }' % (a.cpp, ''.join('        %s\n' % l for l in defaults + s.ctor)))
+            if s.ctor: s.members.append(ctor)
+            else: s.members.insert(0, ctor)
         for access in ('public', 'protected', 'private'):
             ms = [m for acc, m in s.members if acc == access]
             fs = [f for f in s.methods if f[0] == access]
@@ -447,6 +786,16 @@ class ClassEmit:
         lines.append('};\n')
         lines.append(ns_close(a.ns))
         o.header = ''.join(lines)
+        # A class a default names (X::StaticClass(), a component's type, whose members a `Comp->` default reaches)
+        # must be complete before this one: its declaration comes first in the umbrella.
+        by_cpp = s.run.__dict__.setdefault('by_cpp', {})
+        if not by_cpp:
+            for x in s.run.model.assets.values(): by_cpp.setdefault(x.cpp, []).append(x.path)
+        code = re.sub(r'//[^\n]*', '', o.header)
+        for name in set(re.findall(r'([\w:]+)::StaticClass\(\)', code)) | \
+                set(re.findall(r'UE_COMPONENT\(([\w:]+),', code)) | set(re.findall(r'([\w:]+)\* \w+;', code)):
+            hits = by_cpp.get(name.split('::')[-1], [])
+            if len(hits) == 1 and hits[0] != a.path: o.deps.add(hits[0])
         if not is_iface:
             body = []
             for f in s.methods:
@@ -458,7 +807,7 @@ class ClassEmit:
                 full = '%s%s::%s%s%s' % (m.group(1), a.cpp, m.group(2), m.group(3), post)
                 body.append(full + ' {\n' + ''.join(l + '\n' for l in blines) + '}\n\n')
             for access, d, blines in [m for m in s.methods if len(m) == 3]:
-                mm = re.match(r'^(.*?\b)(\w+)(\(.*)\);$', d)
+                mm = re.match(r'^(.*?\b)(\w+)(\(.*\));$', d)
                 body.append('%s%s::%s%s {\n%s}\n\n' % (mm.group(1), a.cpp, mm.group(2), mm.group(3), ''.join(l + '\n' for l in blines)))
             if body:
                 o.cpp = (HEADER_BANNER % a.path) + '#include "%s"\n\n' % '{UMBRELLA}' + ns_open(a.ns) + '\n' + ''.join(body) + ns_close(a.ns)
@@ -486,30 +835,97 @@ def order(outs):
 
 
 def rel_file(mod, a, ext):
+    if not a.path.startswith(mod.root + '/'):      # a second root's asset, in its Game:: namespace
+        return os.path.join('Game', *(a.path[len('/Game/'):].split('/'))) + ext
     return os.path.join(*(a.path[len(mod.root) + 1:].split('/'))) + ext
 
 
+def file_stems(run, mod, seq):
+    """{asset path: where its .h and .cpp go in the mod's folder, without the extension}. The mod's own files keep the
+    names they are known by: <Mod>.h, the umbrella another mod includes; <Mod>.cpp, the file mods.yaml lists; Assets.h.
+    An asset at the mod's root spelled like one of them (a mod named after its main class) takes its kind as a suffix
+    instead, or the umbrella would overwrite its declaration and include itself. The file name is free: the package a
+    class cooks at comes from its namespaces and name, not from where its source sits. Compared without case, as
+    Windows opens them."""
+    taken = {(mod.name + '.h').lower(), (mod.name + '.cpp').lower(), 'assets.h'}
+    stems = {o.a.path: rel_file(mod, o.a, '') for o in seq}
+    used = {s.lower() for s in stems.values()}
+    for o in seq:
+        stem = stems[o.a.path]
+        if (stem + '.h').lower() in taken or (stem + '.cpp').lower() in taken:
+            new = stem + '_' + o.a.kind.capitalize()
+            while new.lower() in used: new += '_'
+            used.add(new.lower())
+            stems[o.a.path] = new
+            run.notes.append('%s: written as %s.h, since %s.h and .cpp are the mod\'s own' % (o.a.path, new, stem))
+    return stems
+
+
+def implied_path(a):
+    """The package a class with no UE_CLASS cooks at: the mod's root (a Game:: namespace is rooted at /Game), its
+    namespaces, its name."""
+    if a.ns and a.ns[0] == 'Game': return '/' + '/'.join(a.ns + [a.cpp])
+    return '/'.join([a.mod.root] + a.ns + [a.cpp])
+
+
 def link_mods(run, model, per_mod):
-    """A mod whose code names another's classes includes that mod's umbrella; every class says with UE_CLASS where
-    it is cooked, or the other mod would cook it a second time and a kept asset of it would load as null."""
+    """A mod whose code names another's classes includes that mod's umbrella; each class of such a mod says with
+    UE_CLASS where it is cooked, or the other mod would cook it a second time and a kept asset of it would load as
+    null. A class of any other mod needs one only where its namespace and name do not give its package, or where a
+    parent and an interface each bring a StaticClass, which X::StaticClass() would find ambiguous."""
     run.mod_needs = defaultdict(list)
     texts = {m.name: ''.join(o.header + (o.cpp or '') for o in per_mod[m.name]) for m in model.mods}
     for m in model.mods:
         for n in model.mods:
             if n is m: continue
-            classes = [o for o in per_mod[n.name] if o.a.kind == 'class']
-            if not any(re.search(r'(?<![\w:])%s\b' % re.escape('::'.join(o.a.ns + [o.a.cpp])), texts[m.name])
+            classes = [o for o in per_mod[n.name] if o.a.kind in ('class', 'widget')]
+            if not any(re.search(r'(?<![\w:])(?:::)?%s\b' % re.escape('::'.join(o.a.ns + [o.a.cpp])), texts[m.name])
                        for o in classes): continue
             run.mod_needs[m.name].append(n.name)
-    for m in model.mods:            # every class says where it is cooked: kept assets of it and other mods name it so
-        for o in [o for o in per_mod[m.name] if o.a.kind == 'class']:
+    # A struct or enum another declaration of its own mod names needs no marker: AssetGen cooks it for that use (REFERENCE
+    # mod-structs-ue.struct-fstats-int32-kills-float). One only other mods name keeps it, or its owner would cook nothing.
+    for m in model.mods:
+        outs = per_mod[m.name]
+        for o in [o for o in outs if o.a.kind in ('struct', 'enum')]:
+            rest = ''.join(re.sub(r'//[^\n]*', '', p.header + (p.cpp or '')) for p in outs if p is not o)
+            if not re.search(r'(?<!\w)%s\b' % re.escape(o.a.cpp), rest): continue
+            if o.a.kind == 'struct':
+                o.header = o.header.replace('struct %s {\n    UE_STRUCT;\n' % o.a.cpp, 'struct %s {\n' % o.a.cpp, 1)
+            else:
+                o.header = o.header.replace('};\nUE_ENUM(%s);\n' % o.a.cpp, '};\n', 1)
+    needed = {n for ns in run.mod_needs.values() for n in ns}
+    for m in model.mods:
+        for o in [o for o in per_mod[m.name] if o.a.kind in ('class', 'widget')]:
             name = o.a.pkg.exports[o.a.export]['name']
+            if m.name not in needed and not o.cooked and name == o.a.cpp + '_C' and implied_path(o.a) == o.a.path and \
+                    not o.a.pkg.struct(o.a.export).interfaces:
+                continue
             line = '    UE_CLASS("%s", "%s");\n' % (o.a.path, name)
+            if o.cooked:
+                line += ('    UE_COOKED;   // bpdecomp: %s. The package ships as it was cooked (mods.yaml kept:),\n'
+                         '                 // and this class is imported; its .cpp is not compiled. Drop UE_COOKED then.\n' % o.cooked)
             o.header, n = re.subn(r'(\nclass %s\b[^\n]*\{\n(?:.*\n)*?public:\n)' % re.escape(o.a.cpp),
                                   lambda mm: mm.group(1) + line, o.header, count=1)
             if not n:               # a class with no members has no public: section yet
                 o.header = re.sub(r'(\nclass %s\b[^\n]*\{\n(?:.*\n)*?)(\};\n)' % re.escape(o.a.cpp),
                                   lambda mm: mm.group(1) + 'public:\n' + line + mm.group(2), o.header, count=1)
+
+
+def unqualifier(run, seq):
+    """A function dropping the namespaces from the mod's own type names, which the umbrella's using-directives find.
+    A name keeps them where a variable spelled like it would hide it (`EEE_Manager*& EEE_Manager`, a member
+    `SpawnControl SpawnControl`), where two of the mod's namespaces declare it, or where UeApi has it too."""
+    text = ''.join(o.header + (o.cpp or '') for o in seq)
+    count = defaultdict(int)
+    for o in seq: count[o.a.cpp] += 1
+    hidden = run.model.var_names() | set(re.findall(r'UE_(?:COMPONENT|WIDGET|ANIMATION)\(\s*[\w:<>]+,\s*(\w+)', text)) | \
+        set(re.findall(r'UE_DISPATCHER\((\w+)', text)) | \
+        set(re.findall(r'^ +[\w:<>,*& ]*?[\w>*&] [*&]?(\w+)(?: = [^\n]*)?;$', text, re.M))
+    full = {'::'.join(o.a.ns + [o.a.cpp]): o.a.cpp for o in seq if o.a.ns and count[o.a.cpp] == 1
+            and o.a.cpp not in hidden and run.api.header_of(o.a.cpp) is None}
+    if not full: return lambda t: t
+    rx = re.compile(r'(?<![\w:])::(%s)\b' % '|'.join(sorted(map(re.escape, full), key=len, reverse=True)))
+    return lambda t: rx.sub(lambda m: full[m.group(1)], t)
 
 
 def write_mod(run, mod, outs, out_dir):
@@ -527,30 +943,38 @@ def write_mod(run, mod, outs, out_dir):
              '#include "../UeApi/FSD.h"\n', '#include "../UeApi/UMG.h"\n', '#include "../../AssetGen/include/Objects.h"\n']
     base = {'Types.h', 'UeMeta.h', 'Engine.h', 'FSD.h', 'UMG.h', 'CoreUObject.h'}
     text = ''.join(o.header + (o.cpp or '') for o in seq)
-    used = {run.api.header_of(w) for w in set(re.findall(r'\b[UAFIE][A-Z]\w+\b', text))} - base - {None}
+    # _C: a game Blueprint's. A dump taken with the mod loaded has headers for the mod's own classes too: not those.
+    own = {a.cpp for a in run.model.assets.values()} | {a.pkg.exports[a.export]['name'] for a in run.model.assets.values()
+                                                        if a.export is not None}
+    words = set(re.findall(r'\b[UAFIE][A-Z]\w+\b', text)) | {w for w in re.findall(r'\b\w+_C\b', text) if w not in own and w[:-2] not in own}
+    used = {run.api.header_of(w) for w in words} - base - {None}
     for h in sorted(used | run.extra_includes.get(mod.name, set())): lines.append('#include "../UeApi/%s"\n' % h)
     for n in run.mod_needs.get(mod.name, ()): lines.append('#include "../%s/%s.h"     // another mod\n' % (n, n))
     lines.append('\n')
-    if getattr(run, 'class_defaults_used', False):
-        lines.append('// The Get Class Defaults node, which AssetGen does not compile yet (EX_ClassContext): the class default object,\n'
-                     '// found by its path, /Game/A/B.B_C -> /Game/A/B.Default__B_C. bpdecomp writes it.\n'
-                     '#ifndef BPDECOMP_CLASS_DEFAULTS\n#define BPDECOMP_CLASS_DEFAULTS\n'
-                     'inline UObject* ClassDefaults(UClass* Class) {\n'
-                     '    return UKismetSystemLibrary::LoadAsset_Blocking(UKismetSystemLibrary::Conv_SoftObjPathToSoftObjRef(\n'
-                     '        UKismetSystemLibrary::MakeSoftObjectPath(UKismetStringLibrary::Replace(\n'
-                     '            UKismetSystemLibrary::GetPathName(Class), ".", ".Default__", ESearchCase::CaseSensitive))));\n'
-                     '}\n#endif\n\n')
     for ns, items in sorted(fwd.items()):
         lines.append('%s%s\n%s' % (ns_open(list(ns)), '\n'.join(items), ns_close(list(ns))))
+    # A mod that another includes has no using-directives: they would pour its names into that mod.
+    spaces = sorted({'::'.join(o.a.ns) for o in seq if o.a.ns})
+    unqualify = lambda t: t
+    if spaces and mod.name not in {n for ns in run.mod_needs.values() for n in ns}:
+        lines.append("\n// The mod's namespaces set its package paths; its sources name their types without them.\n")
+        lines += ['namespace %s {}\n' % ns for ns in spaces] + ['using namespace %s;\n' % ns for ns in spaces]
+        unqualify = unqualifier(run, seq)
+        for o in seq:
+            o.header, o.cpp = unqualify(o.header), o.cpp and unqualify(o.cpp)
     lines.append('\n#include "Assets.h"\n\n')
+    stems = file_stems(run, mod, seq)
     for o in seq:
-        rel = rel_file(mod, o.a, '.h')
+        rel = stems[o.a.path] + '.h'
         path = os.path.join(root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        open(path, 'w', encoding='utf-8-sig', newline='\n').write(o.header)
+        # Each header includes the umbrella, so an editor opening it alone sees every type it names. In the build the
+        # umbrella is already open when it reaches the header, and #pragma once skips the repeat.
+        own = '#include "%s"\n' % ('../' * rel.count(os.sep) + umbrella)
+        open(path, 'w', encoding='utf-8-sig', newline='\n').write(o.header.replace('#pragma once\n', '#pragma once\n' + own, 1))
         lines.append('#include "%s"\n' % rel.replace(os.sep, '/'))
         if o.cpp:
-            cpath = os.path.join(root, rel_file(mod, o.a, '.cpp'))
+            cpath = os.path.join(root, stems[o.a.path] + '.cpp')
             depth = rel.count(os.sep)
             inc = '../' * depth + umbrella
             open(cpath, 'w', encoding='utf-8-sig', newline='\n').write(o.cpp.replace('{UMBRELLA}', inc))
@@ -564,8 +988,8 @@ def write_mod(run, mod, outs, out_dir):
         by_ns[tuple(ns)].append('UE_ASSET_AT(%s, %s, "%s");' % (cls, name, path))
     for ns, items in sorted(by_ns.items()):
         al.append('%s%s\n%s' % (ns_open(list(ns)), '\n'.join(items), ns_close(list(ns))))
-    open(os.path.join(root, 'Assets.h'), 'w', encoding='utf-8-sig', newline='\n').write(''.join(al))
-    cpps = sorted(rel_file(mod, o.a, '.cpp').replace(os.sep, '/') for o in seq if o.cpp)
+    open(os.path.join(root, 'Assets.h'), 'w', encoding='utf-8-sig', newline='\n').write(unqualify(''.join(al)))
+    cpps = sorted((stems[o.a.path] + '.cpp').replace(os.sep, '/') for o in seq if o.cpp and not o.cooked)
     open(os.path.join(root, mod.name + '.cpp'), 'w', encoding='utf-8-sig', newline='\n').write(
         '// The mod\'s package and its one translation unit: mods.yaml lists this file, which takes in every other source.\n'
         '#include "%s"\n\nUE_MOD_PACKAGE("%s");\n\n%s' % (umbrella, mod.root, ''.join('#include "%s"\n' % c for c in cpps)))
@@ -576,15 +1000,17 @@ def main():
     ap.add_argument('content'); ap.add_argument('out')
     ap.add_argument('--mod', action='append', required=True)
     ap.add_argument('--names'); ap.add_argument('--raw'); ap.add_argument('--keep', action='append', default=[])
+    ap.add_argument('--cook', action='append', default=[], help='<asset path>=<why>: ship that class cooked (UE_COOKED)')
     args = ap.parse_args()
     mods = [tuple(m.split('=', 1)) for m in args.mod]
     model = Model(args.content, mods, args.names)
     run = Run(model, args.raw, args.keep)
     run.extra_includes = defaultdict(set)
+    run.cook = dict(c.split('=', 1) for c in args.cook)
     per_mod = defaultdict(list)
     raw = []
     for a in model.assets.values():
-        if a.path in run.keep or a.kind in ('raw', 'data', 'widget'):
+        if a.path in run.keep or a.kind in ('raw', 'data'):
             raw.append(a); continue
         try:
             o = {'enum': emit_enum, 'struct': emit_struct}.get(a.kind, emit_class)(run, a)
@@ -593,6 +1019,7 @@ def main():
             run.notes.append('%s: not decompiled (%s: %s)' % (a.path, type(ex).__name__, ex))
             continue
         per_mod[a.mod.name].append(o)
+        if o.cooked: raw.append(a)
     link_mods(run, model, per_mod)
     for mod in model.mods:
         write_mod(run, mod, per_mod[mod.name], os.path.join(args.out, mod.name))

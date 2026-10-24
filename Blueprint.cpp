@@ -3,6 +3,7 @@
 #include "Uncooked.h"
 
 #include <algorithm>
+#include <array>
 
 namespace Uasset
 {
@@ -189,17 +190,44 @@ FIndex FBlueprintClass::ClassDefaultObject(const std::string& PackageName,
     return Idx;
 }
 
+FIndex FBlueprintClass::DefaultObject(const std::string& PackageName, const std::string& ClassName_)
+{
+    const std::string Key = "cdo:" + PackageName + "." + ClassName_;     // ClassDefaultObject's row
+    auto It = ImportCache.find(Key);
+    if (It == ImportCache.end())
+        It = ImportCache.emplace(Key, P.AddImport({ PackageName, ClassName_, PackageImport(PackageName),
+                                                    "Default__" + ClassName_ })).first;
+    return Imp(It->second);
+}
+
 FIndex FBlueprintClass::Asset(const std::string& ClassPackage, const std::string& ClassName_,
                               const std::string& AssetPackage, const std::string& AssetName)
 {
     const std::string Key = "asset:" + AssetPackage + "." + AssetName;
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
+    /* `&Assets::...::EMode` names the enum (or struct) a property's type already imported: one import, not two. */
+    const std::string Typed = ClassName_ == "UserDefinedEnum"   ? "enum:" + AssetPackage + "." + AssetName
+                            : ClassName_ == "UserDefinedStruct" ? "str:" + AssetPackage + "." + AssetName : "";
+    if (auto T = Typed.empty() ? ImportCache.end() : ImportCache.find(Typed); T != ImportCache.end())
+    {
+        ImportCache.emplace(Key, T->second);
+        if (std::find(CallImports.begin(), CallImports.end(), Imp(T->second).V) == CallImports.end())
+            CallImports.push_back(Imp(T->second).V);
+        return Imp(T->second);
+    }
 
     EngineClass(ClassPackage, ClassName_);      // the linker resolves an import's class through its own import
-    const int32 Row = P.AddImport({ ClassPackage, ClassName_, PackageImport(AssetPackage), AssetName });
+    const int32 Before = P.NumImports();
+    const FIndex Outer = PackageImport(AssetPackage);
+    const int32 Row = P.AddImport({ ClassPackage, ClassName_, Outer, AssetName });
     ImportCache.emplace(Key, Row);
+    if (!Typed.empty()) ImportCache.emplace(Typed, Row);
     CallImports.push_back(Imp(Row).V);
+    /* A default that names the asset is lowered before a set's or map's delta drops the elements the archetype holds:
+       the rows go if nothing written names them (FPackage::DropUnusedImports). */
+    P.SetDroppable(Row);
+    if (Before < P.NumImports() - 1) P.SetDroppable(Before);       // the package, when this call made it
     return Imp(Row);
 }
 
@@ -288,6 +316,12 @@ void FBlueprintClass::AddComponent(const std::string& Name, FIndex ComponentClas
     Components.push_back(FComponent{ Name, ComponentClass, ComponentCdo, bIsSceneComponent, Defaults, NativeTail, {} });
 }
 
+void FBlueprintClass::SetComponentGuid(const std::string& Name, const uint32 (&Guid)[4])
+{
+    for (FComponent& C : Components)
+        if (C.Name == Name) { C.bGuid = true; std::copy(std::begin(Guid), std::end(Guid), C.Guid); }
+}
+
 void FBlueprintClass::AttachComponent(const std::string& Name, const FAttachment& Attachment)
 {
     for (FComponent& C : Components)
@@ -341,6 +375,20 @@ static void TagRefs(const FPropertyDef& P, std::vector<int32>& Out)
     if (P.Members) for (const FPropertyDef& M : *P.Members) TagRefs(M, Out);
 }
 
+/* A default that points at an object instanced in the defaults, pointed at its export: the AddInstanced id's row. */
+static void PointAtInstanced(FPropertyDef& P, int32 FirstRow);
+static void PointAtInstanced(FDefaultValue& D, int32 FirstRow)
+{
+    if (D.Instanced) D.Object = Exp(FirstRow + D.Instanced - 1);
+    for (FDefaultValue& I : D.Items) PointAtInstanced(I, FirstRow);
+    if (D.Members) for (FPropertyDef& M : *D.Members) PointAtInstanced(M, FirstRow);
+}
+static void PointAtInstanced(FPropertyDef& P, int32 FirstRow)
+{
+    PointAtInstanced(P.Default, FirstRow);
+    if (P.Members) for (FPropertyDef& M : *P.Members) PointAtInstanced(M, FirstRow);
+}
+
 void FBlueprintClass::Finish()
 {
     const std::string CDOName = "Default__" + ClassName;
@@ -360,9 +408,7 @@ void FBlueprintClass::Finish()
                                                  CorePkg, "Default__Function" }));
 
     const FIndex ParentIdx = EngineClass(ParentPackage, ParentClass);
-    const FIndex ParentCdo = Imp(P.AddImport({ ParentPackage, ParentClass,
-                                               PackageImport(ParentPackage),
-                                               "Default__" + ParentClass }));
+    const FIndex ParentCdo = DefaultObject(ParentPackage, ParentClass);
     /* An overridden default subobject's archetype is the object of its name under its outer's archetype - the parent
        CDO's subobject (GetArchetypeFromRequiredInfo rule 1, UObjectArchetype.cpp 64-83) - and the cook writes it as the
        export's TemplateIndex: Ene_Butterfly's HealthComponent names
@@ -409,7 +455,16 @@ void FBlueprintClass::Finish()
     const int32 RowFirstWidget = RowTree + 1;
     const int32 RowFirstWidgetSlot = RowFirstWidget + int32(Widgets.size());
     const int32 NumTreeRows = Widgets.empty() ? 0 : 1 + int32(Widgets.size() + WidgetSlots.size());
-    const int32 RowRootTemplate = RowTree + NumTreeRows;
+    /* Then each widget animation: the WidgetAnimation, its MovieScene, and a track and its section per widget it keys. */
+    const int32 RowFirstAnimation = RowTree + NumTreeRows;
+    std::vector<int32> AnimationRows;
+    int32 NumAnimationRows = 0;
+    for (const FAnimation& A : Animations)
+    {
+        AnimationRows.push_back(RowFirstAnimation + NumAnimationRows);
+        NumAnimationRows += 2 + 2 * int32(A.Tracks.size());
+    }
+    const int32 RowRootTemplate = RowFirstAnimation + NumAnimationRows;
     const int32 RowScsNode = RowRootTemplate + 1;
     /* Each UE_COMPONENT takes two rows, archetype then node, so the SCS lands after them all. */
     const int32 RowFirstComponent = RowScsNode + 1;
@@ -419,6 +474,67 @@ void FBlueprintClass::Finish()
     const int32 RowFirstOverride = RowIch + 1;
     const FIndex ScsIdx = bIsActor ? Exp(RowScs) : Null();
     ClassRow = RowClass;
+    /* Last, the objects instanced in the defaults (AddInstanced), in the order added: an outer comes before what it
+       holds. Each default that points at one is pointed at its export now, before the exports copy their defaults. */
+    const int32 RowFirstInstanced = !bIsActor ? RowRootTemplate
+                                  : RowIch + (ComponentOverrides.empty() ? 0 : 1 + int32(ComponentOverrides.size()));
+    for (FPropertyDef& V : Vars) PointAtInstanced(V, RowFirstInstanced);
+    for (FPropertyDef& V : CdoDefaults) PointAtInstanced(V, RowFirstInstanced);
+    for (FComponent& C : Components) for (FPropertyDef& V : C.Defaults) PointAtInstanced(V, RowFirstInstanced);
+    for (FComponentOverride& O : ComponentOverrides) for (FPropertyDef& V : O.Defaults) PointAtInstanced(V, RowFirstInstanced);
+    for (FSubobjectOverride& O : SubobjectOverrides) for (FPropertyDef& V : O.Defaults) PointAtInstanced(V, RowFirstInstanced);
+    for (FInstanced& I : Instanced) for (FPropertyDef& V : I.Defaults) PointAtInstanced(V, RowFirstInstanced);
+    auto OuterRow = [&](const FInstanced& I) {
+        auto At = [](const auto& List, const std::string& Name) {
+            return int32(std::find_if(List.begin(), List.end(), [&](const auto& X) { return X.Name == Name; }) - List.begin());
+        };
+        switch (I.Outer)
+        {
+        case FInstanced::Component: return RowFirstComponent + 2 * At(Components, I.OuterName);
+        case FInstanced::ComponentOverride: return RowFirstOverride + At(ComponentOverrides, I.OuterName);
+        case FInstanced::SubobjectOverride: return RowFirstSubobject + At(SubobjectOverrides, I.OuterName);
+        case FInstanced::Instanced: return RowFirstInstanced + I.OuterId - 1;
+        default: return RowCdo;
+        }
+    };
+    /* Archetyped on a parent's object, not on its class's CDO. */
+    auto InheritsArchetype = [&](const FInstanced& I) {
+        return I.Archetype.V < 0 && P.ImportAt(I.Archetype)->ObjectName.compare(0, 9, "Default__") != 0;
+    };
+    /* What an export the cook writes with instanced objects under it lists (STE_Slow20's CDO, ENE_ShootingPlant_Inferno's
+       ProjectileAttack_GEN_VARIABLE): each of them created before it is serialized, and each archetype it copies one
+       from serialized before it is created, as its own archetype is. */
+    auto HoldsInstanced = [&](FExport& Outer, int32 Row) {
+        for (size_t K = 0; K < Instanced.size(); ++K)
+        {
+            if (OuterRow(Instanced[K]) != Row) continue;
+            Outer.CreateBeforeSer.push_back(Exp(RowFirstInstanced + int32(K)).V);
+            if (InheritsArchetype(Instanced[K])) Outer.SerBeforeCreate.push_back(Instanced[K].Archetype.V);
+        }
+    };
+    auto AddInstancedExports = [&]() {
+        for (size_t K = 0; K < Instanced.size(); ++K)
+        {
+            const FInstanced& I = Instanced[K];
+            const int32 Row = RowFirstInstanced + int32(K);
+            FExport Object;
+            Object.ClassIndex = I.Class;
+            Object.TemplateIndex = I.Archetype;
+            Object.OuterIndex = Exp(OuterRow(I));
+            Object.ObjectName = I.Name;
+            Object.ObjectFlags = RF_Public | RF_Transactional | RF_ArchetypeObject;
+            Object.SerBeforeSer = { Object.OuterIndex.V };
+            for (const FPropertyDef& V : I.Defaults) TagRefs(V, Object.CreateBeforeSer);
+            Object.SerBeforeCreate = { I.Class.V, I.Archetype.V };
+            HoldsInstanced(Object, Row);
+            Object.CreateBeforeCreate = { Object.OuterIndex.V };
+            Object.Serialize = [Defaults = I.Defaults, Tail = I.NativeTail](FArc& Ar) {
+                for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
+                EndComponent(Ar, Tail);
+            };
+            P.AddExport(std::move(Object));
+        }
+    };
 
     std::vector<std::string> FunctionNames;
     for (const FPending& F : Functions) FunctionNames.push_back(F.Def.Name);
@@ -464,6 +580,11 @@ void FBlueprintClass::Finish()
     };
     for (const FParentSubobject& S : ParentSubobjects)
         if (const FIndex Sub = ParentSubobjectAt(S.Name); Sub.V != 0) Class.SerBeforeSer.push_back(Sub.V);
+    /* And each parent's instanced object one of this class's is copied from (STE_Slow20_C lists
+       Default__STE_Spider_Shooter_Acid_C:DotStatusEffectItem_0). */
+    for (const FInstanced& I : Instanced)
+        if (InheritsArchetype(I) && std::find(Class.SerBeforeSer.begin(), Class.SerBeforeSer.end(), I.Archetype.V) == Class.SerBeforeSer.end())
+            Class.SerBeforeSer.push_back(I.Archetype.V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
     std::vector<FIndex> Bindings;               // DynamicBindingObjects, listed first as BP_PlayerControllerBase_C lists them
@@ -479,6 +600,12 @@ void FBlueprintClass::Finish()
     }
     const bool bHasTree = !Widgets.empty();
     if (bHasTree) Class.CreateBeforeSer.push_back(Exp(RowTree).V);      // listed first, as Basic_FlatButton_C lists it
+    std::vector<FIndex> AnimationObjects;
+    for (const int32 Row : AnimationRows)
+    {
+        AnimationObjects.push_back(Exp(Row));
+        Class.CreateBeforeSer.push_back(Exp(Row).V);
+    }
     std::vector<FIndex> Templates;              // the Timelines list, after the bindings as BP_FragilePlatform_C lists them
     for (const int32 Row : TimelineRows)
     {
@@ -503,8 +630,7 @@ void FBlueprintClass::Finish()
     /* UBlueprintGeneratedClass::GetLifetimeBlueprintReplicationList stops after this many CPF_Net properties: without
        the tag nothing the class declares replicates. Measured on BP_LiftPod: the first tag. */
     const int32 NumOverrides = int32(ComponentOverrides.size());
-    const int32 NumReplicated = int32(std::count_if(Vars.begin(), Vars.end(),
-                                                    [](const FPropertyDef& V) { return (V.PropertyFlags & CPF_Net) != 0; }));
+    const int32 NumReplicated = NumReplicatedVars();
     const std::vector<FPropertyBinding> WidgetBindings = PropertyBindings;
     const std::vector<std::string> SlotNames = NamedSlots;
     Class.Serialize = [=](FArc& Ar) {
@@ -537,6 +663,12 @@ void FBlueprintClass::Finish()
                 }
                 StructArray(V, "Bindings", "DelegateRuntimeBinding", int32(WidgetBindings.size()), Elements);
             }, "StructProperty");
+        /* UWidgetBlueprintGeneratedClass::InitializeWidgetStatic sets each animation variable by its MovieScene's name. */
+        if (!AnimationObjects.empty())
+            Tag(Ar, "Animations", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(AnimationObjects.size()));
+                for (const FIndex& A : AnimationObjects) V.Idx(A);
+            }, "ObjectProperty");
         if (!SlotNames.empty())
             Tag(Ar, "NamedSlots", "ArrayProperty", [=](FArc& V) {
                 V.I32(int32(SlotNames.size()));
@@ -618,11 +750,14 @@ void FBlueprintClass::Finish()
     const char* const TickProperty = bIsActor ? "PrimaryActorTick" : "PrimaryComponentTick";
     const char* const TickStruct = bIsActor ? "ActorTickFunction" : "ActorComponentTickFunction";
 
-    const bool bCdoReplicates = bReplicates;
+    /* A UE_DEFAULTS bReplicates of its own wins: one tag, the class's word (a component the editor left unreplicated). */
+    const bool bCdoReplicates = bReplicates && std::none_of(CdoDefaults.begin(), CdoDefaults.end(),
+        [](const FPropertyDef& V) { return V.Name == "bReplicates"; });
     const std::vector<FPropertyDef> Inherited = CdoDefaults;
     std::vector<std::string> SubobjectNames;
     for (const FSubobjectOverride& O : SubobjectOverrides) SubobjectNames.push_back(O.Property);
     for (size_t I = 0; I < SubobjectOverrides.size(); ++I) Cdo.CreateBeforeSer.push_back(Exp(RowFirstSubobject + int32(I)).V);
+    HoldsInstanced(Cdo, RowCdo);
     Cdo.Serialize = [=](FArc& Ar) {
         if (bCdoReplicates) TagBool(Ar, "bReplicates", true);
         if (bOverridesTick)
@@ -673,6 +808,7 @@ void FBlueprintClass::Finish()
         Sub.ObjectFlags = RF_Public | RF_Transactional | RF_ArchetypeObject | RF_DefaultSubObject;
         Sub.SerBeforeCreate = { O.Class.V, Sub.TemplateIndex.V };      // as the cook lists class and template
         Sub.CreateBeforeCreate = { Exp(RowCdo).V };
+        HoldsInstanced(Sub, RowFirstSubobject + int32(I));
         Sub.Serialize = [Defaults, Tail = O.NativeTail](FArc& Ar) {
             for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
             EndComponent(Ar, Tail);
@@ -964,7 +1100,183 @@ void FBlueprintClass::Finish()
         }
     }
 
-    if (!bIsActor) return;
+    /* Each widget animation, as the editor cooked BasicCheckbox's AnimateXHover (ElytrasModManager): the class's
+       <Name>_INST WidgetAnimation, its MovieScene <Name>, a MovieScene2DTransformTrack per widget it keys and that track's
+       one MovieScene2DTransformSection, all RF_Transactional. The MovieScene possesses each widget by a GUID that
+       AnimationBindings names with the widget's name, which UWidgetAnimation::LocateBoundObjects looks up in the user
+       widget's tree. No CompiledData is written: with none, the first play compiles the sequence (a compiled-data entry
+       with no signature is volatile, MovieSceneCompiledVolatilityManager.cpp 35-50), and a track rebuilds its evaluation
+       field whenever its EvaluationFieldGuid is not its Signature (MovieSceneTrack.cpp 369-380). So every signed object
+       gets a signature, seeded by the class, the animation and its keys: a zero one would match the zero a fresh entry
+       holds, and nothing would ever compile. Channels a track does not key are left out: one evaluates only when it is
+       in the section's TransformMask and has data (MovieScene2DTransformSection.cpp 237-245). */
+    std::map<std::string, FIndex> AnimTemplates;    // one import of each class's default object, for every animation
+    for (size_t AI = 0; AI < Animations.size(); ++AI)
+    {
+        const FAnimation A = Animations[AI];
+        const int32 Row = AnimationRows[AI];
+        const FIndex Inst = Exp(Row), Scene = Exp(Row + 1);
+        std::string Seed = A.Name + ":" + std::to_string(A.EndFrame);
+        for (const FAnimTrack& T : A.Tracks)
+        {
+            Seed += "|" + T.Widget;
+            for (int32 C = 0; C < 7; ++C)
+                for (const FAnimKey& K : T.Channels[C])
+                    Seed += ":" + std::to_string(C) + "," + std::to_string(K.Frame) + "," + std::to_string(K.Value) + ","
+                          + std::to_string(K.Arrive) + "," + std::to_string(K.Leave) + "," + std::to_string(K.Interp);
+        }
+        auto Guid = [Cls = ClassName, Seed](const std::string& Of, uint32 (&Out)[4]) { ScsNodeGuid(Cls, "animation." + Of + "." + Seed, Out); };
+        auto Range = [](FArc& V, int32 End) {          // TRange<FFrameNumber>: [0, End), each bound its type then its value
+            V.U8(1); V.I32(0);                          // ERangeBoundTypes::Inclusive
+            V.U8(0); V.I32(End);                        // ERangeBoundTypes::Exclusive
+        };
+        auto Obj = [&](const char* Package, const char* Of, FIndex Outer, const std::string& Name) {
+            FExport E;
+            E.ClassIndex = EngineClass(Package, Of);
+            FIndex& Template = AnimTemplates[Of];
+            if (!Template.V) Template = Imp(P.AddImport({ Package, Of, PackageImport(Package), std::string("Default__") + Of }));
+            E.TemplateIndex = Template;
+            E.OuterIndex = Outer;
+            E.ObjectName = Name;
+            E.ObjectFlags = RF_Transactional;
+            E.SerBeforeCreate = { E.ClassIndex.V, E.TemplateIndex.V };
+            E.CreateBeforeCreate = { Outer.V };
+            return E;
+        };
+        std::vector<std::array<uint32, 4>> Possessed;
+        for (const FAnimTrack& T : A.Tracks)
+        {
+            uint32 G[4];
+            Guid("possessable." + T.Widget, G);
+            Possessed.push_back({ G[0], G[1], G[2], G[3] });
+        }
+
+        FExport Animation = Obj("/Script/UMG", "WidgetAnimation", Exp(RowClass), A.Name + "_INST");
+        Animation.CreateBeforeSer = { Scene.V };
+        Animation.Serialize = [=](FArc& Ar) {
+            Tag(Ar, "MovieScene", "ObjectProperty", [=](FArc& V) { V.Idx(Scene); });
+            Tag(Ar, "AnimationBindings", "ArrayProperty", [&](FArc& V) {
+                FArc Elements(V.Owner());
+                for (size_t T = 0; T < A.Tracks.size(); ++T)
+                {
+                    const uint32 G[4] = { Possessed[T][0], Possessed[T][1], Possessed[T][2], Possessed[T][3] };
+                    Tag(Elements, "WidgetName", "NameProperty", [&](FArc& E) { E.Name(A.Tracks[T].Widget); });
+                    Tag(Elements, "SlotWidgetName", "NameProperty", [&](FArc& E) { E.Name("None"); });
+                    Tag(Elements, "AnimationGuid", "StructProperty", [&](FArc& E) { E.Guid(G); }, "Guid");
+                    TagBool(Elements, "bIsRootWidget", false);
+                    TagEnd(Elements);
+                }
+                StructArray(V, "AnimationBindings", "WidgetAnimationBinding", int32(A.Tracks.size()), Elements);
+            }, "StructProperty");
+            uint32 Signature[4];
+            Guid("sequence", Signature);
+            Tag(Ar, "Signature", "StructProperty", [&](FArc& V) { V.Guid(Signature); }, "Guid");
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Animation));
+
+        FExport MovieScene = Obj("/Script/MovieScene", "MovieScene", Inst, A.Name);
+        for (size_t T = 0; T < A.Tracks.size(); ++T) MovieScene.CreateBeforeSer.push_back(Exp(Row + 2 + 2 * int32(T)).V);
+        for (const FAnimTrack& T : A.Tracks) MovieScene.CreateBeforeSer.push_back(T.WidgetClass.V);
+        MovieScene.Serialize = [=](FArc& Ar) {
+            Tag(Ar, "Possessables", "ArrayProperty", [&](FArc& V) {
+                FArc Elements(V.Owner());
+                for (size_t T = 0; T < A.Tracks.size(); ++T)
+                {
+                    const uint32 G[4] = { Possessed[T][0], Possessed[T][1], Possessed[T][2], Possessed[T][3] };
+                    const uint32 Zero[4] = { 0, 0, 0, 0 };
+                    Tag(Elements, "Tags", "ArrayProperty", [](FArc& E) { E.I32(0); }, "NameProperty");
+                    Tag(Elements, "Guid", "StructProperty", [&](FArc& E) { E.Guid(G); }, "Guid");
+                    Tag(Elements, "Name", "StrProperty", [&](FArc& E) { E.Str(A.Tracks[T].Widget); });
+                    Tag(Elements, "PossessedObjectClass", "ObjectProperty", [&](FArc& E) { E.Idx(A.Tracks[T].WidgetClass); });
+                    Tag(Elements, "ParentGuid", "StructProperty", [&](FArc& E) { E.Guid(Zero); }, "Guid");
+                    TagEnd(Elements);
+                }
+                StructArray(V, "Possessables", "MovieScenePossessable", int32(A.Tracks.size()), Elements);
+            }, "StructProperty");
+            Tag(Ar, "ObjectBindings", "ArrayProperty", [&](FArc& V) {
+                FArc Elements(V.Owner());
+                for (size_t T = 0; T < A.Tracks.size(); ++T)
+                {
+                    const uint32 G[4] = { Possessed[T][0], Possessed[T][1], Possessed[T][2], Possessed[T][3] };
+                    Tag(Elements, "ObjectGuid", "StructProperty", [&](FArc& E) { E.Guid(G); }, "Guid");
+                    Tag(Elements, "BindingName", "StrProperty", [&](FArc& E) { E.Str(A.Tracks[T].Widget); });
+                    Tag(Elements, "Tracks", "ArrayProperty", [&](FArc& E) { E.I32(1); E.Idx(Exp(Row + 2 + 2 * int32(T))); }, "ObjectProperty");
+                    TagEnd(Elements);
+                }
+                StructArray(V, "ObjectBindings", "MovieSceneBinding", int32(A.Tracks.size()), Elements);
+            }, "StructProperty");
+            Tag(Ar, "PlaybackRange", "StructProperty", [&](FArc& V) { Range(V, A.EndFrame); }, "MovieSceneFrameRange");
+            uint32 Signature[4];
+            Guid("moviescene", Signature);
+            Tag(Ar, "Signature", "StructProperty", [&](FArc& V) { V.Guid(Signature); }, "Guid");
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(MovieScene));
+
+        for (size_t T = 0; T < A.Tracks.size(); ++T)
+        {
+            const FIndex TrackRow = Exp(Row + 2 + 2 * int32(T)), SectionRow = Exp(Row + 3 + 2 * int32(T));
+            FExport Track = Obj("/Script/UMG", "MovieScene2DTransformTrack", Scene, "MovieScene2DTransformTrack_" + std::to_string(T));
+            Track.CreateBeforeSer = { SectionRow.V };
+            Track.Serialize = [=](FArc& Ar) {
+                Tag(Ar, "PropertyBinding", "StructProperty", [](FArc& V) {
+                    Tag(V, "PropertyName", "NameProperty", [](FArc& E) { E.Name("RenderTransform"); });
+                    Tag(V, "PropertyPath", "NameProperty", [](FArc& E) { E.Name("RenderTransform"); });
+                    TagBool(V, "bCanUseClassLookup", true);
+                    TagEnd(V);
+                }, "MovieScenePropertyBinding");
+                Tag(Ar, "Sections", "ArrayProperty", [=](FArc& V) { V.I32(1); V.Idx(SectionRow); }, "ObjectProperty");
+                uint32 Signature[4];
+                Guid("track." + A.Tracks[T].Widget, Signature);
+                Tag(Ar, "Signature", "StructProperty", [&](FArc& V) { V.Guid(Signature); }, "Guid");
+                TagEnd(Ar);
+                Ar.Bool(false);
+            };
+            P.AddExport(std::move(Track));
+
+            FExport Section = Obj("/Script/UMG", "MovieScene2DTransformSection", TrackRow, "MovieScene2DTransformSection_0");
+            Section.Serialize = [=](FArc& Ar) {
+                /* FMovieSceneFloatChannel::Serialize (MovieSceneFloatChannel.cpp 1085-1166): the extrapolations, the times
+                   and the 28-byte FMovieSceneFloatValues as sized arrays, the default, the tick resolution. */
+                static const struct { const char* Name; int32 Index; } Channels[7] = {
+                    { "Translation", 0 }, { "Translation", 1 }, { "Rotation", 0 }, { "Scale", 0 }, { "Scale", 1 },
+                    { "Shear", 0 }, { "Shear", 1 } };
+                for (int32 C = 0; C < 7; ++C)
+                {
+                    const std::vector<FAnimKey>& Keys = A.Tracks[T].Channels[C];
+                    if (Keys.empty()) continue;
+                    Tag(Ar, Channels[C].Name, "StructProperty", [&](FArc& V) {
+                        V.U8(4); V.U8(4);                           // Pre/PostInfinityExtrap: RCCE_Constant
+                        V.I32(4); V.I32(int32(Keys.size()));
+                        for (const FAnimKey& K : Keys) V.I32(K.Frame);
+                        V.I32(28); V.I32(int32(Keys.size()));
+                        for (const FAnimKey& K : Keys)
+                        {
+                            const float Fields[5] = { K.Value, K.Arrive, K.Leave, 0.0f, 0.0f };   // the two weights unused
+                            V.Raw(Fields, sizeof(Fields));
+                            V.U8(0); V.U8(0); V.U8(0); V.U8(0);     // TangentWeightMode RCTWM_WeightedNone, padding
+                            V.U8(K.Interp); V.U8(K.TangentMode); V.U8(0); V.U8(0);
+                        }
+                        V.Raw("\0\0\0\0", 4);                       // DefaultValue
+                        V.Bool(false);                              // bHasDefaultValue
+                        V.I32(60000); V.I32(1);                     // TickResolution
+                    }, "MovieSceneFloatChannel", Channels[C].Index);
+                }
+                Tag(Ar, "SectionRange", "StructProperty", [&](FArc& V) { Range(V, A.EndFrame); }, "MovieSceneFrameRange");
+                uint32 Signature[4];
+                Guid("section." + A.Tracks[T].Widget, Signature);
+                Tag(Ar, "Signature", "StructProperty", [&](FArc& V) { V.Guid(Signature); }, "Guid");
+                TagEnd(Ar);
+                Ar.Bool(false);
+            };
+            P.AddExport(std::move(Section));
+        }
+    }
+
+    if (!bIsActor) { AddInstancedExports(); return; }
 
     const FIndex SceneCompClass = EngineClass("/Script/Engine", "SceneComponent");
     const FIndex ScsNodeClass = EngineClass("/Script/Engine", "SCS_Node");
@@ -1082,6 +1394,7 @@ void FBlueprintClass::Finish()
         Template.SerBeforeSer = { Exp(RowClass).V };
         Template.SerBeforeCreate = { C.Class.V, C.Cdo.V };
         Template.CreateBeforeCreate = { Exp(RowClass).V };
+        HoldsInstanced(Template, RowTemplate);
         Template.Serialize = [Defaults, Tail = C.NativeTail](FArc& Ar) {
             for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
             EndComponent(Ar, Tail);
@@ -1089,7 +1402,8 @@ void FBlueprintClass::Finish()
         P.AddExport(std::move(Template));
 
         uint32 NodeGuid[4];
-        ScsNodeGuid(ClassName, C.Name, NodeGuid);
+        if (C.bGuid) std::copy(std::begin(C.Guid), std::end(C.Guid), NodeGuid);
+        else ScsNodeGuid(ClassName, C.Name, NodeGuid);
         std::vector<FIndex> Children;
         for (size_t J = 0; J < Components.size(); ++J)
             if (ParentOf[J] == int32(I)) Children.push_back(Exp(RowFirstComponent + 2 * int32(J) + 1));
@@ -1172,7 +1486,7 @@ void FBlueprintClass::Finish()
     };
     P.AddExport(std::move(Scs));
 
-    if (ComponentOverrides.empty()) return;
+    if (ComponentOverrides.empty()) { AddInstancedExports(); return; }
 
     /*
     The editor's "override an inherited component's defaults". UInheritableComponentHandler holds one
@@ -1231,8 +1545,9 @@ void FBlueprintClass::Finish()
     };
     P.AddExport(std::move(Ich));
 
-    for (const FComponentOverride& O : Overrides)
+    for (size_t K = 0; K < Overrides.size(); ++K)
     {
+        const FComponentOverride& O = Overrides[K];
         const std::vector<FPropertyDef> Defaults = O.Defaults;
         FExport Template;
         Template.ClassIndex = O.Class;
@@ -1240,14 +1555,23 @@ void FBlueprintClass::Finish()
         Template.OuterIndex = Exp(RowClass);
         Template.ObjectName = O.Name + "_GEN_VARIABLE";
         Template.ObjectFlags = RF_Public | RF_ArchetypeObject | RF_InheritableComponentTemplate;
+        /* Its class serialized first, as an SCS template's is, and the class that owns the overridden component created:
+           the cooker's order (EEE's BP_ElectricCloud). Without the first, the loader may serialize the template while
+           its class is only created; the template's ConditionalPostLoadSubobjects then post-loads its outer, the class,
+           with no SuperStruct yet: "Can't find ClassConstructor" (Obj.cpp ConditionalPostLoadSubobjects, Class.cpp
+           UClass::Bind). A late pak mount loads the class first and never shows it; startup force-loading does. */
+        Template.SerBeforeSer = { Exp(RowClass).V };
+        Template.CreateBeforeSer = { O.OwnerClass.V };
         Template.SerBeforeCreate = { O.Class.V, O.ParentTemplate.V };
         Template.CreateBeforeCreate = { Exp(RowClass).V };
+        HoldsInstanced(Template, RowFirstOverride + int32(K));
         Template.Serialize = [Defaults, Tail = O.NativeTail](FArc& Ar) {
             for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
             EndComponent(Ar, Tail);
         };
         P.AddExport(std::move(Template));
     }
+    AddInstancedExports();
 }
 
 /* Measured on DRG's MM_ResourceInfo: Guid tag, empty UStruct body, StructFlags 0, then the default
@@ -1265,6 +1589,7 @@ bool FBlueprintClass::WriteApi(const std::string& OutDir, std::string* Err) cons
         Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags });
     Api.Categories = ApiCategory;
     Api.Docs = ApiDocs;
+    Api.Description = ApiDescription;
     Api.bInterface = (ClassFlags & CLASS_Interface) != 0;
     /* Only what the outside can see. The rest - the UberGraphFrame pointer above all - is
        compiler plumbing that would show up as a broken variable in the editor. */
@@ -1380,9 +1705,10 @@ void FBlueprintClass::FinishCurve(FIndex Class, FIndex ClassCdo, const FTimeline
 /* Measured on DRG's ENU_TextCase: the tags (the editor's DisplayNameMap), no GUID, then UEnum::Names as
    (FName, int64) pairs ending in the _MAX entry, then CppForm 1 (Namespaced). Nothing outside WITH_EDITOR
    reads the names' shape, so they are the C++ ones rather than the editor's NewEnumeratorN.
-   No DisplayNameMap unless an enumerator is cooked under another name (`__UeEnumNames`): UEnum::GetDisplayNameTextByIndex
-   then falls back to the enumerator's own name. With one, each renamed enumerator's display name is its C++ name, the
-   map's text as the editor writes it (no flags, a Base history: empty namespace, a 32-hex key, the string). */
+   No DisplayNameMap unless an enumerator is cooked under another name or given a display name (`__UeEnumNames`):
+   UEnum::GetDisplayNameTextByIndex then falls back to the enumerator's own name. With one, each renamed or labelled
+   enumerator's display name is its label, else its C++ name, the map's text as the editor writes it (no flags, a Base
+   history: empty namespace, a 32-hex key, the string). */
 void FBlueprintClass::FinishEnum(const std::vector<std::pair<std::string, int64>>& Enumerators,
                                  const std::vector<std::pair<std::string, std::string>>& DisplayNames)
 {

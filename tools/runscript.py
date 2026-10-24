@@ -7,7 +7,7 @@ ReturnValue. Anything outside the subset stops with `unsupported`, so a test tha
 every instruction it reached. Parms not given start at 0, the way a frame zeroes them.
 
 As a module: run(base, function, **parms) -> (return value, locals)."""
-import copy, struct, sys, os
+import copy, math, struct, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dumpexp
 from walkscript import W
@@ -74,7 +74,7 @@ class P(W):
             if n.val == 1: k.extend(s.node() for _ in range(3))
             elif n.val in (2, 3): k.append(s.node())
             elif n.val != 0: raise SystemExit('unsupported text literal type %d at mem %d' % (n.val, mem))
-        elif op in (0x19, 0x1A): k.append(s.node()); s.i32(); s.fieldpath(); k.append(s.node())
+        elif op in (0x12, 0x19, 0x1A): k.append(s.node()); s.i32(); s.fieldpath(); k.append(s.node())
         elif op == 0xF: s.fieldpath(); k.append(s.node()); k.append(s.node())
         elif op in (0x14, 0x5F, 0x6B): k.append(s.node()); k.append(s.node())
         elif op in (0x1B, 0x45): n.val = s.name(); s.args(k)
@@ -179,6 +179,9 @@ IMMUTABLE = {'Vector': ('<fff', 'X Y Z'), 'Vector2D': ('<ff', 'X Y'), 'Vector4':
              'Rotator': ('<fff', 'Pitch Yaw Roll'), 'Quat': ('<ffff', 'X Y Z W'), 'IntPoint': ('<ii', 'X Y'),
              'IntVector': ('<iii', 'X Y Z'), 'Color': ('<BBBB', 'B G R A'), 'LinearColor': ('<ffff', 'R G B A'),
              'Guid': ('<iiii', 'A B C D')}
+# Other engine structs a literal may build, by their members in declaration order (EX_StructConst's).
+LITERAL_MEMBERS = {'FormatArgumentData': 'ArgumentName ArgumentValueType ArgumentValue ArgumentValueInt '
+                                         'ArgumentValueFloat ArgumentValueGender'}
 
 
 class Unconstructed:
@@ -380,6 +383,7 @@ MATH = {
     'EqualEqual_ByteByte': lambda a, b: a == b, 'EqualEqual_IntInt': lambda a, b: a == b, 'NotEqual_IntInt': lambda a, b: a != b,
     'Conv_IntToBool': lambda a: a != 0,
     'Not_PreBool': lambda a: not a, 'BooleanAND': lambda a, b: a and b, 'BooleanOR': lambda a, b: a or b,
+    'EqualEqual_BoolBool': lambda a, b: bool(a) == bool(b), 'NotEqual_BoolBool': lambda a, b: bool(a) != bool(b),
     'BooleanXOR': lambda a, b: bool(a) != bool(b),
     'Add_FloatFloat': lambda a, b: a + b, 'Multiply_FloatFloat': lambda a, b: a * b,
     'Conv_IntToFloat': float, 'Not_Int': lambda a: ~a, 'Not_Int64': lambda a: ~a,
@@ -396,6 +400,8 @@ MATH = {
     'Conv_BoolToInt': int, 'Multiply_Int64Int64': lambda a, b: a * b, 'Conv_IntToInt64': int, 'Conv_Int64ToInt': lambda a: i32(a),
     'InRange_IntInt': lambda v, lo, hi, imin, imax: (v >= lo if imin else v > lo) and (v <= hi if imax else v < hi),
     'Abs_Int': lambda a: i32(abs(a)), 'RandomInteger': lambda a: 0,     # RandomInteger: a stand-in; CALLS shows it ran
+    'Max': max, 'Min': min, 'FMax': max, 'FMin': min, 'Abs': abs, 'Clamp': lambda v, lo, hi: min(max(v, lo), hi),
+    'FClamp': lambda v, lo, hi: min(max(v, lo), hi), 'Percent_FloatFloat': lambda a, b: math.fmod(a, b) if b else 0.0,
     'SelectInt': lambda a, b, pick: a if pick else b,
 }
 CALLS = []     # every library call run, as (name, args): a test can see an impure or kept call happen
@@ -443,6 +449,27 @@ def view_of(field):
     return None
 
 
+def scratch_view(n):
+    """A deref view's TArray field over the FDeref scratch: ArrayGetByRef of it reads the memory at the scratch's Data."""
+    return n.op == 0x42 and view_of(n.val) is not None and n.kids[0].op != 0x6B
+
+
+class MemArray:
+    """A TArray in MEM at an address, a view's TArray field laid over it (the compiler's ArrayThrough): its Data pointer
+    and Num where the header lies, its elements read and written there at the view's element size. An index outside
+    Num is the VM's out-of-bounds read, an error here."""
+    def __init__(s, at, view): s.at, (s.size, s.read, s.write) = at, view
+    def __len__(s): return mem_read(s.at + 8, 4, True)
+    def _addr(s, i):
+        if not 0 <= i < len(s): raise SystemExit('index %d of a TArray of %d in memory' % (i, len(s)))
+        return mem_read(s.at, 8, False) + i * s.size
+    def __getitem__(s, i): return s.read(s._addr(i))
+    def __setitem__(s, i, v): s.write(s._addr(i), v)
+    def __iter__(s): return (s[i] for i in range(len(s)))
+    def __eq__(s, o): return o != 0 and list(s) == list(o)
+    def __deepcopy__(s, memo): return list(s)
+
+
 # A native int32 / uint8 parameter receives the low bytes of whatever the VM copies into it, so a wider value
 # handed to an _IntInt / _ByteByte function is truncated, as it is in the engine.
 for _k, _f in list(MATH.items()):
@@ -461,6 +488,22 @@ def atoi(t):
     return i32(int(m.group())) if m else 0
 
 
+def format_text(pattern, args):
+    """UKismetTextLibrary::Format, for a test to put in MATH while it runs (the mod tests log their Format calls
+    instead): each {Name} is its argument's value - an Int or Float as FText::AsNumber writes it
+    by default (grouped, at most 3 fractional digits), a Text as itself - and a backtick escapes the next brace, bar
+    or backtick. A name no argument has stays as written."""
+    import re
+    values = {}
+    for a in args:
+        t = a.get('ArgumentValueType', 0)
+        if t == 0: values[a['ArgumentName']] = '{:,}'.format(i32(a.get('ArgumentValueInt', 0)))
+        elif t == 2: values[a['ArgumentName']] = '{:,.3f}'.format(a.get('ArgumentValueFloat', 0.0)).rstrip('0').rstrip('.')
+        elif t == 4: values[a['ArgumentName']] = a.get('ArgumentValue', '')
+        else: raise SystemExit('Format: unsupported argument type %d' % t)
+    return re.sub(r'`([{}|`])|\{([^}]*)\}', lambda m: m.group(1) or values.get(m.group(2), m.group(0)), pattern)
+
+
 def int64_to_text(v, sign, grouping, lo, hi):
     t = ('{:,}' if grouping else '{}').format(abs(v)).rjust(lo, '0')
     return ('-' if v < 0 else '+' if sign else '') + t
@@ -474,6 +517,7 @@ MATH.update({
     'Conv_IntToString': str, 'Conv_FloatToString': sanitize_float, 'Conv_BoolToString': lambda b: 'true' if b else 'false',
     'Conv_StringToInt': atoi, 'Conv_Int64ToText': int64_to_text, 'Conv_ObjectToString': lambda o: str(o) if o else 'None',
     'Conv_StringToName': str, 'Conv_NameToString': str, 'Conv_NameToText': str, 'Conv_StringToText': str, 'Conv_TextToString': str,
+    'Conv_BoolToText': lambda b: 'true' if b else 'false',
     'EqualEqual_ObjectObject': lambda a, b: a == b, 'NotEqual_ObjectObject': lambda a, b: a != b, 'IsValid': bool,
     'GetFSDGameState': lambda world: GAME_STATE, 'PostGameMessage': MESSAGES.append, 'GetTickableWhenPaused': lambda: False,
 })
@@ -515,6 +559,18 @@ def _set_filter(keep):
     return op
 
 
+def _resize(arr, n):
+    """Array_Resize: new elements are the inner type's default, here 0 / False."""
+    del arr[max(n, 0):]
+    arr.extend([0] * (n - len(arr)))
+
+
+def _set(arr, i, v, size_to_fit):
+    """Array_Set: past the end it grows the array only with bSizeToFit, else it logs and does nothing."""
+    if i >= len(arr) and size_to_fit: _resize(arr, i + 1)
+    if 0 <= i < len(arr): arr[i] = copy.deepcopy(v)
+
+
 def _has(c, v):
     """Contains: an FName or FString compares case-insensitively, as its == does (and a cooked name that differs
     from an earlier one only in case is that one's entry)."""
@@ -540,8 +596,17 @@ class Slot:
         s.m[s.k] = v
 
 
+class SetSlot(Slot):
+    """A TSet element in the same view: its element is the slot's Key, and const. A Slot, so every view site takes it."""
+    def __init__(s, v): s.v = v
+    def __getitem__(s, f):
+        if f != 'Key': raise SystemExit('a read of set slot member ' + f)
+        return s.v
+    def __setitem__(s, f, v): raise SystemExit('a store to set slot member ' + f)
+
+
 class Free:
-    """A free slot of a map's sparse array: the memory of an element it lost. Reading or writing it is a bug."""
+    """A free slot of a sparse array: the memory of an element it lost. Reading or writing it is a bug."""
     def __getitem__(s, f): raise SystemExit('a read of a free map slot')
     def __setitem__(s, f, v): raise SystemExit('a store to a free map slot')
 
@@ -553,11 +618,41 @@ class Holey(dict):
     def __deepcopy__(s, memo): return copy.deepcopy(dict(s), memo)
 
 
+class HoleySet(list):
+    """A set that lost elements, as Holey is a map."""
+    def __init__(s, items, holes): super().__init__(items); s.holes = holes
+    def __deepcopy__(s, memo): return copy.deepcopy(list(s), memo)
+
+
 def slots_of(m):
-    """The __Slots__ view of a map: its elements in order, with a Holey one's free slots among them."""
-    slots = [Slot(m, k) for k in m] if isinstance(m, dict) else []
+    """The __Slots__ view of a map or set: its elements in order, with a holey one's free slots among them."""
+    slots = [Slot(m, k) for k in m] if isinstance(m, dict) else [SetSlot(v) for v in m] if isinstance(m, list) else []
     for i in sorted(getattr(m, 'holes', ())): slots.insert(i, Free())
     return slots
+
+
+class Link:
+    """A slot in the compiler's __Free__ view: a free one's FFreeListLink, whose Next names the next free slot."""
+    def __init__(s, nxt): s.nxt = nxt
+    def __getitem__(s, f):
+        if s.nxt is None: raise SystemExit('a free-list read of a live slot')
+        if f != 'Next': raise SystemExit('a read of free slot member ' + f)
+        return s.nxt
+    def __setitem__(s, f, v): raise SystemExit('a store to free slot member ' + f)
+
+
+def view_member(m, name):
+    """A member of the compiler's views of a map or set's storage (SlotView): its slots, its free count and first free
+    slot, and each free slot's link, the holes chained in ascending order; None for any other name."""
+    holes = sorted(getattr(m, 'holes', ()))
+    if name == '__Slots__': return slots_of(m)
+    if name == '__NumFree__': return len(holes)
+    if name == '__FirstFree__': return holes[0] if holes else -1
+    if name == '__Free__':
+        links = [Link(None) for _ in slots_of(m)]
+        for i, h in enumerate(holes): links[h] = Link(holes[i + 1] if i + 1 < len(holes) else -1)
+        return links
+    return None
 
 
 CONTAINERS = {
@@ -570,12 +665,14 @@ CONTAINERS = {
     'Set_Union': _union,
     'Set_Difference': _set_filter(False),
     'Set_Intersection': _set_filter(True),
-    'Set_ToArray': lambda ev, store, a: store(a[1], list(ev(a[0]))),
-    'Map_Keys': lambda ev, store, a: store(a[1], list(ev(a[0]).keys())),
+    'Set_ToArray': lambda ev, store, a: store(a[1], list(ev(a[0]) or [])),     # an unset set reads as 0
+    'Map_Keys': lambda ev, store, a: store(a[1], list((ev(a[0]) or {}).keys())),
     'Map_Find': lambda ev, store, a: (store(a[2], _made(ev, store, a[0], {}).get(ev(a[1]), 0)), ev(a[1]) in ev(a[0]))[1],
     'Map_Add': lambda ev, store, a: _made(ev, store, a[0], {}).__setitem__(ev(a[1]), copy.deepcopy(ev(a[2]))),
     'Map_Remove': lambda ev, store, a: _made(ev, store, a[0], {}).pop(ev(a[1]), None) is not None,
     'Array_Clear': lambda ev, store, a: store(a[0], []),
+    'Array_Resize': lambda ev, store, a: _resize(_made(ev, store, a[0], []), ev(a[1])),
+    'Array_Set': lambda ev, store, a: _set(_made(ev, store, a[0], []), ev(a[1]), ev(a[2]), ev(a[3])),
     'Set_Clear': lambda ev, store, a: store(a[0], []),
     'Map_Clear': lambda ev, store, a: store(a[0], {}),
     'Array_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], []), ev(a[1])),
@@ -592,6 +689,34 @@ CONTAINERS = {
 
 # No map value is one of these: a container inside a map is the Value of a wrapper struct.
 BARE_CONTAINERS = {'ArrayProperty', 'SetProperty', 'MapProperty'}
+
+
+_LIBRARY = {}
+
+
+def library_of(base, n):
+    """(package base, function) of the static script function in another /Game package of the same build that final
+    call n names - a function library's static, which the engine runs on its class's default object - else None. A
+    test that answers the function itself (MATH) keeps answering it."""
+    if n.op not in (0x1C, 0x68) or n.own or getattr(n, 'imp', None) is None: return None
+    if (base, n.imp) in MATH or n.val in MATH: return None
+    key = (base, n.imp)
+    if key not in _LIBRARY:
+        import invariants
+        hit, r = None, invariants.load(base).resolve(-n.imp - 1)
+        if r:
+            other, k = r
+            st = other.struct(k)
+            if st is not None and getattr(st, 'function_flags', 0) & 0x2000:      # FUNC_Static
+                hit = (other.base, other.exports[k]['name'])
+        _LIBRARY[key] = hit
+    return _LIBRARY[key]
+
+
+def same_case(key, k, v):
+    """An EX_SwitchValue case matches by its index property's Identical: an FName's compares the comparison index, so
+    a NameConst case ignores case, as EqualEqual_NameName does."""
+    return str(k).lower() == str(v).lower() if key.op == 0x21 else k == v
 
 
 def run(base, function, self_vars=None, **parms):
@@ -624,11 +749,14 @@ def run(base, function, self_vars=None, **parms):
             return env.get(n.val, 0)
         if o == 1: return self_vars.get(n.val, 0)
         if o in (0x1D, 0x1E, 0x24, 0x2C, 0x35, 0x21): return n.val
+        if o == 0x42 and n.kids[0].op == 0x6B and scratch_view(n.kids[0].kids[0]) and view_of(n.val):
+            k = n.kids[0]                                            # a TArray at the address the view's element is at
+            return MemArray(ev(k.kids[0].kids[0])['Data'] + ev(k.kids[1]) * view_of(k.kids[0].val)[0], view_of(n.val))
         if o == 0x42:
             s = ev(n.kids[0])
-            if isinstance(s, (Slot, Free)): return s[n.val]
+            if isinstance(s, (Slot, Free, Link)): return s[n.val]
             if n.val == 'Value': return s                            # a nested container's wrapper is its Value
-            if n.val == '__Slots__': return slots_of(s)
+            if (v := view_member(s, n.val)) is not None: return v
             # A donor member at offset 0 reads the operand's own 4 bytes: Vector.X an int32's as a float, IntPoint.X a
             # float's as an int32 (the compiler's __AsFloat__ / __FloatBits__).
             if n.val == 'X' and "'Vector'" in n.owner and isinstance(s, int) and not isinstance(s, bool):
@@ -638,8 +766,9 @@ def run(base, function, self_vars=None, **parms):
             return s.get(n.val, 0) if isinstance(s, dict) else 0     # a struct is a dict; an unset member reads 0
         if o in (0x1F, 0x34): return n.val
         if o == 0x2F:                                                # an IMMUTABLE engine struct's literal: a dict
-            if n.val not in IMMUTABLE: raise SystemExit('unsupported struct literal %s at mem %d' % (n.val, n.mem))
-            return dict(zip(IMMUTABLE[n.val][1].split(), [ev(k) for k in n.kids]))
+            members = IMMUTABLE[n.val][1] if n.val in IMMUTABLE else LITERAL_MEMBERS.get(n.val)
+            if not members: raise SystemExit('unsupported struct literal %s at mem %d' % (n.val, n.mem))
+            return dict(zip(members.split(), [ev(k) for k in n.kids]))
         if o == 0x67: return ev(n.kids[0])
         if o == 0x29: return ev(n.kids[0]) if n.kids else ''
         if o == 0x17: return SELF
@@ -654,13 +783,15 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x26: return 1
         if o == 0x27: return True
         if o == 0x28: return False
-        if o == 0x6B and n.kids[0].op == 0x42 and view_of(n.kids[0].val):
+        if o == 0x6B and scratch_view(n.kids[0]):
             size, read, _ = view_of(n.kids[0].val)
             return read(ev(n.kids[0].kids[0])['Data'] + ev(n.kids[1]) * size)
         if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
-        if o in (0x1B, 0x45) or n.own:                               # the class's own function: a frame of its own
-            names = params_of(base, n.val)
-            outs = params_of(base, n.val, 0x100)
+        lib = library_of(base, n)                                    # or a library's static, in its own package
+        if o in (0x1B, 0x45) or n.own or lib:                        # the class's own function: a frame of its own
+            callee_base, fn = lib or (base, n.val)
+            names = params_of(callee_base, fn)
+            outs = params_of(callee_base, fn, 0x100)
             # The VM steps a reference argument with no result buffer (ProcessScriptFunction), so a constant or a
             # call there writes through null in game: it must be a variable.
             for name, a in zip(names, n.kids):
@@ -671,7 +802,7 @@ def run(base, function, self_vars=None, **parms):
             bound = [i < len(names) and names[i] in outs and read_late(a) for i, a in enumerate(n.kids)]
             vals = [None if b else copy.deepcopy(ev(a)) for b, a in zip(bound, n.kids)]
             vals = [copy.deepcopy(ev(a)) if b else v for b, a, v in zip(bound, n.kids, vals)]
-            r, callee = run(base, n.val, self_vars, **dict(zip(names, vals)))
+            r, callee = run(callee_base, fn, {} if lib else self_vars, **dict(zip(names, vals)))
             for name, a in zip(names, n.kids):                       # a reference parameter is its argument's variable
                 if name in outs and a.op in ADDRESSABLE: store(a, callee.get(name, 0))
             return r
@@ -696,7 +827,7 @@ def run(base, function, self_vars=None, **parms):
                 raise SystemExit('SwitchValue at mem %d: its index (op %02x) leaves no address' % (n.mem, n.kids[0].op))
             v = ev(n.kids[0])
             for key, res in n.val:
-                if ev(key) == v: return ev(res)
+                if same_case(key, ev(key), v): return ev(res)
             raise SystemExit('SwitchValue at mem %d: no case is %r, a script exception in game' % (n.mem, v))
         raise SystemExit('unsupported expression op %02x at mem %d' % (o, n.mem))
 
@@ -708,7 +839,7 @@ def run(base, function, self_vars=None, **parms):
         elif dest.op == 0x42: _made(ev, store, dest.kids[0], {})[dest.val] = v
         elif dest.op in (0, 0x48): env[dest.val] = v
         elif dest.op == 1: self_vars[dest.val] = v
-        elif dest.op == 0x6B and dest.kids[0].op == 0x42 and view_of(dest.kids[0].val): locate(dest)(v)
+        elif dest.op == 0x6B and scratch_view(dest.kids[0]): locate(dest)(v)
         elif dest.op == 0x6B: ev(dest.kids[0])[ev(dest.kids[1])] = v
         else: raise SystemExit('unsupported destination op %02x' % dest.op)
 
@@ -723,7 +854,7 @@ def run(base, function, self_vars=None, **parms):
         if dest.op == 0x42:
             s = _made(ev, store, dest.kids[0], {})
             return lambda v: s.__setitem__(dest.val, copy.deepcopy(v))
-        if dest.op == 0x6B and dest.kids[0].op == 0x42 and view_of(dest.kids[0].val):
+        if dest.op == 0x6B and scratch_view(dest.kids[0]):
             size, _, write = view_of(dest.kids[0].val)
             at = ev(dest.kids[0].kids[0])['Data'] + ev(dest.kids[1]) * size
             return lambda v: write(at, v)
@@ -757,7 +888,8 @@ def run(base, function, self_vars=None, **parms):
         elif o == 4:
             r = n.kids[0]
             if r.op != 0xB: fits('ReturnValue', r)
-            return (ev(r) if r.op != 0xB else None), env
+            v = ev(r) if r.op != 0xB else None
+            return (list(v) if isinstance(v, MemArray) else v), env     # execReturn copies into the result buffer
         elif o == 0xB: pass
         elif o in (0x31, 0x39, 0x3B):                                # empties the variable, then adds each element
             elems = [ev(e) for e in n.kids[1:]]

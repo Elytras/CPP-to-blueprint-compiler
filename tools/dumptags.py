@@ -77,6 +77,20 @@ def tags(b, o, end, names, indent, out):
                 out.extend(nested)
             except (ValueError, struct.error, IndexError):
                 pass
+        elif ptype == "ArrayProperty" and extra == " inner=StructProperty":
+            # count, then one inner tag naming the struct, then each element's own tags up to its None
+            nested = []
+            try:
+                count = struct.unpack_from('<i', b, o)[0]
+                at = name(name(o + 4)[1])[1] + 8
+                sname, at = name(at)
+                at += 17
+                for k in range(count):
+                    nested.append("%s  [%d] %s" % (pad, k, sname))
+                    at = tags(b, at, o + size, names, indent + 2, nested)
+                out.extend(nested)
+            except (ValueError, struct.error, IndexError):
+                pass
         o += size
     return o
 

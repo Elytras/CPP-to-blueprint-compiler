@@ -67,3 +67,14 @@ public:
   void MultiBoom() { Seen = 9; }
   void OnRep_Open() { Seen = 10; }
 };
+
+/* An RPC of its own would turn bReplicates on; the class's own word wins, as the CDO's one tag (a component the
+   editor left unreplicated). */
+class ReplQuiet : public UActorComponent {
+  UE_DEFAULTS { bReplicates = false; }
+
+public:
+  UE_SERVER void ServerPoke();
+};
+
+void ReplQuiet::ServerPoke() {}

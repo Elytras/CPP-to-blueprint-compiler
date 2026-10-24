@@ -325,8 +325,12 @@ def context_rvalue(pkg):
     (2) A context that is the value of a Let or of EX_Return names one: execLet steps the value straight into the
     destination (ScriptCore.cpp 2647-2679) and EX_Return into the caller's (1123-1128), so with no r-value a None object
     leaves the destination holding its previous value where Blueprint zeroes it. Elsewhere - an argument, a condition,
-    another context's object - the slot starts zeroed (a callee's memzeroed frame, a thunk's default-constructed
-    local, execJumpIfNot's `bool Value=0`), so an empty r-value is harmless there and not checked.
+    another context's object - a scalar, object or container slot starts zeroed (a callee's memzeroed frame, a thunk's
+    P_GET_PROPERTY local, execJumpIfNot's `bool Value=0`), so an empty r-value is harmless there and not checked. A
+    struct's does not: a native's parameter is default-constructed (ScriptMacros.h PARAM_PASSED_BY_VAL: an FVector's
+    garbage, an FTransform's identity) and a script callee's initialised to the struct's default
+    (InitializeValue_InContainer), so a call yielding a struct, as an argument or under EX_StructMemberContext, names
+    one too.
     (3) A named r-value has the type of what the member yields - the member variable itself, or the call's return
     value - since ClearValue runs that property's clear on RESULT_PARAM (the property class, and the struct for a
     StructProperty; a cooked ElementSize is the editor's, an FName 12 bytes there and 8 in the game, so no size)."""
@@ -341,6 +345,11 @@ def context_rvalue(pkg):
                 if (parent.op in LETS and j == 1) or parent.op in (0x04, 0x64):
                     yield i, 'context at mem %d is the value of op %02x with no r-value: a None object leaves the ' \
                              'destination stale' % (c.mem, parent.op)
+                elif parent.op in CALLS + (0x42,) and c.kids[1].op in CALLS:
+                    callee = callee_of(pkg, i, c.kids[1], True)
+                    if callee and callee.ret and callee.ret.cls == 'StructProperty':
+                        yield i, 'context at mem %d yields a %r to op %02x with no r-value: a None object leaves the ' \
+                                 'slot its default, not zero' % (c.mem, callee.ret, parent.op)
                 continue
             have = prop_of_path(pkg, segs, owner)
             inner = c.kids[1]

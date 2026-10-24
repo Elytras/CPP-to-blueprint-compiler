@@ -48,7 +48,9 @@ CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
 # 1: UeDefaultSubobjects with the nested ones, __UeSubobject markers joined through the game's Blueprints.
 # 2: "game".
 # 3: <D>__UeDispatcher on each native dispatcher, NotCallable.json, and main's TEnum spellings of native enum fields.
-GENUEAPI_VERSION = 3
+# 4: UeTemplateSubobjects, the objects instanced under a game Blueprint's component templates.
+# 5: UeIchRecords, the inherited components a game Blueprint has a template of its own for.
+GENUEAPI_VERSION = 5
 
 
 def dump_identity(sdk_dir):
@@ -69,10 +71,20 @@ def class_refs(t):
 def split_args(text):
     return [a.strip() for a in split_params(text)]
 FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ()\"]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
+WEAK = re.compile(r"^TWeakObjectPtr<class\s+(\w+)>$")     # a native struct's weak member, of a native class
 NO_STRUCT_LITERAL = ("TDelegate<", "TMulticast", "TScriptInterface<")    # EX_StructConst has no zero for these
 # The engine's C++ constructor where it takes the members in another order than the reflected one (FColor's are B, G,
 # R, A in memory). The stub takes them the C++ way, and AssetGen puts each argument on the member its parameter names.
 CTOR_PARAMS = {"FColor": ("uint8 R", "uint8 G", "uint8 B", "uint8 A = 255")}
+# The engine's converting constructors a value needs: a Niagara variable's handle is made from the type definition it
+# names, which is what the cook writes for it (AssetGen reads the argument as the handle's value).
+# A wildcard struct parameter (SetStructurePropertyByName's) takes any struct, which AssetGen passes as it is.
+CTOR_EXTRA = {"FNiagaraTypeDefinitionHandle": "FNiagaraTypeDefinitionHandle(const struct FNiagaraTypeDefinition &) {}",
+              "FGenericStruct": "template <class T> FGenericStruct(const T &) {}",
+              # UE's own order and Make Transform's: AssetGen makes either with UKismetMathLibrary::MakeTransform.
+              "FTransform": "FTransform(const FRotator &Rotation, const FVector &Translation) {}\n"
+                            "    FTransform(const FRotator &Rotation, const FVector &Translation, const FVector &Scale3D) {}\n"
+                            "    FTransform(const FVector &Location, const FRotator &Rotation, const FVector &Scale) {}"}
 INCLUDE = re.compile(r'^#include\s+"(\w+)_classes\.hpp"')
 
 SCALARS = {
@@ -186,6 +198,9 @@ class Struct(object):
         self.link = []           # the names EX_StructConst writes, in PropertyLink order: see resolve_structs
         self.complete = False    # every reflected field is emitted, so a constructor over all of them exists
         self.pkg = path[len("/Script/"):]
+        self.is_game = False     # a game Blueprint's struct (UserDefinedStruct), Game/<cpp>.h: see game_structs
+        self.real = {}           # a game struct's member -> its engine name, `MinAmount_13_06D0...`
+        self.inits = {}          # a game struct's member -> its default instance's value, where that is not the zero
 
 
 class Enum(object):
@@ -196,9 +211,12 @@ class Enum(object):
 
 
 ENUM_COMMENT = re.compile(r"^// Enum (\S+)\.(\w+)\s*$")
+BP_ENUM_COMMENT = re.compile(r"^// UserDefinedEnum (\S+)\.(\w+)\s*$")
+BP_ENUMS = set()     # the C++ names of the game's Blueprint enums (UserDefinedEnum), filled by parse_structs
 ENUM_DECL = re.compile(r"^enum class (\w+) : (\w+)\s*$")
 ENUM_VALUE = re.compile(r"^\t(\w+)\s*=\s*(-?\d+),?\s*$")
 STRUCT_COMMENT = re.compile(r"^// ScriptStruct (\S+)\.(\w+)\s*$")
+GAME_STRUCT_COMMENT = re.compile(r"^// UserDefinedStruct (/Game/\S+)\.(\w+)\s*$")
 STRUCT_SIZE = re.compile(r"^// 0x([0-9A-Fa-f]+) \(0x([0-9A-Fa-f]+) - 0x([0-9A-Fa-f]+)\)")
 # Dumper-7 writes alignas(N) when the struct's MinAlignment is more than its members give (FQuat, FPlane).
 STRUCT_DECL = re.compile(r"^struct (?:alignas\((0x[0-9A-Fa-f]+)\)\s+)?(\w+)(?:\s+final)?(?:\s*:\s*public\s+(\w+))?\s*$")
@@ -214,9 +232,17 @@ def parse_structs(path, pkg):
         if m:
             pending = ("enum", m.group(1), m.group(2))
             continue
+        m = BP_ENUM_COMMENT.match(line)
+        if m:
+            pending = ("bpenum", m.group(1), m.group(2))
+            continue
         m = STRUCT_COMMENT.match(line)
         if m:
             pending = ("struct", m.group(1), m.group(2))
+            continue
+        m = GAME_STRUCT_COMMENT.match(line)
+        if m:
+            pending = ("gstruct", m.group(1), m.group(2))
             continue
         m = STRUCT_SIZE.match(line)
         if m:
@@ -228,14 +254,18 @@ def parse_structs(path, pkg):
             if pending and pending[0] == "enum" and "/" not in pending[1]:
                 cur_enum = ENUMS[m.group(1)] = Enum(m.group(1), pkg, m.group(2))
                 cur_enum.ue_name = pending[2]     # `TextureGroup`, where Dumper-7 says ETextureGroup
+            elif pending and pending[0] == "bpenum":
+                BP_ENUMS.add(m.group(1))
             pending = None
             continue
         m = STRUCT_DECL.match(line)
         if m:
             cur_struct, cur_enum = None, None
-            if pending and pending[0] == "struct" and pending[1].startswith("/Script/"):
+            if pending and (pending[0] == "struct" and pending[1].startswith("/Script/") or pending[0] == "gstruct"):
                 cur_struct = STRUCTS[m.group(2)] = Struct(m.group(2), m.group(3) or "", pending[1], pending[2], size)
                 cur_struct.explicit_align = int(m.group(1), 16) if m.group(1) else 1
+                if pending[0] == "gstruct":
+                    cur_struct.is_game, cur_struct.pkg = True, "Game/" + m.group(2)
             pending = None
             continue
         if line.startswith("};"):
@@ -255,6 +285,63 @@ def parse_structs(path, pkg):
                 cur_struct.raw_fields.append(("bool" if m.group(3) else m.group(1), m.group(2), transient))
 
 
+def game_structs(own, content):
+    """Keeps a game Blueprint's struct (UserDefinedStruct) where AssetGen can import it as it is: every member mapped,
+    each joined to its engine name (`MinAmount_13_06D0...`) off the object dump, in order, and its default instance -
+    which a cooked value's tags are against, and which the header says as initializers - read off the game's package
+    (--game) and of kinds an initializer can say. Drops the rest, and then each struct holding a dropped one."""
+    import invariants
+    import struct
+    dropped = []
+    for st in [s for s in STRUCTS.values() if s.is_game]:
+        names = [n for _, ns in sorted(REAL_FIELDS.get(st.path + "." + st.ue_name, {}).items()) for n in ns]
+        why = "ours" if st.path.startswith(own) else "no --game" if not content else None
+        if not why and not (st.complete and len(names) == len(st.raw_fields) == len(st.fields)
+                            and all(is_spelling_of(n, r) for (_, n), r in zip(st.fields, names))):
+            why = "members"
+        if not why:
+            st.real = dict((n, r) for (_, n), r in zip(st.fields, names))
+            base = os.path.join(content, st.path[len("/Game/"):].split(".")[0])
+            p = invariants.Package(base) if os.path.exists(base + ".uasset") else None
+            ex = [i for i in range(len(p.exports)) if p.class_of(i + 1) == "UserDefinedStruct"] if p else []
+            if not ex:
+                why = "no package"
+            else:
+                by_real = dict((r, n) for n, r in st.real.items())
+                types = dict((n, t) for t, n in st.fields)
+                for t in p.struct(ex[0]).defaults:
+                    n, v = by_real.get(t["name"]), bytes(t["value"])
+                    if t["type"] == "BoolProperty":
+                        if t["bool"]:
+                            st.inits[n] = "true"
+                    elif not any(v):
+                        continue
+                    elif t["type"] == "IntProperty":
+                        st.inits[n] = str(struct.unpack("<i", v)[0])
+                    elif t["type"] == "FloatProperty":
+                        st.inits[n] = repr(struct.unpack("<f", v)[0]) + "f"
+                    elif t["type"] == "ByteProperty" and t.get("enum") == "None" and types.get(n) == "uint8":
+                        st.inits[n] = str(v[0])
+                    else:
+                        # ponytail: the scalars only; a struct, text, soft path, enum or array default drops the struct
+                        why = "a %s default" % t["type"]
+                        break
+        if why:
+            dropped.append((st.cpp, why))
+            del STRUCTS[st.cpp]
+    while True:
+        held = [st for st in STRUCTS.values() if st.is_game and any(d not in STRUCTS for d in
+                [w for t, _ in st.fields for w in re.findall(r"\bF\w+", t) if w != st.cpp])]
+        if not held:
+            break
+        for st in held:
+            dropped.append((st.cpp, "holds a dropped one"))
+            del STRUCTS[st.cpp]
+    kept = sum(1 for st in STRUCTS.values() if st.is_game)
+    print("  game structs: %d kept, %d left out (%s)" % (kept, len(dropped), ", ".join(
+        "%s %d" % (w, c) for w, c in collections.Counter(w for _, w in dropped).most_common())))
+
+
 def resolve_structs():
     """Second pass: map field types now that every struct and enum name is known. `fields` are C++'s order, the super's
     members first, which the stub's constructor takes; `link` is what EX_StructConst writes: UStruct::Link fills
@@ -272,6 +359,13 @@ def resolve_structs():
         own, link, complete = [], [], base.complete if base else True
         for raw, name, transient in st.raw_fields:
             mapped = map_type(raw)
+            weak = WEAK.match(raw.strip())
+            if weak:
+                # Read like an object (Types.h's TWeakObjectPtr), as a Break node does. No literal: EX_StructConst would
+                # write an object into the weak pointer's bytes.
+                own.append(("TWeakObjectPtr<class %s>" % weak.group(1), name))
+                complete = False
+                continue
             if mapped in KINDS or mapped == "void" or any(s in mapped for s in NO_STRUCT_LITERAL):
                 complete = False
                 continue
@@ -341,6 +435,12 @@ def beside(pkg, target):
 
 def emit_struct(st, conv_names, methods, spell):
     body = ["struct %s%s" % (st.cpp, (" : public %s" % st.base) if st.base in STRUCTS else ""), "{"]
+    if st.is_game:
+        body.append('    UE_GAME_STRUCT("%s", "%s");' % (st.path, st.ue_name))
+        body += ["    %s %s%s;" % (t, n, " = " + st.inits[n] if n in st.inits else "") for t, n in st.fields]
+        body += hidden(['static constexpr const char* %s__UeName = "%s";' % (n, st.real[n]) for _, n in st.fields])
+        body.append("};")
+        return "\n".join(body)
     base = STRUCTS.get(st.base)
     own = st.fields[len(base.fields):] if base else st.fields
     for t, n in own:
@@ -353,6 +453,8 @@ def emit_struct(st, conv_names, methods, spell):
     if st.complete:
         params = CTOR_PARAMS.get(st.cpp) or ["%s %s" % (t, n) for t, n in st.fields]
         body.append("    %s(%s) {}" % (st.cpp, ", ".join(params)))
+    if st.cpp in CTOR_EXTRA:
+        body.append("    " + CTOR_EXTRA[st.cpp])
     if st.cpp in conv_names:
         body.append("    UE_CONV_%s" % st.cpp)
     lines, marks = method_lines(methods, spell)
@@ -377,7 +479,8 @@ OP_FN = re.compile(r"^(%s)_(\w+)$" % "|".join(OPS))
 
 
 def operator_extra(params):
-    return [(0.0001 if "Tolerance" in n else 0.0) if t == "float" else (False if t == "bool" else 0) for t, n in params]
+    return [single(t, 0.0001 if "Tolerance" in n else 0.0) if t in ("float", "double") else (False if t == "bool" else 0)
+            for t, n in params]
 
 
 def operators(classes):
@@ -391,7 +494,9 @@ def operators(classes):
             m = OP_FN.match(fname)
             if not (m and is_static and len(params) >= 2):
                 continue
-            lhs, rhs = params[0][0], params[1][0]
+            if UE5 and "float" in (params[0][0], params[1][0]):     # a native float operand (Multiply_LinearColorFloat)
+                continue
+            lhs, rhs = real(params[0][0]), real(params[1][0])
             if soft_template(conv_kind(lhs) or "") and conv_kind(lhs) == conv_kind(rhs):
                 lhs, rhs = conv_kind(lhs), conv_kind(rhs)
             elif lhs not in STRUCTS and rhs not in STRUCTS and lhs not in CONV_STRUCTS:
@@ -431,7 +536,7 @@ def write_types(out_dir):
                 ', "form": "%s"' % e.form if e.form else "", "," if i + 1 < len(ens) else "")
              for i, e in enumerate(ens)]
     rows += ['  },', '  "structs": {']
-    sts = sorted(STRUCTS.values(), key=lambda t: t.cpp)
+    sts = sorted((t for t in STRUCTS.values() if not t.is_game), key=lambda t: t.cpp)
     for i, st in enumerate(sts):
         fields = ", ".join('["%s", "%s"]' % (t, n) for t, n in st.fields)
         # A literal's member order where it is not `fields`': a struct with a super and members of its own, or one with
@@ -441,6 +546,11 @@ def write_types(out_dir):
         rows.append('    "%s": {"package": "%s", "name": "%s", "size": %d, "align": %d, "complete": %s, "fields": [%s]%s}%s'
                     % (st.cpp, st.path, st.ue_name, st.size, struct_align(st), "true" if st.complete else "false",
                        fields, link, "," if i + 1 < len(sts) else ""))
+    gs = sorted((t for t in STRUCTS.values() if t.is_game), key=lambda t: t.cpp)
+    rows += ['  },', '  "game_structs": {']
+    rows += ['    "%s": {"package": "%s", "name": "%s", "fields": [%s]}%s'
+             % (st.cpp, st.path, st.ue_name, ", ".join('["%s", "%s", "%s"]' % (t, n, st.real[n]) for t, n in st.fields),
+                "," if i + 1 < len(gs) else "") for i, st in enumerate(gs)]
     rows += ['  }', '}']
     io.open(os.path.join(out_dir, "Types.json"), "w", encoding="utf-8", newline="\n").write("\n".join(rows) + "\n")
     print("  types: %d enums (%d enum class, %d TEnumAsByte), %d structs (%d complete)"
@@ -729,7 +839,8 @@ def read_real_fields(sdk_dir):
             continue
         m = DUMP_OBJECT.match(line)
         owner = m.group(2).rstrip("\r\n") if m else None
-        cur = REAL_FIELDS.setdefault(owner, {}) if m and m.group(1).endswith("Class") else None
+        cur = REAL_FIELDS.setdefault(owner, {}) if m and (m.group(1).endswith("Class") or m.group(1) == "UserDefinedStruct") \
+            else None
         sig = SIGNATURES.setdefault(owner, []) if m and m.group(1) in ("DelegateFunction", "SparseDelegateFunction") else None
         sub = DUMP_SUBOBJECT.match(m.group(2).rstrip("\r\n")) if m else None
         if sub:
@@ -1105,8 +1216,15 @@ def parse_header(path):
         if not m:
             continue
         cur.raw_funcs.append((m.group(2), m.group(3), m.group(4)))
-        ret = map_type(m.group(2))
-        params = parse_params(m.group(4))
+        ret_raw, params_raw = m.group(2), m.group(4)
+        if m.group(1):
+            # ponytail: a static's Blueprint enum is passed as the byte the VM passes (a function library's static has no
+            # override to carry the property's Enum to). Every other member of one stays out, and the enum has no C++
+            # type: that needs its cooked NewEnumeratorN names off --game, as Dumper-7 writes the display names (TODO.md).
+            as_byte = lambda t: re.sub(r"\b(E\w+)\b", lambda e: "uint8" if e.group(1) in BP_ENUMS else e.group(1), t)
+            ret_raw, params_raw = as_byte(ret_raw), as_byte(params_raw)
+        ret = map_type(ret_raw)
+        params = parse_params(params_raw)
         if ret in KINDS or isinstance(params, str):
             skipped[ret if ret in KINDS else params] += 1
             continue
@@ -1117,7 +1235,28 @@ def parse_header(path):
 
 
 CONV = re.compile(r"^Conv_(\w+)To(\w+)$")
-CONV_SCALARS = ("FString", "FName", "FText", "int", "int64", "float", "bool", "uint8", "class UObject*")
+CONV_SCALARS = ("FString", "FName", "FText", "int", "int64", "float", "double", "bool", "uint8", "class UObject*")
+# S40: a UE5 dump's Blueprint real is a double (LWC), which the compiler names "float", the type a mod writes; set by
+# main from the dump's engine. A native `float` parameter stays float, and its constant a F32 (EX_FloatConst).
+UE5 = False
+
+
+class F32(float):
+    """A constant for a native `float` parameter of a UE5 function, written {"float": v}: the compiler's plain number
+    there is a double."""
+    def __repr__(self):
+        return '{"float": %r}' % float(self)
+    __str__ = __repr__
+
+
+def real(t):
+    """The compiler's name for scalar spelling t: a UE5 double is its "float"."""
+    return "float" if UE5 and t == "double" else t
+
+
+def single(t, v):
+    """Constant v for a parameter spelled t, marked F32 where UE5 keeps it a 4-byte float."""
+    return F32(v) if UE5 and t == "float" else v
 # Conv_RotatorToVector: a rotator is not implicitly a direction. Conv_Int64ToString: only Modio has it;
 # the compiler goes through Conv_Int64ToText + Conv_TextToString instead.
 # The filters below leave out the rest of 4.27's Conv_s, each for a reason: Conv_FloatToText's RoundingMode has no default
@@ -1133,8 +1272,10 @@ SOFT = {"TSoftObjectPtr": "TSoftObjectPtr<UObject>", "TSoftClassPtr": "TSoftClas
 def conv_kind(t):
     """The name Conv.json gives a Conv_'s value or result of mapped type t, as the compiler's Canon names a value's
     type; None where AssetGen converts no such value."""
+    if UE5 and t == "float":    # a native 4-byte float, no Blueprint real: the compiler casts it where it meets one
+        return None
     if t in CONV_SCALARS or t in STRUCTS:
-        return t
+        return real(t)
     if t.startswith("TSubclassOf<"):
         return "class UObject*"
     tpl = t.split("<", 1)[0]
@@ -1170,7 +1311,7 @@ def conversions(classes):
                 continue
             if any(n not in CONV_DEFAULTS for _, n in params[1:]):
                 continue
-            extra = [CONV_DEFAULTS[n] for _, n in params[1:]]
+            extra = [single(t, CONV_DEFAULTS[n]) for t, n in params[1:]]
             found.setdefault((src, dst), (k.path, k.ue_name, fname, extra, ref_positions(k.ue_name, fname, params)))
     return found
 
@@ -1327,8 +1468,10 @@ def write_out_arrays(out_dir):
 
 
 SCRIPT_INHERIT = 0x4AA1364E         # CLASS_ScriptInherit, ObjectMacros.h:249-259
-RF_ARCHETYPE_OBJECT, RF_DEFAULT_SUBOBJECT = 0x20, 0x40000
+RF_ARCHETYPE_OBJECT, RF_DEFAULT_SUBOBJECT, RF_INHERITABLE_COMPONENT_TEMPLATE = 0x20, 0x40000, 0x400000
 GAME_SUBOBJECTS = {}                # game Blueprint class path -> ["<class path> <name>"] under its CDO (scan_game)
+GAME_ICH_RECORDS = {}               # game Blueprint class path -> [<Var>]: its InheritableComponentHandler's templates (scan_game)
+GAME_TEMPLATE_SUBOBJECTS = {}       # game Blueprint class path -> ["<class path> <Var>_GEN_VARIABLE:<name>"] (scan_game)
 GAME_MEMBER_SUBOBJECTS = {}         # (native class path, member's engine name lowered) -> {subobject names} (scan_game)
 OBJECT_PATH = "/Script/CoreUObject.Object"
 DEFAULT_TAIL = (0, OBJECT_PATH, "Engine")   # UObject's: Object.h:57-60
@@ -1361,6 +1504,12 @@ def scan_game(content, container_members):
             up = p.exports[up - 1]["outer"]
         return up == cdo
 
+    def template_of(p, k, cls):
+        """The export right under the class that export k sits under."""
+        while p.exports[k - 1]["outer"] != cls:
+            k = p.exports[k - 1]["outer"]
+        return k
+
     def name_path(p, k, cdo):
         x = p.exports[k - 1]
         return x["name"] if x["outer"] == cdo else name_path(p, x["outer"], cdo) + ":" + x["name"]
@@ -1382,6 +1531,22 @@ def scan_game(content, container_members):
                     GAME_SUBOBJECTS[p.path(i + 1)] = [
                         "%s %s" % (p.path(x["cls"]), name_path(p, k + 1, st.cdo)) for k, x in enumerate(p.exports)
                         if x["flags"] & (RF_DEFAULT_SUBOBJECT | RF_ARCHETYPE_OBJECT) and under(p, x, st.cdo)]
+                    # And every object instanced under one of its component templates, `<Var>_GEN_VARIABLE` under the
+                    # class (its own SCS nodes' and its overrides of inherited ones): a child's object of the same name
+                    # and class there is archetyped on it (UObjectArchetype.cpp 64-83), ProjectileAttack_GEN_VARIABLE:
+                    # NormalProjectileAttack_0 in ENE_ShootingPlant_C.
+                    # Each inherited component it has a record of its own for: the template the ICH makes is the
+                    # class's `<Var>_GEN_VARIABLE`, flagged RF_InheritableComponentTemplate (Blueprint
+                    # InheritableComponentHandler.cpp, CreateOverridenComponentTemplate). A child's template of that
+                    # component is archetyped on it, not on the owner's (UObjectArchetype.cpp 83-108).
+                    GAME_ICH_RECORDS[p.path(i + 1)] = [
+                        x["name"][:-len("_GEN_VARIABLE")] for x in p.exports
+                        if x["outer"] == i + 1 and x["flags"] & RF_INHERITABLE_COMPONENT_TEMPLATE
+                        and x["name"].endswith("_GEN_VARIABLE")]
+                    GAME_TEMPLATE_SUBOBJECTS[p.path(i + 1)] = [
+                        "%s %s" % (p.path(x["cls"]), name_path(p, k + 1, i + 1)) for k, x in enumerate(p.exports)
+                        if x["flags"] & RF_ARCHETYPE_OBJECT and x["outer"] != i + 1 and under(p, x, i + 1)
+                        and p.exports[template_of(p, k + 1, i + 1) - 1]["name"].endswith("_GEN_VARIABLE")]
                     for prop in st.props:
                         enum_kinds(p, prop)
                     # A Blueprint's default object holds a tag for each component member, naming the default subobject
@@ -1524,9 +1689,9 @@ def native_interfaces(classes, by_name, game, overrides):
 
 def write_containers(classes, sdk_dir, out_dir):
     """Containers.h: one UE_CONTAINER_<Template> macro of method declarations per library.
-    A method is const when its function is BlueprintPure."""
-    # ponytail: Keys / Values / ToArray / the set operations / RandomFromStream leave the container alone
-    # but are BlueprintCallable in 4.27, so a const container cannot call them. A name list if that bites.
+    A method is const when its function is BlueprintPure, or reads the container into an out parameter: Keys / Values
+    / ToArray / the set operations are BlueprintCallable in 4.27 but leave it alone, and a const function calls them."""
+    reads = {"Map_Keys", "Map_Values", "Set_ToArray", "Set_Union", "Set_Difference", "Set_Intersection"}
     text = io.open(os.path.join(sdk_dir, "Engine_functions.cpp"), encoding="utf-8", errors="replace").read()
     flags = dict(((m.group(1), m.group(2)), m.group(3)) for m in FUNC_FLAGS.finditer(text))
     macros, structs, count = [], set(), 0
@@ -1548,7 +1713,8 @@ def write_containers(classes, sdk_dir, out_dir):
                 continue
             structs.update(w for t, _ in args for w in re.findall(r"\bF\w+", t) if w in STRUCTS)
             members.append("    %s %s(%s)%s;" % (ret, fname[len(prefix):], ", ".join("%s %s" % a for a in args),
-                                                 " const" if "BlueprintPure" in flags.get((k.ue_name, fname), "") else ""))
+                                                 " const" if fname in reads or "BlueprintPure" in flags.get((k.ue_name, fname), "")
+                                                 else ""))
         count += len(members)
         macros.append("#define UE_CONTAINER_%s \\\n%s\n" % (tpl, " \\\n".join(members)))
     out = ["#pragma once",
@@ -1569,10 +1735,13 @@ def main():
     if len(args) < 2 or ("--game" in sys.argv and not game_dir):
         sys.exit(__doc__.strip().splitlines()[-1])
     sdk_dir, out_dir = args[0], args[1]
+    global UE5
+    UE5 = dump_identity(sdk_dir)[0] != "4.27"
 
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_structs.hpp")):
         parse_structs(os.path.join(sdk_dir, name), name[: -len("_structs.hpp")])
     resolve_structs()
+    read_real_fields(sdk_dir)
 
     headers = sorted(f for f in os.listdir(sdk_dir) if f.endswith("_classes.hpp"))
     classes, totals, pathless = [], dict((k, 0) for k in KINDS), 0
@@ -1581,7 +1750,7 @@ def main():
     own = ("/Game/_ElytrasMods/_NestedContainerStructs/",) + tuple(sorted(set(
         m + "/" for f in os.listdir(mod_dir) if f.endswith((".cpp", ".h"))
         for m in re.findall(r'UE_MOD_PACKAGE\("([^"]+)"', io.open(os.path.join(mod_dir, f), encoding="utf-8-sig").read()))))
-    read_real_fields(sdk_dir)
+    game_structs(own, game_dir)
     read_ref_parms(sdk_dir)
     for name in headers:
         found, skipped, _ = parse_header(os.path.join(sdk_dir, name))
@@ -1610,7 +1779,8 @@ def main():
     name_count = collections.Counter(k.ue_name for k in classes)
     for k in classes:
         k.ns = namespace_of(k.path) if k.is_bp else ""
-        k.emit = (k.ns + "::" + k.ue_name) if k.ns else (k.ue_name if k.is_bp else k.cpp)
+        # Rooted: a /Game/Game Blueprint opens Game::Game, inside which a bare `Game::X` finds that inner Game.
+        k.emit = ("::" + k.ns + "::" + k.ue_name) if k.ns else (k.ue_name if k.is_bp else k.cpp)
         k.header = ("Game/" + k.ue_name) if k.is_bp else k.path[len("/Script/"):]
     unique = set(n for n, c in name_count.items() if c == 1)
 
@@ -1621,6 +1791,8 @@ def main():
     read_enum_forms(sdk_dir, game_enums)
     for k in classes:
         k.default_subobjects = GAME_SUBOBJECTS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
+        k.template_subobjects = GAME_TEMPLATE_SUBOBJECTS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
+        k.ich_records = GAME_ICH_RECORDS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
     tails = class_tails(classes, by_name, game)
     ifaces = native_interfaces(classes, by_name, game, overrides)
     ordered, seen = [], set()
@@ -1659,6 +1831,9 @@ def main():
         deps[st.pkg].update(ENUMS[t].pkg for t, _ in st.fields if t in ENUMS and ENUMS[t].pkg != st.pkg)
     for k in ordered:
         for t in [t for _, r, _, ps in k.funcs for t in [r] + [pt for pt, _ in ps]] + [t for t, _ in k.fields]:
+            for w in re.findall(r"\bF\w+", t):
+                if w != t and w in STRUCTS and STRUCTS[w].is_game:
+                    deps[k.header].add(STRUCTS[w].pkg)
             if t in STRUCTS and STRUCTS[t].pkg != k.header:
                 deps[k.header].add(STRUCTS[t].pkg)
             elif t in ENUMS and ENUMS[t].pkg != k.header:
@@ -1789,6 +1964,13 @@ def main():
                 # name can hold a space): a child is serialized after each.
                 marks.append('static constexpr const char* UeDefaultSubobjects = "%s";'
                              % c_literal(";".join(k.default_subobjects)))
+            if k.ich_records:
+                # The inherited components it has a template of its own for, by node name, ';'.
+                marks.append('static constexpr const char* UeIchRecords = "%s";' % c_literal(";".join(k.ich_records)))
+            if k.template_subobjects:
+                # The objects instanced under its component templates, "<class path> <Var>_GEN_VARIABLE:<name>", ';'.
+                marks.append('static constexpr const char* UeTemplateSubobjects = "%s";'
+                             % c_literal(";".join(k.template_subobjects)))
             names = set(f for _, _, f, _ in k.funcs)
             for ftype, fname in k.fields:
                 if fname in names:
@@ -1866,6 +2048,10 @@ def main():
                 for ret, name, target in UOBJECT_FORWARDS:
                     body.append("    %s %s();" % (ret, name))
                     marks.append('static constexpr const char* %s__UeForward = "%s";' % (name, target))
+            if k.cpp == "AActor":
+                body.append("    /* The editor's Get Components by Class node: K2_GetComponentsByClass(T::StaticClass()), its array of")
+                body.append("       UActorComponent* taken as an array of T* (every element is a T). AssetGen lowers it; no UFunction. */")
+                body.append("    template <class T> TArray<T *> GetComponentsByClass() const;")
             for ret, name, params, target in CLASS_FORWARDS.get(k.cpp, ()):
                 body.append("    %s %s(%s);" % (ret, name, params))
                 marks.append('static constexpr const char* %s__UeForward = "%s";' % (name, target))
@@ -1896,8 +2082,8 @@ def main():
                 body.append("using %s = %s;" % (k.ue_name, k.emit))
                 aliased += 1
 
-        title = ("Blueprint class " + pkg[len("Game/"):]) if pkg.startswith("Game/") \
-            else "Package /Script/" + pkg
+        title = ("Blueprint struct " if pkg[len("Game/"):] in STRUCTS else "Blueprint class ") + pkg[len("Game/"):] \
+            if pkg.startswith("Game/") else "Package /Script/" + pkg
         out = ["#pragma once",
                "/*",
                "%s, generated by AssetGen/tools/genueapi.py. Do not edit." % title,
@@ -1957,9 +2143,15 @@ def main():
     if os.path.normcase(os.path.realpath(hand)) != os.path.normcase(os.path.realpath(out_dir)):
         for name in ("UeMeta.h", "Types.h"):
             shutil.copyfile(os.path.join(hand, name), os.path.join(out_dir, name))
+    # S40: UE5's real arithmetic is KismetMathLibrary's X_DoubleDouble, where the compiler names 4.27's X_FloatFloat; the
+    # map is the dump's, so a name UE5 kept (Percent_FloatFloat) stays.
+    math = dict(("%s_FloatFloat" % fn[:-len("_DoubleDouble")], fn) for k in classes
+                if k.path == "/Script/Engine" and k.ue_name == "KismetMathLibrary"
+                for is_static, _, fn, _ in k.funcs if is_static and fn.endswith("_DoubleDouble")) if UE5 else {}
     io.open(os.path.join(out_dir, "Version.json"), "w", encoding="utf-8", newline="\n").write(
-        '{"genueapi": %d, "game": %s, "ue": "%s", "project": "%s"}\n'
-        % ((GENUEAPI_VERSION, "true" if game_dir else "false") + dump_identity(sdk_dir)))
+        '{"genueapi": %d, "game": %s, "ue": "%s", "project": "%s"%s}\n'
+        % ((GENUEAPI_VERSION, "true" if game_dir else "false") + dump_identity(sdk_dir)
+           + ((', "math": ' + json.dumps(math, sort_keys=True)) if math else "",)))
     if not game_dir:
         print("  no --game: no game Blueprint's default subobjects or tail, so the compiler refuses a class deriving "
               "from one")

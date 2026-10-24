@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""usage: bpdecomp.py <Content dir> <out dir> --mod </Game/root>=<ModName> [--mod ...] [--names <uncooked Content dir>]
-                      [--raw <dir>] [--keep <package path>]... [--only <package path prefix>]
+"""usage: bpdecomp_emit.py <Content dir> <out dir> --mod </Game/root>=<ModName> [--mod ...] [--names <uncooked Content dir>]
+                           [--raw <dir>] [--keep <package path>]... [--cook <package path>=<why>]...
+
+The entry point is bpdecomp_emit.py; this module holds the run and the class context it drives.
 
 A decompiler from cooked UE 4.27 Blueprint packages back to AssetGen C++. Every UserDefinedEnum, UserDefinedStruct,
 Blueprint interface and Blueprint class under each --mod root becomes a header (its declaration) and, for a class with
@@ -25,13 +27,41 @@ from bpdecomp_model import *
 
 # ---- tagged values (class defaults, struct defaults, component templates, data assets)
 
+# Engine structs serialized in a form of their own (WithSerializer), not as tags: Values.native_form reads each.
+NATIVE_FORMS = ('GameplayTagContainer', 'NiagaraVariableBase', 'NiagaraVariable', 'NiagaraVariableWithOffset')
+
 IMMUTABLE = {'Vector': ('<fff', 'FVector'), 'Vector2D': ('<ff', 'FVector2D'), 'Rotator': ('<fff', 'FRotator'),
              'Vector4': ('<ffff', 'FVector4'), 'Quat': ('<ffff', 'FQuat'), 'IntPoint': ('<ii', 'FIntPoint'),
              'IntVector': ('<iii', 'FIntVector'), 'LinearColor': ('<ffff', 'FLinearColor'), 'Guid': ('<IIII', 'FGuid')}
 
 
+def tpkg(prop, pkg):
+    """The package whose tables a property's type references (prop.ref, prop.enum) index: the one it was read from. A
+    struct member read off another package (struct_members) is not the package whose tag bytes hold the value."""
+    return getattr(prop, '_tpkg', None) or pkg
+
+
 def fmt_num(v):
     return B.cfloat(v) if isinstance(v, float) else str(v)
+
+
+RF_ArchetypeObject, RF_DefaultSubObject = 0x20, 0x40000
+
+
+def instanced_export(pkg, i):
+    """Whether export i is an object instanced in a class's defaults (UE_INSTANCED): an archetype under the CDO, under
+    a component template (<Var>_GEN_VARIABLE), or under another such object, and neither a default subobject nor a
+    template itself. RF_ArchetypeObject need not be set: an inherited component's override template holds its instanced
+    object without it (ENE_Spider_Tank_Teleporter's StabAttack DamageComponent_0, flags 0x9), the template above it
+    making it one."""
+    e = pkg.exports[i]
+    if not e['outer'] or e['flags'] & RF_DefaultSubObject or e['name'].endswith('_GEN_VARIABLE'):
+        return False
+    o = pkg.exports[e['outer'] - 1] if e['outer'] > 0 else None
+    while o is not None and not (o['name'].startswith('Default__') or o['name'].endswith('_GEN_VARIABLE')):
+        if not o['outer'] or o['outer'] < 0: return False
+        o = pkg.exports[o['outer'] - 1]
+    return o is not None
 
 
 class Values:
@@ -48,6 +78,7 @@ class Values:
         try:
             return s.value(pkg, t['type'], bytes(t['value']), prop, cur, t)
         except Exception as e:
+            if os.environ.get('BPDECOMP_TRACE'): import traceback; traceback.print_exc()
             s.cx.notes.append('%s: default %s not rendered (%s)' % (cur.path, t['name'], e))
             return None
 
@@ -65,10 +96,12 @@ class Values:
         if ty in ('ByteProperty', 'EnumProperty'):
             if len(b) == 1: return str(b[0])
             entry = s.name_at(pkg, b, 0)
+            if prop is None and t and t.get('enum', 'None') != 'None':     # a widget's or a slot's: the tag names its enum
+                return s.cx.enum_of_tag(t['enum'], entry)
             return s.cx.enum_by_name(pkg, prop, entry)
         if ty in ('ObjectProperty', 'ClassProperty', 'InterfaceProperty'):
             idx = struct.unpack('<i', b[:4])[0]
-            return 'nullptr' if idx == 0 else s.cx.object_ref_static(pkg, idx, cur)
+            return 'nullptr' if idx == 0 else s.object(pkg, idx, cur)
         if ty in ('SoftObjectProperty', 'SoftClassProperty'):
             path = s.name_at(pkg, b, 0)
             sub = read_fstring(b, 8)[0]
@@ -81,36 +114,63 @@ class Values:
             n = struct.unpack_from('<i', b, 4 if ty == 'SetProperty' else 0)[0]
             o = 8 if ty == 'SetProperty' else 4
             itype = t['inner'] if t else inner.type
-            items, o = s.elements(pkg, itype, b, o, n, inner, cur)
+            items, o = s.elements(pkg, itype, b, o, n, inner, cur, s.hint_args(t, 1))
             return '{%s}' % ', '.join(items)
         if ty == 'MapProperty':
             kp, vp = (prop.subs + [None, None])[:2] if prop is not None else (None, None)
             n = struct.unpack_from('<i', b, 4)[0]
             o = 8
             out = []
+            kh, vh = (s.hint_args(t, 2) + [None, None])[:2] if kp is None else (None, None)
             for _ in range(n):
-                k, o = s.elements(pkg, t['inner'], b, o, 1, kp, cur)
-                v, o = s.elements(pkg, t['value_type'], b, o, 1, vp, cur)
+                k, o = s.elements(pkg, t['inner'], b, o, 1, kp, cur, [kh])
+                v, o = s.elements(pkg, t['value_type'], b, o, 1, vp, cur, [vh])
                 out.append('{%s, %s}' % (k[0], v[0]))
             return '{%s}' % ', '.join(out)
         raise ValueError('a %s' % ty)
 
-    def elements(s, pkg, ty, b, o, n, prop, cur):
+    @staticmethod
+    def hint_args(t, want):
+        """The struct names (UeApi's, no F) of a container's element types, off the C++ type hint struct_from_tags
+        gives a native struct's member (TMap<FNiagaraVariable, FNiagaraVariable>); None where there is none."""
+        m = re.match(r'\s*T(?:Array|Set|Map)<(.*)>\s*$', (t or {}).get('cpp', ''))
+        if not m: return [None] * want
+        args, depth, cur_ = [], 0, ''
+        for ch in m.group(1):
+            if ch == ',' and depth == 0: args.append(cur_); cur_ = ''; continue
+            depth += (ch == '<') - (ch == '>'); cur_ += ch
+        args.append(cur_)
+        out = [m2.group(1) if (m2 := re.match(r'^(?:struct\s+)?F(\w+)$', a.strip())) else None for a in args]
+        return (out + [None] * want)[:want]
+
+    def elements(s, pkg, ty, b, o, n, prop, cur, hint=None):
+        # a container's element is written whole, so an engine struct in it is its constructor call (struct_from_tags)
+        s.in_element = getattr(s, 'in_element', 0) + 1
+        try: return s._elements(pkg, ty, b, o, n, prop, cur, hint)
+        finally: s.in_element -= 1
+
+    def _elements(s, pkg, ty, b, o, n, prop, cur, hint=None):
         out = []
-        if ty == 'StructProperty' and n and prop is not None:
-            sname = s.cx.struct_short_name(pkg, prop.ref)
-            if sname not in IMMUTABLE and n and o + 8 <= len(b) and s._looks_tag(pkg, b, o):
-                # an array of structs leads with one tag for its inner property
+        if ty == 'StructProperty' and n:
+            sname = s.cx.struct_short_name(tpkg(prop, pkg), prop.ref) if prop is not None else (hint or [None])[0]
+            if o + 8 <= len(b) and s._looks_tag(pkg, b, o):
+                # an array of structs leads with one tag for its inner property, of any struct (PropertyArray.cpp 205);
+                # its StructName is the type where no member says it (a native struct's array UeApi has no member for)
                 tl = s.read_tag(pkg, b, o)
-                o = tl['next']
+                sname = sname or tl['struct']
+                o = tl['next'] - tl['size']     # its size spans the elements, which follow it
+            if sname is None: raise ValueError('an element of %s' % ty)
+            ref = prop.ref if prop is not None else None
             for _ in range(n):
-                if sname in IMMUTABLE:
+                if sname in NATIVE_FORMS:
+                    v, o = s.native_form(pkg, sname, b, o, cur); out.append(v)
+                elif sname in IMMUTABLE:
                     fmt, cpp = IMMUTABLE[sname]
                     size = struct.calcsize(fmt)
                     out.append(s.struct_value(pkg, sname, b[o:o + size], prop, cur)); o += size
                 else:
                     tags, o = s.read_tags(pkg, b, o)
-                    out.append(s.struct_from_tags(pkg, prop.ref, tags, cur))
+                    out.append(s.struct_from_tags(pkg, ref, tags, cur, None if ref else sname, tp=tpkg(prop, pkg)))
             return out, o
         for _ in range(n):
             if ty == 'IntProperty': out.append(str(struct.unpack_from('<i', b, o)[0])); o += 4
@@ -131,13 +191,23 @@ class Values:
                 v, o = read_ftext(b, o); out.append(B.cstring(v))
             elif ty in ('ObjectProperty', 'ClassProperty', 'InterfaceProperty'):
                 idx = struct.unpack_from('<i', b, o)[0]; o += 4
-                out.append('nullptr' if not idx else s.cx.object_ref_static(pkg, idx, cur))
+                out.append('nullptr' if not idx else s.object(pkg, idx, cur))
             elif ty in ('SoftObjectProperty', 'SoftClassProperty'):
                 path = s.name_at(pkg, b, o); o += 8
                 sub, o = read_fstring(b, o)
                 out.append(B.cstring(path + (':' + sub if sub else '')))
             else: raise ValueError('an element of %s' % ty)
         return out, o
+
+    def object(s, pkg, idx, cur):
+        """An object value. One of the package's own objects instanced in the defaults (a damage component's bonus) has
+        no asset path to name it by: the class emitter writes it as a UE_INSTANCED local and this is that local. Any
+        other subobject is noted."""
+        if idx > 0 and pkg.exports[idx - 1]['outer']:
+            hook = getattr(s.cx, 'instanced', None)
+            if hook and instanced_export(pkg, idx - 1): return hook(idx - 1)
+            raise ValueError('a subobject %s, which AssetGen cannot point at' % pkg.exports[idx - 1]['name'])
+        return s.cx.object_ref_static(pkg, idx, cur)
 
     def _looks_tag(s, pkg, b, o):
         i = struct.unpack_from('<i', b, o)[0]
@@ -178,20 +248,73 @@ class Values:
             bb, g, r, a = b[:4]
             return 'FColor(%d, %d, %d, %d)' % (r, g, bb, a)
         if sname == 'DateTime': return 'FDateTime(%d)' % struct.unpack('<q', b[:8])[0]
+        if sname in NATIVE_FORMS: return s.native_form(pkg, sname, b, 0, cur)[0]
         tags, _ = s.read_tags(pkg, b, 0)
         ref = prop.ref if prop is not None else None
-        return s.struct_from_tags(pkg, ref, tags, cur, sname)
+        return s.struct_from_tags(pkg, ref, tags, cur, sname, tp=tpkg(prop, pkg))
 
-    def struct_from_tags(s, pkg, ref, tags, cur, sname=None):
-        members = s.cx.struct_members(pkg, ref) if ref else None
+    def native_form(s, pkg, sname, b, o, cur):
+        """(C++ value, offset after it) of a NATIVE_FORMS struct at b[o:]: FGameplayTagContainer::Serialize writes its
+        tags' count and FNames; a Niagara variable its Name, its type definition as tags (ClassStructOrEnum,
+        UnderlyingType), then FNiagaraVariable its VarData and FNiagaraVariableWithOffset its Offset."""
+        if sname == 'GameplayTagContainer':
+            n = struct.unpack_from('<i', b, o)[0]; o += 4
+            tags = []
+            for _ in range(n):
+                tags.append('FGameplayTag(%s)' % B.cstring(s.name_at(pkg, b, o))); o += 8
+            return 'FGameplayTagContainer({%s}, {})' % ', '.join(tags), o
+        name = s.name_at(pkg, b, o); o += 8
+        tdef, o = s.read_tags(pkg, b, o)
+        by = {t['name']: bytes(t['value']) for t in tdef}
+        idx = struct.unpack('<i', by['ClassStructOrEnum'][:4])[0] if 'ClassStructOrEnum' in by else 0
+        under = struct.unpack('<H', by['UnderlyingType'][:2])[0] if 'UnderlyingType' in by else 0
+        if not idx: obj = 'nullptr'
+        else:
+            path = pkg.path(idx)
+            top, _, short = path.partition('.')
+            if pkg.class_of(idx) == 'ScriptStruct' and s.cx.api.struct_cpp.get(short):
+                obj = 'StaticStructOf<%s>()' % s.cx.api.struct_cpp[short]
+            else: obj = s.object(pkg, idx, cur)
+        args = [B.cstring(name) if name != 'None' else 'FName()', 'FNiagaraTypeDefinition(%s, %d)' % (obj, under)]
+        if sname == 'NiagaraVariable':
+            n = struct.unpack_from('<i', b, o)[0]; o += 4
+            args.append('{%s}' % ', '.join(str(x) for x in b[o:o + n])); o += n
+        elif sname == 'NiagaraVariableWithOffset':
+            args.append(str(struct.unpack_from('<i', b, o)[0])); o += 4
+        return 'F%s(%s)' % (sname, ', '.join(args)), o
+
+    def struct_from_tags(s, pkg, ref, tags, cur, sname=None, tp=None):
+        tp = tp or pkg
+        members = s.cx.struct_members(tp, ref) if ref else None
+        if (sname or (tp.path(ref).rsplit('.', 1)[-1] if ref else None)) == 'Transform':
+            return s.transform(pkg, tags, cur)
         parts = []
+        uname = sname or (tp.path(ref).rsplit('.', 1)[-1] if ref else '')
+        fields = s.cx.api.fields.get(uname, {})
         for t in tags:
             mp = members.get(t['name']) if members else None
-            mpkg = members.pkg if members else pkg
+            if mp is None and t['name'] in fields: t = dict(t, cpp=fields[t['name']])     # a native struct's member
             v = s.value(pkg, t['type'], bytes(t['value']), mp, cur, t)
-            parts.append('.%s = %s' % (ident(authored(t['name'])), v))
-        tname = s.cx.types.struct(pkg, ref, cur) if ref else 'F' + (sname or '')
-        return '%s{%s}' % (tname, ', '.join(parts))
+            parts.append((t['name'], v))
+        tname = s.cx.types.struct(tp, ref, cur) if ref else 'F' + (sname or '')
+        native = not ref or tp.path(ref).startswith('/Script/')
+        order = s.cx.api.ctor_fields.get(uname) if getattr(s, 'in_element', 0) and native else None
+        if order and uname != 'Color' and all(n in order for n, _ in parts):
+            # its constructor, every member in order; one the cooked value leaves out is UE_KEEP, unwritten, so it
+            # holds what the engine's constructor sets, as the cooked value does
+            given = dict(parts)
+            if not given: return '%s()' % tname
+            return '%s(%s)' % (tname, ', '.join(given.get(n, 'UE_KEEP') for n in order))
+        return '%s{%s}' % (tname, ', '.join('.%s = %s' % (ident(authored(n)), v) for n, v in parts))
+
+    def transform(s, pkg, tags, cur):
+        """An FTransform written as tags, as its constructor: a member left out holds the identity's."""
+        by = {t['name']: bytes(t['value']) for t in tags}
+        q = struct.unpack('<ffff', by['Rotation'][:16]) if 'Rotation' in by else (0.0, 0.0, 0.0, 1.0)
+        t = struct.unpack('<fff', by['Translation'][:12]) if 'Translation' in by else (0.0, 0.0, 0.0)
+        sc = struct.unpack('<fff', by['Scale3D'][:12]) if 'Scale3D' in by else (1.0, 1.0, 1.0)
+        f = lambda xs: ', '.join(fmt_num(x) for x in xs)
+        return 'FTransform(FQuat(%s), FVector(%s), FVector(%s))' % (f(q), f(t), f(sc))
 
 
 class Members(dict):
@@ -232,7 +355,13 @@ class Ctx:
 
     def member_text(s, body, name):
         i = ident(name)
-        if any(ident(n) == i for n in body.props) or any(ident(n) == i for n in body.locals_used):
+        st = s.pkg.struct(s.asset.export)
+        if st is not None and not any(p.name == name for p in st.props):
+            for cn in s.m.ancestors(s.asset.cpp)[1:]:
+                hit = s.api.members(cn).get(name.lower())
+                if hit: i = hit; break
+        if any(ident(n) == i for n in body.props) or any(ident(n) == i for n in body.locals_used) or \
+                any(v == i for v in body.frame.values()):
             return 'this->' + i
         return i
 
@@ -262,7 +391,12 @@ class Ctx:
         out.pkg = p2
         st = p2.struct(k)
         if st:
-            for p in st.props: out[p.name] = p
+            def mark(p):
+                p._tpkg = p2
+                for q in (p.subs or []): mark(q)
+            for p in st.props:
+                mark(p)
+                out[p.name] = p
         return out
 
     def struct_short_name(s, pkg, ref):
@@ -290,16 +424,41 @@ class Ctx:
         if prop is not None:
             idx = prop.enum if prop.type == 'EnumProperty' else prop.ref
             if idx:
-                path = pkg.path(idx)
+                path = tpkg(prop, pkg).path(idx)
                 a = s.m.asset_of_object(path)
                 if a is not None:
                     for (n, val), raw in zip(s.run.enum_entries(a), s.run.enum_raw(a)):
                         if raw == short: return '%s::%s' % (s.types.spell_mod(a, s.asset), n)
+                    if short == a.name + '_MAX':    # the sentinel past the last entry, which emit_enum declares
+                        return '%s::%s' % (s.types.spell_mod(a, s.asset), short)
                     return '/* bpdecomp: %s */ {}' % entry
                 top, _, name = path.partition('.')
                 cpp = s.api.enums.get((top, name), (name,))[0]
                 return '%s::%s' % (cpp, short)
+        # No property to type it (a member of a native class or of a component): the tag's own name says the enum -
+        # 'E::Entry' for an enum class, the bare entry for a namespaced one, which only one UeApi enum may hold.
+        if enum is not None:
+            a = next((x for x in s.m.assets.values() if x.kind == 'enum' and x.name == enum), None)
+            if a is not None:
+                for (n, val), raw in zip(s.run.enum_entries(a), s.run.enum_raw(a)):
+                    if raw == short: return '%s::%s' % (s.types.spell_mod(a, s.asset), n)
+            elif enum in s.run.api_enum_names and short in s.run.native_enum(enum):
+                return entry
+        else:
+            owners = s.run.enum_owners().get(short, [])
+            if len(owners) == 1: return '%s::%s' % (owners[0], short)
         return '/* bpdecomp: %s */ {}' % entry
+
+    def enum_of_tag(s, enum, entry):
+        """An enum tag's value by the enum name the tag carries, for a tag with no property at hand: a mod enum of that
+        name, else UeApi's."""
+        short = entry.split('::', 1)[-1]
+        for a in s.m.assets.values():
+            if a.kind == 'enum' and a.pkg.exports[a.export]['name'] == enum:
+                for (n, val), raw in zip(s.run.enum_entries(a), s.run.enum_raw(a)):
+                    if raw == short: return '%s::%s' % (s.types.spell_mod(a, s.asset), n)
+        cpp = next((v[0] for (top, name), v in s.api.enums.items() if name == enum), None)
+        return '%s::%s' % (cpp, short) if cpp else '/* bpdecomp: %s */ {}' % entry
 
     # objects
     def object_ref(s, body, idx):
@@ -309,7 +468,7 @@ class Ctx:
         o = pkg.obj(idx)
         cls = pkg.class_of(idx)
         name = o['name']
-        if cls in ('Class', 'BlueprintGeneratedClass', 'WidgetBlueprintGeneratedClass'):
+        if cls in ('Class', 'BlueprintGeneratedClass', 'WidgetBlueprintGeneratedClass', 'AnimBlueprintGeneratedClass'):
             return '%s::StaticClass()' % s.types.cls(pkg, idx, cur)
         path = pkg.path(idx)
         if name.startswith('Default__'):
@@ -354,9 +513,41 @@ class Ctx:
                 if cls is None and obj.op == 0x20:       # a by-name call on a library's default object
                     oi = next(v[1] for v in obj.ops if v[0] == 'obj')
                     if s.pkg.obj(oi)['name'].startswith('Default__'):
-                        cls = s.m.asset_of_object(s.pkg.path(oi).replace('.Default__', '.'))
+                        cpath = s.pkg.path(oi).replace('.Default__', '.')
+                        cls = s.m.asset_of_object(cpath)
                         if cls is not None: info.static, info.owner_cpp = True, s.types.spell_mod(cls, s.asset)
+                        elif s.api.classes.get(tuple(cpath.split('.', 1))):     # not the mod's: UeApi declares it
+                            info.static, info.owner_cpp = True, s.api.classes[tuple(cpath.split('.', 1))]
+                            nsig = s.run.native_sig(info.owner_cpp, fname, nargs)
+                            if nsig:
+                                ret, params, _st = nsig
+                                info.ret = re.sub(r'\b(UE_\w+|static|virtual|inline)\s+', '', ret)
+                                info.ptypes = [ty for ty, _ in params]
+                                for k, (ty, _n) in enumerate(params):
+                                    info.hints.append(body.hint_of_ctype(ty))
+                                    if '&' in ty and 'const' not in ty: info.out.add(k)
+                            return info
                 if cls is not None: sig = s.run.find_mod_function(cls, fname)
+                nsig = None
+                if cls is None and not info.static:
+                    t = body.type_of(obj)
+                    if t and t.endswith('*'):
+                        nsig = s.run.native_sig(t.replace('class ', '').rstrip('*').strip().split('::')[-1], fname, nargs)
+                        if nsig:
+                            ret, params, _st = nsig
+                            info.ret = re.sub(r'\b(UE_\w+|static|virtual|inline)\s+', '', ret)
+                            info.ptypes = [ty for ty, _ in params]
+                            for k, (ty, _n) in enumerate(params):
+                                info.hints.append(body.hint_of_ctype(ty))
+                                if '&' in ty and 'const' not in ty: info.out.add(k)
+                if not sig and not nsig and obj.op in B.VARS:    # an engine class's method (UWidget's SetVisibility): UeApi's types
+                    p, ppkg = body.prop_of_var(obj)
+                    native = s.types.cls(ppkg, p.ref, s.asset) if p is not None and p.type == 'ObjectProperty' else None
+                    nsig = next((r for c in (s.m.ancestors(native.split('::')[-1]) if native else [])
+                                 for r in [s.run.native_sig(c, fname, nargs)] if r), None)
+                    if nsig:
+                        info.hints = [body.hint_of_ctype(ty) for ty, _ in nsig[1]]
+                        info.out = {k for k, (ty, _) in enumerate(nsig[1]) if '&' in ty and 'const' not in ty}
             if sig: s.apply_mod_sig(body, info, *sig)
             return info
         fidx = next(o[1] for o in n.ops if o[0] == 'obj')
@@ -384,6 +575,7 @@ class Ctx:
         info.owner_cpp = s.api.classes.get((top, oname)) or ('U' + oname)
         native = top.startswith('/Script/')
         info.static = cdo or n.op == 0x68
+        if obj is None and not info.static and n.op in (0x1C, 0x46) and fname == body.method: info.super_call = True
         if native and info.static: info.lib = oname
         sig = s.run.native_sig(info.owner_cpp, fname, nargs)
         if sig:
@@ -399,8 +591,10 @@ class Ctx:
             if fname in ('Array_Get',): info.out.add(2)
             if fname in ('Map_Find',): info.out.add(2)
             if fname in ('Map_Keys', 'Map_Values', 'Set_ToArray'): info.out.add(1)
-        info.pure = info.lib in B.PURE_MATH or (info.container and fname.split('_', 1)[1] in
+        info.pure = info.lib in B.PURE_MATH or (info.container and '_' in fname and fname.split('_', 1)[1] in
                                                   ('Length', 'Get', 'Contains', 'Find', 'IsValidIndex', 'LastIndex'))
+        if obj is None and not info.static and fname == body.method:
+            info.super_call = True      # Parent: PreConstruct, an engine class's event; unqualified it would recurse
         return info
 
     def apply_mod_sig(s, body, info, fpkg, st):
@@ -536,6 +730,15 @@ class Run:
         s._entries[a.path] = out
         return out
 
+    def enum_owners(s):
+        """{enumerator: [UeApi enums declaring it]}."""
+        if not hasattr(s, '_owners'):
+            s._owners = defaultdict(list)
+            for text in s.api._text.values():
+                for cpp, body in re.findall(r'^enum\s+(?:class\s+)?(\w+)\s*(?::\s*\w+)?\s*\{([^}]*)\}', text, re.M):
+                    for nm in re.findall(r'^\s*(\w+)\s*=', body, re.M): s._owners[nm].append(cpp)
+        return s._owners
+
     def native_enum(s, cpp):
         if cpp in s._native_enum: return s._native_enum[cpp]
         out = {}
@@ -574,9 +777,9 @@ class Run:
             if cands:
                 exact = [c for c in cands if len(c[1]) == nargs]
                 res = exact[0] if exact else max(cands, key=lambda c: len(c[1]))
-        if res is None and cls.startswith('Game::') is False:
-            # a game class may declare it on a parent: try the parent named in the header
-            pass
+        base = s.api.bases.get(cls.split('::')[-1])
+        if res is None and base:            # declared on a parent: UBorder's SetVisibility is UWidget's
+            res = s.native_sig(base, fn, nargs)
         s._native_sig[key] = res
         return res
 
@@ -601,7 +804,7 @@ class Run:
         if idx < 0:
             o = pkg.obj(idx)
             a = s.model.asset_of_object(o['class_package'] + '.' + o['class_name'])   # the mod's own class first:
-            cls = '::' + s.types.spell_mod(a, None) if a else \
+            cls = s.types.spell_mod(a, None) if a else \
                 s.api.classes.get(('/Script/' + o['class_package'].split('/')[-1], o['class_name'])) or \
                 s.api.classes.get((o['class_package'], o['class_name'])) or 'UObject'   # the modded dump has it too
         ns = ['Assets'] + [ident(p) for p in package.split('/')[2:-1]]

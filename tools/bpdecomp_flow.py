@@ -68,7 +68,9 @@ class Graph:
                 nxt = (i + 1, stack)
                 if s.split and i in s.split:
                     kind, resume = s.split[i]
-                    s.nodes[k] = ('latent', n, (s._goto_free(nxt), s._goto_free((s.at[resume], ()))))
+                    # Linkage -1: nothing is wired after the latent node's output, so nothing resumes
+                    after = s._goto_free((s.at[resume], ())) if resume in s.at else RET
+                    s.nodes[k] = ('latent', n, (s._goto_free(nxt), after))
                 else:
                     s.nodes[k] = ('stmt', n, (s._goto_free(nxt),))
 
