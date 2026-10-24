@@ -814,7 +814,8 @@ def main():
         else:
             failed.append(name)
 
-    if not failed and not check_mod_imports(staged, set(p for _n, _c, p in staged)):
+    # Under --no-pak no mod's kept packages are placed, so every import of one would read as missing:
+    if not failed and not no_pak and not check_mod_imports(staged, set(p for _n, _c, p in staged)):
         failed.append("cross-mod imports")
 
     print("built %d, packed %d, up to date %d, failed %d"
