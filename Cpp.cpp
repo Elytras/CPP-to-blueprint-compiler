@@ -9107,22 +9107,26 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                      "name a void method without parameters, or pass a delegate"; return false; }
         }
     }
-    /* `A->GetComponentsByClass<T>()` (UeApi's AActor declares it, no UFunction) is the editor's Get Components by Class
-       node: `A->K2_GetComponentsByClass(T::StaticClass())`, the TArray<UActorComponent*> it returns taken as the
-       TArray<T*> the call is typed, which costs nothing, as every element is a T. */
-    if (MethodName == "GetComponentsByClass" && K == "CXXMemberCallExpr" && CallExprNode["inner"].size() == 1)
+    /* `A->GetComponentsByClass<T>()` and `A->GetComponentByClass<T>()` (UeApi's AActor declares both, no UFunction) are
+       the editor's Get Component(s) by Class nodes: `A->K2_GetComponentsByClass(T::StaticClass())` and
+       `A->GetComponentByClass(T::StaticClass())`, the UActorComponent* result taken as the T* (or TArray<T*>) the call is
+       typed, which costs nothing, as every component it returns is a T. Both UFunctions are DeterminesOutputType. */
+    if ((MethodName == "GetComponentsByClass" || MethodName == "GetComponentByClass") && K == "CXXMemberCallExpr"
+        && CallExprNode["inner"].size() == 1)
     {
-        std::string Elem;
-        TemplateArg(StripTypeKeywords(TypeOf(CallExprNode)), "TArray", &Elem);
+        const bool bAll = MethodName == "GetComponentsByClass";
+        const std::string Real = bAll ? "K2_GetComponentsByClass" : "GetComponentByClass";
+        std::string Elem = StripTypeKeywords(TypeOf(CallExprNode));
+        if (bAll) { const std::string Arr = Elem; Elem.clear(); TemplateArg(Arr, "TArray", &Elem); }
         while (!Elem.empty() && (Elem.back() == '*' || Elem.back() == ' ')) Elem.pop_back();
         const FRecord* Actor = Find("AActor");
         const Json* K2 = nullptr;
         if (Actor)
-            if (const auto It = Actor->Methods.find("K2_GetComponentsByClass"); It != Actor->Methods.end()) K2 = It->second;
+            if (const auto It = Actor->Methods.find(Real); It != Actor->Methods.end()) K2 = It->second;
         if (!K2 || !Find(StripTypeKeywords(Elem)))
-        { *Err = "GetComponentsByClass<" + Elem + ">: no AActor::K2_GetComponentsByClass, or an unknown class"; return false; }
+        { *Err = MethodName + "<" + Elem + ">: no AActor::" + Real + ", or an unknown class"; return false; }
         Json Member = *Callee;
-        Member["name"] = "K2_GetComponentsByClass";
+        Member["name"] = Real;
         Member["referencedMemberDecl"] = K2->value("id", std::string());
         const Json Of = { {"kind", "DeclRefExpr"}, {"type", {{"qualType", "UClass *(" + Elem + " *)"}}},
                           {"referencedDecl", {{"kind", "FunctionDecl"}, {"name", "StaticClassOf"}}} };

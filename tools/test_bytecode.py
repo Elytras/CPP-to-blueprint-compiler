@@ -2136,6 +2136,16 @@ for own, other in ((0, 0), (2, 3), (1, 0)):
     assert vm.call('CountMeshes', Other=them) == own * 100 + other, (own, other)
 print('ok  SugarForms.CountMeshes: GetComponentsByClass<T>() is K2_GetComponentsByClass(T::StaticClass()), on self and '
       'on another actor  (3 cases)')
+proves('finding-actors-and.a-getcomponentbyclass')
+for own, other in ((False, False), (True, False), (False, True), (True, True)):
+    them = Obj('Actor')
+    def get_one(vm, ctx, cls):
+        assert cls == 'StaticMeshComponent', cls
+        return Obj('StaticMeshComponent') if (own if ctx is vm.self else other) else None
+    vm = VM(asset('SugarForms'), natives=dict(SUGAR, GetComponentByClass=get_one))
+    assert vm.call('FindMesh', Other=them) == own * 100 + other, (own, other)
+print('ok  SugarForms.FindMesh: GetComponentByClass<T>() is GetComponentByClass(T::StaticClass()), on self and on '
+      'another actor  (4 cases)')
 proves('validity-and-comparison.if-cls')
 for cls, want in ((None, 210), ('Actor', 101)):
     assert VM(asset('SugarForms'), natives=SUGAR, Cls=cls).call('ClassSet') == want, cls

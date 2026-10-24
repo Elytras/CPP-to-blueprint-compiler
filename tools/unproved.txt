@@ -233,7 +233,6 @@ the-player-and.for-aplayercharacter-p-gs
 finding-actors-and.getallactorsofclasswithtag
 finding-actors-and.getallactorswithinterface
 finding-actors-and.ugameplaystatics-getactorofclass
-finding-actors-and.a-getcomponentbyclass
 finding-actors-and.uactorfunctionlibrary
 subsystems.utracermanager
 declaring-data-assets.namespace-moods-umooddef-angry

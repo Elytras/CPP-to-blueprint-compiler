@@ -3752,7 +3752,7 @@ Notes:
 | <a id="finding-actors-and.getallactorsofclasswithtag"></a>`GetAllActorsOfClassWithTag(AActor::StaticClass(), FName("Loot"), Loot)`, `GetAllActorsWithTag(FName("Loot"), Loot)` | The With Tag nodes. They match an actor's `Tags` array. | Yes |
 | <a id="finding-actors-and.getallactorswithinterface"></a>`GetAllActorsWithInterface(ITargetable::StaticClass(), Found)` | Get All Actors With Interface: every actor that implements the interface. | Yes |
 | <a id="finding-actors-and.ugameplaystatics-getactorofclass"></a>`UGameplayStatics::GetActorOfClass(AMyManager::StaticClass())` | Get Actor Of Class: the first actor of the class (subclasses included) that the world's actor iterator reaches, or null. With several actors of the class, which one comes back depends on that order, so use it for a class the world holds one of. | Yes |
-| <a id="finding-actors-and.a-getcomponentbyclass"></a>`A->GetComponentByClass(UHealthComponentBase::StaticClass())` | Get Component by Class: the actor's first component of that class, or null. It is typed `UActorComponent*`, so Cast it. `K2_GetComponentsByClass(Class)` returns all of them, and `GetComponentsByTag(Class, Tag)` also filters by component tag. | Yes |
+| <a id="finding-actors-and.a-getcomponentbyclass"></a>`A->GetComponentByClass<UHealthComponentBase>()`, `A->GetComponentByClass(UHealthComponentBase::StaticClass())` | Get Component by Class: the actor's first component of that class, or null. The template form is typed `UHealthComponentBase *` and needs no cast: it is the class form, whose `UActorComponent *` can only hold that class. The class form, for a class known only at run time, is typed `UActorComponent *`, so Cast it. `K2_GetComponentsByClass(Class)` returns all of them, and `GetComponentsByTag(Class, Tag)` also filters by component tag. | Yes |
 | <a id="finding-actors-and.a-getcomponentsbyclass"></a>`A->GetComponentsByClass<UStaticMeshComponent>()`, `GetComponentsByClass<UMyPart>()` | Get Components by Class: every component of that class, as a `TArray<UStaticMeshComponent *>` that needs no cast. It is `K2_GetComponentsByClass(UStaticMeshComponent::StaticClass())`, whose array of `UActorComponent *` holds only that class. | Yes |
 | <a id="finding-actors-and.uactorfunctionlibrary"></a>`UActorFunctionLibrary::GetPlayersInRange(K2_GetActorLocation(), 1000.0f, true)` | DRG's getter for the player characters within a radius, as a `TArray<APlayerCharacter *>` that needs no cast. The last argument is MustBeAlive. DRG marks it authority-only: on a client the call is skipped and returns an empty array. | Yes |
 | <a id="finding-actors-and.ue-authority-only"></a>an engine or game static marked `UE_AUTHORITY_ONLY` or `UE_COSMETIC` | Called on its class's default object, as the editor's node calls it, so the engine decides where it runs. For a static of a function library, an actor or a component class, which is nearly all of them, an authority-only one is skipped on a client and a cosmetic one on a dedicated server. A skipped call returns zero or None and leaves its output parameters as they were. | Yes |
@@ -3786,7 +3786,7 @@ public:
   }
 
   float HealthOf(AActor *A) {
-    UHealthComponentBase *H = Cast<UHealthComponentBase>(A->GetComponentByClass(UHealthComponentBase::StaticClass()));
+    UHealthComponentBase *H = A->GetComponentByClass<UHealthComponentBase>();
     return H ? H->GetHealth() : 0.0f;
   }
 

@@ -410,7 +410,8 @@ Reading another object's property is the Get node with a Target: `Me->HealthComp
 read or a call through a null object does not crash: the game logs `Accessed None`, and a value reads as zero.
 `if (Obj)` is the IsValid node, which is also false for an object that is being destroyed; `if (Cls)` on a
 `TSubclassOf` is Is Valid Class. `A->GetComponentsByClass<UStaticMeshComponent>()` is the Get Components by Class node,
-typed `TArray<UStaticMeshComponent *>`, so its elements need no cast. A subsystem is its class's
+typed `TArray<UStaticMeshComponent *>`, so its elements need no cast; `A->GetComponentByClass<UStaticMeshComponent>()`
+is Get Component by Class, typed `UStaticMeshComponent *`. A subsystem is its class's
 static `Get()`, the editor's Get node for it: `UTracerManager::Get()`, or `GetSubsystem<UTracerManager>()`. Left out,
 the world context is `this`. See [Working with other objects](REFERENCE.md#working-with-other-objects) for the kinds
 and for spelling the getter by hand.
