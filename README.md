@@ -16,14 +16,14 @@ prints. [examples/](examples/) holds complete mods that build as they are.
 AssetGen builds and runs on Windows and on Linux, and is meant to write the same bytes on both
 ([Reproducible output](GUIDE.md#reproducible-output) says what has been compared).
 
-| What | Windows | Linux |
-| --- | --- | --- |
-| C++17 compiler | Visual Studio 2022 (v143, x64) | GCC or clang (tested with GCC 13), CMake 3.16+ |
-| `nlohmann-json` | [vcpkg](https://github.com/microsoft/vcpkg) with `vcpkg integrate install`, restored from `vcpkg.json` on first build | the distro package (`nlohmann-json3-dev`, `nlohmann-json`), else CMake downloads it |
-| LLVM `clang++` on `PATH` | yes (LLVM 20) | yes, clang 20 (see [Build](#build)). AssetGen parses your source with clang's JSON AST dump |
-| Python 3 + `pyyaml` | yes | yes. For `tools/bpbuild.py`, the multi-mod build driver |
-| UE 4.27 `UnrealPak` (optional) | `UnrealPak.exe`, found at the default Epic install path or `UNREALPAK=<path>` | `UnrealPak` on `PATH`, `UNREALPAK=<path>`, or [repak](https://github.com/trumank/repak) on `PATH` (see [Packing on Linux](#packing-on-linux)) |
-| The game SDK headers (`UeApi/`) | yes | yes. What your mod `#include`s. Get them from [DRG-Blueprint-Cpp-SDK](https://github.com/Elytras/DRG-Blueprint-Cpp-SDK), or generate your own with `tools/genueapi.py` |
+| What                            | Windows                                                                                                               | Linux                                                                                                                                                                  |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C++17 compiler                  | Visual Studio 2022 (v143, x64)                                                                                        | GCC or clang (tested with GCC 13), CMake 3.16+                                                                                                                         |
+| `nlohmann-json`                 | [vcpkg](https://github.com/microsoft/vcpkg) with `vcpkg integrate install`, restored from `vcpkg.json` on first build | the distro package (`nlohmann-json3-dev`, `nlohmann-json`), else CMake downloads it                                                                                    |
+| LLVM `clang++` on `PATH`        | yes (LLVM 20)                                                                                                         | yes, clang 20 (see [Build](#build)). AssetGen parses your source with clang's JSON AST dump                                                                            |
+| Python 3 + `pyyaml`             | yes                                                                                                                   | yes. For `tools/bpbuild.py`, the multi-mod build driver                                                                                                                |
+| UE 4.27 `UnrealPak` (optional)  | `UnrealPak.exe`, found at the default Epic install path or `UNREALPAK=<path>`                                         | `UnrealPak` on `PATH`, `UNREALPAK=<path>`, or [repak](https://github.com/trumank/repak) on `PATH` (see [Packing on Linux](#packing-on-linux))                          |
+| The game SDK headers (`UeApi/`) | yes                                                                                                                   | yes. What your mod `#include`s. Get them from [DRG-Blueprint-Cpp-SDK](https://github.com/Elytras/DRG-Blueprint-Cpp-SDK), or generate your own with `tools/genueapi.py` |
 
 ## Build
 
