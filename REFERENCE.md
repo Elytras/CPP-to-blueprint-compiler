@@ -2605,8 +2605,9 @@ Notes:
 - Other libraries sit beside it: `UKismetStringLibrary`, `UKismetTextLibrary`, `UKismetArrayLibrary`,
   `UKismetSystemLibrary` and `UGameplayStatics`. The game adds its own in `UeApi/FSD.h`, for example
   `UGameFunctionLibrary`.
-- On Windows clang finds the MSVC headers, so `#include <cmath>` parses and only the call is refused. On Linux the only
-  standard header a mod can include is `<initializer_list>`.
+- On Windows clang finds the MSVC headers, so `#include <cmath>` parses and only the call is refused. On Linux a mod can
+  include only `<initializer_list>`, `<type_traits>` and `<cstddef>`, AssetGen's stand-ins for what MSVC's
+  `<initializer_list>` declares (the basic traits such as `std::is_same_v`, and `std::size_t`).
 - For math on constants, a `consteval` function runs at build time and only its answer reaches the Blueprint; see
   [Constants](#constants).
 
@@ -7592,9 +7593,12 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   in `UE_CLASS("/Game/_MyMods/MathLib/MathLib", "MathLib_C");`, and list the mod that cooks it. See
   [Mod sources and packages](#mod-sources-and-packages).
 - `UnrealPak not found at <Path> - skipping the pak.`: no UnrealPak at `UNREALPAK`, at the default UE 4.27 path on
-  Windows, or on `PATH` elsewhere. Every mod is still compiled and staged under `build/<mod>/FSD`, but each mod that
+  Windows, or elsewhere on `PATH` or at that default path on the mounted Windows drive. Every mod is still compiled and staged under `build/<mod>/FSD`, but each mod that
   needed a pak counts as failed and the exit code is 1. Fix: install UE 4.27, set `UNREALPAK=<path>`, or pass
   `--no-pak` and pack the staged files yourself. See [Building mods](GUIDE.md#building-mods).
+- ``mods.yaml: <Path> is on drive <X>:, which is not mounted here (set BPBUILD_DRIVES="<X>=<its mount>")``: off
+  Windows, a Windows drive path in `mods.yaml` whose drive is neither in `BPBUILD_DRIVES` nor at `/mnt/<x>` or
+  `/mnt/win<x>`. Fix: mount the drive and name its mount in `BPBUILD_DRIVES`. See [Building mods](GUIDE.md#packing).
 - `UnrealPak failed (<Code>):`: UnrealPak exited with an error; the last six lines of its output follow. Fix: read
   those lines. See [Building mods](GUIDE.md#building-mods).
 - ``mods.yaml: an `api_dir` entry has no `path` ``: an `api_dir` entry written as a mapping without `path:`, as in

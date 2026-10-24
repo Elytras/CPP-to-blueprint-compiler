@@ -1,8 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(AssetGen LANGUAGES CXX)
 
-# The Linux build; Windows builds AssetGen.sln. Kept out of the sources so they stay a byte-identical mirror of
-# ue-mods/AssetGen.
+# The Linux build (`cmake -B build && cmake --build build -j` -> build/assetgen); Windows builds AssetGen.vcxproj.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -23,10 +22,12 @@ if(NOT nlohmann_json_FOUND)
   FetchContent_MakeAvailable(nlohmann_json)
 endif()
 
-# Cpp.cpp reads clang's AST dump on a second thread; glibc before 2.34 needs libpthread linked for std::thread.
 find_package(Threads REQUIRED)
 
-add_executable(assetgen
-  Blueprint.cpp Command.cpp Cooked.cpp Cpp.cpp Main.cpp Package.cpp Registry.cpp Script.cpp Uncooked.cpp Verify.cpp)
-target_include_directories(assetgen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# Every .cpp beside this file, as AssetGen.vcxproj lists them: one added on Windows needs no edit here.
+file(GLOB ASSETGEN_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
+add_executable(assetgen ${ASSETGEN_SOURCES})
+# The parent too, as the vcxproj's $(SolutionDir): "SharedLib/core/Types.h" is ue-mods' SharedLib, or the public
+# mirror's own copy beside the sources.
+target_include_directories(assetgen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_link_libraries(assetgen PRIVATE nlohmann_json::nlohmann_json Threads::Threads)
