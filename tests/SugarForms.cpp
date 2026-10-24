@@ -5,7 +5,7 @@
 
 UE_MOD_PACKAGE("/Game/_ElytrasMods/SugarForms");
 
-/* Spellings a hand-written mod reaches for: GetComponentsByClass<T>(), a class tested as a bool, `==` on vectors and
+/* Spellings a hand-written mod reaches for: GetComponent(s)ByClass<T>(), a class tested as a bool, `==` on vectors and
    rotators, a range over a computed value, `?:` over two chars or two string literals of one length, and FTransform's
    rotator constructors. */
 class SugarForms : public AActor {
@@ -22,6 +22,12 @@ public:
     for (UStaticMeshComponent *C : Other->GetComponentsByClass<UStaticMeshComponent>())
       if (C) N += 1;
     return N;
+  }
+
+  /* Get Component by Class, typed T*: its own and another actor's. */
+  int32 FindMesh(AActor *Other) {
+    UStaticMeshComponent *Own = GetComponentByClass<UStaticMeshComponent>();
+    return (Own ? 100 : 0) + (Other->GetComponentByClass<UStaticMeshComponent>() ? 1 : 0);
   }
 
   /* `if (Cls)` is Is Valid Class. */

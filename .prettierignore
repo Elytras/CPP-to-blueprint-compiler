@@ -1,0 +1,3 @@
+# REFERENCE.md is ~1,300 table rows: Prettier pads every column to its widest cell, which nearly doubles the file
+# and turns a one-cell edit into a whole-table diff.
+REFERENCE.md

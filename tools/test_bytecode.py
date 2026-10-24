@@ -2136,6 +2136,16 @@ for own, other in ((0, 0), (2, 3), (1, 0)):
     assert vm.call('CountMeshes', Other=them) == own * 100 + other, (own, other)
 print('ok  SugarForms.CountMeshes: GetComponentsByClass<T>() is K2_GetComponentsByClass(T::StaticClass()), on self and '
       'on another actor  (3 cases)')
+proves('finding-actors-and.a-getcomponentbyclass')
+for own, other in ((False, False), (True, False), (False, True), (True, True)):
+    them = Obj('Actor')
+    def get_one(vm, ctx, cls):
+        assert cls == 'StaticMeshComponent', cls
+        return Obj('StaticMeshComponent') if (own if ctx is vm.self else other) else None
+    vm = VM(asset('SugarForms'), natives=dict(SUGAR, GetComponentByClass=get_one))
+    assert vm.call('FindMesh', Other=them) == own * 100 + other, (own, other)
+print('ok  SugarForms.FindMesh: GetComponentByClass<T>() is GetComponentByClass(T::StaticClass()), on self and on '
+      'another actor  (4 cases)')
 proves('validity-and-comparison.if-cls')
 for cls, want in ((None, 210), ('Actor', 101)):
     assert VM(asset('SugarForms'), natives=SUGAR, Cls=cls).call('ClassSet') == want, cls
@@ -8982,9 +8992,9 @@ print('ok  IfaceStaticClass: IIscMark::StaticClass() on a mod interface names II
 
 
 def weak_field_read():
-    """WeakFieldRead: a native struct's TWeakObjectPtr member is EX_StructMemberContext of it, read like an object: the
-    object of a call, the value an object variable is set to, IsValid's argument. Assigning one, and a weak variable of
-    the mod's own, are refused."""
+    """WeakFieldRead: a native struct's TWeakObjectPtr member is EX_StructMemberContext of it, a class's is
+    EX_InstanceVariable in a Context, each read like an object: the object of a call, the value an object variable is
+    set to, IsValid's argument. Assigning either, and a weak variable of the mod's own, are refused."""
     base = asset('WeakFieldRead')
     keeps_invariants(base)
     text = dump('walkscript.py', base, export_index(base, 'Take'))
@@ -8994,7 +9004,15 @@ def weak_field_read():
     assert re.search(r"LetObj\s*\n.*Causer@.*\n.*" + member % ('DamageCauser', 'DamageData'), text), text
     proves('conditions.if-target')
     assert re.search(r"Function'IsValid'\s*\n.*" + member % ('Component', 'DamageDataBase'), text), text
+    # A class's weak member: EX_InstanceVariable in a Context, read as any object member is.
+    owned = dump('walkscript.py', base, export_index(base, 'Owned'))
+    inst = r"Context\s+skip \d+ %s@imp\[\d+\]:Class'%s'"
+    assert re.search(inst % ('ParentComponent', 'Actor') + r"(.*\n)*.*FinalFunction\s+imp\[\d+\]:Function'GetOwner'", owned), owned
+    assert re.search(r"LetObj\s*\n.*Parent@.*\n.*" + inst % ('ParentComponent', 'Actor'), owned), owned
+    assert re.search(r"Function'IsValid'\s*\n.*" + inst % ('PhysicsVolume', 'SceneComponent'), owned), owned
     proves('object-and-class.data-instigator-k2-getpawn')
+    refused('WeakMemberWrite', '  void Set(AActor *Other) { Other->ParentComponent = Other->ParentComponent; }\n',
+            'an assignment to a TWeakObjectPtr member')
     refused('WeakFieldWrite', '  void Take(FDamageData Data) { Data.Instigator = Data.Instigator; }\n',
             'an assignment to a TWeakObjectPtr member')
     proves('object-and-class.tweakobjectptr-aactor-last')
@@ -9002,7 +9020,7 @@ def weak_field_read():
 
 
 weak_field_read()
-print('ok  WeakFieldRead: FDamageData\'s weak members read as objects (StructMemberContext); writing one is refused')
+print('ok  WeakFieldRead: FDamageData\'s and AActor\'s weak members read as objects; writing one is refused')
 
 
 def game_enum_static_arg():
