@@ -1431,6 +1431,9 @@ bpbuild finds UnrealPak in this order:
 3. on other systems, `UnrealPak` on `PATH`, else the Windows default path above on the mounted Windows drive (below).
 
 An `UNREALPAK` or found path ending in `.exe` runs under Wine off Windows; a native Linux UnrealPak runs as it is.
+With no UnrealPak at all, off Windows, [repak](https://github.com/trumank/repak) on `PATH` (the packer MINT uses; its
+release has a Linux build) packs and extracts instead, writing what UnrealPak would: UE 4.27's pak version, zlib, and
+the tree under `../../../FSD/`. `UNREALPAK=<path to repak>` picks it over an UnrealPak.
 
 Off Windows, a Windows drive path in `mods.yaml` (`game_content`, `api_dir`, a `kept` `from`, as in `D:/DRGExtract/...`)
 is read from that drive's mount, so a dual boot builds the Windows checkout's `mods.yaml` as it is. The mount is
@@ -2126,7 +2129,7 @@ write once and the method to paste.
   [Calling engine and game functions](REFERENCE.md#calling-engine-and-game-functions).
 - **Packing on Linux.** bpbuild needs UE 4.27's UnrealPak: a native Linux build on `PATH`, or the Windows
   `UnrealPak.exe` under Wine, found at the default install path on the mounted Windows drive or named by the
-  `UNREALPAK` variable. Windows drive paths in `mods.yaml` are read from the drive's mount (`BPBUILD_DRIVES`). See
+  `UNREALPAK` variable, or else repak. Windows drive paths in `mods.yaml` are read from the drive's mount (`BPBUILD_DRIVES`). See
   [Packing](#packing).
 - **The game under Proton.** It reads paks from the same folders as on Windows, under
   `steamapps/common/Deep Rock Galactic/FSD/`.
