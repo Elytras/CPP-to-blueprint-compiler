@@ -1,0 +1,14 @@
+// markdownlint rules for this repo's docs: VS Code's markdownlint extension and tools/mdfmt.py both read this file.
+{
+	"default": true,
+	// Prose is wrapped at 120; tables and code blocks run as long as they need.
+	"MD013": { "line_length": 120, "tables": false, "code_blocks": false },
+	"MD024": false, // the same heading under different sections
+	"MD026": false, // trailing punctuation in headings
+	"MD029": false, // ordered list numbering
+	"MD033": false, // inline HTML (REFERENCE.md's <a id> anchors)
+	"MD036": false, // emphasis used as a heading
+	"MD038": false, // spaces inside code: message prefixes like `<Class>::<Function>: ` keep their trailing space
+	"MD040": false, // fenced code without a language
+	"MD060": false // table pipe spacing: Prettier aligns tables, and REFERENCE.md's stay compact on purpose
+}
