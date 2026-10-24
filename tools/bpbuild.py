@@ -448,6 +448,23 @@ VS_FILTERS = (("Mods", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b01"), ("Tests", "5b1f0
               ("Helpers", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b03"), ("UeApi", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b04"))
 
 
+def vs_namespace_filter(path, folder_name):
+    """The sub-filter a mod's source goes under in Visual Studio: its first namespace, which is its package folder
+    in game (Manager::Core::Services::Logger gives Manager\\Core\\Services\\Logger), so a mod of hundreds of files in
+    one folder (EMM, EEE) shows as its package tree rather than one alphabetical list. A leading Game:: (a child of a
+    game Blueprint) is dropped. None for a file with no namespace and for the mod's own umbrella files, named after
+    its folder (ElytrasModManager.h / .cpp), which stay at the top."""
+    if os.path.splitext(os.path.basename(path))[0].lower() == folder_name.lower():
+        return None
+    m = re.search(r"^namespace ([\w:]+) \{", io.open(path, encoding="utf-8-sig", errors="replace").read(), re.M)
+    if not m:
+        return None
+    name = m.group(1)
+    if name.startswith("Game::"):
+        name = name[len("Game::"):]
+    return name.replace("::", "\\")
+
+
 def write_vs_filters(bp):
     """The project's file list and its folders (Mods / Tests / Helpers / UeApi), written from what is on disk, on
     every build and only when it changed - a rewrite makes Visual Studio reload the project. Wildcards would need no
@@ -474,8 +491,15 @@ def write_vs_filters(bp):
     # instead. Generated headers and build output are skipped at any depth (a game's own `RC/UeApi` is thousands of
     # files). A filter's GUID is derived from its name, so a rewrite does not churn it.
     filters = list(VS_FILTERS)
+    known = {f for f, _ in filters}
     def add_filter(folder):
-        filters.append((folder, str(uuid.uuid5(uuid.NAMESPACE_URL, "bpmods:" + folder.lower()))))
+        # Each level of a nested filter is declared, the outer first, once.
+        parts = folder.split("\\")
+        for i in range(1, len(parts) + 1):
+            level = "\\".join(parts[:i])
+            if level not in known:
+                known.add(level)
+                filters.append((level, str(uuid.uuid5(uuid.NAMESPACE_URL, "bpmods:" + level.lower()))))
     for root, dirs, files in os.walk(bp):
         dirs[:] = sorted((d for d in dirs if d not in ("build", "out", "__pycache__") + GENERATED), key=str.lower)
         if root != bp:
@@ -487,7 +511,12 @@ def write_vs_filters(bp):
             for f in sorted(files, key=str.lower):
                 if f.endswith((".cpp", ".h")) or (test and f.endswith(".py")):
                     kind = "ClCompile" if f.endswith(".cpp") else "ClInclude" if f.endswith(".h") else "None"
-                    rows.append((kind, os.path.relpath(os.path.join(root, f), bp), folder))
+                    where = folder
+                    sub = None if test else vs_namespace_filter(os.path.join(root, f), os.path.basename(root))
+                    if sub:
+                        where = folder + "\\" + sub
+                        add_filter(where)
+                    rows.append((kind, os.path.relpath(os.path.join(root, f), bp), where))
     # The compiler's own test mods (their headers and tests/ast too, not the test run's build/) and the headers any mod
     # may include live beside it, in AssetGen.
     add_filter("Tests\\AssetGen")
