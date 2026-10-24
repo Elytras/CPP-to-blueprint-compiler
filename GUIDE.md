@@ -1651,7 +1651,10 @@ A class stub holds:
 - one function graph per function a Blueprint can call, with an entry node for the inputs and a result node for the
   outputs. A `UE_PURE` function has no exec pins. The graphs are empty; the editor recompiles them when it loads the
   asset. Static functions have no world-context parameter, because the editor adds its own hidden one;
-- each function's access, static, const and net flags, its `UE_CATEGORY`, and its `UE_TOOLTIP` and `UE_KEYWORDS`;
+- each function's access, static, const and net flags, its `UE_CATEGORY`, and its `UE_TOOLTIP` and `UE_KEYWORDS`.
+  A function with no `UE_TOOLTIP` takes the comment written right above it as its tooltip, and the class's own comment
+  is the Blueprint's description, the class's tooltip
+  ([REFERENCE.md](REFERENCE.md#access-read-only.doc-comment-tooltip));
 - the class's variables that are not private, with their flags, replication, RepNotify, category and literal defaults;
 - an empty generated class and default object, which the editor fills in on load, and registry tags, so that the
   Content Browser lists the asset.

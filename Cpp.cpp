@@ -1116,6 +1116,7 @@ struct FRecord
     std::string TimelineMisplaced;                  // the first of them no method follows, as written
     std::map<std::string, std::pair<std::string, std::string>> Docs;   // UE_TOOLTIP / UE_KEYWORDS: method -> (tooltip, keywords)
     std::string DocMisplaced;                       // the first of them no method follows, as written
+    std::string Doc;                                // the comment right above the class: its description in the API stub
     const Json* Defaults = nullptr;               // UE_DEFAULTS: the static-init block, never lowered
     bool bFinal = false;        // `class X final`: X has no subclass
     bool bFinalAsLeaf = false;  // UE_FINAL_AS's leaf: its base's one subclass
@@ -2536,6 +2537,8 @@ private:
     /* `Other->Base::Method()`: the qualifier a call on another object is written with, else empty. */
     std::string QualifiedOnOther(const Json& Callee, const Json& Obj, const FRecord& R, const std::string& Method) const;
     const std::vector<std::string>& ModSources() const;
+    /* The comment written right above Decl in a mod source, as tooltip text; empty when none. */
+    std::string DocAbove(const Json& Decl) const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
     /* The nearest declaration of some method along R's chain is `= 0`: the class Generate cooks CLASS_Abstract. */
     bool IsAbstract(const FRecord& R) const;
@@ -3484,6 +3487,7 @@ bool FCompiler::Collect(std::string* Err)
 
         FRecord R;
         R.CppName = Ns + Name(N);
+        R.Doc = DocAbove(N);
         if (auto SI = Structs.find(Name(N)); Ns.empty() && SI != Structs.end())
         {
             R.UePackage = SI->second.Package;
@@ -3545,6 +3549,10 @@ bool FCompiler::Collect(std::string* Err)
                     else if (R.DocMisplaced.empty()) R.DocMisplaced = std::string(bToolTip ? "UE_TOOLTIP" : "UE_KEYWORDS") + "(\"" + Text + "\")";
                 PendingDocs.clear();
             }
+            /* No UE_TOOLTIP: the comment written right above the method is its tooltip. */
+            if (Kind(C) == "CXXMethodDecl" && C.contains("name") && !C.value("isImplicit", false))
+                if (auto D = R.Docs.find(Name(C)); D == R.Docs.end() || D->second.first.empty())
+                    if (std::string Doc = DocAbove(C); !Doc.empty()) R.Docs[Name(C)].first = Doc;
             if ((!PendingInput.empty() || !PendingTimeline.empty()) && !C.value("isImplicit", false))
             {
                 const bool bMethod = Kind(C) == "CXXMethodDecl" && C.contains("name") && Name(C) != "UeDefaults__";
@@ -8047,6 +8055,81 @@ const std::vector<std::string>& FCompiler::ModSources() const
         for (const auto& File : Files) SourceTexts.push_back(ReadText(File.second.string()));
     }
     return SourceTexts;
+}
+
+/* The comment on the lines right above the line At is on, written as a doc comment is: one `/* ... *\/` block that begins
+   its line, or a run of `//` lines. Its lines are joined with spaces and a blank one is kept as a paragraph break; the
+   `/**`, `///` and ` * ` decorations are dropped. Empty when the line above is code, a marker, an access specifier or
+   blank, so a comment trailing the previous member (`int32 A; // ...`) describes nothing below it. */
+static std::string CommentAbove(const std::string& T, size_t At)
+{
+    auto Trim = [](const std::string& S) {
+        const size_t B = S.find_first_not_of(" \t\r"), E = S.find_last_not_of(" \t\r");
+        return B == std::string::npos ? std::string() : S.substr(B, E - B + 1);
+    };
+    size_t Start = At;
+    while (Start > 0 && T[Start - 1] != '\n') --Start;
+    /* The line ending right before Start, trimmed; Start moves to its beginning. */
+    auto LineAbove = [&](std::string* Out) {
+        if (Start == 0) return false;
+        size_t B = Start - 1;
+        while (B > 0 && T[B - 1] != '\n') --B;
+        *Out = Trim(T.substr(B, Start - 1 - B));
+        Start = B;
+        return true;
+    };
+    std::vector<std::string> Lines;     // bottom up
+    std::string L;
+    if (!LineAbove(&L)) return std::string();
+    if (L.compare(0, 2, "//") == 0)
+        do Lines.push_back(Trim(L.substr(std::min(L.find_first_not_of("/!"), L.size()))));
+        while (LineAbove(&L) && L.compare(0, 2, "//") == 0);
+    else if (L.size() >= 2 && L.compare(L.size() - 2, 2, "*/") == 0)
+    {
+        L.erase(L.size() - 2);
+        for (;;)
+        {
+            const size_t Open = L.find("/*");
+            if (Open != std::string::npos && Open != 0) return std::string();   // code before it: not a doc comment
+            if (Open == 0) L.erase(0, std::min(L.find_first_not_of("/*!"), L.size()));
+            else if (!L.empty() && L[0] == '*' && (L.size() == 1 || L[1] == ' ')) L.erase(0, 1);   // a ` * ` margin
+            while (!L.empty() && L.back() == '*') L.pop_back();
+            Lines.push_back(Trim(L));
+            if (Open == 0) break;
+            if (!LineAbove(&L)) return std::string();
+        }
+    }
+    std::string Out;
+    bool bBreak = false;
+    for (auto Line = Lines.rbegin(); Line != Lines.rend(); ++Line)
+    {
+        if (Line->empty()) { bBreak = !Out.empty(); continue; }
+        if (!Out.empty()) Out += bBreak ? "\n\n" : " ";
+        Out += *Line;
+        bBreak = false;
+    }
+    return Out;
+}
+
+/* The dump names no file for a declaration in the one before it, so Decl's text is the mod source where its range
+   begins, a token long, and where its head (up to the first `{` or `;`) has its name as a word. A declaration that
+   begins in a macro, or outside the mod's sources (UeApi), has none. */
+std::string FCompiler::DocAbove(const Json& Decl) const
+{
+    const Json Begin = Decl.value("range", Json::object()).value("begin", Json::object());
+    const std::string Name = Decl.value("name", std::string());
+    if (Name.empty() || Begin.contains("spellingLoc") || !Begin.contains("offset") || !Begin.contains("tokLen")) return std::string();
+    const size_t From = Begin["offset"].get<size_t>();
+    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+    for (const std::string& T : ModSources())
+    {
+        if (From >= T.size()) continue;
+        const size_t HeadEnd = T.find_first_of("{;", From);
+        if (HeadEnd == std::string::npos) continue;
+        for (size_t At = T.find(Name, From); At != std::string::npos && At < HeadEnd; At = T.find(Name, At + 1))
+            if ((At == 0 || !Ident(T[At - 1])) && !Ident(T[At + Name.size()])) return CommentAbove(T, From);
+    }
+    return std::string();
 }
 
 /* The path a source's UE_MOD_PACKAGE("...") names, or empty. Its text, comments and all: a caller that must not read
@@ -18149,6 +18232,7 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     /* The editor's side, so a Blueprint made there can implement it: a Blueprint Interface asset with a function graph
        per function, as the editor saves one. Its variables, AssetGen's own idea, are not there: the editor's interfaces
        hold none. */
+    BP.ApiDescription = R.Doc;
     if (ApiDir && !BP.WriteApi(*ApiDir, Err))
     {
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
@@ -22475,6 +22559,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     BP.Finish();
     if (R.bIsPatch) return TransplantFunctions(R, *B, P, BP.ClassIndex(), Err);
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
+    BP.ApiDescription = R.Doc;
     if (ApiDir && !BP.WriteApi(*ApiDir, Err))
     {
         /* A class with nothing callable is not a build failure; the mod simply has no API surface. */
@@ -22630,7 +22715,7 @@ private:
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
    DeclRefExpr's or LambdaExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier and
    CaptureNames, a MemberExpr's whole range, see MemberQualifier and WrittenQualifier, and a braced value's, see
-   IsUnsetInit), mangled names, a record's definitionData and a few flags are most of the dump, and building them was
+   IsUnsetInit), and a method's or record's range begin, see DocAbove, mangled names, a record's definitionData and a few flags are most of the dump, and building them was
    most of a compile. A key read later must be in neither DroppedAstKey nor key()'s own rules. */
 class FAstSax : public nlohmann::json_sax<Json>
 {
@@ -22645,7 +22730,8 @@ public:
     bool string(string_t& V) override
     {
         if (bKindNext && !Skipped)          // "kind" comes before "range"; a TypeTraitExpr's begin is its trait (FoldConst)
-            Ranged.back() = V == "DeclRefExpr" || V == "TypeTraitExpr" || V == "LambdaExpr" ? ERange::Begin
+            Ranged.back() = V == "DeclRefExpr" || V == "TypeTraitExpr" || V == "LambdaExpr" || V == "CXXMethodDecl" || V == "CXXRecordDecl"
+                          ? ERange::Begin
                           : V == "MemberExpr" || V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
         if (bTypeNext) V = Unrooted(std::move(V));
         return Value(std::move(V));

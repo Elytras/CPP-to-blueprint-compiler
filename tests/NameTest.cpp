@@ -33,6 +33,7 @@ public:
   /* UObject's C++ helpers, forwarded to the Kismet statics: this or any object. The second GetName() here is
      UFSDSaveGame's own UFunction, which hides UObject's forwarder as it would in C++: the real function wins. */
   FString Whose() { return GetOuter()->GetName() + "/" + GetName(); }
+  // Whether Other is an object of this one's class.
   bool SameKind(UObject *Other) { return Other->GetClass() == GetClass(); }
 
   /* UE_CATEGORY files what follows it under a category of the editor's menus, in the API stub. */
@@ -53,11 +54,11 @@ protected:
   UE_READONLY int32 Cap = 5;
 
 public:
-  /* UE_TOOLTIP and UE_KEYWORDS: the function's tooltip and search words in the editor, carried by the API stub alone. */
-  UE_TOOLTIP("Lifts the cap to nine.") UE_KEYWORDS("raise lift cap")
-  void Raise() { Cap = 9; }
+  /* UE_TOOLTIP and UE_KEYWORDS: the function's tooltip and search words in the editor, carried by the API stub alone.
+     Without UE_TOOLTIP this comment would be the tooltip, as Whose's is. */
+  UE_TOOLTIP("Lifts the cap to nine.") UE_KEYWORDS("raise lift cap") void Raise() { Cap = 9; }
 
 private:
-  int32 Seed;
+  int32 Seed; // a comment trailing a member describes nothing below it
   int32 Twice() { return Step() + Step(); }
 };
