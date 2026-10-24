@@ -35,6 +35,49 @@
 #include "Registry.h"
 #include "Script.h"
 
+#include <chrono>
+/* ---- hdrcache-measure: env-gated phase timing (AG_TIMING=1), from the 2026-09-30 header-cost measurements
+   (DESIGN.md, "Compile time: the UeApi header cost"). Off, it costs one getenv. ---- */
+#ifdef _WIN32
+struct AgPmc { unsigned long cb; unsigned long PageFaultCount; size_t PeakWorkingSetSize, WorkingSetSize,
+    QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage; };
+extern "C" __declspec(dllimport) void* __stdcall GetCurrentProcess();
+extern "C" __declspec(dllimport) int __stdcall K32GetProcessMemoryInfo(void*, AgPmc*, unsigned long);
+static double AgPrivMB() { AgPmc P{}; P.cb = sizeof(P); K32GetProcessMemoryInfo(GetCurrentProcess(), &P, sizeof(P)); return P.PagefileUsage / 1048576.0; }
+static double AgPeakMB() { AgPmc P{}; P.cb = sizeof(P); K32GetProcessMemoryInfo(GetCurrentProcess(), &P, sizeof(P)); return P.PeakPagefileUsage / 1048576.0; }
+#else
+static double AgPrivMB() { return 0; }
+static double AgPeakMB() { return 0; }
+#endif
+struct FAgTiming
+{
+    using Clock = std::chrono::steady_clock;
+    bool bOn = getenv("AG_TIMING") != nullptr;
+    Clock::time_point T0 = Clock::now(), Last = T0;
+    std::vector<std::pair<std::string, double>> Rows;
+    double SaveSecs = 0;
+    void Mark(const char* What)
+    {
+        const auto Now = Clock::now();
+        Rows.push_back({ What, std::chrono::duration<double>(Now - Last).count() });
+        char Mem[64];
+        snprintf(Mem, sizeof(Mem), " [priv %.0f MB]", AgPrivMB());
+        Rows.back().first += Mem;
+        Last = Now;
+    }
+    void Add(const char* What, double Secs) { Rows.push_back({ What, Secs }); }
+    ~FAgTiming()
+    {
+        if (!bOn) return;
+        fprintf(stderr, "AG_TIMING total %.3f s  peak-priv %.0f MB\n",
+                std::chrono::duration<double>(Clock::now() - T0).count(), AgPeakMB());
+        for (const auto& [W, S] : Rows) fprintf(stderr, "AG_TIMING %-48s %8.3f s\n", W.c_str(), S);
+        fprintf(stderr, "AG_TIMING %-48s %8.3f s\n", "(of which SavePackage)", SaveSecs);
+    }
+};
+static FAgTiming GAg;
+static double AgSecs(std::chrono::steady_clock::time_point A) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - A).count(); }
+
 namespace Uasset
 {
 namespace
@@ -2639,8 +2682,11 @@ private:
     {
         const std::filesystem::path File = FileOf(OutDir, Package);
         std::error_code Ec;
+        const auto AgT = std::chrono::steady_clock::now();
         std::filesystem::create_directories(File.parent_path(), Ec);
-        return P.Save(File.string(), Err);
+        const bool bOk = P.Save(File.string(), Err);
+        GAg.SaveSecs += AgSecs(AgT);
+        return bOk;
     }
 
     Json Doc;
@@ -23032,13 +23078,119 @@ bool ParseClangAst(const std::string& Cmd, const std::string& SourcePath, Json* 
         FAstSource Src(Chunks, bFilter);
         bParsed = ParseAst(Src, Out, false);
     };
-    if (!RunClang(Cmd, SourcePath, Parse, Err)) return false;
+    const bool bRan = RunClang(Cmd, SourcePath, Parse, Err);
+    GAg.Mark("clang + dump streamed + filtered + FAstSax parse");
+    if (!bRan) return false;
     if (bParsed) return true;
     if (!bFilter) { *Err = "could not parse clang's AST dump"; return false; }
     fprintf(stderr, "assetgen: the filtered AST dump did not parse; reading it again unfiltered (clang runs again, so "
                     "its warnings above print again)\n");
     *Out = Json();
     return ParseClangAst(Cmd, SourcePath, Out, Err, false);
+}
+
+/* hdrcache-measure: serialize the pruned DOM every way nlohmann can, then time loading each back (AG_DOM_BENCH). */
+struct FNullSax : nlohmann::json_sax<Json>
+{
+    size_t Values = 0;
+    bool null() override { ++Values; return true; }
+    bool boolean(bool) override { ++Values; return true; }
+    bool number_integer(number_integer_t) override { ++Values; return true; }
+    bool number_unsigned(number_unsigned_t) override { ++Values; return true; }
+    bool number_float(number_float_t, const string_t&) override { ++Values; return true; }
+    bool string(string_t&) override { ++Values; return true; }
+    bool binary(binary_t&) override { ++Values; return true; }
+    bool start_object(size_t) override { return true; }
+    bool start_array(size_t) override { return true; }
+    bool end_object() override { return true; }
+    bool end_array() override { return true; }
+    bool key(string_t&) override { return true; }
+    bool parse_error(size_t, const std::string&, const nlohmann::detail::exception&) override { return false; }
+};
+void AgWrite(const std::string& Path, const void* Data, size_t Size)
+{
+    FILE* F = fopen(Path.c_str(), "wb");
+    if (F) { fwrite(Data, 1, Size, F); fclose(F); }
+}
+std::vector<uint8_t> AgRead(const std::string& Path)
+{
+    std::vector<uint8_t> V;
+    std::error_code Ec;
+    const auto N = std::filesystem::file_size(Path, Ec);
+    FILE* F = Ec ? nullptr : fopen(Path.c_str(), "rb");
+    if (!F) return V;
+    V.resize(size_t(N));
+    V.resize(fread(V.data(), 1, V.size(), F));
+    fclose(F);
+    return V;
+}
+size_t AgCount(const Json& J)
+{
+    size_t N = 1;
+    if (J.is_structured()) for (const Json& C : J) N += AgCount(C);
+    return N;
+}
+void DomBench(const Json& Doc, const std::string& Prefix)
+{
+    using Clock = std::chrono::steady_clock;
+    auto T = Clock::now();
+    fprintf(stderr, "BENCH nodes(values) in pruned DOM: %zu   priv now %.0f MB\n", AgCount(Doc), AgPrivMB());
+    fprintf(stderr, "BENCH count walk %.3f s\n", AgSecs(T));
+    T = Clock::now(); { Json Copy = Doc; fprintf(stderr, "BENCH deep copy %.3f s (priv with copy %.0f MB)\n", AgSecs(T), AgPrivMB()); }
+    struct FFmt { const char* Name; std::vector<uint8_t> Bytes; };
+    std::vector<FFmt> Fmts;
+    T = Clock::now(); std::string J = Doc.dump(); fprintf(stderr, "BENCH serialize json   %.3f s  %.1f MB\n", AgSecs(T), J.size() / 1048576.0);
+    AgWrite(Prefix + ".json", J.data(), J.size());
+    J.clear(); J.shrink_to_fit();
+    T = Clock::now(); Fmts.push_back({ "cbor", Json::to_cbor(Doc) });       fprintf(stderr, "BENCH serialize cbor   %.3f s  %.1f MB\n", AgSecs(T), Fmts.back().Bytes.size() / 1048576.0);
+    T = Clock::now(); Fmts.push_back({ "msgpack", Json::to_msgpack(Doc) }); fprintf(stderr, "BENCH serialize msgpack %.3f s  %.1f MB\n", AgSecs(T), Fmts.back().Bytes.size() / 1048576.0);
+    T = Clock::now(); Fmts.push_back({ "bson", Json::to_bson(Doc) });       fprintf(stderr, "BENCH serialize bson   %.3f s  %.1f MB\n", AgSecs(T), Fmts.back().Bytes.size() / 1048576.0);
+    T = Clock::now(); Fmts.push_back({ "ubjson", Json::to_ubjson(Doc) });   fprintf(stderr, "BENCH serialize ubjson %.3f s  %.1f MB\n", AgSecs(T), Fmts.back().Bytes.size() / 1048576.0);
+    for (auto& F : Fmts) AgWrite(Prefix + "." + F.Name, F.Bytes.data(), F.Bytes.size());
+    Fmts.clear(); Fmts.shrink_to_fit();
+    for (int Rep = 0; Rep < 3; ++Rep)
+    {
+        for (const char* Ext : { "json", "cbor", "msgpack", "bson", "ubjson" })
+        {
+            auto T0 = Clock::now();
+            std::vector<uint8_t> Bytes = AgRead(Prefix + "." + Ext);
+            const double ReadS = AgSecs(T0);
+            const double Before = AgPrivMB();
+            auto T1 = Clock::now();
+            Json X;
+            const std::string E = Ext;
+            if (E == "json") X = Json::parse(Bytes.begin(), Bytes.end());
+            else if (E == "cbor") X = Json::from_cbor(Bytes);
+            else if (E == "msgpack") X = Json::from_msgpack(Bytes);
+            else if (E == "bson") X = Json::from_bson(Bytes);
+            else X = Json::from_ubjson(Bytes);
+            const double LoadS = AgSecs(T1);
+            const double DomMB = AgPrivMB() - Before;
+            auto T2 = Clock::now();
+            const bool bSame = X == Doc;
+            const double EqS = AgSecs(T2);
+            fprintf(stderr, "BENCH rep%d load %-7s read %.3f s  parse %.3f s  (+%.0f MB priv)  equal=%d (%.3f s)\n",
+                    Rep, Ext, ReadS, LoadS, DomMB, int(bSame), EqS);
+        }
+    }
+    if (const char* Raw = getenv("AG_RAW_BENCH"))
+    {
+        auto T0 = Clock::now();
+        std::vector<uint8_t> Bytes = AgRead(Raw);
+        fprintf(stderr, "BENCH raw dump %.1f MB read %.3f s\n", Bytes.size() / 1048576.0, AgSecs(T0));
+        for (int Rep = 0; Rep < 3; ++Rep)
+        {
+            FNullSax Null;
+            T0 = Clock::now();
+            Json::sax_parse(Bytes.begin(), Bytes.end(), &Null);
+            fprintf(stderr, "BENCH rep%d raw dump null-SAX (lex only) %.3f s  values %zu\n", Rep, AgSecs(T0), Null.Values);
+            Json Pruned;
+            FAstSax Sax(Pruned, false);
+            T0 = Clock::now();
+            Json::sax_parse(Bytes.begin(), Bytes.end(), &Sax);
+            fprintf(stderr, "BENCH rep%d raw dump FAstSax from memory %.3f s  same=%d\n", Rep, AgSecs(T0), int(Pruned == Doc));
+        }
+    }
 }
 
 /* The clang command whose stdout is the AST dump of SourcePath, with the UeApi headers in IncludeDir: a compile's,
@@ -23056,13 +23208,17 @@ std::string ClangCommand(const std::string& SourcePath, const std::string& Inclu
 #ifndef _WIN32
     /* Parse with the game's ABI, not the host's: on x86-64 Linux size_t is `unsigned long`, so sizeof has no
        Kismet conversion. The msvc target finds no C++ headers here and the SDK needs only <initializer_list>,
-       so hand clang a stand-in (it checks only the two-pointer layout). */
+       so hand clang a stand-in (it checks only the two-pointer layout). MSVC's <initializer_list> also brings in
+       <cstddef> and its basic traits (xtr1common), which a mod may use unincluded on Windows (`std::is_same_v` in a
+       requires-clause), so the stand-in declares them too, and <type_traits> and <cstddef> are names for it. */
     const std::filesystem::path ShimDir = std::filesystem::temp_directory_path(TmpEc) / "assetgen-include";
     std::filesystem::create_directories(ShimDir, TmpEc);
-    const std::filesystem::path Shim = ShimDir / "initializer_list";
-    static const char ShimText[] =
+    static const char InitListText[] =
         "#pragma once\n"
         "namespace std {\n"
+        "using size_t = decltype(sizeof 0);\n"
+        "using ptrdiff_t = decltype((int*)0 - (int*)0);\n"
+        "using nullptr_t = decltype(nullptr);\n"
         "template <class E> class initializer_list {\n"
         "    const E* First = nullptr;\n"
         "    const E* Last = nullptr;\n"
@@ -23072,16 +23228,56 @@ std::string ClangCommand(const std::string& SourcePath, const std::string& Inclu
         "    constexpr const E* end() const noexcept { return Last; }\n"
         "    constexpr decltype(sizeof 0) size() const noexcept { return Last - First; }\n"
         "};\n"
+        "template <class T, T V> struct integral_constant {\n"
+        "    static constexpr T value = V;\n"
+        "    using value_type = T;\n"
+        "    using type = integral_constant;\n"
+        "    constexpr operator value_type() const noexcept { return value; }\n"
+        "    constexpr value_type operator()() const noexcept { return value; }\n"
+        "};\n"
+        "template <bool V> using bool_constant = integral_constant<bool, V>;\n"
+        "using true_type = bool_constant<true>;\n"
+        "using false_type = bool_constant<false>;\n"
+        "template <bool B, class T = void> struct enable_if {};\n"
+        "template <class T> struct enable_if<true, T> { using type = T; };\n"
+        "template <bool B, class T = void> using enable_if_t = typename enable_if<B, T>::type;\n"
+        "template <bool B, class T, class F> struct conditional { using type = T; };\n"
+        "template <class T, class F> struct conditional<false, T, F> { using type = F; };\n"
+        "template <bool B, class T, class F> using conditional_t = typename conditional<B, T, F>::type;\n"
+        "template <class A, class B> inline constexpr bool is_same_v = __is_same(A, B);\n"
+        "template <class A, class B> struct is_same : bool_constant<__is_same(A, B)> {};\n"
+        "template <class T> struct remove_const { using type = __remove_const(T); };\n"
+        "template <class T> using remove_const_t = __remove_const(T);\n"
+        "template <class T> struct remove_volatile { using type = __remove_volatile(T); };\n"
+        "template <class T> using remove_volatile_t = __remove_volatile(T);\n"
+        "template <class T> struct remove_cv { using type = __remove_cv(T); };\n"
+        "template <class T> using remove_cv_t = __remove_cv(T);\n"
+        "template <class T> struct remove_reference { using type = __remove_reference_t(T); };\n"
+        "template <class T> using remove_reference_t = __remove_reference_t(T);\n"
+        "template <class T> struct remove_cvref { using type = __remove_cvref(T); };\n"
+        "template <class T> using remove_cvref_t = __remove_cvref(T);\n"
+        "template <class T> inline constexpr bool is_integral_v = __is_integral(T);\n"
+        "template <class T> struct is_integral : bool_constant<__is_integral(T)> {};\n"
+        "template <class T> inline constexpr bool is_floating_point_v = __is_floating_point(T);\n"
+        "template <class T> struct is_floating_point : bool_constant<__is_floating_point(T)> {};\n"
+        "template <class T> inline constexpr bool is_arithmetic_v = __is_arithmetic(T);\n"
+        "template <class T> struct is_arithmetic : bool_constant<__is_arithmetic(T)> {};\n"
+        "template <class... T> inline constexpr bool disjunction_v = (false || ... || bool(T::value));\n"
+        "template <class... T> struct disjunction : bool_constant<disjunction_v<T...>> {};\n"
         "}\n";
-    /* Parallel compiles share this file, and one compile's clang may be reading it as the next compile starts. So
-       it is never truncated in place: it is rewritten only when it differs, whole, into a temp file named for this
+    static const char ForwardText[] = "#pragma once\n#include <initializer_list>\n";
+    /* Parallel compiles share these files, and one compile's clang may be reading one as the next compile starts. So
+       none is truncated in place: it is rewritten only when it differs, whole, into a temp file named for this
        process, which is then renamed over it (POSIX replaces the name atomically). A write or rename that fails
        leaves no temp file and stays silent, as before; clang then reports the missing header. */
-    if (ReadText(Shim.string()) != ShimText)
+    for (const auto& [Name, Text] : { std::pair<const char*, const char*>{ "initializer_list", InitListText },
+                                      { "type_traits", ForwardText }, { "cstddef", ForwardText } })
     {
-        const std::filesystem::path Tmp = ShimDir / ("initializer_list." + std::to_string(getpid()) + ".tmp");
+        const std::filesystem::path Shim = ShimDir / Name;
+        if (ReadText(Shim.string()) == Text) continue;
+        const std::filesystem::path Tmp = ShimDir / (std::string(Name) + "." + std::to_string(getpid()) + ".tmp");
         std::ofstream Out(Tmp, std::ios::binary | std::ios::trunc);
-        Out << ShimText;
+        Out << Text;
         Out.close();
         std::error_code ShimEc;
         if (!Out.fail()) std::filesystem::rename(Tmp, Shim, ShimEc);
@@ -23380,10 +23576,29 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (Stamp.contains("math") && Stamp["math"].is_object())
         for (auto It = Stamp["math"].begin(); It != Stamp["math"].end(); ++It)
             if (It->is_string()) GRealMath[It.key()] = It->get<std::string>();
-    if (!ParseClangAst(ClangCommand(SourcePath, IncludeDir), SourcePath, &Doc, Err)) return false;
+    std::string Cmd = ClangCommand(SourcePath, IncludeDir);
+    if (const char* Extra = getenv("AG_CLANG_EXTRA")) Cmd += std::string(" ") + Extra;
+    GAg.Mark("startup (process start -> Run)");
+    if (const char* Load = getenv("AG_DOM_LOAD"))
+    {
+        std::vector<uint8_t> Bytes = AgRead(Load);
+        GAg.Mark("AG_DOM_LOAD read file");
+        Doc = Json::from_cbor(Bytes);
+        GAg.Mark("AG_DOM_LOAD from_cbor");
+    }
+    else if (!ParseClangAst(Cmd, SourcePath, &Doc, Err)) return false;
+    if (const char* Bench = getenv("AG_DOM_BENCH")) { DomBench(Doc, Bench); GAg.Mark("DomBench (ignore)"); }
+    if (const char* Save = getenv("AG_DOM_SAVE"))
+    {
+        const std::vector<uint8_t> Bytes = Json::to_cbor(Doc);
+        AgWrite(Save, Bytes.data(), Bytes.size());
+        GAg.Mark("AG_DOM_SAVE to_cbor + write (ignore)");
+    }
 
     if (!LoadTables(IncludeDir, Err)) return false;
-    if (!Collect(Err)) return false;
+    GAg.Mark("LoadTables");
+    if (!Collect(Err)) { GAg.Mark("Collect (failed)"); return false; }
+    GAg.Mark("Collect");
     std::function<void(const Json&, bool)> IndexConsts = [&](const Json& N, bool bInClass) {
         const std::string K = Kind(N);
         if (K == "VarDecl" && N.contains("init") && N.contains("id")
@@ -23395,6 +23610,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             ForEach(N, [&](const Json& C) { IndexConsts(C, K == "CXXRecordDecl"); });
     };
     IndexConsts(Doc, false);
+    GAg.Mark("IndexConsts");
     /* `sizeof...` reads a pack's template parameter off its template (FoldConst). */
     auto IndexTemplate = [&](const Json& T) {
         ForEach(T, [&](const Json& M) { TemplateOf[M.value("id", std::string())] = &T; });
@@ -23463,6 +23679,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (It != N.end()) for (Json& C : *It) IndexInlines(C, In, bTemplate || K == "FunctionTemplateDecl");
     };
     IndexInlines(Doc, std::string(), false);
+    GAg.Mark("IndexInlines");
     for (const FChain* C : ChainOrder)
     {
         if (!C->Def) continue;
@@ -23543,6 +23760,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 
     /* A namespace is a folder (PathIn), so `Game::<the mod's own path>::X` is X's package, and a package name is
        case-blind. */
+    GAg.Mark("NormalizePointers (generated/mod records)");
     std::map<std::string, std::string> Cooked;
     for (const auto& [Cpp, R] : Records)
         if (R.IsGenerated())
@@ -23602,6 +23820,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (!Entry.second.IsNative() && !Entry.second.bIsStruct && HasWidgetTree(Entry.second))
             GameClassKinds[PackageOf(Entry.second) + "." + ClassOf(Entry.second)] = { "/Script/UMG", "WidgetBlueprintGeneratedClass" };
 
+    GAg.Mark("package-name + asset checks");
     int32 Generated = 0;
     /* Remove every generated asset. */
     auto RemoveGenerated = [&] {
@@ -23666,8 +23885,9 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (!GenerateAssetEdits(*Block, Err)) return false;
     if (!CheckAssetReads(Err) || !SaveEdits(OutDir, Err)) return false;
     if (Generated == 0 && RegistryRows.empty() && Edited.empty())
-    { *Err = "the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit"; return false; }
+    { GAg.Mark("(nothing generated)"); *Err = "the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit"; return false; }
     if (!GenerateNestedWrappers(OutDir, Err)) return false;
+    GAg.Mark("patches/deref/slots/globals/enums/assets/edits/wrappers");
 
     /* A cooked package carries no registry data; without the bake the classes are invisible to it. A pak keeps its
        one registry beside its Content folder, FSD/AssetRegistry.bin, as the game's own pak and every editor-cooked
@@ -23698,6 +23918,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     else
         RegistryDir = OutDir;
     if (!MergeAssetRegistry(RegistryRows, RegistryDir + "/AssetRegistry.bin", Err)) return false;
+    GAg.Mark("registry merge");
     printf("  %-14s -> %s/AssetRegistry.bin  (%d asset%s)\n", "registry", RegistryDir == OutDir ? "." : RegistryDir.c_str(),
            int32(RegistryRows.size()), RegistryRows.size() == 1 ? "" : "s");
     return true;

@@ -80,7 +80,7 @@ packs it into a pak.
 ### Get the compiler and the SDK
 
 Build AssetGen as the [README](README.md) describes. You get `x64\Release\assetgen.exe` on Windows or `build/assetgen`
-on Linux. The compiler parses every mod with LLVM's `clang++`, so that has to be on `PATH`. The build driver,
+on Linux, where `cmake -B build && cmake --build build -j` in the AssetGen folder builds it with GCC or clang. The compiler parses every mod with LLVM's `clang++`, so that has to be on `PATH`. The build driver,
 `tools/bpbuild.py`, needs Python 3 with `pyyaml`, and UE 4.27's UnrealPak to make the pak.
 
 Then clone the SDK beside the AssetGen folder:
@@ -232,7 +232,8 @@ built 1, packed 1, up to date 0, failed 0
 ```
 
 On Windows, bpbuild looks for UnrealPak at `C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe`,
-and the `UNREALPAK` variable points it elsewhere. The README's *Packing on Linux* covers Linux. Without UnrealPak,
+and the `UNREALPAK` variable points it elsewhere. On Linux it runs that same `UnrealPak.exe` under Wine, off the
+mounted Windows drive ([Packing](#packing)). Without UnrealPak,
 bpbuild prints `UnrealPak not found at <path> - skipping the pak.` and counts the mod as failed. A second run with
 nothing changed prints `HelloWorld       up to date`. [Building mods](#building-mods) covers the rest of `mods.yaml`.
 
@@ -1427,10 +1428,18 @@ bpbuild finds UnrealPak in this order:
 1. the `UNREALPAK` environment variable, if set;
 2. on Windows, `C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe` (there is no `PATH` lookup on
    Windows);
-3. on other systems, `UnrealPak` on `PATH`.
+3. on other systems, `UnrealPak` on `PATH`, else the Windows default path above on the mounted Windows drive (below).
 
-On Linux that is a native UnrealPak or a wrapper that runs the Windows one under Wine; the [README](README.md)'s
-section on packing on Linux has the script. bpbuild writes the response file
+An `UNREALPAK` or found path ending in `.exe` runs under Wine off Windows; a native Linux UnrealPak runs as it is.
+With no UnrealPak at all, off Windows, [repak](https://github.com/trumank/repak) on `PATH` (the packer MINT uses; its
+release has a Linux build) packs and extracts instead, writing what UnrealPak would: UE 4.27's pak version, zlib, and
+the tree under `../../../FSD/`. `UNREALPAK=<path to repak>` picks it over an UnrealPak.
+
+Off Windows, a Windows drive path in `mods.yaml` (`game_content`, `api_dir`, a `kept` `from`, as in `D:/DRGExtract/...`)
+is read from that drive's mount, so a dual boot builds the Windows checkout's `mods.yaml` as it is. The mount is
+`BPBUILD_DRIVES` (`BPBUILD_DRIVES="C=/mnt/c;D=/media/me/Data"`), else the first of `/mnt/<x>` and `/mnt/win<x>` that
+exists; a drive with neither stops the build. An `api_dir` there must be writable: a read-only NTFS mount fails the
+stub write of a `generate_api` mod. bpbuild writes the response file
 `"<mods dir>\build\<name>\FSD\*.*" "..\..\..\FSD\*.*"` and runs
 `UnrealPak <pak> -platform=Windows -create=<response file> -compress`. The whole `build/<name>/FSD` tree goes into the
 pak under `../../../FSD/`, the layout of the game's own pak. When UnrealPak fails, bpbuild prints
@@ -2105,16 +2114,22 @@ write once and the method to paste.
 
 - **Windows and Linux.** `assetgen` builds and runs on both. One comparison found their output byte-identical, and CI
   checks behaviour on both systems, not bytes; [Reproducible output](#reproducible-output) says what that comparison
-  covered. A different `clang++` version parsing the mod has not been compared.
+  covered. A different `clang++` version parsing the mod has not been compared. Use clang 20, as the Windows build
+  does (LLVM 20): clang 18's JSON dump, Ubuntu 24.04's default, leaves out `__is_same`'s two types, so a mod that
+  writes it fails with `unimplemented argument TypeTraitExpr`. Ubuntu 24.04 has `clang-20`; put its `clang++` first on
+  `PATH`, as with `sudo apt install clang-20` and `PATH=/usr/lib/llvm-20/bin:$PATH`.
 - **Standard headers.** On Linux, clang still parses a mod for the game's target, `x86_64-pc-windows-msvc`, so
   `sizeof`, `long` and `wchar_t` mean what they mean in the game. That target has no C++ standard library on Linux:
-  `<initializer_list>`, which the SDK needs and AssetGen supplies, is the only standard header a mod can include
-  there. On any system, a call into the standard library is refused, even with its header included. Use clang builtins
-  in place of `<type_traits>`: `__is_same(A, B)` anywhere, the others in `if constexpr` or `static_assert`; and `UKismetMathLibrary`
-  for math. See
+  AssetGen supplies `<initializer_list>`, which the SDK needs, with what MSVC's copy brings in along with it, so a mod
+  builds as it does on Windows: `std::size_t`, `std::nullptr_t`, and the basic traits (`std::is_same_v`, `enable_if_t`,
+  `conditional_t`, `remove_cvref_t`, `is_integral_v`, `integral_constant` and the rest of MSVC's `<xtr1common>`).
+  `<type_traits>` and `<cstddef>` name the same stand-in; no other standard header exists there. On any system, a call
+  into the standard library is refused, even with its header included. For a trait beyond those, use a clang builtin:
+  `__is_same(A, B)` anywhere, the others in `if constexpr` or `static_assert`; and `UKismetMathLibrary` for math. See
   [Calling engine and game functions](REFERENCE.md#calling-engine-and-game-functions).
 - **Packing on Linux.** bpbuild needs UE 4.27's UnrealPak: a native Linux build on `PATH`, or the Windows
-  `UnrealPak.exe` under Wine, named by the `UNREALPAK` variable as the README shows. See
-  [Building mods](#building-mods).
+  `UnrealPak.exe` under Wine, found at the default install path on the mounted Windows drive or named by the
+  `UNREALPAK` variable, or else repak. Windows drive paths in `mods.yaml` are read from the drive's mount (`BPBUILD_DRIVES`). See
+  [Packing](#packing).
 - **The game under Proton.** It reads paks from the same folders as on Windows, under
   `steamapps/common/Deep Rock Galactic/FSD/`.
