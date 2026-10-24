@@ -21,9 +21,44 @@ from mintcache import MINT_CACHE, MODIO_URL   # MINT's download cache: what a mo
 
 MOD_PACKAGE = re.compile(r'UE_MOD_PACKAGE\s*\(\s*"([^"]+)"')
 
-# Off Windows there is no default install: a Linux UnrealPak on PATH, or UNREALPAK=<a script running UnrealPak.exe under Wine>.
-UNREALPAK = os.environ.get("UNREALPAK") or (r"C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe"
-                                            if os.name == "nt" else shutil.which("UnrealPak") or "UnrealPak")
+# Off Windows, a `C:/...` path in mods.yaml is one on that Windows drive as this machine mounts it (a dual boot's
+# drives): BPBUILD_DRIVES="C=/mnt/c;D=/media/me/Data" names the mounts, else the first of /mnt/<x>, /mnt/win<x> that exists.
+DRIVES = dict((d.strip().upper(), root.strip()) for d, _eq, root in
+              (e.partition("=") for e in os.environ.get("BPBUILD_DRIVES", "").split(";") if "=" in e))
+WINDOWS_PATH = re.compile(r"^([A-Za-z]):[\\/]")
+
+
+def drive_path(path):
+    """Off Windows, Windows drive path `path` on that drive's mount (DRIVES), or None when the drive is not mounted;
+    any other path as it is."""
+    m = WINDOWS_PATH.match(path) if os.name != "nt" else None
+    if not m:
+        return path
+    drive = m.group(1).upper()
+    root = DRIVES.get(drive) or next((r for r in ("/mnt/" + drive.lower(), "/mnt/win" + drive.lower())
+                                      if os.path.isdir(r)), None)
+    return os.path.join(root, *re.split(r"[\\/]+", path[3:])) if root else None
+
+
+def manifest_path(bp, path):
+    """A path mods.yaml gives, absolute: relative ones resolve against BpMods/, $VARS expand, and a Windows drive
+    path is found on that drive's mount (drive_path)."""
+    path = os.path.expandvars(path)
+    host = drive_path(path)
+    if host is None:
+        drive = path[0].upper()
+        sys.exit("mods.yaml: %s is on drive %s:, which is not mounted here (set BPBUILD_DRIVES=\"%s=<its mount>\")"
+                 % (path, drive, drive))
+    return os.path.abspath(os.path.join(bp, host))
+
+
+# UnrealPak: UNREALPAK, else UE 4.27's default install. Off Windows, a Linux UnrealPak on PATH, else that default
+# install's UnrealPak.exe on the mounted Windows drive; an .exe there runs under Wine.
+UNREALPAK_DEFAULT = r"C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe"
+UNREALPAK = os.environ.get("UNREALPAK") or (UNREALPAK_DEFAULT if os.name == "nt" else
+                                            shutil.which("UnrealPak") or drive_path(UNREALPAK_DEFAULT) or "UnrealPak")
+UNREALPAK_RUN = ([shutil.which("wine") or "wine", UNREALPAK]
+                 if os.name != "nt" and UNREALPAK.lower().endswith(".exe") else [UNREALPAK])
 
 
 def newest(paths):
@@ -187,7 +222,7 @@ def api_roots(mod, config, bp):
         if ue != API_UE_VERSION:
             sys.exit("mods.yaml: api_dir %s wants UE %s; assetgen writes %s only"
                      % (path, ue, API_UE_VERSION))
-        out.append(os.path.abspath(os.path.join(bp, os.path.expandvars(path))))
+        out.append(manifest_path(bp, path))
     return out
 
 
@@ -266,7 +301,7 @@ def content_of(src, bp, root):
         src, what, note = mint_blob(src, MINT_CACHE)
         if note:
             print("note: " + note)
-    src = os.path.abspath(os.path.join(bp, os.path.expandvars(src)))
+    src = manifest_path(bp, src)
     if os.path.isdir(src):
         root = src
     else:
@@ -282,7 +317,7 @@ def content_of(src, bp, root):
                     if len(paks) != 1:
                         sys.exit("%s holds %d .pak files, not one" % (src, len(paks)))
                     pak = z.extract(paks[0], os.path.join(root, ".zip"))
-            proc = subprocess.run([UNREALPAK, pak, "-Extract", root], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            proc = subprocess.run(UNREALPAK_RUN + [pak, "-Extract", root], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, errors="replace")
             if proc.returncode != 0:
                 sys.exit("UnrealPak could not extract %s:\n%s" % (pak, proc.stdout[-2000:]))
@@ -403,7 +438,7 @@ def run_unrealpak(fsd_dir, pak_path):
     io.open(response, "w", encoding="utf-8", newline="\n").write(
         '"%s" "..\\..\\..\\%s\\*.*"\n' % (os.path.join(fsd_dir, "*.*"), PROJECT))
 
-    cmd = [UNREALPAK, pak_path, "-platform=Windows", "-create=" + response, "-compress"]
+    cmd = UNREALPAK_RUN + [pak_path, "-platform=Windows", "-create=" + response, "-compress"]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if proc.returncode != 0:
         print("  UnrealPak failed (%d):" % proc.returncode)
@@ -578,7 +613,7 @@ def main():
     # UE_ASSET_EDIT / UE_PATCH start from the game's own packages: the /Game folder of the extracted game pak.
     # ponytail: a mod's staleness does not see this tree (300k files); after re-extracting an updated game, --force.
     game = config.get("game_content")
-    game_dir = os.path.abspath(os.path.join(bp, os.path.expandvars(game))) if game else None
+    game_dir = manifest_path(bp, game) if game else None
 
     game_dirs = {}
 
