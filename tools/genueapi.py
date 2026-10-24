@@ -2049,9 +2049,11 @@ def main():
                     body.append("    %s %s();" % (ret, name))
                     marks.append('static constexpr const char* %s__UeForward = "%s";' % (name, target))
             if k.cpp == "AActor":
-                body.append("    /* The editor's Get Components by Class node: K2_GetComponentsByClass(T::StaticClass()), its array of")
-                body.append("       UActorComponent* taken as an array of T* (every element is a T). AssetGen lowers it; no UFunction. */")
+                body.append("    /* The editor's Get Component(s) by Class nodes: K2_GetComponentsByClass(T::StaticClass()) and")
+                body.append("       GetComponentByClass(T::StaticClass()), their UActorComponent* taken as T* (every one is a T).")
+                body.append("       AssetGen lowers them; no UFunction. */")
                 body.append("    template <class T> TArray<T *> GetComponentsByClass() const;")
+                body.append("    template <class T> T *GetComponentByClass() const;")
             for ret, name, params, target in CLASS_FORWARDS.get(k.cpp, ()):
                 body.append("    %s %s(%s);" % (ret, name, params))
                 marks.append('static constexpr const char* %s__UeForward = "%s";' % (name, target))
