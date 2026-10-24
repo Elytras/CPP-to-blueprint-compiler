@@ -1,6 +1,9 @@
 ﻿#!/usr/bin/env python3
-"""usage: genueapi.py <SDK dir> <output dir> [--game <Content dir>]
+"""usage: genueapi.py <SDK dir> <output dir> [--game <Content dir>] [--gaps <file>]
        e.g. C:/Dumper-7/<version>-FSD/SDK/SDK  BpMods/UeApi  --game D:/DRGExtract/FSD-WindowsNoEditor/FSD/Content
+
+--gaps writes what the dump has and the output leaves out (members, functions, structs AssetGen cannot take), one JSON
+row each with the type in the way, and prints a summary of it (write_gaps).
 
 --game reads the game's cooked Blueprints for what the dump does not carry: each game Blueprint class's tail
 (UeClassTail) and the subobjects under its CDO (UeDefaultSubobjects), the native interfaces a native class
@@ -104,6 +107,9 @@ SCALARS = {
 }
 
 KINDS = ("enum", "struct", "name", "container", "other")
+# Everything the dump has that this UeApi leaves out, for --gaps: (what, owner, name, the type in the way, why). owner is
+# a Klass or Struct (its path is known only after parse_header), or a name.
+GAPS = []
 
 
 def classify(t):
@@ -160,6 +166,11 @@ def map_type(raw):
     m = PTR.match(t)
     if m and "class " + m.group(1) in TEXT_TYPES:     # `class FString* Out`: text is no UObject, so Dumper-7 means an out-parm
         return TEXT_TYPES["class " + m.group(1)] + "&"
+    # `const class UMeshComponent*& Mesh`: a ConstParm ReferenceParm object. C++ binds no `X*` to `const X*&`, so it is
+    # written `X* const&`, which AssetGen reads as the same const reference (a script callee steps an out parm with no
+    # result buffer, so the argument must stay a place, not become a value)
+    if not m and t.startswith("const ") and t.endswith("&") and PTR.match(base):
+        return "class %s* const&" % PTR.match(base).group(1)
     if m:
         return "class %s*" % m.group(1)
     m = TPL.match(t)
@@ -328,6 +339,7 @@ def game_structs(own, content):
                         break
         if why:
             dropped.append((st.cpp, why))
+            if why != "ours": GAPS.append(("game struct", st, "", "", why))
             del STRUCTS[st.cpp]
     while True:
         held = [st for st in STRUCTS.values() if st.is_game and any(d not in STRUCTS for d in
@@ -336,6 +348,7 @@ def game_structs(own, content):
             break
         for st in held:
             dropped.append((st.cpp, "holds a dropped one"))
+            GAPS.append(("game struct", st, "", "", "holds a dropped one"))
             del STRUCTS[st.cpp]
     kept = sum(1 for st in STRUCTS.values() if st.is_game)
     print("  game structs: %d kept, %d left out (%s)" % (kept, len(dropped), ", ".join(
@@ -368,6 +381,8 @@ def resolve_structs():
                 continue
             if mapped in KINDS or mapped == "void" or any(s in mapped for s in NO_STRUCT_LITERAL):
                 complete = False
+                GAPS.append(("struct member", st, name, raw, mapped if mapped in KINDS else
+                             "other" if mapped == "void" else "no struct literal"))
                 continue
             own.append((mapped, name))
             if not transient:
@@ -571,6 +586,16 @@ def split_params(text):
     if text[start:].strip():
         out.append(text[start:])
     return out
+
+
+def first_unmapped(text):
+    """The first parameter of `text` that parse_params cannot map, as Dumper-7 wrote it: what keeps a function out."""
+    for raw in split_params(text):
+        p = raw.strip()
+        m = re.match(r"^(.*?)([A-Za-z_]\w*)$", p)
+        if not m or map_type(m.group(1)) in KINDS + ("void",):
+            return p
+    return text
 
 
 def parse_params(text):
@@ -1139,6 +1164,7 @@ def parse_field(cur, m, skipped):
     mapped = "bool" if bits else map_type(raw)
     if mapped in KINDS or mapped == "void":
         skipped[mapped if mapped in KINDS else "other"] += 1
+        GAPS.append(("member", cur, fname, raw, mapped if mapped in KINDS else "other"))
         return
     cur.fields.append((mapped, fname))
     # BlueprintReadOnly: the stub declares it UE_READONLY (`mutable`), so a child's UE_DEFAULTS may still set it.
@@ -1227,6 +1253,8 @@ def parse_header(path):
         params = parse_params(params_raw)
         if ret in KINDS or isinstance(params, str):
             skipped[ret if ret in KINDS else params] += 1
+            bad = ret_raw if ret in KINDS else first_unmapped(params_raw)
+            GAPS.append(("function", cur, m.group(3), bad, ret if ret in KINDS else params))
             continue
         cur.funcs.append((bool(m.group(1)), ret, m.group(3), params))
         if m.group(5):
@@ -1727,7 +1755,11 @@ def write_containers(classes, sdk_dir, out_dir):
 
 def main():
     args = sys.argv[1:]
-    game_dir = None
+    game_dir = gaps_file = None
+    if "--gaps" in args:
+        at = args.index("--gaps")
+        gaps_file = args[at + 1] if at + 1 < len(args) else sys.exit("--gaps needs a file")
+        del args[at:at + 2]
     if "--game" in args:
         at = args.index("--game")
         game_dir = args[at + 1] if at + 1 < len(args) else None
@@ -1764,6 +1796,7 @@ def main():
         found = [k for k in found if not k.path.startswith(own)]
         keep = [k for k in found if not k.is_bp or k.path.startswith("/")]
         pathless += len(found) - len(keep)
+        GAPS.extend(("class", k, "", "", "no /Game path in the dump") for k in found if k not in keep)
         classes.extend(keep)
         for k in KINDS:
             totals[k] += skipped[k]
@@ -2174,6 +2207,41 @@ def main():
     if pathless:
         print("  blueprint classes dropped for want of a /Game path: %d"
               " (re-dump with Dumper-7 FullAssetPaths=1)" % pathless)
+    if gaps_file:
+        write_gaps(gaps_file, own)
+
+
+def gap_shape(raw):
+    """A left-out type with its names taken out, so that one kind of gap counts once: `TMap<class X*, struct F>`."""
+    t = re.sub(r"\s+[A-Za-z_]\w*$", "", raw.strip()) if re.search(r"[\w>*&]\s+[A-Za-z_]\w*$", raw.strip()) else raw
+    t = re.sub(r"\bconst\s+", "", t).replace("&", "").strip()
+    t = re.sub(r"\bclass\s+(?:\w+::)*\w+", "class X", t)
+    t = re.sub(r"\bstruct\s+(?:\w+::)*\w+", "struct F", t)
+    t = re.sub(r"\b(?:\w+::)*E[A-Z]\w*", "E", t)
+    t = re.sub(r'"\w+"', '"name"', t)
+    return " ".join(t.split())
+
+
+def write_gaps(path, own):
+    """--gaps <file>: every member, function and struct the dump has that this UeApi leaves out, as JSON rows
+    {what, owner, name, type, why, shape}, and a summary on stdout: per what and why, then the type shapes in the way,
+    most first. A row's `type` is the piece AssetGen cannot take: the member's type, the function's return type or first
+    such parameter."""
+    def owner(o):
+        p = getattr(o, "path", None)
+        return (p + "." + o.ue_name) if p and getattr(o, "ue_name", None) else getattr(o, "cpp", o)
+    rows = [dict(what=w, owner=owner(o), name=n, type=t, why=y, shape=gap_shape(t) if t else "")
+            for w, o, n, t, y in GAPS if not str(getattr(o, "path", "")).startswith(own)]
+    rows.sort(key=lambda r: (r["what"], r["owner"], r["name"]))
+    io.open(path, "w", encoding="utf-8", newline="\n").write(json.dumps(rows, indent=1) + "\n")
+    print("gaps: %d rows -> %s" % (len(rows), path))
+    for (w, y), c in collections.Counter((r["what"], r["why"]) for r in rows).most_common():
+        print("  %6d  %-14s %s" % (c, w, y))
+    shapes = collections.Counter(r["shape"] for r in rows if r["shape"])
+    print("  the types in the way, most first:")
+    for s, c in shapes.most_common(60):
+        ex = next(r for r in rows if r["shape"] == s)
+        print("  %6d  %-60s e.g. %s %s::%s" % (c, s[:60], ex["what"], ex["owner"].rsplit(".", 1)[-1], ex["name"]))
 
 
 if __name__ == "__main__":
