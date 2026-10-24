@@ -23208,13 +23208,17 @@ std::string ClangCommand(const std::string& SourcePath, const std::string& Inclu
 #ifndef _WIN32
     /* Parse with the game's ABI, not the host's: on x86-64 Linux size_t is `unsigned long`, so sizeof has no
        Kismet conversion. The msvc target finds no C++ headers here and the SDK needs only <initializer_list>,
-       so hand clang a stand-in (it checks only the two-pointer layout). */
+       so hand clang a stand-in (it checks only the two-pointer layout). MSVC's <initializer_list> also brings in
+       <cstddef> and its basic traits (xtr1common), which a mod may use unincluded on Windows (`std::is_same_v` in a
+       requires-clause), so the stand-in declares them too, and <type_traits> and <cstddef> are names for it. */
     const std::filesystem::path ShimDir = std::filesystem::temp_directory_path(TmpEc) / "assetgen-include";
     std::filesystem::create_directories(ShimDir, TmpEc);
-    const std::filesystem::path Shim = ShimDir / "initializer_list";
-    static const char ShimText[] =
+    static const char InitListText[] =
         "#pragma once\n"
         "namespace std {\n"
+        "using size_t = decltype(sizeof 0);\n"
+        "using ptrdiff_t = decltype((int*)0 - (int*)0);\n"
+        "using nullptr_t = decltype(nullptr);\n"
         "template <class E> class initializer_list {\n"
         "    const E* First = nullptr;\n"
         "    const E* Last = nullptr;\n"
@@ -23224,16 +23228,56 @@ std::string ClangCommand(const std::string& SourcePath, const std::string& Inclu
         "    constexpr const E* end() const noexcept { return Last; }\n"
         "    constexpr decltype(sizeof 0) size() const noexcept { return Last - First; }\n"
         "};\n"
+        "template <class T, T V> struct integral_constant {\n"
+        "    static constexpr T value = V;\n"
+        "    using value_type = T;\n"
+        "    using type = integral_constant;\n"
+        "    constexpr operator value_type() const noexcept { return value; }\n"
+        "    constexpr value_type operator()() const noexcept { return value; }\n"
+        "};\n"
+        "template <bool V> using bool_constant = integral_constant<bool, V>;\n"
+        "using true_type = bool_constant<true>;\n"
+        "using false_type = bool_constant<false>;\n"
+        "template <bool B, class T = void> struct enable_if {};\n"
+        "template <class T> struct enable_if<true, T> { using type = T; };\n"
+        "template <bool B, class T = void> using enable_if_t = typename enable_if<B, T>::type;\n"
+        "template <bool B, class T, class F> struct conditional { using type = T; };\n"
+        "template <class T, class F> struct conditional<false, T, F> { using type = F; };\n"
+        "template <bool B, class T, class F> using conditional_t = typename conditional<B, T, F>::type;\n"
+        "template <class A, class B> inline constexpr bool is_same_v = __is_same(A, B);\n"
+        "template <class A, class B> struct is_same : bool_constant<__is_same(A, B)> {};\n"
+        "template <class T> struct remove_const { using type = __remove_const(T); };\n"
+        "template <class T> using remove_const_t = __remove_const(T);\n"
+        "template <class T> struct remove_volatile { using type = __remove_volatile(T); };\n"
+        "template <class T> using remove_volatile_t = __remove_volatile(T);\n"
+        "template <class T> struct remove_cv { using type = __remove_cv(T); };\n"
+        "template <class T> using remove_cv_t = __remove_cv(T);\n"
+        "template <class T> struct remove_reference { using type = __remove_reference_t(T); };\n"
+        "template <class T> using remove_reference_t = __remove_reference_t(T);\n"
+        "template <class T> struct remove_cvref { using type = __remove_cvref(T); };\n"
+        "template <class T> using remove_cvref_t = __remove_cvref(T);\n"
+        "template <class T> inline constexpr bool is_integral_v = __is_integral(T);\n"
+        "template <class T> struct is_integral : bool_constant<__is_integral(T)> {};\n"
+        "template <class T> inline constexpr bool is_floating_point_v = __is_floating_point(T);\n"
+        "template <class T> struct is_floating_point : bool_constant<__is_floating_point(T)> {};\n"
+        "template <class T> inline constexpr bool is_arithmetic_v = __is_arithmetic(T);\n"
+        "template <class T> struct is_arithmetic : bool_constant<__is_arithmetic(T)> {};\n"
+        "template <class... T> inline constexpr bool disjunction_v = (false || ... || bool(T::value));\n"
+        "template <class... T> struct disjunction : bool_constant<disjunction_v<T...>> {};\n"
         "}\n";
-    /* Parallel compiles share this file, and one compile's clang may be reading it as the next compile starts. So
-       it is never truncated in place: it is rewritten only when it differs, whole, into a temp file named for this
+    static const char ForwardText[] = "#pragma once\n#include <initializer_list>\n";
+    /* Parallel compiles share these files, and one compile's clang may be reading one as the next compile starts. So
+       none is truncated in place: it is rewritten only when it differs, whole, into a temp file named for this
        process, which is then renamed over it (POSIX replaces the name atomically). A write or rename that fails
        leaves no temp file and stays silent, as before; clang then reports the missing header. */
-    if (ReadText(Shim.string()) != ShimText)
+    for (const auto& [Name, Text] : { std::pair<const char*, const char*>{ "initializer_list", InitListText },
+                                      { "type_traits", ForwardText }, { "cstddef", ForwardText } })
     {
-        const std::filesystem::path Tmp = ShimDir / ("initializer_list." + std::to_string(getpid()) + ".tmp");
+        const std::filesystem::path Shim = ShimDir / Name;
+        if (ReadText(Shim.string()) == Text) continue;
+        const std::filesystem::path Tmp = ShimDir / (std::string(Name) + "." + std::to_string(getpid()) + ".tmp");
         std::ofstream Out(Tmp, std::ios::binary | std::ios::trunc);
-        Out << ShimText;
+        Out << Text;
         Out.close();
         std::error_code ShimEc;
         if (!Out.fail()) std::filesystem::rename(Tmp, Shim, ShimEc);
