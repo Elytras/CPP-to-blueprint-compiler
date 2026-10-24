@@ -4480,6 +4480,21 @@ def api_stub():
         assert text.hex() in entries['Raise'] and not any(text.hex() in entries[f] for f in entries if f != 'Raise'), entries
         proves('access-read-only.ue-tooltip-adds-charges-ue')
         assert text not in cooked, text
+    # Without UE_TOOLTIP the comment right above a method is its tooltip: a /* */ block's lines joined (Whose), a `//`
+    # line (SameKind). Raise's UE_TOOLTIP wins over its comment; a member's trailing comment (Seed's, above Twice), a
+    # marker line (Peek) and an access specifier (Next, Step) leave a method none. The class's comment is the
+    # Blueprint's description (its tag and its registry tag). None of it is in the pak.
+    whose = b"this or any object. The second GetName() here is UFSDSaveGame's own UFunction, which hides"
+    for fn, text in (('Whose', whose), ('SameKind', b"Whether Other is an object of this one's class.")):
+        proves('access-read-only.doc-comment-tooltip', 'methods-as-blueprint.ue-tooltip-ue-keywords')
+        assert text.hex() in entries[fn] and text not in cooked, (fn, entries[fn])
+    proves('access-read-only.doc-comment-tooltip')
+    assert b'Without UE_TOOLTIP'.hex() not in entries['Raise'], entries['Raise']
+    assert 'ToolTip' in entries['Whose'] and not any('ToolTip' in entries[f] for f in ('Twice', 'Peek', 'Next', 'Step')), entries
+    description = b"Dumper-7 respells what C++ cannot say: UFSDSaveGame's `Index` and `Name` are Index_0 and Name_0 in the SDK, because its"
+    proves('access-read-only.class-doc-comment')
+    assert re.search(r'BlueprintDescription \[0\] StrProperty', '\n'.join(out)) and description in blob, out
+    assert ua.count(description) == 2 and description not in cooked, 'BlueprintDescription: the tag and the registry tag'
     # A private field is left out; the const one is offered read-only (CPF_BlueprintReadOnly 0x10).
     proves('access-read-only.private')
     assert set(variables) == {'Charges', 'Plain', 'Limit', 'Cap'}, set(variables)
