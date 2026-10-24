@@ -53,12 +53,15 @@ def manifest_path(bp, path):
 
 
 # UnrealPak: UNREALPAK, else UE 4.27's default install. Off Windows, a Linux UnrealPak on PATH, else that default
-# install's UnrealPak.exe on the mounted Windows drive; an .exe there runs under Wine.
+# install's UnrealPak.exe on the mounted Windows drive; an .exe there runs under Wine. With none of those, repak
+# (github.com/trumank/repak, what MINT packs with) on PATH packs and extracts instead; UNREALPAK=<repak> picks it.
 UNREALPAK_DEFAULT = r"C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe"
 UNREALPAK = os.environ.get("UNREALPAK") or (UNREALPAK_DEFAULT if os.name == "nt" else
                                             shutil.which("UnrealPak") or drive_path(UNREALPAK_DEFAULT) or "UnrealPak")
 UNREALPAK_RUN = ([shutil.which("wine") or "wine", UNREALPAK]
                  if os.name != "nt" and UNREALPAK.lower().endswith(".exe") else [UNREALPAK])
+REPAK = (UNREALPAK if os.path.basename(UNREALPAK).lower().startswith("repak") else
+         shutil.which("repak") if not os.environ.get("UNREALPAK") and not os.path.exists(UNREALPAK) else None)
 
 
 def newest(paths):
@@ -317,7 +320,8 @@ def content_of(src, bp, root):
                     if len(paks) != 1:
                         sys.exit("%s holds %d .pak files, not one" % (src, len(paks)))
                     pak = z.extract(paks[0], os.path.join(root, ".zip"))
-            proc = subprocess.run(UNREALPAK_RUN + [pak, "-Extract", root], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            extract = [REPAK, "unpack", pak, "-o", root, "-f", "-q"] if REPAK else UNREALPAK_RUN + [pak, "-Extract", root]
+            proc = subprocess.run(extract, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, errors="replace")
             if proc.returncode != 0:
                 sys.exit("UnrealPak could not extract %s:\n%s" % (pak, proc.stdout[-2000:]))
@@ -430,6 +434,17 @@ def run_compile(cmd):
 
 
 def run_unrealpak(fsd_dir, pak_path):
+    if REPAK:
+        # What UnrealPak writes for the response file below: UE 4.27's pak version, zlib, the tree under ../../../FSD/.
+        if os.path.exists(pak_path):
+            os.remove(pak_path)
+        proc = subprocess.run([REPAK, "pack", "--version", "V11", "--compression", "Zlib", "-m", "../../../%s/" % PROJECT,
+                               fsd_dir, pak_path, "-q"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if proc.returncode != 0:
+            print("  repak failed (%d):" % proc.returncode)
+            print("    " + "\n    ".join(proc.stdout.strip().splitlines()[-6:]))
+            return False
+        return True
     if not os.path.exists(UNREALPAK):
         print("  UnrealPak not found at %s - skipping the pak." % UNREALPAK)
         return False
