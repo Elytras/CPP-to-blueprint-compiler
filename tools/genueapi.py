@@ -1162,6 +1162,11 @@ def parse_field(cur, m, skipped):
         at = int(off.group(1), 16)
         cur.offsets[fname] = (at, sum(1 for o, _ in cur.offsets.values() if o == at))
     mapped = "bool" if bits else map_type(raw)
+    weak = WEAK.match(raw.strip())
+    if weak:
+        # Read like an object (Types.h's TWeakObjectPtr), as a struct's weak member is: execInstanceVariable hands the
+        # object out through CopyCompleteValueToScriptVM, as EX_StructMemberContext does. AssetGen refuses a write.
+        mapped = "TWeakObjectPtr<class %s>" % weak.group(1)
     if mapped in KINDS or mapped == "void":
         skipped[mapped if mapped in KINDS else "other"] += 1
         GAPS.append(("member", cur, fname, raw, mapped if mapped in KINDS else "other"))

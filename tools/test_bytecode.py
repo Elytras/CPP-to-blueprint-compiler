@@ -8992,9 +8992,9 @@ print('ok  IfaceStaticClass: IIscMark::StaticClass() on a mod interface names II
 
 
 def weak_field_read():
-    """WeakFieldRead: a native struct's TWeakObjectPtr member is EX_StructMemberContext of it, read like an object: the
-    object of a call, the value an object variable is set to, IsValid's argument. Assigning one, and a weak variable of
-    the mod's own, are refused."""
+    """WeakFieldRead: a native struct's TWeakObjectPtr member is EX_StructMemberContext of it, a class's is
+    EX_InstanceVariable in a Context, each read like an object: the object of a call, the value an object variable is
+    set to, IsValid's argument. Assigning either, and a weak variable of the mod's own, are refused."""
     base = asset('WeakFieldRead')
     keeps_invariants(base)
     text = dump('walkscript.py', base, export_index(base, 'Take'))
@@ -9004,7 +9004,15 @@ def weak_field_read():
     assert re.search(r"LetObj\s*\n.*Causer@.*\n.*" + member % ('DamageCauser', 'DamageData'), text), text
     proves('conditions.if-target')
     assert re.search(r"Function'IsValid'\s*\n.*" + member % ('Component', 'DamageDataBase'), text), text
+    # A class's weak member: EX_InstanceVariable in a Context, read as any object member is.
+    owned = dump('walkscript.py', base, export_index(base, 'Owned'))
+    inst = r"Context\s+skip \d+ %s@imp\[\d+\]:Class'%s'"
+    assert re.search(inst % ('ParentComponent', 'Actor') + r"(.*\n)*.*FinalFunction\s+imp\[\d+\]:Function'GetOwner'", owned), owned
+    assert re.search(r"LetObj\s*\n.*Parent@.*\n.*" + inst % ('ParentComponent', 'Actor'), owned), owned
+    assert re.search(r"Function'IsValid'\s*\n.*" + inst % ('PhysicsVolume', 'SceneComponent'), owned), owned
     proves('object-and-class.data-instigator-k2-getpawn')
+    refused('WeakMemberWrite', '  void Set(AActor *Other) { Other->ParentComponent = Other->ParentComponent; }\n',
+            'an assignment to a TWeakObjectPtr member')
     refused('WeakFieldWrite', '  void Take(FDamageData Data) { Data.Instigator = Data.Instigator; }\n',
             'an assignment to a TWeakObjectPtr member')
     proves('object-and-class.tweakobjectptr-aactor-last')
@@ -9012,7 +9020,7 @@ def weak_field_read():
 
 
 weak_field_read()
-print('ok  WeakFieldRead: FDamageData\'s weak members read as objects (StructMemberContext); writing one is refused')
+print('ok  WeakFieldRead: FDamageData\'s and AActor\'s weak members read as objects; writing one is refused')
 
 
 def game_enum_static_arg():
