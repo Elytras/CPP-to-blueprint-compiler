@@ -18,11 +18,11 @@ AssetGen builds and runs on Windows and on Linux, and is meant to write the same
 
 | What | Windows | Linux |
 | --- | --- | --- |
-| C++17 compiler | Visual Studio 2022 (v143, x64) | GCC or clang (tested with GCC 13 and clang 18), CMake 3.16+ |
+| C++17 compiler | Visual Studio 2022 (v143, x64) | GCC or clang (tested with GCC 13), CMake 3.16+ |
 | `nlohmann-json` | [vcpkg](https://github.com/microsoft/vcpkg) with `vcpkg integrate install`, restored from `vcpkg.json` on first build | the distro package (`nlohmann-json3-dev`, `nlohmann-json`), else CMake downloads it |
-| LLVM `clang++` on `PATH` | yes | yes. AssetGen parses your source with clang's JSON AST dump |
+| LLVM `clang++` on `PATH` | yes (LLVM 20) | yes, clang 20 (see [Build](#build)). AssetGen parses your source with clang's JSON AST dump |
 | Python 3 + `pyyaml` | yes | yes. For `tools/bpbuild.py`, the multi-mod build driver |
-| UE 4.27 `UnrealPak` (optional) | `UnrealPak.exe`, found at the default Epic install path or `UNREALPAK=<path>` | `UnrealPak` on `PATH`, or `UNREALPAK=<path>` (see [Packing on Linux](#packing-on-linux)) |
+| UE 4.27 `UnrealPak` (optional) | `UnrealPak.exe`, found at the default Epic install path or `UNREALPAK=<path>` | `UnrealPak` on `PATH`, `UNREALPAK=<path>`, or [repak](https://github.com/trumank/repak) on `PATH` (see [Packing on Linux](#packing-on-linux)) |
 | The game SDK headers (`UeApi/`) | yes | yes. What your mod `#include`s. Get them from [DRG-Blueprint-Cpp-SDK](https://github.com/Elytras/DRG-Blueprint-Cpp-SDK), or generate your own with `tools/genueapi.py` |
 
 ## Build
@@ -32,7 +32,8 @@ AssetGen builds and runs on Windows and on Linux, and is meant to write the same
 **Linux:**
 
 ```sh
-sudo apt install build-essential cmake clang python3-yaml nlohmann-json3-dev   # Debian / Ubuntu
+sudo apt install build-essential cmake clang-20 python3-yaml nlohmann-json3-dev   # Ubuntu 24.04, Mint 22
+export PATH=/usr/lib/llvm-20/bin:$PATH      # AssetGen runs `clang++`: make it clang 20
 cmake -B build
 cmake --build build -j
 ```
@@ -40,10 +41,15 @@ cmake --build build -j
 and you get `build/assetgen`. On Arch the packages are `base-devel cmake clang python-yaml nlohmann-json`,
 on Fedora `gcc-c++ cmake clang python3-pyyaml json-devel`.
 
+The `clang++` AssetGen runs to parse a mod must be clang 20, as on Windows: clang 18, the default on Ubuntu 24.04
+and Mint 22, leaves out what some mods need from its AST dump (`__is_same`), and those fail with
+`unimplemented argument TypeTraitExpr`. `clang++ --version` tells which one is first on `PATH`.
+
 On Linux, clang still parses your mod for the game's target (`x86_64-pc-windows-msvc`), so `sizeof`,
-`long` and `wchar_t` mean what they mean in the game. That target has no C++ standard library on Linux,
-so `<initializer_list>`, which the SDK needs, is the only standard header a mod can include there. Use
-clang builtins such as `__is_same(A, B)` instead of `<type_traits>`.
+`long` and `wchar_t` mean what they mean in the game. That target has no C++ standard library on Linux, so
+AssetGen supplies `<initializer_list>`, which the SDK needs, with what MSVC's brings in along with it
+(`std::size_t`, `std::is_same_v` and the other basic traits); `<type_traits>` and `<cstddef>` name the same
+stand-in. No other standard header exists there.
 
 ## Use
 
@@ -119,9 +125,16 @@ every key. `python tools/bpbuild.py examples <UeApi dir> <path to assetgen>` bui
 
 ### Packing on Linux
 
-A native Linux UnrealPak (from a source-built UE 4.27) goes on `PATH` or in `UNREALPAK`. Otherwise run the
-Windows `UnrealPak.exe` under Wine, straight from a UE 4.27 install (a dual-boot Windows drive
-works, read-only is fine) or a copy of its `Engine` folder. Save a wrapper script:
+Without UE 4.27, use [repak](https://github.com/trumank/repak), the packer MINT uses: download
+`repak_cli-x86_64-unknown-linux-gnu.tar.xz` from its releases and put `repak` on `PATH` (`~/.local/bin`). With no
+UnrealPak around, bpbuild packs with it and extracts `kept` and `game_content` paks with it, writing what UnrealPak
+would (UE 4.27's pak version, zlib, the files under `../../../FSD/`).
+
+A native Linux UnrealPak (from a source-built UE 4.27) goes on `PATH` or in `UNREALPAK`. On a dual boot, bpbuild
+finds the Windows `UnrealPak.exe` at the default install path on the mounted Windows drive and runs it under Wine,
+and reads a `C:/...` or `D:/...` path in `mods.yaml` from that drive (`/mnt/c`, `/mnt/winc`, or
+`BPBUILD_DRIVES="C=<mount>;D=<mount>"`); read-only is fine except for an `api_dir` there. For a copy of UE's `Engine`
+folder elsewhere, save a wrapper script:
 
 ```sh
 #!/bin/sh
