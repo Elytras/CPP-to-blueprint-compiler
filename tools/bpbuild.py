@@ -9,12 +9,15 @@ import shutil
 import subprocess
 import sys
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dumpexp import load as load_package
+import mintcache
+from mintcache import MINT_CACHE, MODIO_URL   # MINT's download cache: what a mod.io `game_content` names
 
 MOD_PACKAGE = re.compile(r'UE_MOD_PACKAGE\s*\(\s*"([^"]+)"')
 
@@ -241,40 +244,81 @@ def stage_bundle(files, stage_fsd):
         shutil.copy2(src, to)
 
 
-def kept_source(mod, bp):
-    """The Content folder a mod's `kept` packages come from: `kept.from` itself, or, for a .pak, its extraction under
-    build/<mod>/kept, made once and again only when the pak changes."""
-    src = os.path.abspath(os.path.join(bp, os.path.expandvars(mod["kept"]["from"])))
+def mint_blob(url, cache):
+    """The file MINT downloaded for `url`, a MODIO_URL, out of the MINT cache folder `cache`: (its path, what it is,
+    a note or None). Unpinned, it is the mod's latest file MINT knows, the one a profile that lists the same URL
+    installs; pinned, that file, with a note when MINT knows a newer one. Stops the build when MINT has not fetched
+    it. content_of calls it for a `game_content` or a `kept` `from` that is a mod.io URL; the cache reading itself
+    is mintcache.lookup, shared with tools/mintlib.py."""
+    try:
+        hit = mintcache.lookup(url, cache)
+    except mintcache.Miss as e:
+        sys.exit(str(e))
+    return hit["path"], hit["what"], hit["note"] and hit["note"] + ": recheck the patch against it"
+
+
+def content_of(src, bp, root):
+    """The Content folder of `src`, a path in mods.yaml: the folder itself, or, for a .pak or a .zip holding one (a
+    mod.io download, as MINT caches it), its extraction under `root`, made once and again only when the file changes.
+    A mod.io URL (MODIO_URL) names the download MINT cached for it (mint_blob)."""
+    what = None
+    if MODIO_URL.match(src):
+        src, what, note = mint_blob(src, MINT_CACHE)
+        if note:
+            print("note: " + note)
+    src = os.path.abspath(os.path.join(bp, os.path.expandvars(src)))
     if os.path.isdir(src):
         root = src
     else:
-        root = os.path.join(bp, "build", mod["name"], "kept")
         stamp = os.path.join(root, ".pak")
         want = "%s %d %d" % (src, os.path.getsize(src), int(os.path.getmtime(src)))
         if read_text(stamp) != want:
             shutil.rmtree(root, ignore_errors=True)
             os.makedirs(root)
-            proc = subprocess.run([UNREALPAK, src, "-Extract", root], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            pak = src
+            if zipfile.is_zipfile(src):
+                with zipfile.ZipFile(src) as z:
+                    paks = [n for n in z.namelist() if n.lower().endswith(".pak")]
+                    if len(paks) != 1:
+                        sys.exit("%s holds %d .pak files, not one" % (src, len(paks)))
+                    pak = z.extract(paks[0], os.path.join(root, ".zip"))
+            proc = subprocess.run([UNREALPAK, pak, "-Extract", root], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, errors="replace")
             if proc.returncode != 0:
-                sys.exit("kept: UnrealPak could not extract %s:\n%s" % (src, proc.stdout[-2000:]))
+                sys.exit("UnrealPak could not extract %s:\n%s" % (pak, proc.stdout[-2000:]))
             io.open(stamp, "w", encoding="utf-8").write(want)
+            if what:
+                print("extracted %s -> %s" % (what, root))
     for sub in ("Content", os.path.join("FSD", "Content")):
         if os.path.isdir(os.path.join(root, sub)):
             return os.path.join(root, sub)
     return root
 
 
+def kept_source(entry, mod, bp, i):
+    """The Content folder a `kept` entry's packages come from: its `from`, extracted under build/<mod>/kept (kept<i>
+    for the i-th entry after the first)."""
+    return content_of(entry["from"], bp, os.path.join(bp, "build", mod["name"], "kept" + (str(i) if i else "")))
+
+
 def place_kept(mod, bp, stage_fsd):
     """A mod's `kept` packages - assets it ships as they were cooked, which no source of it builds (textures, fonts,
-    a widget with animations) - into its FSD tree for the pak. `paths` lists /Game package paths or folders. Hard
-    links where the volume allows: a texture folder runs to gigabytes. Returns how many files it placed."""
+    a data asset no source fills) - into its FSD tree for the pak. `kept` is one `{from, paths}` entry or a list of
+    them; `paths` lists /Game package paths or folders. Hard links where the volume allows: a texture folder runs to
+    gigabytes. Returns how many files it placed."""
     kept = mod.get("kept")
     if not kept:
         return 0
-    content = kept_source(mod, bp)
     n = 0
-    for path in kept.get("paths") or []:
+    for i, entry in enumerate(kept if isinstance(kept, list) else [kept]):
+        n += place_kept_entry(entry, mod, bp, i, stage_fsd)
+    return n
+
+
+def place_kept_entry(entry, mod, bp, i, stage_fsd):
+    content = kept_source(entry, mod, bp, i)
+    n = 0
+    for path in entry.get("paths") or []:
         rel = path[len("/Game/"):] if path.startswith("/Game/") else path.lstrip("/")
         base = os.path.join(content, *rel.split("/"))
         files = [os.path.join(r, f) for r, _d, fs in os.walk(base) for f in fs] if os.path.isdir(base) else \
@@ -375,6 +419,10 @@ def check_mod_imports(staged, mod_packages):
         return sorted(os.path.relpath(f, content).replace(os.sep, "/")
                       for f in cooked_assets(content) if f.endswith(".uasset"))
 
+    # A mod may cook under a second root (`namespace Game::...`, as EEE does), beside its package's folder: look at
+    # its whole Content folder, which holds what it ships, kept packages included.
+    staged = [(mod, os.path.normpath(os.path.join(content, *[".."] * (package.count("/") - 1))), "/Game")
+              for mod, content, package in staged]
     produced = set()
     for _mod, content, package in staged:
         produced.update(package + "/" + f[:-len(".uasset")] for f in packages(content))
@@ -400,6 +448,23 @@ VS_FILTERS = (("Mods", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b01"), ("Tests", "5b1f0
               ("Helpers", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b03"), ("UeApi", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b04"))
 
 
+def vs_namespace_filter(path, folder_name):
+    """The sub-filter a mod's source goes under in Visual Studio: its first namespace, which is its package folder
+    in game (Manager::Core::Services::Logger gives Manager\\Core\\Services\\Logger), so a mod of hundreds of files in
+    one folder (EMM, EEE) shows as its package tree rather than one alphabetical list. A leading Game:: (a child of a
+    game Blueprint) is dropped. None for a file with no namespace and for the mod's own umbrella files, named after
+    its folder (ElytrasModManager.h / .cpp), which stay at the top."""
+    if os.path.splitext(os.path.basename(path))[0].lower() == folder_name.lower():
+        return None
+    m = re.search(r"^namespace ([\w:]+) \{", io.open(path, encoding="utf-8-sig", errors="replace").read(), re.M)
+    if not m:
+        return None
+    name = m.group(1)
+    if name.startswith("Game::"):
+        name = name[len("Game::"):]
+    return name.replace("::", "\\")
+
+
 def write_vs_filters(bp):
     """The project's file list and its folders (Mods / Tests / Helpers / UeApi), written from what is on disk, on
     every build and only when it changed - a rewrite makes Visual Studio reload the project. Wildcards would need no
@@ -422,20 +487,40 @@ def write_vs_filters(bp):
         elif f.endswith(".h"):
             rows.append(("ClInclude", f, "Helpers"))
     # A mod in its own folder (`MyMod/`) gets a filter of its own under Mods (`Mods\MyMod`), nested as the folders
-    # are. Its GUID is derived from the name, so a rewrite does not churn it.
+    # are; everything under `Tests/` (the test mods and each mod's behaviour tests, .py included) goes under Tests
+    # instead. Generated headers and build output are skipped at any depth (a game's own `RC/UeApi` is thousands of
+    # files). A filter's GUID is derived from its name, so a rewrite does not churn it.
     filters = list(VS_FILTERS)
+    known = {f for f, _ in filters}
+    def add_filter(folder):
+        # Each level of a nested filter is declared, the outer first, once.
+        parts = folder.split("\\")
+        for i in range(1, len(parts) + 1):
+            level = "\\".join(parts[:i])
+            if level not in known:
+                known.add(level)
+                filters.append((level, str(uuid.uuid5(uuid.NAMESPACE_URL, "bpmods:" + level.lower()))))
     for root, dirs, files in os.walk(bp):
-        dirs[:] = sorted((d for d in dirs if root != bp or d not in ("build", "out") + GENERATED), key=str.lower)
+        dirs[:] = sorted((d for d in dirs if d not in ("build", "out", "__pycache__") + GENERATED), key=str.lower)
         if root != bp:
-            folder = "Mods\\" + os.path.relpath(root, bp)
-            filters.append((folder, str(uuid.uuid5(uuid.NAMESPACE_URL, "bpmods:" + folder.lower()))))
+            rel = os.path.relpath(root, bp)
+            test = rel.split(os.sep)[0] == "Tests"
+            folder = rel if test else "Mods\\" + rel
+            if folder != "Tests":
+                add_filter(folder)
             for f in sorted(files, key=str.lower):
-                if f.endswith((".cpp", ".h")):
-                    rows.append(("ClCompile" if f.endswith(".cpp") else "ClInclude",
-                                 os.path.relpath(os.path.join(root, f), bp), folder))
+                if f.endswith((".cpp", ".h")) or (test and f.endswith(".py")):
+                    kind = "ClCompile" if f.endswith(".cpp") else "ClInclude" if f.endswith(".h") else "None"
+                    where = folder
+                    sub = None if test else vs_namespace_filter(os.path.join(root, f), os.path.basename(root))
+                    if sub:
+                        where = folder + "\\" + sub
+                        add_filter(where)
+                    rows.append((kind, os.path.relpath(os.path.join(root, f), bp), where))
     # The compiler's own test mods (their headers and tests/ast too, not the test run's build/) and the headers any mod
     # may include live beside it, in AssetGen.
-    for sub, folder in (("tests", "Tests"), ("include", "Helpers")):
+    add_filter("Tests\\AssetGen")
+    for sub, folder in (("tests", "Tests\\AssetGen"), ("include", "Helpers")):
         d = os.path.join(bp, "..", "AssetGen", sub)
         for root, dirs, files in os.walk(d):
             dirs[:] = sorted((x for x in dirs if x != "build"), key=str.lower)
@@ -495,6 +580,18 @@ def main():
     game = config.get("game_content")
     game_dir = os.path.abspath(os.path.join(bp, os.path.expandvars(game))) if game else None
 
+    game_dirs = {}
+
+    def mod_game_dir(mod):
+        """A mod's own `game_content` wins over the manifest's: another mod's pak, mod.io zip or mod.io URL, for a
+        patch of a third-party mod's Blueprint, extracted under build/<mod>/game. Resolved once a build."""
+        own = mod.get("game_content")
+        if not own:
+            return game_dir
+        if mod["name"] not in game_dirs:
+            game_dirs[mod["name"]] = content_of(own, bp, os.path.join(bp, "build", mod["name"], "game"))
+        return game_dirs[mod["name"]]
+
     # The dumped headers mod_sources does not walk: UeApi and its sibling UeAssets, each with its subfolders.
     ue_assets = os.path.join(os.path.dirname(ue_api), "UeAssets")
     toolchain_time = max(newest(tree_files(ue_api)), newest(tree_files(ue_assets)), newest([assetgen]))
@@ -520,6 +617,7 @@ def main():
             continue
 
         package = mod_package(sources)
+        game = mod_game_dir(mod)
         stage_fsd = os.path.join(bp, "build", name, PROJECT)
         stage_content = os.path.join(stage_fsd, "Content", *package.replace("/Game/", "").split("/"))
         assets = cooked_assets(stage_content)
@@ -536,7 +634,7 @@ def main():
 
         # An edit's output is the game's package, edited: it is stale when the game's copy is newer (a re-extract
         # after a game update), or an edit of the old package would ship over the new one.
-        edits = staged_edits(stage_fsd, stage_content, game_dir)
+        edits = staged_edits(stage_fsd, stage_content, game)
         outputs = assets + [s for s, _g in edits]
         # The stamp sits beside FSD, not in it: the pak takes the whole FSD tree.
         settings = mod_settings(mod, config)
@@ -548,7 +646,7 @@ def main():
                  or read_text(settings_file) != settings
                  or inputs_time > oldest(outputs)
                  or any(os.path.getmtime(g) > os.path.getmtime(s) for s, g in edits)
-                 or newest(read_files(reads_file, game_dir)) > oldest(outputs))
+                 or newest(read_files(reads_file, game)) > oldest(outputs))
         job = None
         if stale:
             # The pak takes the whole FSD tree, so the whole Content tree goes, not just this package's folder:
@@ -587,8 +685,8 @@ def main():
             cmd = [assetgen, "compile", unit, ue_api, stage_content]
             if api_content:
                 cmd += ["--api", api_content]
-            if game_dir:
-                cmd += ["--game", game_dir]
+            if game:
+                cmd += ["--game", game]
             job = pool.submit(run_compile, cmd)
         entries.append((mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings,
                         inputs_time))
@@ -639,7 +737,7 @@ def main():
         dep_stages = [dep_stage(d, by_name, bp) for d in transitive_needs(name, by_name)] if embed else []
         dep_assets = [f for content, _p, _f in dep_stages for f in cooked_assets(content)]
         bundle = bundle_files(mod, bp)
-        assets = cooked_assets(stage_content) + [s for s, _g in staged_edits(stage_fsd, stage_content, game_dir)]
+        assets = cooked_assets(stage_content) + [s for s, _g in staged_edits(stage_fsd, stage_content, mod_game_dir(mod))]
         pak = os.path.join(bp, "out", name + "_P.pak")
         # A dep's assets are baked into this pak, so a change to one restales it; likewise our own
         # assets after a --no-pak run. Judged on our sources alone the old pak would ship, and a mod

@@ -1,4 +1,4 @@
-# AssetGen guide
+﻿# AssetGen guide
 
 This guide shows how to write, build and run a Deep Rock Galactic mod with AssetGen. [REFERENCE.md](REFERENCE.md)
 covers every construct the compiler accepts, warns about or refuses. [examples/](examples/) holds complete mods that
@@ -35,10 +35,10 @@ Each piece of C++ becomes the Blueprint construct the editor would have made:
 | An `inline` method or function | No function at all: each call pastes the body in, like a macro |
 | A local, `int32 Sum = 0;` | A local variable of the function |
 | A `T&` parameter, `void Around(int32 A, int32 &Lo, int32 &Hi)` | A pass-by-reference pin: the function writes the caller's variable |
-| `UE_PURE int32 Doubled() const { ... }` | A pure function, drawn without exec pins |
+| `int32 Doubled() const { ... }`, `UE_PURE static int32 Tripled(int32 V)` | A pure function, drawn without exec pins |
 | Static methods of a class deriving `UBlueprintFunctionLibrary` | A Blueprint Function Library |
 | A variable at namespace scope, `int32 Total = 0;` | No Blueprint has globals: a class that AssetGen generates holds it in its default object |
-| `if`, `switch`, `for`, `while` | The Branch node, Switch on Int / Enum, the ForLoop and WhileLoop macros, compiled to jumps |
+| `if`, `switch`, `for`, `while` | The Branch node, Switch on Int / Enum (one jump through a table), the ForLoop and WhileLoop macros, compiled to jumps |
 | `Cast<APawn>(Obj)` | The Cast To node |
 | `UKismetSystemLibrary::Delay(2.0f);` | A latent node: the function becomes part of the class's event graph and resumes when the delay ends |
 
@@ -52,12 +52,14 @@ The source is C++, but what runs is a Blueprint. These are the differences that 
 - **Your C++ never runs as C++.** Member initializers, `UE_DEFAULTS` and a default constructor are read when the mod
   is built, as the class's defaults, and run-time setup goes in `ReceiveBeginPlay`. See
   [Classes and variables](#classes-and-variables).
-- **A method is a Blueprint function unless it is `inline`**, and a free function must be `inline`. See
-  [Functions and events](#functions-and-events).
+- **A function is a Blueprint function unless it is `inline`**: a method one of its class, a free function one of
+  `BPL_<source>`, a function library the compiler generates. See [Functions and events](#functions-and-events).
 - **Only Blueprint's types exist.** There is no `double`, and the only integer types are `uint8`, `int32` and
-  `int64`: write `0.5f`, not `0.5`. See [Types](REFERENCE.md#types).
-- **The engine's C++ is out of reach.** A mod calls the reflected functions in the SDK headers. There is no `FMath`
-  and no standard library, and Print String shows nothing in the retail game. See
+  `int64`: write `0.5f`, not `0.5`. There is no char either: `'y'`, and `C ? 'y' : 'n'`, is its int code. See
+  [Types](REFERENCE.md#types).
+- **The engine's C++ is out of reach.** A mod calls the reflected functions in the SDK headers. There is no standard
+  library, `FMath` is only the math nodes that `AssetGen/include/FMath.h` spells its way, and Print String shows
+  nothing in the retail game. See
   [Talking to the game](#talking-to-the-game).
 - **Locals have no address and no scope.** Two locals of one name and type in different blocks are one variable, which
   correct C++ cannot notice. Give locals of different types different names: `{ int32 X; } { FString X; }` makes two
@@ -301,9 +303,9 @@ Watch for:
 - A constructor never runs. A default constructor is read as the class's defaults, `Lantern() : Charges(5) {}` as
   `int32 Charges = 5;`, and its other statements as `UE_DEFAULTS`; anything else in it is refused. Do run-time setup
   in `ReceiveBeginPlay`. See [Constructors](REFERENCE.md#constructors).
-- Redeclaring an inherited property, such as `float InitialLifeSpan = 3.0f;` in a class derived from `AActor`,
-  compiles with no warning. It adds a second variable that hides the parent's, and the engine never reads it. Use
-  `UE_DEFAULTS`.
+- Redeclaring an inherited property, such as `float InitialLifeSpan = 3.0f;` in a class derived from `AActor`, is
+  refused (`AActor already has a variable InitialLifeSpan`): it would be a second variable that hides the parent's,
+  which the engine never reads. Use `UE_DEFAULTS`.
 - UE 4.27 Blueprint has no `double`, `int8`, `int16`, `uint16`, `uint32` or `uint64`, and a variable of any of them is
   refused. `X * 0.5` with a `float X` is a `double` operation in C++, so it is refused too, with
   `no Kismet conversion from float to double`. Write `0.5f`.
@@ -332,9 +334,12 @@ body is copied in. A call that stays a call is bound only to a function the fina
 overrides or inherits is called by name, as the editor calls a function that is not Final, which with no subclass
 reaches the same body.
 
-`UE_PURE` makes a pure function, drawn without exec pins. A `T&` parameter is an output, a pass-by-reference pin. A
+A `const` method that returns a value is a pure function, drawn without exec pins, as UHT makes one; `UE_PURE` makes a
+static one pure, and also promises no side effects, so an unused call of it is dropped. A `T&` parameter is an output, a pass-by-reference pin. A
 `static` method runs on the class default object (the instance that holds Class Defaults), which has no world, so give
-it a `UObject *WorldContextObject` parameter if it calls the engine. A method that waits follows extra rules, in
+it a `UObject *WorldContextObject` parameter if it calls the engine. A static of a function library
+(`UBlueprintFunctionLibrary`) is always called, as the editor's library nodes are, unless you mark it
+`[[gnu::always_inline]]` to have its body copied into each caller, or make it `inline` to have no function at all. A method that waits follows extra rules, in
 [Timers, waiting and input](#timers-waiting-and-input).
 
 ```cpp
@@ -371,8 +376,13 @@ Watch for:
   from UeApi.
 - A Blueprint class has one function per name. Two non-inline methods with the same name are refused ("a second
   function of that name"). Rename one, or make the extra overloads `inline`.
-- A function outside a class must be `inline`. Without it the call is refused with
-  `call to an unknown function: Helper`. Lambdas and function pointers are refused.
+- A function outside a class is a static of `BPL_<source>`, a function library the compiler generates beside the
+  mod's classes, unless it is `inline`. Its body must be in the source or a header it includes, or the call is
+  refused with `call to an unknown function: Helper`. Two such functions of one name are refused: rename one, or make
+  it `inline`. A function template without `inline` is one such static per instantiation, named by its arguments
+  (`Max2__float`), and a class or struct template one cooked class or struct per instantiation; see
+  [Templates](REFERENCE.md#templates). A lambda is expanded where it is called (`[&]`, `[=]`, `mutable`, init-captures, passed to an inline
+  template; see [Lambdas](REFERENCE.md#lambdas)); function pointers are refused.
 
 Full rules: [Functions](REFERENCE.md#functions), [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls),
 [Inline functions and templates](REFERENCE.md#inline-functions-and-templates). Examples:
@@ -392,11 +402,14 @@ game message. The dwarf is null until it exists; [Timers, waiting and input](#ti
 wait for it. The engine's getters, such as `UGameplayStatics::GetPlayerController(0)`, work too.
 `UGameplayStatics::GetAllActorsOfClass` fills a `TArray<AActor *>` that you pass in, and `Cast<T>` is the Cast To
 node: the object if it is a `T`, else null. Math is in `UKismetMathLibrary` (`Clamp`, `FMin`, `Sqrt`,
-`RandomInteger`, ...); there is no `FMath` and no C++ standard library.
+`RandomInteger`, ...), which `AssetGen/include/FMath.h` also spells UE's way (`FMath::Clamp`, `FMath::Max`, ...);
+there is no C++ standard library.
 
 Reading another object's property is the Get node with a Target: `Me->HealthComponent->GetHealth()`. Unlike C++, a
 read or a call through a null object does not crash: the game logs `Accessed None`, and a value reads as zero.
-`if (Obj)` is the IsValid node, which is also false for an object that is being destroyed. A subsystem is its class's
+`if (Obj)` is the IsValid node, which is also false for an object that is being destroyed; `if (Cls)` on a
+`TSubclassOf` is Is Valid Class. `A->GetComponentsByClass<UStaticMeshComponent>()` is the Get Components by Class node,
+typed `TArray<UStaticMeshComponent *>`, so its elements need no cast. A subsystem is its class's
 static `Get()`, the editor's Get node for it: `UTracerManager::Get()`, or `GetSubsystem<UTracerManager>()`. Left out,
 the world context is `this`. See [Working with other objects](REFERENCE.md#working-with-other-objects) for the kinds
 and for spelling the getter by hand.
@@ -431,7 +444,8 @@ Watch for:
   [Multiplayer](#multiplayer)).
 - A pure function whose result you do not use is removed, and clang warns
   `ignoring return value of function declared with pure attribute`. An array the engine fills must have the
-  parameter's exact type: `TArray<AActor *>`, not `TArray<APlayerCharacter *>`.
+  parameter's exact type: `TArray<AActor *>`, not `TArray<APlayerCharacter *>`. An array it only reads, a
+  `const TArray<AActor *>&`, takes a `TArray<APlayerCharacter *>`.
 
 Full rules: [Calling engine and game functions](REFERENCE.md#calling-engine-and-game-functions),
 [Working with other objects](REFERENCE.md#working-with-other-objects). Examples:
@@ -439,10 +453,11 @@ Full rules: [Calling engine and game functions](REFERENCE.md#calling-engine-and-
 
 ### Components and spawning
 
-`UE_COMPONENT(Type, Name)` adds a component, as Add Component in the Components panel does. `Name` is an object
-variable, and each spawned actor gets its own instance, in place by the time its construction script and BeginPlay
+A pointer member the constructor sets with `CreateDefaultSubobject`, as in UE C++, adds a component, as Add Component
+in the Components panel does: `UStaticMeshComponent *Mesh;` and `Mesh = CreateDefaultSubobject<UStaticMeshComponent>("Mesh");`
+(the older `UE_COMPONENT(Type, Name)` says the same). `Mesh` is an object variable, and each spawned actor gets its own instance, in place by the time its construction script and BeginPlay
 run. The first scene component is the root, and every later scene component attaches to it. To place one elsewhere,
-write `Tip->SetupAttachment(Glow);` in `UE_DEFAULTS`, as a C++ constructor does: under another of the class's
+write `Tip->SetupAttachment(Glow);` in the constructor, as UE C++ does: under another of the class's
 components, at a socket with `SetupAttachment(Glow, FName("Muzzle"))`, or under a component the class inherits, from
 a mod or game Blueprint parent or a native one (`SetupAttachment(Mesh)` in an `ACharacter` or `APlayerCharacter`
 child), or under the actor's root, whichever that is (`SetupAttachment(RootComponent)`). A component that is not a
@@ -450,10 +465,12 @@ scene component, such as a movement component, attaches to nothing. `SetupAttach
 keeping the relative transform, with a warning: the engine's own does nothing once the actor is constructed, so write
 `AttachToComponent` there.
 
-Set a component's defaults in `UE_DEFAULTS`, one `Comp->Field = value;` each, as you would in its Details panel.
+Set a component's defaults in the constructor (or `UE_DEFAULTS`), one `Comp->Field = value;` each, as you would in its Details panel.
 Assign a struct whole (`FVector(...)`, `FColor(R, G, B)`), and an asset with `&Asset`
-(see [Data assets and game assets](#data-assets-and-game-assets)). The class must be an engine or game component
-class; add a component class of your own at run time with `AddComponentByType<T>(this)`.
+(see [Data assets and game assets](#data-assets-and-game-assets)). The class can be an engine or game component
+class, or a component class your mod declares
+([REFERENCE.md](REFERENCE.md#declaring-components.ue-component-ucharges-ammo)); `AddComponentByType<T>(this)` adds
+one at run time instead.
 
 The spawn and construct nodes are inline helpers in `Objects.h`, in AssetGen's `include` folder; include it by its
 path or copy it beside your source. `SpawnActor<T>(Class, Transform, Owner)` is Spawn Actor from Class, and the new
@@ -470,12 +487,15 @@ UE_ASSET_AT(UStaticMesh, SM_Crate_B, "/Game/Art/Environments/SpaceRig/SM_Crate_B
 
 class Crate : public AActor {
 public:
-  UE_COMPONENT(USceneComponent, Root);        // the first scene component is the root
-  UE_COMPONENT(UStaticMeshComponent, Mesh);   // attached to Root
-  UE_COMPONENT(UPointLightComponent, Lamp);   // attached to Root
+  USceneComponent *Root;                      // the first scene component is the root
+  UStaticMeshComponent *Mesh;                 // attached to Root
+  UPointLightComponent *Lamp;                 // attached to Root
 
-  UE_DEFAULTS {                               // what the Details panel would set
-    Mesh->StaticMesh = &SM_Crate_B;
+  Crate() {                                   // read as the defaults, never run
+    Root = CreateDefaultSubobject<USceneComponent>("Root");
+    Mesh = CreateDefaultSubobject<UStaticMeshComponent>("Mesh");
+    Lamp = CreateDefaultSubobject<UPointLightComponent>("Lamp");
+    Mesh->StaticMesh = &SM_Crate_B;           // what the Details panel would set
     Lamp->Intensity = 1500.0f;
     Lamp->LightColor = FColor(255, 128, 0);
     Lamp->RelativeLocation = FVector(0.0f, 0.0f, 80.0f);
@@ -502,9 +522,11 @@ Watch for:
   `USceneComponent` root hands them on to the components attached to it. (A class whose parent already has a root,
   such as a Blueprint parent or `ACharacter`, adds no root: its first scene component keeps its transform.) A mesh or a light as the root keeps them,
   and AssetGen warns that they are not applied. Declare a `USceneComponent` first.
-- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, part of a struct such as
-  `Lamp->RelativeLocation.Z = 50.0f;`, or another object's member is refused: set a struct whole. A variable the class
-  declares itself takes an initializer instead.
+- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, or another object's member is
+  refused; the calls it reads are `SetupAttachment` and binding a component's event (see
+  [Dispatchers and interfaces](#dispatchers-and-interfaces)). A part of a struct, `PrimaryActorTick.bStartWithTickEnabled = false;`, sets that part alone; a vector or a
+  color is one value, so `Lamp->RelativeLocation.Z = 50.0f;` is refused: set it whole. A variable the class declares
+  itself takes an initializer instead.
   `Target = nullptr;`, `Count = {};` and `Offset = FVector();` write the type's zero over the parent's value.
   `Hit = FHitResult();` is refused: an FHitResult's values come from the engine's constructor (Time is 1), which
   no header shows; give the members instead, `Hit = {.Time = 1.0f};`. The same goes for every engine struct but
@@ -523,8 +545,8 @@ waits before the next one starts. An object in a local is kept only weakly acros
 made or loaded can be garbage-collected meanwhile and read None after it. The compiler warns where that can happen;
 keep such an object in a member. The caller gets control back at the method's first wait. Leave out the world
 context and the `FLatentActionInfo`: the compiler supplies both, and `RetriggerableDelay`, `MoveComponentTo` and the
-other latent functions are called the same way. Never pass the `FLatentActionInfo` yourself. With the world context
-the call is refused, and without it (`Delay(1.0f, Info)`) it is not caught yet and compiles to a broken call.
+other latent functions are called the same way. Never pass the `FLatentActionInfo` yourself: with or without the
+world context (`Delay(1.0f, Info)`), the call is refused with `leave the FLatentActionInfo argument out`.
 
 A timer calls a method at a fixed rate. `K2_SetTimerDelegate({this, &Class::Method}, Time, bLooping, 0.0f, 0.0f)` is
 Set Timer by Event; keep the `FTimerHandle` it returns in a member, and `K2_ClearAndInvalidateTimerHandle(Handle)`
@@ -621,7 +643,10 @@ once.
 `Add` and `Remove` also work on the game's dispatchers, on this actor, on another object or on a component:
 `OnDestroyed`, `Me->OnFlareThrown`, `Box->OnComponentBeginOverlap`. The handler returns `void` and takes exactly the
 parameters the header declares, spelled the same way, and clang checks this at the `Add`. It may be another object's:
-`OnScored.Add(Board, &Board::Show)` runs `Show` on Board at each broadcast. A function that takes a single delegate,
+`OnScored.Add(Board, &Board::Show)` runs `Show` on Board at each broadcast. Written in `UE_DEFAULTS` or the
+constructor, `Box->OnComponentBeginOverlap.Add(this, &Class::OnTouch);` is the editor's component-bound event: every
+actor of the class binds it as it is made
+([REFERENCE.md](REFERENCE.md#the-root-and.trigger-oncomponentbeginoverlap)). A function that takes a single delegate,
 such as a timer, takes `{this, &Class::Method}` or `{Other, &Other::Method}`. `Broadcast` works on a dispatcher of
 this class, of a mod parent, of another mod class or game Blueprint through a pointer (`T->OnHit.Broadcast(3)`), and
 on the few native ones the engine marks BlueprintCallable.
@@ -757,12 +782,16 @@ variables, and the editor's Make Struct when one computes something (`FVector2D(
 its own statement, left to right. Braces, positional or with designated members, are the editor's Make Struct:
 `FHitResult Hit = { .Time = 0.5f };`. Members the braces leave out keep their defaults; a member given `{}` is a fresh
 value of its type, as in C++: zero, empty, None. Member reads and writes, nested to any depth, act on the struct in
-place. A struct of your own carries `UE_STRUCT;` in its body. It is cooked as a Structure asset in the mod package, and
-its members' initializers are its default values.
+place. A struct of your own is cooked as a Structure asset in the mod package once a member, parameter, local or
+container of a mod class names it, and its members' initializers are its default values; one only C++ reads (a
+constexpr table) stays plain, and `UE_STRUCT;` in its body cooks it anyway. `==` and `!=` on two vectors compare every component exactly, as
+in UE C++, not with the editor node's 1e-4 tolerance; on two rotators they compare rotations, with a warning.
+`FTransform(Rotation, Translation, Scale)`, UE's order with an FRotator, and `FTransform(Location, Rotation, Scale)`,
+the Make Transform node's, are both that node.
 
-An enum of your own is an `enum class` with a `uint8`, `int32` or `int64` underlying type, followed by `UE_ENUM(Name);`.
-It is cooked as an Enumeration asset and then works like any Blueprint enum: variables, parameters, constants and
-`switch`. Without `UE_ENUM` its constants still fold to numbers, but a variable of it is refused.
+An enum of your own is an `enum class : uint8`, cooked as an Enumeration asset once a reflected position names it, as a
+struct is. It then works like any Blueprint enum: variables, parameters, constants and `switch`. An `int32` or `int64`
+one needs `UE_ENUM(Name);` after it; without that its constants still fold to numbers, but a variable of it is refused.
 `UE_ENUM_MAP(E, FName, Names);` declares a `TMap<E, FName>` member and fills in a name table at build time, and
 `UE_ENUM_MAP(FString, E, ByName);` the way back. For enum to name, declare the variable as `TEnum<E>`: it is still an
 E, and `.Name()` / `.String()` ask the engine. The game's enum fields and return values already come as `TEnum<E>` in
@@ -773,15 +802,20 @@ enumerator of value N, with `.Has(E)`, `.Add(E)`, `.Remove(E)` and `.Clear()`.
 UE's C++ API: `Add`, `Contains`, `Find(Key, Out)`, `Keys(OutArray)`, `Num()` and so on, with results coming back
 through reference parameters. `Map[Key]` reads with the Find node: you get a copy of the value, or the value type's
 default for a missing key, and nothing is added. `Map[Key] = V`, `+=` and `++` store with the Add node. A range-for
-with `auto& [Key, Value]` walks the map where it lives, so a write to `Value` changes the map. A container inside a
+with `auto& [Key, Value]` walks the map where it lives, so a write to `Value` changes the map. A range-for over a
+call, `for (int32 X : GetItems())`, runs the call once and walks its result.
+`for (auto &[Item, Index] : Items.Enumerate())` gives each element where it lives together with its index, which the
+body cannot assign; `const auto &` makes Item read-only too. A container inside a
 container works through a generated wrapper struct ([Containers](REFERENCE.md#containers) says where it is cooked).
+A container of objects passes where one of a base class is wanted, as the editor links an Actor array pin to an Object
+array one: a `TArray<APawn *>` for a `const TArray<AActor *>&` or by-value parameter, or assigned to a
+`TArray<UObject *>`. It works the same for a `TSet`, and for a `TMap` whose key and value are each the same type or an
+upcast. Interfaces, downcasts and other element types are refused, and so is a non-const `TArray<AActor *>&`.
 
 ```cpp
-enum class ERank : uint8 { Rookie, Veteran, Legend };
-UE_ENUM(ERank);
+enum class ERank : uint8 { Rookie, Veteran, Legend };      // cooked: FEntry names it
 
-struct FEntry {
-  UE_STRUCT;
+struct FEntry {                                             // cooked: Tally's members name it
   FName Player;
   int32 Kills = 0;
   ERank Rank = ERank::Rookie;
@@ -816,8 +850,9 @@ Watch for:
   call, and the compiler warns, since code that reads the map during the call sees the old value.
 - `TArray::Remove(I)` is the Remove Index node: it removes the element at index `I`. To remove by value, call
   `RemoveItem(V)`. On a `TArray<int32>` both compile, so C++ code ported with `Remove(Value)` removes the wrong element.
-- A mod struct has no methods and no operators. A non-inline method on a `UE_STRUCT` compiles without a word into a
-  call that cannot work, so write a free `inline` function that takes the struct instead. `==` on a mod struct or on
+- A mod struct has no methods and no operators. A non-inline method on a `UE_STRUCT` is refused
+  (`a UE_STRUCT holds no functions`), since a Blueprint struct has none, so write a free `inline` function that takes
+  the struct instead. `==` on a mod struct or on
   two containers is a clang error: compare the members, or use `A.Identical(B)` for arrays.
 - A container that a non-inline function returns has to be stored in a local before you call a method on it, index it
   or loop over it. `Append` and `Union` take one directly, and an inline function's result already counts as a
@@ -945,12 +980,24 @@ public:
 
 Watch for:
 
-- Change an inherited variable's default in `UE_DEFAULTS`. Redeclaring it (`float SpeedThreshold = 2000.0f;`) compiles
-  without a warning into a second variable that hides the parent's, and the game never reads it.
+- Change an inherited variable's default in `UE_DEFAULTS`. Redeclaring it (`float SpeedThreshold = 2000.0f;`) is
+  refused as `already has a variable`, since it would be a second variable that hides the parent's.
 - A component the game Blueprint adds is matched by its construction-script node, which the SDK records beside the
   member as `<Comp>__UeScsNode`. Only an SDK generated from a [Dumper-7 fork](https://github.com/Elytras/Dumper-7) dump
   has these markers. Without one, the override is refused: "... its header does not say which SCS node it is -
   re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi".
+- A property that holds an object made for the class, such as a status effect's `StatusEffects` or a projectile
+  attack's `Projectiles`, takes `NewObject<Type>(Outer, "Name")` in the constructor (`UE_INSTANCED(Type, Outer,
+  "Name")` is its old spelling). Hold it in a local to set its fields, and give it
+  the name the parent's object has to change that one rather than add another:
+
+  ```cpp
+  UNormalProjectileAttack *Shot = NewObject<UNormalProjectileAttack>(ProjectileAttack, "NormalProjectileAttack_0");
+  Shot->RandomAngle = 5.0f;                    // the rest of the game's NormalProjectileAttack_0 stays as it is
+  ProjectileAttack->Projectiles = {Shot};
+  ```
+
+  See [Instanced objects](REFERENCE.md#instanced-objects).
 - Your class is a new class. The game keeps spawning its own, so spawn yours yourself (see
   [Components and spawning](#components-and-spawning)). To change what the game spawns, patch its Blueprint instead:
   see the next section.
@@ -996,13 +1043,22 @@ Watch for:
 - Extract the pak again after a game update. bpbuild then rebuilds the mod, so the edit starts from the new package.
 - Two paks that edit the same asset each carry the whole package, and the game loads only one. Keep the edits of an
   asset in one mod.
+- A patch can edit another mod's Blueprint the same way: give the patch's entry in `mods.yaml` a `game_content` of its
+  own, the other mod's pak or its mod.io URL (see [mods.yaml](#modsyaml)), and include the class from a `UeApi`
+  generated off a dump taken with that mod loaded. The patch's pak then carries a copy of the mod's package, so the mod manager must load it in
+  place of the mod's own: MINT keeps the copy of the mod listed first, so list the patch above the mod. Rebuild the
+  patch, and check that the functions it replaces kept their shape, when the mod updates.
 
 Full rules: [Editing game packages](REFERENCE.md#editing-game-packages).
 
 ### Several mods and shared code
 
-Every mod that includes a header compiles what is in it. Without an owner, a class, struct or enum declared in a shared
-header is cooked by each of those mods, as separate copies that do not match. Name the one mod that cooks it:
+Every mod that includes a header compiles what is in it, and the folder the header sits in says whose it is. A class,
+struct or enum declared in a mod's own folder (the folder of the source holding its `UE_MOD_PACKAGE`, or one below it)
+is that mod's: it cooks it, and every other mod that includes the header, `#include "../Core/Shared.h"`, imports it.
+A header in no mod's folder, or in a folder several mods' sources share, has no owner: a class, struct or enum in it
+would be cooked by each mod that includes it, as separate copies that do not match. There, name the one mod that cooks
+it:
 `UE_CLASS("<package>", "<Name>_C")` inside a class, `UE_STRUCT_IN("<owner's UE_MOD_PACKAGE>")` inside a struct, and
 `UE_ENUM_IN(Enum, "<owner's UE_MOD_PACKAGE>")` after an enum. Every other mod imports it.
 
@@ -1179,7 +1235,7 @@ hundreds of MB; it streams from clang through a pipe and is never written to dis
 | `<Ns>__<Name>`, a class whose default object holds a namespace-scope variable | when a function uses the variable |
 | `FDeref`, the scratch struct that raw pointer reads go through | when the source reads through a pointer and does not declare `FDeref` itself |
 | `FDerefView_<Struct>`, the view a whole struct is read and written through | when the source reads or writes that struct whole through a pointer |
-| two structs per map type walked in place, `FMapSlot_TMap_<K>_<V>` and `FMapSlots_TMap_<K>_<V>`, and a wrapper struct per container nested in another container | when the code needs one |
+| four structs per map or set type a range-for walks, such as `FMapSlot_TMap_<K>_<V>`, `FMapSlots_TMap_<K>_<V>` and their `_Free_` twins, and a wrapper struct per container nested in another container | when the code needs one |
 | each game package an edit names, at its own path, printed as `edit -> <package>.uasset (the game's, edited: ...)` | when the source has a `UE_ASSET_EDIT`, `UE_ASSET_EDITS` or `UE_PATCH` |
 | nothing; a line `value <- <package> (<path> = <value>, read when the mod is built)` for each game asset's value read | when the source reads one, `ED_Grunt.SpawnSpread`; bpbuild keeps the list in `build/<mod>/reads.txt` |
 
@@ -1211,7 +1267,8 @@ mod shares in one fixed folder (see [Containers](REFERENCE.md#containers)).
 
 A cooked package carries no asset-registry data of its own. So every compile also writes rows into an
 `AssetRegistry.bin` for everything it cooked, each with its class, and bpbuild packs it with the mod so that the
-game's asset registry lists the mod's assets.
+game's asset registry lists the mod's assets. A class's row also carries the tags the editor's cooker writes, among
+them `NativeParentClass` (see [the row](REFERENCE.md#the-mod-package.a-class-s-registry-tags)).
 
 - When the out dir ends in `/Content/<package path without /Game>` (compared ignoring case), the registry goes to
   `<root>/AssetRegistry.bin`, beside `Content`, which is where a cooked pak keeps it. Any other out dir gets its own
@@ -1220,8 +1277,9 @@ game's asset registry lists the mod's assets.
   package's old rows, so several sources compiled into one pak share one registry.
 
 `assetgen registry <out> <in>...` merges registries that AssetGen wrote into `<out>`, and creates `<out>` when it is
-missing. Each input's rows replace the rows `<out>` already had for the same packages. It refuses a registry that has
-tags or dependencies, such as an editor-cooked one, rather than read half of it. bpbuild uses this command for `embed`.
+missing. Each input's rows replace the rows `<out>` already had for the same packages, tags and all. It refuses a
+registry with what AssetGen never writes, such as an editor-cooked one with its chunks and dependencies, rather than
+read half of it. bpbuild uses this command for `embed`.
 
 ### Reproducible output
 
@@ -1286,6 +1344,7 @@ Keys of a mod:
 | `bundle` | none | A list of folders, relative to the mods dir, each laid out like a staged FSD tree (`Content/...`). Every file in them is copied unchanged into the mod's pak at its path under the folder: `MyMod/Bundle/Content/_Shared/Lib.uasset` ships as `FSD/Content/_Shared/Lib.uasset`. It is for assets the mod calls but must not cook, such as a shared framework that other mods ship the same copy of. Nothing reads or rewrites the bytes. A listed entry that is not an existing folder stops the build with ``mods.yaml: a `bundle` entry is not a folder: <entry>``. `embed` does not carry a dependency's bundle: a mod that needs those files lists the folder in its own `bundle`. |
 | `generate_api` | `false` | Also writes the editor stubs for this mod's classes, interfaces, structs and enums (see [Editor API stubs](#editor-api-stubs)). |
 | `api_dir` | top-level `api_dir`, else `<mods dir>/out/api/Content` | Where the stubs go: the `Content` folder of a UE project. A mod's stubs land in `<api_dir>/<package path without /Game>/`. Only read when `generate_api` is set. |
+| `game_content` | top-level `game_content` | Where this mod's edits read their packages from, for a `UE_PATCH` of another mod's Blueprint rather than the game's: a `Content` folder, that mod's `.pak`, a `.zip` holding one, or its mod.io URL as a MINT profile lists it (`https://mod.io/g/drg/m/<mod>#<id>`, pinned to one file with `#<id>/<modfile id>`), which names the download MINT cached for it ([the row](REFERENCE.md#building-edits.game-content-https-mod-io)). A pak or zip is extracted once into `build/<name>/game/`, and again when the file changes. |
 
 `api_dir` takes any of these forms:
 
@@ -1592,7 +1651,10 @@ A class stub holds:
 - one function graph per function a Blueprint can call, with an entry node for the inputs and a result node for the
   outputs. A `UE_PURE` function has no exec pins. The graphs are empty; the editor recompiles them when it loads the
   asset. Static functions have no world-context parameter, because the editor adds its own hidden one;
-- each function's access, static, const and net flags, its `UE_CATEGORY`, and its `UE_TOOLTIP` and `UE_KEYWORDS`;
+- each function's access, static, const and net flags, its `UE_CATEGORY`, and its `UE_TOOLTIP` and `UE_KEYWORDS`.
+  A function with no `UE_TOOLTIP` takes the comment written right above it as its tooltip, and the class's own comment
+  is the Blueprint's description, the class's tooltip
+  ([REFERENCE.md](REFERENCE.md#access-read-only.doc-comment-tooltip));
 - the class's variables that are not private, with their flags, replication, RepNotify, category and literal defaults;
 - an empty generated class and default object, which the editor fills in on load, and registry tags, so that the
   Content Browser lists the asset.
@@ -1781,7 +1843,9 @@ and `dumpedl.py` lists every export with its index.
 | `dumpstruct.py` | `dumpstruct.py <base> <export-index>` | A function or class export's body: its super, children, every property with flags and type, the bytecode sizes, then the function flags or the class trailer. |
 | `dumptags.py` | `dumptags.py <base> <export-index> [byte-offset]` | The export's tagged properties, decoded, such as a default object's defaults. A struct's default instance starts after the struct's body, so pass that offset. |
 | `dumpexp.py` | `dumpexp.py <base> <export-index> [count]` | The export's class, super and outer, then its payload as 4-byte words, each annotated with the name or import it may stand for. Reads cooked packages and single-file uncooked ones, such as editor stubs. |
-| `dumpar.py` | `dumpar.py <AssetRegistry.bin>` | Every row of a registry, AssetGen's or the game's, then `OK - consumed the whole file`. It exits with an error unless the whole file parses. |
+| `walk5.py` | `walk5.py <base> [function-name...]` | Every script function of a UE 5.6 package, or those whose names contain one of the words, with the memory offset of each expression: `walkscript.py` with the 5.6 operands. |
+| `pakx.py` | `pakx.py <file.pak> <out-dir> <path-part>... [--oodle <dll>]` | Extracts the files whose pak paths contain one of the parts from a v11 `.pak` written by UE 5, which UE 4.27's UnrealPak refuses to extract. Oodle-compressed files need `oo2core_9_win64.dll`: pass `--oodle`, or put it on PATH. |
+| `dumpar.py` | `dumpar.py <AssetRegistry.bin>` | Every row of a registry, AssetGen's or the game's, with its tags, then `OK - consumed the whole file`. It exits with an error unless the whole file parses. |
 | `genenums.py` | `genenums.py <UE_4.27/Engine/Source/Runtime>` | Regenerates the compiler's `UeEnums.h` (bytecode tokens and flag values) from the engine source. For compiler development only. |
 
 To read one function, find its index with `dumpedl.py`, then walk it. For `Half` above, export 3:
@@ -1803,13 +1867,17 @@ and the mod's registry:
 ```
 > python tools\dumpar.py mods\build\RunDemo\FSD\AssetRegistry.bin
 version 8
-1 asset(s), 5 name(s)
+1 asset(s), 12 name(s)
   /Game/_MyMods/RunDemo/RunDemo.RunDemo_C              BlueprintGeneratedClass
      package /Game/_MyMods/RunDemo/RunDemo   path /Game/_MyMods/RunDemo   asset RunDemo_C
-     flags 0x80000000  tagmap 0x0  bundles 0  chunks 0
+     flags 0x80000000  tags 4  bundles 0  chunks 0
+     tag ParentClass = Class'/Script/Engine.Actor'
+     tag NativeParentClass = Class'/Script/Engine.Actor'
+     tag NumReplicatedProperties = 0
+     tag ModuleName = RunDemo
 dependencies: 0 node(s)
 package data: 0 entr(y/ies)
-OK - consumed the whole file (323 bytes)
+OK - consumed the whole file (540 bytes)
 ```
 
 The bytecode's exact shape changes as the compiler improves, so compare what a function does, not its opcodes. When you
@@ -1882,8 +1950,8 @@ void Bump(int32 Player) { Add5(ByPlayer[Player]); }   // warns
   registry       -> ./AssetRegistry.bin  (1 asset)
 ```
 
-Read each warning: whether the difference matters depends on your code. AssetGen has five warnings, and the table
-below has the three you meet first. clang prints warnings of its own, with the file and line in front, such as
+Read each warning: whether the difference matters depends on your code. The table below has the three you meet
+first, and [Diagnostics](REFERENCE.md#diagnostics) lists every one. clang prints warnings of its own, with the file and line in front, such as
 `-Wunused-value` for a pure call whose result you ignore. They do not stop the build either.
 
 ### What a failed compile leaves behind
@@ -1909,8 +1977,8 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | --- | --- | --- | --- |
 | `no Kismet conversion from float to double` | In C++, `0.5` is a `double`, and Blueprint has no double. | `X * 0.5f` | [Literals and conversions](REFERENCE.md#literals-and-conversions) |
 | `TODO: unimplemented local D: double`, `TODO: unimplemented property Mask: uint32` | A variable, parameter or return needs a Blueprint type. `double`, `int8`, `int16`, `uint16`, `uint32` and `uint64` have none. | `float`, `int32` or `int64` | [Types](REFERENCE.md#types) |
-| `call to an unknown function: Helper` | A Blueprint has no free functions. A free function or template without `inline` is not compiled. | `inline int32 Helper(int32 X) { ... }`, or a method of the class | [Inline functions and templates](REFERENCE.md#inline-functions-and-templates) |
-| clang: `use of undeclared identifier 'FMath'`, `no member named 'min' in namespace 'std'` | There is no FMath and no standard library. | `UKismetMathLibrary::FClamp(V, 0.0f, 10.0f)`, `UKismetMathLibrary::Min(A, B)` | [Calling engine and game functions](REFERENCE.md#calling-engine-and-game-functions) |
+| `call to an unknown function: Helper` | AssetGen compiles the functions whose body it sees. `Helper` is declared here and defined in another source, or it is a C runtime function such as `sqrtf`. | Define `Helper` in this source or a header it includes; for math, `UKismetMathLibrary` | [Free functions](REFERENCE.md#free-functions) |
+| clang: `use of undeclared identifier 'FMath'`, `no member named 'min' in namespace 'std'` | There is no standard library, and FMath only through `AssetGen/include/FMath.h`. | `#include "../include/FMath.h"`, then `FMath::Clamp(V, 0.0f, 10.0f)`, `FMath::Min(A, B)` | [Calling engine and game functions](REFERENCE.md#calling-engine-and-game-functions) |
 | clang: `only virtual member functions can be marked 'override'` | The SDK declares engine functions non-virtual. The method's name alone makes the override. | `void ReceiveTick(float DeltaSeconds) { ... }` | [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls) |
 | `<Member>: a default is a value known when the mod is built - ...` | A member initializer is read when the mod is built and never runs, so it takes only a value known then. A call's result is not one. | Set it in `ReceiveBeginPlay`: `Roll = UKismetMathLibrary::RandomInteger(3);` | [Classes and variables](REFERENCE.md#classes-and-variables) |
 | `<Class>::UE_DEFAULTS: Charges is declared here - give it an initializer instead` | `UE_DEFAULTS` sets inherited variables and components, not the class's own. | `int32 Charges = 3;` | [Class defaults](REFERENCE.md#class-defaults) |
@@ -1920,9 +1988,11 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | ``a delegate cannot bind Handle: an inline function is expanded where it is called, no UFunction (drop `inline`)`` | An inline method is pasted into its callers and is no function of the class. | Drop `inline` from the handler | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `a delegate on a Helper cannot bind Other::Handle: the engine looks it up by name on that object, whose class has no such function` | A binding is an object and a function name, and the object's class has no function of that name, so the broadcast would skip it. | Bind a function of the object's own class: `OnHit.Add(H, &Helper::Handle)` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `a delegate cannot bind AItem::Server_StartUsing on another object: the editor binds a BlueprintCallable function that is not pure or latent, and Server_StartUsing is not BlueprintCallable` | The editor's Create Event takes only a function Blueprint code can call; an event the engine calls, an RPC or a RepNotify is none. | Bind a method of your own class that calls it | [Event dispatchers](REFERENCE.md#event-dispatchers) |
-| `OnDestroyed.Broadcast: OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable, ...` | The editor's Call node refuses a native dispatcher the engine does not mark BlueprintCallable; only the engine broadcasts it. | Call what makes the event happen, such as `K2_DestroyActor()` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
+| `OnDestroyed.Broadcast: OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable, ...` | The editor's Call node refuses a native dispatcher the engine does not mark BlueprintCallable. | Call what makes the event happen, such as `K2_DestroyActor()`, or write `UE_FORCE_BROADCAST(OnDestroyed).Broadcast(this)` to run the handlers anyway (it warns) | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `a container operation needs a variable, not a computed value: Length` | A container node works on a variable, not on the result of a call. | `TArray<int32> L = GetItems(); return L.Num();` | [Containers](REFERENCE.md#containers) |
-| `TODO: unimplemented local Inc: (lambda at ...)` | Lambdas are not compiled, in any form. | An `inline` method or a free `inline` function | [Functions](REFERENCE.md#functions) |
+| `TODO: lambda L used as a value: ...` | A lambda was passed to a function that is not expanded, stored or returned: it is a body expanded at each call, not a value. | Call it where it is, or pass it to an inline function or template | [Lambdas](REFERENCE.md#lambdas) |
+| `TODO: the lambda (lambda at ...) calls itself: ...` | A lambda that recurses (the `auto Self` trick) cannot be expanded. | A method | [Lambdas](REFERENCE.md#lambdas) |
+| `TODO: unimplemented local P: int (*)(int32)` | A function pointer, a lambda converted with `+[]{}` included, has no Blueprint form. | An `inline` method, or a template parameter | [Functions](REFERENCE.md#functions) |
 | `warning: ... reference parameter V is bound to a map element: ... V gets a copy, stored back after the call` | Blueprint has no reference to a map element. | Nothing, unless the callee reads the map while it runs: it sees the old value there | [Functions](REFERENCE.md#functions) |
 | `warning: <Class>::UE_DEFAULTS: Body is the actor's root, ... so its RelativeScale3D is not applied` | The engine puts the root component at the spawn transform. | Declare `UE_COMPONENT(USceneComponent, Root);` first, so the other components attach to it | [Components](REFERENCE.md#components) |
 | `warning: LatentJob::Run waits, and an object of this class finds its world only through its Outer ...` | A plain `UObject` has no world of its own, and a wait needs one. | Create it with an actor or a component as Outer: `NewObject<LatentJob>(this)` from `Objects.h` | [Latent calls](REFERENCE.md#latent-calls) |
@@ -1999,8 +2069,9 @@ A few mistakes also compile without a message, because the construct itself work
 
 **Missing, with nothing to write yet.**
 
-- A widget animation. The layout itself, its events, named slots and property bindings included, is declared with
-  `UE_WIDGET` and the constructor. See [Widget layouts](REFERENCE.md#widget-layouts).
+- A widget animation of anything but the render transform (opacity, colors). The layout itself, its events, named
+  slots, property bindings and render-transform animations included, is declared with `UE_WIDGET`, `UE_ANIMATION`
+  and the constructor. See [Widget layouts](REFERENCE.md#widget-layouts).
 - A check of a game component class's own native data. A `UE_COMPONENT` of one of the game's component classes gets
   the native data of its engine ancestors, which matches every game component class that appears as a template in the
   game's content. 177 never appear there, mostly abstract bases, objectives and character states; one of those that
@@ -2010,8 +2081,6 @@ A few mistakes also compile without a message, because the construct itself work
   dump's properties of it and the game's Blueprints are reflected, and 240 of the SDK's 1445 enums have none (the
   enum's own form is not in the dump yet); a variable of one is a Byte, which differs from the editor's Enum variable
   only in type, and only if the enum is an `enum class`. See [Enums](REFERENCE.md#enums).
-- Walking a `TSet` in place. A range-for over a `TSet` walks a copy, while a `TMap` walks its own slots. Only the cost
-  differs. See [Loops](REFERENCE.md#loops).
 - Reusing a repeated pure call. It is evaluated each time it appears. To compute it once, keep the result in a local.
   See [The optimizer](REFERENCE.md#the-optimizer).
 - Game members the SDK generator cannot map. genueapi leaves out every function and property with a type it has no

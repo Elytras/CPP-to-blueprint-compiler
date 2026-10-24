@@ -34,6 +34,7 @@ struct FDefaultValue
     double F = 0.0;                     // Float
     std::string S;                      // Str: UTF-8, for StrProperty / NameProperty / TextProperty
     FIndex Object;                      // Obj: the asset an ObjectProperty points at
+    int32 Instanced = 0;                // Obj: an object instanced in the defaults, FBlueprintClass::AddInstanced's id (Finish sets Object)
     std::vector<FDefaultValue> Items;   // Array (also a set / map): one value per element, typed by the property's Inner; a map alternates key, value
     std::shared_ptr<std::vector<struct FPropertyDef>> Members;  // Struct, as a container's element: its own members (a lone struct's are FPropertyDef::Members)
     std::vector<FDefaultValue> Removed; // a set / map read over the parent's value: its elements (a map's keys) taken out first
@@ -64,6 +65,8 @@ struct FPropertyDef
 };
 
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);
+/* A FloatProperty whatever the engine: a UE5 native event's float parameter (S40). */
+FPropertyDef SingleParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef IntParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef Int64Param(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags = 0);
@@ -96,7 +99,8 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked = false);
 void WriteDefaultTag(FArc& Ar, const FPropertyDef& P);
 /* P.Default alone, as a tag's value or a container element holds it: no tag around it. */
 void WriteDefaultValue(FArc& Ar, const FPropertyDef& P);
-/* The bytes a struct the engine serializes natively takes (FVector's three floats: 12), or 0 for one written as tags. */
+/* The bytes a struct the engine serializes natively takes (FVector's three floats: 12, UE5's three doubles: 24), or 0
+   for one written as tags. */
 int32 NativeStructSize(const std::string& StructName);
 /* The bytes WriteDefaultValue writes for P whatever the value, or 0 when that depends on the value (a string, a text, a
    soft path, a struct written as tags, a container). */
@@ -134,7 +138,10 @@ public:
     void IntConst(int32 Value);
     void Int64Const(int64 Value);
     void ByteConst(uint8 Value);
-    void FloatConst(float Value);
+    /* A Blueprint real: EX_FloatConst on 4.27, EX_DoubleConst on UE5 (LWC). */
+    void FloatConst(double Value);
+    /* EX_FloatConst whatever the engine: a UE5 native `float` parameter. */
+    void SingleConst(float Value);
     void NameConst(const std::string& NameStr);
     void StringConst(const std::string& Value);             // ANSI
     void UnicodeStringConst(const std::u16string& Value);   // UCS-2
@@ -221,10 +228,12 @@ public:
                  const std::function<void(FScript&)>& Value);
 
     /* The skip count is MEMORY bytes of ContextExpr, measured here. RValue is the property
-       ContextExpr reads, which the VM zeroes when the object is null. */
+       ContextExpr reads, which the VM zeroes when the object is null. EX_ClassContext has the same layout, with a
+       class for ObjectExpr: ContextExpr runs on its default object (execClassContext, ScriptCore.cpp 2209-2256). */
     void Context(const std::function<void(FScript&)>& ObjectExpr,
                  const std::function<void(FScript&)>& ContextExpr,
-                 const std::optional<FFieldRef>& RValue = std::nullopt);
+                 const std::optional<FFieldRef>& RValue = std::nullopt,
+                 EExprToken ContextOp = EX_Context);
 
     void StructConst(FIndex Struct, int32 SerializedSize, const std::function<void(FScript&)>& Members);
 

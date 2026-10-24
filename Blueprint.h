@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include <algorithm>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -67,6 +68,10 @@ public:
     /* Replication: the CDO's bReplicates, set when the class replicates a variable or declares an RPC. The class's
        NumReplicatedProperties tag is counted from the CPF_Net variables. */
     void SetReplicates(bool bValue) { bReplicates = bValue; }
+    int32 NumReplicatedVars() const
+    {
+        return int32(std::count_if(Vars.begin(), Vars.end(), [](const FPropertyDef& V) { return (V.PropertyFlags & CPF_Net) != 0; }));
+    }
     /* ExecuteUbergraph_<Class>: written as the class's UberGraphFunction tag. */
     void SetUberGraphFunction(FIndex Function) { UberGraphFunction = Function; }
 
@@ -79,6 +84,8 @@ public:
     std::map<std::string, std::string> ApiCategory;
     /* UE_TOOLTIP / UE_KEYWORDS: a function's (tooltip, keywords), editor metadata likewise. */
     std::map<std::string, std::pair<std::string, std::string>> ApiDocs;
+    /* The class's comment: the stub Blueprint's description, which the editor makes the class's tooltip. */
+    std::string ApiDescription;
 
     FIndex AddFunction(const std::string& Name, FIndex Super,
                        const std::vector<FPropertyDef>& Params,
@@ -121,6 +128,11 @@ public:
     };
     void AttachComponent(const std::string& Name, const FAttachment& Attachment);
 
+    /* The SCS node's VariableGuid for a component added above, as the class's `<Comp>__UeScsNode` gives it: a class
+       rebuilt from a cooked one keeps the guid its subclasses' override records name (FComponentKey's AssociatedGuid),
+       which a subclass still shipped as cooked matches the node by. Without one the guid is ScsNodeGuid's. */
+    void SetComponentGuid(const std::string& Name, const uint32 (&Guid)[4]);
+
     /* Whether the SCS lists its DefaultSceneRoot node, in RootNodes and AllNodes: the actor has no root before it runs
        and no scene component of the class's own is left to be the root - none, or each attached somewhere. The editor
        keeps the node there exactly then (ValidateSceneRootNodes, SimpleConstructionScript.cpp 1132-1150), and gives the
@@ -155,6 +167,29 @@ public:
     {
         ParentSubobjects.push_back(FParentSubobject{ Name, ClassPackage, ClassName_ });
     }
+
+    /*
+    UE_INSTANCED: an object instanced in a default, an export Name of Class under its outer - the CDO, one of the
+    class's UE_COMPONENT templates, an override of an inherited component (AddComponentOverride's Name), a native
+    subobject's override (AddSubobjectOverride's Name), or another instanced object (its id) - its Defaults as tags.
+    Archetype is the object of its name under the outer's archetype, imported, or Class's CDO (UObjectArchetype.cpp
+    64-83), which the loader builds it from. Measured on EEE's STE_Slow20 and ENE_ShootingPlant_Inferno. Returns the
+    id a default's FDefaultValue::Instanced names it by; Finish points the tag at the export.
+    */
+    struct FInstanced
+    {
+        enum EOuter { Cdo, Component, ComponentOverride, SubobjectOverride, Instanced } Outer = Cdo;
+        std::string OuterName;      // Component, ComponentOverride, SubobjectOverride
+        int32 OuterId = 0;          // Instanced
+        std::string Name;
+        FIndex Class, Archetype;
+        std::vector<FPropertyDef> Defaults;
+        std::vector<uint8> NativeTail;
+    };
+    int32 AddInstanced(const FInstanced& Object) { Instanced.push_back(Object); return int32(Instanced.size()); }
+    /* A class's default object as an import, with no load dependency recorded (ClassDefaultObject's): an instanced
+       object's archetype, or its outer's. */
+    FIndex DefaultObject(const std::string& PackageName, const std::string& ClassName_);
 
     /* A tag on this class's CDO for a property an ancestor declares, which a member initializer
        cannot express: declaring the name again would shadow it with a second property. */
@@ -230,6 +265,30 @@ public:
        time it is drawn (InitializeBindingsStatic binds the widget's <Property>Delegate). */
     struct FPropertyBinding { std::string Widget, Property, Function; };
     void AddPropertyBinding(const FPropertyBinding& Binding) { PropertyBindings.push_back(Binding); }
+    /* One UE_ANIMATION: a WidgetAnimation of the class, in its Animations, with its MovieScene, which binds each widget it
+       animates by name (AnimationBindings) to a RenderTransform track of one section keying the channels given. Times
+       are frames at the MovieScene's tick resolution, 60000 a second; EndFrame is the playback range's exclusive end.
+       Channels: Translation X and Y, Rotation, Scale X and Y, Shear X and Y, the section's FMovieSceneFloatChannels.
+       A key's tangents are value per frame; Interp an ERichCurveInterpMode, TangentMode an ERichCurveTangentMode. */
+    struct FAnimKey
+    {
+        int32 Frame = 0;
+        float Value = 0.0f, Arrive = 0.0f, Leave = 0.0f;
+        uint8 Interp = 0, TangentMode = 0;
+    };
+    struct FAnimTrack
+    {
+        std::string Widget;
+        FIndex WidgetClass;
+        std::vector<FAnimKey> Channels[7];
+    };
+    struct FAnimation
+    {
+        std::string Name;
+        int32 EndFrame = 0;
+        std::vector<FAnimTrack> Tracks;
+    };
+    void AddAnimation(const FAnimation& Animation) { Animations.push_back(Animation); }
 
     /* The actor has a root before this class's SCS runs: a Blueprint parent's SCS leaves one, and a native parent's
        constructor sets one or ExecuteConstruction takes its first native scene component. Then the DefaultSceneRoot
@@ -304,6 +363,8 @@ private:
         std::vector<FPropertyDef> Defaults;
         std::vector<uint8> NativeTail;
         FAttachment Attachment;
+        bool bGuid = false;             // SetComponentGuid: the node's VariableGuid as given, not ScsNodeGuid's
+        uint32 Guid[4] = {};
     };
     std::vector<FComponent> Components;
 
@@ -335,6 +396,7 @@ private:
         std::string Name, ClassPackage, ClassName;
     };
     std::vector<FParentSubobject> ParentSubobjects;
+    std::vector<FInstanced> Instanced;
 
     bool bWidgetClass = false;
     struct FWidget
@@ -356,6 +418,7 @@ private:
     std::vector<std::string> NamedSlots;
     std::vector<FComponentBinding> ComponentBindings;
     std::vector<FPropertyBinding> PropertyBindings;
+    std::vector<FAnimation> Animations;
 
     int32 ClassRow = 0;
 };

@@ -73,6 +73,7 @@ class Body:
         s.stmts = stmts
         s.entry_mem = entry_mem
         s.frame = frame or {}
+        s.writing = False       # rendering a target that is written: a const& parameter in it is cast writable
         s.split = split or {}
         s.method = method or s.pkg.exports[fidx]['name']
         s.notes = []
@@ -142,6 +143,7 @@ class Body:
     def expr_hint(s, n):
         if n.op in VARS:
             p, pkg = s.prop_of_var(n)
+            if p is None and n.op == 0x01: return s.hint_of_ctype(s.native_class_member_ctype(n))
             return s.hint_of_prop(pkg, p)
         if n.op == 0x42:
             owner, name = next(o for o in n.ops if o[0] == 'prop')[2], var_name(n)[0]
@@ -150,6 +152,14 @@ class Body:
             return s.hint_of_prop(pkg, p)
         if n.op in (0x19, 0x1A): return s.expr_hint(n.kids[1])
         return None
+
+    def native_class_member_ctype(s, n):
+        """The C++ type of a native (or game Blueprint) class's member a variable node reads, off its UeApi header."""
+        name, owner = var_name(n)
+        if not owner: return None
+        top, _, cname = s.pkg.path(owner).partition('.')
+        cpp = s.fx.api.classes.get((top, cname))
+        return s.fx.api.member_type(cpp.split('::')[-1], name) if cpp else None
 
     def native_member_ctype(s, owner, name):
         """The C++ type of member `name` of the native struct `owner` names, off Types.json."""
@@ -163,6 +173,7 @@ class Body:
         try:
             if n.op in VARS:
                 p, pkg = s.prop_of_var(n)
+                if p is None and n.op == 0x01: return s.native_class_member_ctype(n)
                 return s.fx.types.of(pkg, p, s.fx.asset) if p is not None else None
             if n.op in CALLS: return s.fx.callee(s, n, None).ret
             if n.op in (0x19, 0x1A) and n.kids[1].op in CALLS: return s.fx.callee(s, n.kids[1], n.kids[0]).ret
@@ -182,8 +193,12 @@ class Body:
     def coerce(s, e, src, dst, lvalue=False, out=False):
         """Expression e of C++ type src where dst is wanted: Blueprint lets a pin of a parent class, a class pin of
         another class and a DeterminesOutputType return in where C++ wants a cast. The casts compile to nothing."""
-        if not src or not dst: return e
         norm = lambda t: t.replace('const ', '').replace('&', '').replace('class ', '').replace(' ', '')
+        if dst and not out and re.fullmatch(r'\d+', e.text):
+            d = norm(dst)
+            if d.startswith('TEnum<') or (d.split('::')[-1].startswith('E') and '<' not in d and not d.endswith('*')):
+                return E('(%s)%s' % (d[len('TEnum<'):-1] if d.startswith('TEnum<') else d, e.text), P_UNARY)
+        if not src or not dst: return e
         src, dst = norm(src), norm(dst)
         if src == dst: return e
         last = lambda t: t.rstrip('*').split('::')[-1]
@@ -246,7 +261,8 @@ class Body:
         if op == 0x13:      # Cast To Class: a TSubclassOf conversion alone is unchecked, so the check is spelled out
             # ponytail: the value is evaluated twice; fine for the variables the cast node reads
             c, x = s.fx.types.cls(s.pkg, next(o[1] for o in n.ops if o[0] == 'obj'), s.fx.asset), s.expr(n.kids[0]).text
-            return E('(UKismetMathLibrary::ClassIsChildOf(%s, %s::StaticClass()) ? TSubclassOf<%s>(%s) : TSubclassOf<%s>(nullptr))' % (x, c, c, x, c))
+            return E('(UKismetMathLibrary::ClassIsChildOf((UClass*)%s, %s::StaticClass()) ? TSubclassOf<%s>(%s) : TSubclassOf<%s>(nullptr))'
+                     % (s.expr(n.kids[0]).at(P_UNARY), c, c, x, c))
         if op in (0x52, 0x54):
             return E('TScriptInterface<%s>(%s)' % (s.fx.types.cls(s.pkg, next(o[1] for o in n.ops if o[0] == 'obj'), s.fx.asset), s.expr(n.kids[0]).text))
         if op == 0x55: return E('Cast<%s>(%s)' % (s.fx.types.cls(s.pkg, next(o[1] for o in n.ops if o[0] == 'obj'), s.fx.asset), s.expr(n.kids[0]).text))
@@ -260,8 +276,11 @@ class Body:
         if op == 0x2F: return s.struct_const(n)
         if op == 0x69: return s.switch_value(n, hint)
         if op == 0x4B: return E('&%s::%s' % (s.fx.cpp_self, ident(next(o[1] for o in n.ops if o[0] == 'name'))))
-        if op == 0x65:
-            return E('{%s}' % ', '.join(s.expr(k).text for k in n.kids if k.op != 0x66))
+        if op in (0x65, 0x3D):     # an array's or a set's literal: its elements
+            return E('{%s}' % ', '.join(s.expr(k).text for k in n.kids if k.op not in (0x66, 0x3E)))
+        if op == 0x3F:             # a map's literal: keys and values alternate
+            kv = [s.expr(k).text for k in n.kids if k.op != 0x40]
+            return E('{%s}' % ', '.join('{%s, %s}' % (kv[i], kv[i + 1]) for i in range(0, len(kv) - 1, 2)))
         if op == 0x02:
             name, owner = var_name(n)
             return E('%s::StaticClass()->GetDefaultObject()->%s' % (s.fx.cpp_self, ident(name)))
@@ -276,7 +295,13 @@ class Body:
         if n.op in (0x00, 0x48):
             if s.owner_is_frame(owner) and name in s.frame: return s.frame[name]
             s.locals_used.add(name)
-            return s.local_ident(name)
+            t = s.local_ident(name)
+            p = s.props.get(name) if s.writing else None
+            if p is not None and p.flags & CPF_Parm and not p.flags & CPF_ReturnParm and \
+                    not (p.flags & CPF_OutParm and not p.flags & CPF_ConstParm) and \
+                    (p.flags & CPF_ReferenceParm or (p.flags & CPF_ConstParm and p.flags & CPF_OutParm)):
+                return '((%s&)%s)' % (s.fx.types.of(s.pkg, p, s.fx.asset), t)
+            return t
         return s.fx.member_text(s, name)
 
     def byte_const(s, v, hint):
@@ -318,7 +343,7 @@ class Body:
 
     def object_const(s, n):
         idx = next(o[1] for o in n.ops if o[0] == 'obj')
-        return E(s.fx.object_ref(s, idx))
+        return E('nullptr') if not idx else E(s.fx.object_ref(s, idx))     # an unset object pin is a null constant
 
     def struct_const(s, n):
         sidx = next(o[1] for o in n.ops if o[0] == 'obj')
@@ -346,28 +371,75 @@ class Body:
         if inner.op in CALLS: return s.call(inner, obj)
         if inner.op in (0x01, 0x6C):
             name, owner = var_name(inner)
-            return E('%s->%s' % (s.expr(obj).at(P_PRIMARY), s.fx.other_member_ident(s.pkg, owner, name)))
+            o = s.expr(obj)
+            ot = s.type_of(obj)
+            if owner and ot and ot.endswith('*') and '<' not in ot:
+                oc = s.fx.types.cls(s.pkg, owner, s.fx.asset)
+                if oc and oc.split('::')[-1] not in s.fx.m.ancestors(ot.replace('class ', '').rstrip('*').strip().split('::')[-1]):
+                    o = E('((%s*)%s)' % (oc, o.at(P_UNARY)))
+            return E('%s->%s' % (o.at(P_PRIMARY), s.fx.other_member_ident(s.pkg, owner, name)))
         if inner.op == 0x42:
             return E('%s->%s' % (s.expr(obj).at(P_PRIMARY), s.member(inner).text))
         s.note('context over op %#x' % inner.op)
         return E('%s->%s' % (s.expr(obj).at(P_PRIMARY), s.expr(inner).text))
 
     def class_context(s, n):
+        """Get Class Defaults: GetDefault<T>(Class)->Member, GetMutableDefault<T>(Class)->Fn(), and the object itself,
+        EX_Self run in the context, GetMutableDefault<UObject>(Class)."""
         cls, inner = n.kids[0], n.kids[1]
-        base = s.expr(cls)
-        # Get Class Defaults: AssetGen has no EX_ClassContext yet, so the umbrella's ClassDefaults finds the object
-        s.fx.run.class_defaults_used = True
+        if inner.op == 0x17: return E('GetMutableDefault<UObject>(%s)' % s.expr(cls).text)
         if inner.op in CALLS:
-            info = s.fx.callee(s, inner, None)
-            return s.call(inner, None, prefix='Cast<%s>(ClassDefaults(%s))->' % (info.owner_cpp, base.text))
+            owner = s.fx.callee(s, inner, None).owner_cpp
+            return s.call(inner, None, prefix='GetMutableDefault<%s>(%s)->' % (owner, s.held_class(cls, owner)))
         name, owner = var_name(inner)
-        return E('Cast<%s>(ClassDefaults(%s))->%s' % (s.fx.types.cls(s.pkg, owner, s.fx.asset), base.text, ident(name)))
+        owner = s.fx.types.cls(s.pkg, owner, s.fx.asset)
+        return E('GetDefault<%s>(%s)->%s' % (owner, s.held_class(cls, owner), ident(name)))
+
+    def held_class(s, cls, owner):
+        """The class expression of a Get Class Defaults whose member owner declares: as it is when its type says it holds
+        an owner, else converted to TSubclassOf<owner>, which GetDefault<owner> takes (the node's pin is typed so)."""
+        t, base = s.type_of(cls) or '', s.expr(cls)
+        m = re.match(r'(?:class )?TSubclassOf<(?:class )?([\w:]+)>', t.strip())
+        leaf = owner.split('::')[-1]
+        if leaf == 'UObject' or m and leaf in s.fx.m.ancestors(m.group(1).split('::')[-1]): return base.text
+        return 'TSubclassOf<%s>(%s)' % (owner, base.text)
 
     # ---- calls
 
     ELEM_ARG = {'Array_Add': 1, 'Array_AddUnique': 1, 'Array_Set': 2, 'Array_Insert': 1, 'Array_Find': 1,
                 'Array_Contains': 1, 'Array_RemoveItem': 1, 'Set_Add': 1, 'Set_Contains': 1, 'Set_Remove': 1,
                 'Map_Add': 1, 'Map_Find': 1, 'Map_Contains': 1, 'Map_Remove': 1}
+
+    READS = {'Array_Length', 'Array_Get', 'Array_Contains', 'Array_Find', 'Array_IsValidIndex', 'Array_LastIndex',
+             'Array_Identical', 'Array_Random', 'Array_RandomFromStream', 'Set_Length', 'Set_Contains', 'Set_ToArray',
+             'Set_Union', 'Set_Difference', 'Set_Intersection', 'Map_Length', 'Map_Contains', 'Map_Find', 'Map_Keys',
+             'Map_Values'}
+    # argument -> (type, out) with E / K / V the element, key and value type, C the container's own
+    ARGS = {'Array_Get': {2: ('E&', True)}, 'Array_Add': {1: ('E', False)}, 'Array_AddUnique': {1: ('E', False)},
+            'Array_Contains': {1: ('E', False)}, 'Array_Find': {1: ('E', False)}, 'Array_RemoveItem': {1: ('E', False)},
+            'Array_Insert': {1: ('E', False)}, 'Array_Set': {2: ('E', False)}, 'Array_Append': {1: ('C', False)},
+            'Set_Add': {1: ('E', False)}, 'Set_Contains': {1: ('E', False)}, 'Set_Remove': {1: ('E', False)},
+            'Set_AddItems': {1: ('TArray<E>', False)}, 'Set_RemoveItems': {1: ('TArray<E>', False)},
+            'Set_ToArray': {1: ('TArray<E>&', True)}, 'Set_Union': {1: ('C', False), 2: ('C&', True)},
+            'Set_Difference': {1: ('C', False), 2: ('C&', True)}, 'Set_Intersection': {1: ('C', False), 2: ('C&', True)},
+            'Map_Add': {1: ('K', False), 2: ('V', False)}, 'Map_Find': {1: ('K', False), 2: ('V&', True)},
+            'Map_Contains': {1: ('K', False)}, 'Map_Remove': {1: ('K', False)},
+            'Map_Keys': {1: ('TArray<K>&', True)}, 'Map_Values': {1: ('TArray<V>&', True)}}
+
+    def container_args(s, fn, args):
+        """{argument: (C++ type, out)} of a container call, off the container's type: Blueprint passes an element of a
+        subclass, a byte for an enum, an array of a subclass, where C++ wants the container's own."""
+        spec = s.ARGS.get(fn)
+        t = s.type_of(args[0]) if spec else None
+        if not t or '<' not in t: return {}
+        t = t.replace('const ', '').rstrip('&').strip()
+        subs = [x.strip() for x in split_top(t[t.index('<') + 1:t.rindex('>')])]
+        names = {'E': subs[0], 'K': subs[0], 'V': subs[-1], 'C': t}
+        out = {}
+        for i, (ty, o) in spec.items():
+            if i >= len(args): continue
+            out[i] = (re.sub(r'\b[EKVC]\b', lambda m: names[m.group(0)], ty), o)
+        return out
 
     def container_hints(s, fn, args, hints):
         """The hint of a wildcard element, key or value argument, off the container's own property (or C++ type):
@@ -389,11 +461,18 @@ class Body:
         hints = info.hints + [None] * max(0, len(args) - len(info.hints))
         if info.container and args: s.container_hints(info.raw, args, hints)
         rendered = []
+        want = s.container_args(info.raw, args) if info.container and args else {}
         for i, a in enumerate(args):
             if i in info.drop: continue
-            e = s.expr(a, hints[i])
+            if i == 0 and info.container and info.raw not in s.READS: e = E(s.lvalue(a))     # the container is written
+            elif i in info.out and not info.container: e = E(s.lvalue(a))
+            else: e = s.expr(a, hints[i])
+            if i in want:
+                e = s.coerce(e, s.type_of(a), want[i][0], lvalue=want[i][1] or a.op in VARS, out=want[i][1])
             if i < len(info.ptypes):
-                e = s.coerce(e, s.type_of(a), info.ptypes[i], lvalue=i in info.out or a.op in VARS, out=i in info.out)
+                # a struct's member is an lvalue too: `(TMap<int, int>&)Transformed.ActorTransform` for a wildcard
+                e = s.coerce(e, s.type_of(a), info.ptypes[i], lvalue=i in info.out or a.op in VARS or a.op == 0x42,
+                             out=i in info.out)
                 if i in info.out and a.op in VARS and e.text == s.var(a):
                     p, _pkg = s.prop_of_var(a)
                     if p is not None and p.flags & CPF_ConstParm and p.flags & CPF_Parm:
@@ -477,7 +556,11 @@ class Body:
         return s.fx.bound_delegate(s, n)
 
     def lvalue(s, n):
-        return s.expr(n).text
+        was, s.writing = s.writing, True
+        try:
+            return s.expr(n).text
+        finally:
+            s.writing = was
 
     # ---- the whole function
 
@@ -530,6 +613,8 @@ class Body:
         resume = s.lower(it.resume, [])
         if len(now) == 1 and isinstance(now[0], CReturn):
             return [S(l) for l in call] + resume
+        if not resume or (len(resume) == 1 and isinstance(resume[0], CReturn) and resume[0].text is None):
+            return [S(l) for l in call] + now
         name = '%s_Resume%d' % (s.method, len(s.latent_helpers))
         s.latent_helpers.append((name, [S(l) for l in call] + resume))
         return [S('%s();' % name)] + now

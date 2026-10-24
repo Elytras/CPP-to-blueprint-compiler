@@ -52,3 +52,28 @@ public:
 };
 
 class UWtCardKid : public UWtCard {};
+
+/*
+Widget animations. Pop scales Mark from half size to 0.7 over a quarter second, as a checkbox might grow its checkmark on
+hover: a User slope on the first key, Auto on the last. Spin turns Box a full circle in a 2 s animation,
+a Linear key between two Constant ones. OnHover plays Pop. Mark's brush sets two of its members, its slot one part of its padding.
+*/
+class UWtPulse : public UUserWidget {
+public:
+  UE_WIDGET(UOverlay, Box);
+  UE_WIDGET(UBorder, Mark);
+  UE_ANIMATION(Pop);
+  UE_ANIMATION(Spin, 2.0f);
+
+  UWtPulse() {
+    UOverlaySlot *At = Box->AddChildToOverlay(Mark);
+    At->Padding.Top = 6.0f;                               // the rest keeps the slot's default
+    Mark->Background.ImageSize = FVector2D(32, 32);       // two parts of the brush; the rest keeps the Border's default
+    Mark->Background.DrawAs = ESlateBrushDrawType::Image;
+    UE_KEYS(Pop, Mark->RenderTransform.Scale.X, (0, 0.5, Cubic, 1.159), (0.25, 0.7, Cubic));
+    UE_KEYS(Pop, Mark->RenderTransform.Scale.Y, (0, 0.5, Cubic, 1.159), (0.25, 0.7, Cubic));
+    UE_KEYS(Spin, Box->RenderTransform.Angle, (0, 0, Constant), (0.5, 0), (1.5, 360, Constant));
+  }
+
+  void OnHover() { PlayAnimation(Pop, 0.0f, 1, EUMGSequencePlayMode::Forward, 1.0f, false); }
+};

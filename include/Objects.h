@@ -84,7 +84,8 @@ inline void FinishComponent(AActor *Owner, UActorComponent *Component, bool bMan
 }
 
 /* UObject::GetTypedOuter, as a walk up GetOuter(): the nearest outer that is a T, or null. Each step is one
-   GetOuterObject call and one Cast<T> (EX_DynamicCast), as the editor would spell it. Obj itself is not a candidate. */
+   GetOuter() read (memory, no engine call; O is tested first, since a null read crashes) and one Cast<T>
+   (EX_DynamicCast). Obj itself is not a candidate. */
 template <Derives<UObject> T>
 inline T *GetTypedOuter(UObject *Obj) {
   UObject *O = Obj;

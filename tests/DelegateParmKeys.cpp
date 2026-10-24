@@ -74,6 +74,11 @@ public:
     ByKey[Bump()] = {H, &DelegateParmKeysNs::DelegateParmKeysHelper::Pick};
     Peer->ByKey[1] = {H, &DelegateParmKeysNs::DelegateParmKeysHelper::Pick};
   }
+  void AddPicks() {
+    Picks.Add({H, &DelegateParmKeysNs::DelegateParmKeysHelper::Pick});
+    Peer->Picks.Insert({H, &DelegateParmKeysNs::DelegateParmKeysHelper::Pick}, 0);
+    Peer->ByKey.Add(2, {H, &DelegateParmKeysNs::DelegateParmKeysHelper::Pick});
+  }
 };
 
 class DelegateParmKeysZKid : public DelegateParmKeysNs::DelegateParmKeysTop {

@@ -8,6 +8,7 @@ folder of its own, outside the test mods the suite cooks; astcheck parses it wit
 - a string that ends in a backslash, so its closing quote comes right after an escaped one (\\"): kept (a deprecation
   message) and dropped (a #line file name, inside the locations after it)
 - DeclRefExprs and a MemberExpr written through macros: their range's end has a spellingLoc, which FAstSax keeps
+- a LambdaExpr, whose range begin FAstSax keeps (CaptureNames reads the capture list there), written and through a macro
 - the largest u64, the smallest i64, negative enumerators and '\xff'
 - friend templates, and operator= declared defaulted, user-defined, and implicit (in a class with a virtual)
 - a type alias (typeAliasDeclId) and a declaration from an included file (includedFrom): this file, included again
@@ -23,6 +24,7 @@ folder of its own, outside the test mods the suite cooks; astcheck parses it wit
 #define Q(x) (x + 1)
 #define QUAL S::V
 #define FIELD(o) o.F
+#define LAMBDA(v) [Z = (v)](int N) { return Z * N; }
 
 /// A doc comment with non-ASCII text, é, € and 😀, and two control characters:  and .
 int g = 5;
@@ -90,7 +92,9 @@ int h()
     va = vb;
     Box<int> x{ 1 }, y{ 2 };
     const bool bEq = x == y;
-    return M(g) + Q(g) - -3 + Twice(4) + int(Twice(2.5)) + bEq + QUAL + a.Get() + FIELD(a) + Peek(x) + FromInclude(Café);
+    auto Lam = [Z = g + 1, &R = a](int N) mutable { return Z * N + R.F; };
+    const auto LamM = LAMBDA(g);
+    return M(g) + Q(g) - -3 + Twice(4) + int(Twice(2.5)) + bEq + QUAL + a.Get() + FIELD(a) + Peek(x) + FromInclude(Café) + LamM(3) + Lam(2);
 }
 
 /* Longer than the 256 KB chunks the reader hands the parser, so the literal's dump spans chunks, escapes and all.

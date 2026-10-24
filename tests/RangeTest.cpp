@@ -9,6 +9,7 @@ class RangeTest : public AActor {
   TArray<int32> Items;
   TSet<int32> Seen;
   TMap<FName, int32> Scores;
+  TMap<FName, int32> Positive;
   TMap<FName, FIntPoint> Spots;
   TMap<FName, RangeTest *> Peers;
   TMap<int32, TArray<int32>> Lists;
@@ -229,17 +230,108 @@ public:
     return Sum;
   }
 
-  /* Removing from the map it walks would move the walk under it: this loop walks a copy of the keys instead. */
+  /* `const T&` over a TSet walks the set's own slots: X is the element where it lives. */
+  int32 FoldSet() {
+    int32 Sum = 0;
+    for (const int32 &X : Seen) Sum = Sum * 3 + X;
+    for (auto &X : Seen) Sum += X;
+    return Sum;
+  }
+
+  /* `auto& P` is a slot as a pair: P.Value is the map's own value and P.Key its key, and a reference to either is another
+     name for it, as `auto& [K, V]` binds them. */
+  int32 PairInPlace(int32 D) {
+    int32 Sum = 0;
+    for (auto &P : Scores) {
+      const auto &K = P.Key;
+      auto &V = P.Value;
+      V += D;
+      Sum += Scores[K];
+      P.Value = V * 2;
+      AddOne(V);
+      Sum += P.Value * 100;
+    }
+    return Sum;
+  }
+
+  int32 PairConst() {
+    int32 Sum = 0;
+    for (const auto &P : Scores) Sum = Sum * 2 + P.Value;
+    return Sum;
+  }
+
+  /* A by-value pair is a copy, as `auto [K, V]` is: the map keeps its values. */
+  int32 PairCopy() {
+    int32 Sum = 0;
+    for (auto P : Scores) {
+      P.Value += 1000;
+      Sum += P.Value;
+    }
+    return Sum;
+  }
+
+  /* A body that removes from the map walks a copy of its keys, taken explicitly: every range-for over the map walks the
+     map itself. */
   int32 DropNegatives() {
     int32 Kept = 0;
-    for (auto &[Key, Value] : Scores) {
-      if (Value < 0) {
+    TArray<FName> Keys;
+    Scores.Keys(Keys);
+    for (const FName &Key : Keys) {
+      if (Scores[Key] < 0) {
         Scores.Remove(Key);
         continue;
       }
-      Value += 1;
+      Scores[Key] += 1;
       Kept++;
     }
     return Kept;
+  }
+
+  /* By value, `Scores[Key]` is still the map's own value, not the copy Value is. */
+  int32 ByValueStore() {
+    int32 Sum = 0;
+    for (auto [Key, Value] : Scores) {
+      Scores[Key] = Value * 2;
+      Sum += Value;
+    }
+    return Sum;
+  }
+
+  /* Another map of the same type is another container: changed directly, with the walk still in place, and no warning. */
+  int32 CopyPositive() {
+    int32 Count = 0;
+    for (auto &[Key, Value] : Scores)
+      if (Value > 0) {
+        Positive.Add(Key, Value);
+        Count++;
+      }
+    return Count;
+  }
+
+  /* Each changes the container it walks: warned "unsafe to mutate iterated container", and compiled as written. None of
+     them is run. */
+  void WarnRemove() {
+    for (auto &[Key, Value] : Scores)
+      if (Value < 0) Scores.Remove(Key);
+  }
+  void WarnByValue() {
+    for (auto [Key, Value] : Scores) Scores.Remove(Key);
+  }
+  void WarnStore(FName Other) {
+    for (const auto &[Key, Value] : Scores) Scores[Other] = Value;
+  }
+  void WarnSetAdd() {
+    for (const int32 &X : Seen) Seen.Add(X + 1);
+  }
+  void WarnArrayAdd() {
+    for (int32 X : Items) Items.Add(X);
+  }
+  void Prune(TMap<FName, int32> &M, FName Key) { M.Remove(Key); }
+  void WarnPassed() {
+    for (auto &[Key, Value] : Scores) Prune(Scores, Key);
+  }
+  void DropAll() { Scores.Clear(); }
+  void WarnCalls() {
+    for (auto &[Key, Value] : Scores) DropAll();
   }
 };
