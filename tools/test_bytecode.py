@@ -10064,15 +10064,40 @@ def delegate_inherit_bind():
             assert vm.binds == [], vm.binds
 
 
-def delegate_rpc_refusals():
-    """A native function the engine does not mark BlueprintCallable is one the editor's Create Event node refuses
-    (K2Node_CreateDelegate.cpp 156-164 -> EdGraphSchema_K2.cpp 929-933, 974-985). A server RPC is one, which UeApi's
-    UE_SERVER says: refused on another object and on this one."""
-    proves('handler-functions.onuse-add-item-aitem-server')
-    refused('DelegateOtherRpc', '  UE_DISPATCHER(OnUse, bool Using);\n  AItem *I = nullptr;\n'
-            '  void F() { OnUse.Add(I, &AItem::Server_StartUsing); }\n', 'Server_StartUsing is not BlueprintCallable')
-    refused('DelegateSelfRpc', '  UE_DISPATCHER(OnUse, bool Using);\n  void F() { OnUse.Add(this, &AItem::Server_StartUsing); }\n',
-            'Server_StartUsing is not BlueprintCallable', base='AItem')
+def game_blueprint_flags():
+    """GameBlueprintFlags: another mod's Blueprint classes, from the header it shares, are in no UeApi table. Every
+    function of a Blueprint is a BlueprintEvent, so their interface is implemented (a stub for GetName) and their
+    functions overridden, and each implementation or override copies what the header's marks say: UE_PROTECTED,
+    UE_PRIVATE, UE_BLUEPRINT_PURE with `const`, UE_COSMETIC, and UE_BLUEPRINT_CALLABLE on a function graph that overrides
+    an engine event (UserConstructionScript: AActor's is not BlueprintCallable, a Blueprint's is). Before, the interface was refused ("Opened is native only")
+    and an override got plain flags. A function the engine does not mark BlueprintCallable (an RPC, a RepNotify, an
+    event) is bound like any other: the engine binds a UFunction by name, and only the editor asks for BlueprintCallable."""
+    base = asset('GameBlueprintFlags')
+    keeps_invariants(base)
+    flags = lambda fn: int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', base, export_index(base, fn))).group(1), 16)
+    PUBLIC, PRIVATE, PROTECTED, EVENT, PURE, CONST, COSMETIC = 0x20000, 0x40000, 0x80000, 0x8000000, 0x10000000, 0x40000000, 0x8
+    CALLABLE = 0x4000000
+    proves('overriding-engine-and.ue-protected', 'implementing-an.another-mod-s-interface')
+    for fn, want in (('Opened', PUBLIC), ('Closed', PROTECTED), ('GetName', PUBLIC), ('Hidden', PRIVATE),
+                     ('Peek', PUBLIC | PURE | CONST), ('Flash', PUBLIC | COSMETIC)):
+        got = flags(fn)
+        assert got & (want | EVENT) == want | EVENT, (fn, hex(got))
+        assert not got & (PUBLIC | PRIVATE | PROTECTED) & ~want, (fn, hex(got))
+    assert flags('UserConstructionScript') & (CALLABLE | PUBLIC | EVENT) == CALLABLE | PUBLIC | EVENT, hex(flags('UserConstructionScript'))
+    me = {'Count': 0}
+    run(base, 'Opened', self_vars=me, By=3)
+    run(base, 'Closed', self_vars=me, Why=1)
+    assert me['Count'] == 2, me
+    assert run(base, 'Peek', self_vars=me, Out=0)[1]['Out'] == 2
+    vm = VM(base, {})
+    a, item = Obj('Actor'), Obj('Item')
+    vm.self.vars['A'], vm.self.vars['I'] = a, item
+    proves('handler-functions.onuse-add-item-aitem-server', 'handler-functions.ontick-add-a-aactor-receivetick')
+    for fn, bind in (('BindOnRep', ('OnPing', 'OnRep_Instigator', a)), ('BindRpc', ('OnUse', 'Server_StartUsing', item)),
+                     ('BindEvent', ('OnTick', 'ReceiveTick', a))):
+        vm.binds = []
+        vm.call(fn)
+        assert vm.binds == [(vm.self,) + bind], (fn, vm.binds)
 
 
 def delegate_callable_rpc():
@@ -10080,8 +10105,8 @@ def delegate_callable_rpc():
     asks for BlueprintCallable, not pure, not latent, and nothing about the net flags (K2Node_CreateDelegate.cpp
     154-161). 49 native functions are both; APlayerController::ClientClearCameraLensEffects binds on another object
     and AFSDPlayerController::Server_ResetHUD on this one. fix/r5-delegates (cab61cb6) refused both against a UeApi
-    without NotCallable.json, saying they were not BlueprintCallable, as it took every UE_SERVER / UE_CLIENT /
-    UE_MULTICAST for one that is not; NotCallable.json is compulsory now (UeApi version 3)."""
+    without NotCallable.json, saying they were not BlueprintCallable; since genueapi 6 nothing is refused for that
+    (GameBlueprintFlags binds RPCs the engine does not mark BlueprintCallable)."""
     base = asset('DelegateCallableRpc')
     keeps_invariants(base)
     vm = VM(base, {})
@@ -10096,16 +10121,6 @@ def delegate_callable_rpc():
     vm.call('Bind')
     proves('handler-functions.onping-add-pc-aplayercontroller')
     assert vm.binds == [(vm.self, 'OnReset', 'Server_ResetHUD', vm.self)], vm.binds
-
-
-def delegate_not_callable_refusals():
-    """AActor::OnRep_Instigator is a native function that is not BlueprintCallable, and nothing in its declaration says
-    so: UeApi's NotCallable.json does. Refused on another object and on this one."""
-    refused('DelegateOtherOnRep', '  UE_DISPATCHER(OnPing);\n  AActor *A = nullptr;\n'
-            '  void F() { OnPing.Add(A, &AActor::OnRep_Instigator); }\n', 'OnRep_Instigator is not BlueprintCallable')
-    proves('handler-functions.onuse-add-item-aitem-server')
-    refused('DelegateSelfOnRep', '  UE_DISPATCHER(OnPing);\n  void F() { OnPing.Add(this, &AActor::OnRep_Instigator); }\n',
-            'OnRep_Instigator is not BlueprintCallable')
 
 
 def delegate_sigs(base):
@@ -10437,12 +10452,11 @@ print('ok  DelegateNativeMethod: a member pointer to AActor\'s function keeps AA
 delegate_inherit_bind()
 print('ok  DelegateInheritBind: a function of another object bound to an inherited dispatcher - a mod parent\'s, a game '
       'Blueprint\'s - is typed with the parent\'s signature, imported, and the broadcast reaches it')
-delegate_rpc_refusals()
-print('ok  delegate RPC refusals: a server RPC is not BlueprintCallable, so it is bound on no object')
+game_blueprint_flags()
+print('ok  GameBlueprintFlags: another mod\'s Blueprint interface is implemented and its functions overridden from its '
+      'header alone, with the flags its marks say; an RPC, a RepNotify and an event bind like any function')
 delegate_callable_rpc()
 print('ok  DelegateCallableRpc: an RPC the engine marks BlueprintCallable binds on another object and on this one')
-delegate_not_callable_refusals()
-print('ok  delegate not-callable refusals: OnRep_Instigator, which UeApi\'s NotCallable.json names, is bound on no object')
 delegate_parm_sig()
 print('ok  DelegateParmSig: an override\'s TDelegate parameter, and a value handed to a mod parent\'s, a sibling\'s or a '
       'parent\'s variable, name the declaring class\'s signature, imported, and still reach where they go')
@@ -10462,16 +10476,12 @@ print('ok  native dispatchers: Broadcast on a BlueprintCallable one names a sign
       'parameters and reaches its handler; one the editor\'s nodes refuse is refused, and UE_FORCE_BROADCAST broadcasts '
       'it with a warning')
 # A bound name the object's class does not have: the broadcast or the timer skips it (ScriptDelegates.h 38-49,
-# 479-502). The editor binds only a BlueprintCallable function, never a pure or latent one (K2Node_CreateDelegate.cpp
-# 156-164 -> EdGraphSchema_K2.cpp 929-985): AActor::ReceiveTick is a BlueprintEvent only.
+# 479-502).
 proves('handler-functions.onhit-add-h-other-handlehit')
 refused('DelegateOtherForeign', '  UE_DISPATCHER(OnHit, int32 Points);\n  DelegateOtherHolder *H = nullptr;\n'
         '  void Own(int32 Points) {}\n  void F() { OnHit.Add(H, &DelegateOtherForeign::Own); }\n',
         'cannot bind DelegateOtherForeign::Own',
         top='class DelegateOtherHolder : public AActor {\npublic:\n  int32 N = 0;\n};\n')
-proves('handler-functions.ontick-add-a-aactor-receivetick')
-refused('DelegateOtherEvent', '  UE_DISPATCHER(OnTick, float Delta);\n  AActor *A = nullptr;\n'
-        '  void F() { OnTick.Add(A, &AActor::ReceiveTick); }\n', 'cannot bind AActor::ReceiveTick')
 proves('handler-functions.onhit-add-h-helper-half')
 refused('DelegateOtherDeclared', '  UE_DISPATCHER(OnHit, int32 Points);\n  DelegateOtherHalf *H = nullptr;\n'
         '  void F() { OnHit.Add(H, &DelegateOtherHalf::Take); }\n',

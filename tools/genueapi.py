@@ -53,7 +53,9 @@ CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
 # 3: <D>__UeDispatcher on each native dispatcher, NotCallable.json, and main's TEnum spellings of native enum fields.
 # 4: UeTemplateSubobjects, the objects instanced under a game Blueprint's component templates.
 # 5: UeIchRecords, the inherited components a game Blueprint has a template of its own for.
-GENUEAPI_VERSION = 5
+# 6: a game Blueprint's functions marked UE_PROTECTED / UE_PRIVATE / UE_BLUEPRINT_PURE / UE_BLUEPRINT_CALLABLE, and left out of Events.json;
+#    no NotCallable.json. The compiler still takes 5: it reads an older Events.json's game rows where they are.
+GENUEAPI_VERSION = 6
 
 
 def dump_identity(sdk_dir):
@@ -1452,17 +1454,19 @@ PURE = set()     # (class, function) of every BlueprintPure function, filled by 
 NATIVE = set()   # (package leaf, class, function) of every FUNC_Native function, filled by write_events
 MARKS = {}       # (class, function) -> "UE_SERVER UE_RELIABLE " and the like, filled by write_events
 NOT_CALLABLE = set()   # (class, function) of every function neither BlueprintCallable nor a BlueprintEvent, filled by write_events
+ACCESS = {}      # (class, function) -> "UE_PROTECTED " or "UE_PRIVATE " of a game Blueprint's function, filled by write_events
+BP_CALLABLE = set()         # (class, function) of each BlueprintCallable game Blueprint function, filled by write_events
+UNCALLABLE_EVENTS = set()   # names of native BlueprintEvents the engine does not mark BlueprintCallable, filled by write_events
 MARK_OF = (("NetServer", "UE_SERVER"), ("NetClient", "UE_CLIENT"), ("NetMulticast", "UE_MULTICAST"),
            ("NetReliable", "UE_RELIABLE"), ("BlueprintAuthorityOnly", "UE_AUTHORITY_ONLY"), ("BlueprintCosmetic", "UE_COSMETIC"))
 
 
 def write_events(sdk_dir, out_dir):
-    """Events.json: "Package.Class.Function" -> EFunctionFlags of every BlueprintEvent, the functions a Blueprint
-    overrides or implements. The compiler copies part of these onto the override (KismetCompiler.cpp).
-    Also collects PURE, and writes NotCallable.json: "Package.Class.Function" of every function that is neither
-    BlueprintCallable nor a BlueprintEvent (OnRep_*, RPCs, Exec commands, ExecuteUbergraph_*), which the editor's
-    Create Event node does not bind (EdGraphSchema_K2.cpp 929-933, 974-985) and no other flag in UeApi tells apart."""
-    rows, not_callable = [], []
+    """Events.json: "Package.Class.Function" -> EFunctionFlags of every native BlueprintEvent, the functions a
+    Blueprint overrides or implements. The compiler copies part of these onto the override (KismetCompiler.cpp).
+    A game Blueprint's function has no row: every one is a BlueprintEvent, and its header marks what else an override
+    takes (ACCESS, PURE, MARKS, `const`), which the compiler reads instead. Also collects PURE and NOT_CALLABLE."""
+    rows = []
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_functions.cpp")):
         text = io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace").read()
         stem = name[: -len("_functions.cpp")]
@@ -1479,15 +1483,22 @@ def write_events(sdk_dir, out_dir):
             marks = "".join(mark + " " for flag, mark in MARK_OF if flag in names)
             if marks:
                 MARKS[(cls, real)] = marks
-            if "BlueprintEvent" in names:
+            if cls.endswith("_C"):
+                ACCESS[(cls, real)] = ("UE_PROTECTED " if "Protected" in names else
+                                       "UE_PRIVATE " if "Private" in names else "")
+                if "BlueprintCallable" in names:
+                    BP_CALLABLE.add((cls, real))
+            elif "BlueprintEvent" in names:
+                if "BlueprintCallable" not in names:
+                    UNCALLABLE_EVENTS.add(real)
                 rows.append('  %s: %d' % (json.dumps("%s.%s.%s" % (pkg, cls, real)), sum(FUNC_BITS[n] for n in names)))
-            elif "BlueprintCallable" not in names:
-                not_callable.append("%s.%s.%s" % (pkg, cls, real))
+            if "BlueprintEvent" not in names and "BlueprintCallable" not in names:
                 NOT_CALLABLE.add((cls, real))
     io.open(os.path.join(out_dir, "Events.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
-    io.open(os.path.join(out_dir, "NotCallable.json"), "w", encoding="utf-8", newline="\n").write(
-        "[\n" + ",\n".join("  " + json.dumps(k) for k in sorted(set(not_callable))) + "\n]\n")
-    print("  events: %d, not callable: %d" % (len(rows), len(not_callable)))
+    stale = os.path.join(out_dir, "NotCallable.json")     # genueapi 5's; nothing reads it now
+    if os.path.exists(stale):
+        os.remove(stale)
+    print("  native events: %d, game Blueprint functions marked: %d" % (len(rows), len(ACCESS)))
 
 
 def write_out_arrays(out_dir):
@@ -2068,9 +2079,19 @@ def main():
                 refs = REF_PARMS.get((k.ue_name, real_fn), ())
                 variants = [(r, [(const_ref(t) if n in refs else t, n) for t, n in v]) for r, v in variants]
                 const_refs += sum(1 for t, n in params if n in refs and const_ref(t) != t)
+                # A game Blueprint's function has no Events.json row: its marks say what an override takes.
+                flags = MARKS.get((k.ue_name, real_fn), "")
+                if k.is_bp:
+                    flags += ACCESS.get((k.ue_name, real_fn), "")
+                    if not pure and (k.ue_name, real_fn) in PURE:
+                        flags += "UE_BLUEPRINT_PURE "
+                    # An override takes its native event's flags, plus the BlueprintCallable the editor gives a function
+                    # graph. Matched by name: the compiler reads the mark only on an override.
+                    if (k.ue_name, real_fn) in BP_CALLABLE and real_fn in UNCALLABLE_EVENTS:
+                        flags += "UE_BLUEPRINT_CALLABLE "
                 for vret, plist in variants:
                     args = ", ".join("%s %s" % (rewrite(named(t), short, k), n) for t, n in plist)
-                    body.append("    %s%s%s%s %s(%s)%s;" % (MARKS.get((k.ue_name, real_fn), ""),
+                    body.append("    %s%s%s%s %s(%s)%s;" % (flags,
                                                              "UE_PURE " if pure else "", "static " if is_static else "",
                                                            rewrite(named(vret), short, k), fname, args,
                                                            " const" if fname in k.const_funcs else ""))
