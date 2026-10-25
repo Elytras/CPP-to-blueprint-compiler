@@ -17750,7 +17750,7 @@ bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Ho
     if (TagsOnlyIn == &BP) { *Sig = Null(); return true; }
     /* DelegateSigs is the last class's still when an asset or a struct asks: its indices are that package's. */
     if (DelegateSigsIn != &BP)
-    { *Err = Holder + ": " + Type + " needs a signature function, which only a class holds, not a struct or an interface"; return false; }
+    { *Err = Holder + ": " + Type + " needs a signature function, which a class or an interface holds, not a struct"; return false; }
     const std::string Key = DelegateKey(Type);
     if (auto It = DelegateSigs.find(Key); It != DelegateSigs.end()) { *Sig = It->second.second; return true; }
     const size_t Open = Type.find('('), Close = Type.rfind(')');
@@ -17948,13 +17948,23 @@ std::string FCompiler::SignatureName(const FRecord& In, const std::string& Type,
    held to its parameters the same (invariants.py func_override_params). Up mod classes only: a native's or another
    mod's parameter names a signature UeApi does not, and the class keeps its own there. The type is the declaring
    class's own parameter's, from the declaration its Generate lowers (Fn.Def: the out-of-line definition, else the one in
-   the class), never the asker's spelling of it (ForeignSignature). */
+   the class), never the asker's spelling of it (ForeignSignature). A mod interface's function is copied the same way:
+   an implementation's entry pins are the interface function's (FKismetCompilerContext::CreateFunctionList finds it as
+   the function to implement), so a class that no mod parent gives Method takes the signature of the interface it
+   implements, and a caller through the interface binds its value with it. */
 const FRecord* FCompiler::SignatureDeclarer(const FRecord& Owner, const std::string& Method) const
 {
+    auto Declares = [&](const FRecord* I) { return I && I->bIsInterface && I->IsGenerated() && I != Cur && I->Methods.count(Method); };
+    if (Owner.bIsInterface) return Declares(&Owner) ? &Owner : nullptr;
     const FRecord* D = &Owner;
     for (const FRecord* A = Owner.Base.empty() ? nullptr : Find(Owner.Base); A && !A->IsNative() && !A->bIsInterface;
          A = A->Base.empty() ? nullptr : Find(A->Base))
         if (!IsInlineMethod(*A, Method) && CompilesMethod(*A, Method)) D = A;
+    if (D == &Owner)
+        for (const FRecord* A = &Owner; A && !A->IsNative(); A = A->Base.empty() ? nullptr : Find(A->Base))
+            for (const std::string& I : A->Interfaces)
+                for (const FRecord* Link : InterfaceChain(Find(I)))
+                    if (Declares(Link)) return Link;
     if (D == Cur || D->IsNative() || !D->IsGenerated() || D->bIsStruct || D->bIsInterface || IsInlineMethod(*D, Method)
         || !CompilesMethod(*D, Method))
         return nullptr;
@@ -18253,6 +18263,7 @@ no state, so there are no variables to carry.
 bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, std::string* Err)
 {
     Cur = &R;
+    BuiltClasses.insert(R.CppName);     // the signature functions it exports are known by name now (ForeignSignature)
     const std::string PackageName = PackageOf(R);
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
@@ -18272,6 +18283,11 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     BP.GameClassKinds = &GameClassKinds;
     BP.SetIsActor(false);
     BP.SetClassFlags(CLASS_Parsed | CLASS_Interface | CLASS_CompiledFromBlueprint);
+    /* An interface is a class too, so a TDelegate parameter of one of its functions gets a signature function in it,
+       as in a class (DelegateSignature), which its implementations and callers import (SignatureDeclarer). */
+    struct FSigScope { const FBlueprintClass*& In; ~FSigScope() { In = nullptr; } } SigScope{ DelegateSigsIn };
+    DelegateSigs.clear();
+    DelegateSigsIn = &BP;
 
     /* A variable on an interface is this compiler's own idea, not the engine's: it becomes a property of every
        class that implements the interface (Generate), so none is written here. What cannot move that way is

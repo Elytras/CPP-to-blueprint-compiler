@@ -13388,7 +13388,7 @@ def asset_delegate_value():
     # A struct makes no signature function, so a delegate in one is refused, though the class generated just before it
     # (by name) left one of that type in DelegateSigs: the struct cooked with that package's index.
     refused('AdvStructDel', '  TDelegate<void()> Mine;\n',
-            'member D: TDelegate<void ()> needs a signature function, which only a class holds, not a struct or an interface',
+            'member D: TDelegate<void ()> needs a signature function, which a class or an interface holds, not a struct',
             top='struct FZzAdvHeld {\n  UE_STRUCT;\n  TDelegate<void()> D;\n  int32 N = 0;\n};\n')
 
 
@@ -13396,6 +13396,38 @@ asset_delegate_value()
 print('ok  AssetDelegateValue: an unbound delegate in an asset\'s braces, a TMap\'s value and a mod interface\'s variable '
       'is written as an FScriptDelegate, null and None, and the asset names no signature function of another package; '
       'a UE_STRUCT\'s delegate is refused whatever class was built before it')
+
+
+def iface_delegate():
+    """IfaceDelegate: a TDelegate parameter of a mod interface's function names a signature function the interface's
+    package exports, a delegate function, so it loads; the implementer and a caller through the interface compile and
+    keep their own."""
+    here = os.path.dirname(asset('IfaceDelegate'))
+    base = os.path.join(here, 'IIfdSchedules')
+    keeps_invariants(base)
+    names = exports_of(base)
+    for fn, parm in (('Schedule', 'Call'), ('Count', 'Each')):
+        out = dump('dumpstruct.py', base, names.index(fn))
+        sig = re.search(r'DelegateProperty %s .* exp\[(\d+)\]' % parm, out)
+        proves('delegate-values.void-schedule-tdelegate-void-call')
+        assert sig, out
+        target = names[int(sig.group(1))]
+        assert target.endswith('__DelegateSignature'), (fn, target)
+        flags = int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', base, int(sig.group(1)))).group(1), 16)
+        assert flags & 0x100000, (target, hex(flags))           # FUNC_Delegate
+    # The implementation's parameters name the interface's, imported; the caller, binding values straight into the
+    # call, holds no delegate property.
+    keeps_invariants(os.path.join(here, 'AIfdCaller'))
+    clock = os.path.join(here, 'AIfdClock')
+    keeps_invariants(clock)
+    imported = {p.rsplit(':', 1)[-1] for p in import_paths(clock) if 'IIfdSchedules_C:' in p}
+    proves('delegate-values.void-schedule-tdelegate-void-call')
+    assert {'Call__DelegateSignature', 'Each__DelegateSignature'} <= imported, imported
+
+
+iface_delegate()
+print('ok  IfaceDelegate: a mod interface function\'s TDelegate parameter names the interface\'s own signature function, '
+      'which its implementer imports; a caller through it compiles')
 
 
 def interface_var_names():
