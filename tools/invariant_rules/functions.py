@@ -18,6 +18,7 @@ FUNC_Public, FUNC_Private, FUNC_Protected = 0x20000, 0x40000, 0x80000
 FUNC_NetServer, FUNC_HasOutParms, FUNC_HasDefaults, FUNC_NetClient = 0x200000, 0x400000, 0x800000, 0x1000000
 FUNC_BlueprintCallable, FUNC_BlueprintEvent, FUNC_BlueprintPure = 0x4000000, 0x8000000, 0x10000000
 FUNC_NetFuncFlags = FUNC_Net | FUNC_NetReliable | FUNC_NetServer | FUNC_NetClient | FUNC_NetMulticast     # Script.h:157
+FUNC_Delegate = 0x100000
 FUNC_FuncInherit = 0x4C000A0C                                                                              # Script.h:155
 FUNC_AccessSpecifiers = FUNC_Public | FUNC_Private | FUNC_Protected
 FUNC_Routed = FUNC_NetFuncFlags | FUNC_BlueprintAuthorityOnly | FUNC_BlueprintCosmetic | FUNC_NetRequest | FUNC_NetResponse
@@ -526,7 +527,9 @@ def interface_class_stubs(pkg):
         for c in cst.children:
             if c <= 0 or pkg.class_of(c) not in Package.FUNCTION_CLASSES: continue
             st = pkg.struct(c - 1)
-            if st.function_flags & INTERFACE_STUB != INTERFACE_STUB:
+            # A delegate parameter's signature function is the interface's too, as a class's is: only reflection reads
+            # it, nothing calls it.
+            if st.function_flags & INTERFACE_STUB != INTERFACE_STUB and not st.function_flags & FUNC_Delegate:
                 yield c - 1, 'interface function FunctionFlags %#x lack %#x' % (st.function_flags, INTERFACE_STUB & ~st.function_flags)
             if st.super: yield c - 1, 'interface function with super %s' % pkg.path(st.super)
             ops = sorted({n.op for n in statements(pkg, c - 1)[0]} & EFFECTS)
