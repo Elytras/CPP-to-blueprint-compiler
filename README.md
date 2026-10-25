@@ -107,8 +107,10 @@ Several mods, only rebuilding what changed, packed into paks:
 python tools/bpbuild.py <mods dir> <UeApi dir> <path to assetgen> [--force] [--no-pak]
 ```
 
-For example `python tools\bpbuild.py mods ..\DrgCppSdk\UeApi x64\Release\assetgen.exe` on Windows, or
-`python3 tools/bpbuild.py mods ../DrgCppSdk/UeApi build/assetgen` on Linux.
+For example `python tools\bpbuild.py ..\mymods ..\DRG-Blueprint-Cpp-SDK\UeApi x64\Release\assetgen.exe` on
+Windows, or `python3 tools/bpbuild.py ../mymods ../DRG-Blueprint-Cpp-SDK/UeApi build/assetgen` on Linux, run from
+this folder with the SDK and your mods beside it. [The folder layout](GUIDE.md#get-the-compiler-and-the-sdk) shows the
+three folders and how a mod's `#include`s find the SDK.
 
 `<mods dir>` holds a `mods.yaml`:
 
@@ -144,7 +146,7 @@ exec wine "$HOME/UE_4.27/Engine/Binaries/Win64/UnrealPak.exe" "$@"
 `chmod +x` it and point `UNREALPAK` at it:
 
 ```sh
-UNREALPAK=~/bin/unrealpak-wine python3 tools/bpbuild.py mods ../DrgCppSdk/UeApi build/assetgen
+UNREALPAK=~/bin/unrealpak-wine python3 tools/bpbuild.py ../mymods ../DRG-Blueprint-Cpp-SDK/UeApi build/assetgen
 ```
 
 With `--no-pak` (or no UnrealPak at all) bpbuild still compiles every mod and leaves the assets under
