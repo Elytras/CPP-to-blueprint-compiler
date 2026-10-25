@@ -1172,6 +1172,9 @@ struct FRecord
     bool bCooked = false;       // UE_COOKED: shipped as the cooked package it was built from; imported here, never cooked
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
+    /* A game Blueprint from UeApi's Game/, or another mod's class from the header it shares: every function of one is a
+       Blueprint function (GameFunctionFlags). */
+    bool IsGameBlueprint() const { return IsNative() && UePackage.compare(0, 6, "/Game/") == 0; }
     bool IsGenerated() const { return !IsNative() && !bIsPatch && (bIsStruct || bIsInterface || !Base.empty()); }
     /* A UserDefinedStruct: cooked here, or cooked by the mod its UE_STRUCT_IN names and imported. */
     bool IsModStruct() const { return bIsStruct && (UePackage.empty() || UePackage.compare(0, 6, "/Game/") == 0); }
@@ -2594,6 +2597,7 @@ private:
     /* The native UFunction Method overrides, or null; InheritedFlags gets the flags it passes on, also
        for a method implementing an interface's function, which has no Super. */
     uint32 ModMethodFlags(const FRecord& Owner, const std::string& Method, FBlueprintClass& BP);
+    uint32 GameFunctionFlags(const FRecord& R, const std::string& Method) const;
     FIndex FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method,
                      uint32* InheritedFlags, bool bFlagsOnly = false);
     /* The declaration of the function Method replaces, as ParentClass->FindFunctionByName finds it (each class's own
@@ -2706,10 +2710,9 @@ private:
     std::map<std::string, std::map<std::string, std::string>> EnumUeNames;        // `<Enum>__UeEnumNames`: C++ -> cooked
     std::map<std::string, std::map<std::string, std::string>> EnumUeDisplay;      // and C++ -> display
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
-    std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
-    /* UeApi/NotCallable.json: "Package.Class.Function" of each function the engine does not mark BlueprintCallable and
-       that is no BlueprintEvent (Events.json has those). Every UeApi this compiler takes has it (UeApiVersion 3). */
-    std::set<std::string> NotCallable;
+    /* UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags of each native BlueprintEvent. A UeApi from before
+       genueapi 6 lists the game Blueprints' functions too, and GameFunctionFlags takes those rows where they are. */
+    std::map<std::string, uint32> EventFlags;
     /* UeApi/OutArrays.json: "Package.Class.Function" -> bit I for each parameter I of a native that is an out TArray,
        emptied before the call (FCallIR::EmptiedArgs). A UeApi without the file empties nothing, as before. */
     std::map<std::string, uint64> OutArrayArgs;
@@ -4374,6 +4377,7 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
     /* Events.json and the Super import know the function by the engine's name (`Set is Extruded`). */
     const std::string UeMethod = UeNameOf(Self, Method);
     auto FlagsOf = [&](const FRecord& R) {
+        if (R.IsGameBlueprint()) return GameFunctionFlags(R, Method);
         auto It = EventFlags.find(R.UePackage.substr(R.UePackage.rfind('/') + 1) + "." + R.UeName + "." + UeMethod);
         return It == EventFlags.end() ? uint32(0) : It->second;
     };
@@ -4560,6 +4564,47 @@ uint32 FCompiler::ModMethodFlags(const FRecord& Owner, const std::string& Method
     const std::string DeclType = TypeOf(Decl);
     if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;
     return Flags | NetFlagsOf(Decl) | NetFlagsOf(Def) | AccessFlagsOf(Decl) | AccessFlagsOf(Def);
+}
+
+/* The flags of a game Blueprint's function (or of another mod's class, from the header it shares), with no table
+   needed: every function of a Blueprint is a BlueprintEvent but its ExecuteUbergraph, which no header declares
+   (20960 functions in the CL 158958 dump). An older UeApi's Events.json row wins where there is one. Else the function
+   it overrides gives them, as the Kismet compiler copies a parent's: a native one's from Events.json, a game one's
+   the same way; ParentClass->FindFunctionByName looks in a class's interfaces before its super (Class.cpp:5281-5323).
+   Else its declaration says them, as genueapi writes it: UE_PROTECTED / UE_PRIVATE, UE_PURE or UE_BLUEPRINT_PURE,
+   `const`, `static`, and the net and authority marks. Measured on that dump: what the declaration cannot say,
+   FUNC_Event (custom events, 300 functions) and an anim graph's functions without Public or BlueprintCallable, is
+   left out; it changes no call, and an override's own FUNC_Event follows kPlainMethodFlags anyway. */
+uint32 FCompiler::GameFunctionFlags(const FRecord& R, const std::string& Method) const
+{
+    auto Row = [&](const FRecord& A) {
+        const auto It = EventFlags.find(A.UePackage.substr(A.UePackage.rfind('/') + 1) + "." + A.UeName + "."
+                                        + UeNameOf(&A, Method));
+        return It == EventFlags.end() ? uint32(0) : It->second;
+    };
+    if (const uint32 Old = Row(R)) return Old;
+    // An override takes what it overrides, plus the BlueprintCallable the editor gives a function graph, which
+    // genueapi marks UE_BLUEPRINT_CALLABLE where the engine's event lacks it (UserConstructionScript):
+    const auto M = R.Methods.find(Method);
+    const uint32 Graph = M != R.Methods.end() && HasAttr(*M->second, "ReturnsTwiceAttr") ? FUNC_BlueprintCallable : 0;
+    auto Inherit = [&](uint32 Flags) { return Flags ? Flags | Graph : 0; };
+    for (const FRecord* C = &R; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+    {
+        if (C != &R && C->Methods.count(Method) && !C->Forwards.count(Method))
+            return Inherit(C->IsGameBlueprint() ? GameFunctionFlags(*C, Method) : C->IsNative() ? Row(*C) : 0);
+        for (const std::string& I : C->Interfaces)
+            if (const FRecord* IR = Find(I); IR && IR->IsNative() && IR->Methods.count(Method))
+                return Inherit(IR->IsGameBlueprint() ? GameFunctionFlags(*IR, Method) : Row(*IR));
+    }
+    if (M == R.Methods.end()) return 0;
+    const Json& Decl = *M->second;
+    uint32 Flags = FUNC_BlueprintEvent | FUNC_BlueprintCallable;
+    Flags |= HasAttr(Decl, "LeafAttr") ? FUNC_Protected : HasAttr(Decl, "MinSizeAttr") ? FUNC_Private : FUNC_Public;
+    if (IsPureDecl(Decl) || HasAttr(Decl, "NoSplitStackAttr")) Flags |= FUNC_BlueprintPure;
+    const std::string DeclType = TypeOf(Decl);
+    if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;
+    if (IsStaticDecl(Decl)) Flags |= FUNC_Static;
+    return Flags | NetFlagsOf(Decl) | AccessFlagsOf(Decl);
 }
 
 /* Measured on shipped DRG classes: BP_JetBootsBurnTrigger (Actor) 0x00840814, BP_ThornsComponent
@@ -5531,12 +5576,12 @@ bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, const std::s
         { *Err = "a delegate on a " + OnType + " cannot bind " + Owner->second + "::" + FnName + ": the engine looks it up by name on "
                  "that object, whose class has no such function"; return false; }
     }
-    /* What the editor binds, on this object or another (K2Node_CreateDelegate.cpp 156-164, FunctionCanBeUsedInDelegate
-       EdGraphSchema_K2.cpp 929-933, 974-985): a BlueprintCallable function, not pure, not latent. A mod's method is what
-       Generate makes it - BlueprintCallable, unless it overrides an event that is not - and one only declared is no
-       function at all. A native or game Blueprint's event says so in Events.json; any other function UeApi lists is
-       BlueprintCallable unless NotCallable.json names it (OnRep_*, most RPCs, ExecuteUbergraph_*). The net flags say
-       nothing here: 49 RPCs are BlueprintCallable (ClientClearCameraLensEffects), and the editor binds them. */
+    /* The editor binds a function that is not pure and not latent (K2Node_CreateDelegate.cpp 156-164,
+       FunctionCanBeUsedInDelegate EdGraphSchema_K2.cpp 929-933, 974-985). It also wants BlueprintCallable, but that is
+       only the editor's: the engine binds any UFunction by name, and one that is not BlueprintCallable (an
+       OnRep_*, an RPC, an event such as ReceiveTick) runs when the delegate fires as any other does. A mod's method is
+       what Generate makes it, and one only declared is no function at all; a game Blueprint's says so in its
+       declaration (GameFunctionFlags), a native one's in Events.json, and any other native one is not pure. */
     if (R)
     {
         std::string Why;
@@ -5549,17 +5594,16 @@ bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, const std::s
             { *Err = "a delegate cannot bind " + R->CppName + "::" + FnName + ", which " + R->CppName + " declares and never defines"; return false; }
             Flags = ModMethodFlags(*R, FnName, BP);
         }
+        else if (R->IsGameBlueprint())
+            Flags = GameFunctionFlags(*R, FnName);
         else if (auto E = EventFlags.find(Key); E != EventFlags.end())
             Flags = E->second;
-        else
-            Flags = NotCallable.count(Key) ? 0u : uint32(FUNC_BlueprintCallable);
         if (M != R->Methods.end() && IsPureDecl(*M->second)) Flags |= FUNC_BlueprintPure;
-        if (!(Flags & FUNC_BlueprintCallable)) Why = FnName + " is not BlueprintCallable";
-        else if (Flags & FUNC_BlueprintPure) Why = FnName + " is pure";
+        if (Flags & FUNC_BlueprintPure) Why = FnName + " is pure";
         else if (DesugaredTypeOf(Ref).find("FLatentActionInfo") != std::string::npos) Why = FnName + " is latent";
         if (!Why.empty())
         { *Err = "a delegate cannot bind " + R->CppName + "::" + FnName + (bSelf ? " on this object" : " on another object")
-                 + ": the editor binds a BlueprintCallable function that is not pure or latent, and " + Why; return false; }
+                 + ": the editor binds a function that is not pure or latent, and " + Why; return false; }
     }
     if (bSelf)
     {
@@ -21973,11 +22017,13 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         const std::string& I = IR.CppName;
         /* A mod's own interface needs none of the Events.json conformance check below: GenerateInterface
            emits every one of its functions as a BlueprintEvent, so all of them are implementable by
-           construction. What it does share is the empty stub for one this class leaves out. */
-        if (IR.bIsInterface)
+           construction. So is a Blueprint interface of the game or of another mod (IsGameBlueprint), whose header
+           need not be in the UeApi's tables. What they share is the empty stub for one this class leaves out. */
+        if (IR.bIsInterface || IR.IsGameBlueprint())
         {
             for (const auto& M : IR.Methods)
             {
+                if (M.first == "StaticClass") continue;     // UE_CLASS's
                 if (std::any_of(Methods.begin(), Methods.end(),
                                 [&](const FMethod& F) { return F.Name == M.first; })) continue;
                 if (ReplacesInherited(I, M.first, *M.second)) return false;
@@ -22323,7 +22369,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         const auto [Owner, Replaced] = ReplacedDecl(R, Fn.Name);
         /* Only a Blueprint event is looked up by name; C++ and the calls bound to a native function (EX_FinalFunction)
            keep running it, so a function of the same name replaces it for some callers only. Events.json lists every
-           event of the engine and the game; another mod's class, from its UE_CLASS header, is not in it. */
+           native event; a Blueprint's functions, the game's or another mod's, are all events (GameFunctionFlags). */
         if (Super.V != 0 && !(Inherited & FUNC_BlueprintEvent) && Owner && Owner->UePackage.compare(0, 8, "/Script/") == 0)
         { *Err = R.CppName + "::" + Fn.Name + ": " + Owner->CppName + "::" + Fn.Name + " is native and no Blueprint event, so "
                  "no function replaces it: C++ and the calls bound to it still run it; rename " + Fn.Name; return false; }
@@ -23492,11 +23538,11 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
         if (Out->is_discarded()) { *Err = std::string("missing or invalid ") + IncludeDir + "/" + File + " (run genueapi.py)"; return false; }
         return true;
     };
-    Json ConvDoc, OpsDoc, TypesDoc, EventsDoc, NotCallableDoc;
+    /* An older UeApi's NotCallable.json is left unread: the engine binds a function that is not BlueprintCallable. */
+    Json ConvDoc, OpsDoc, TypesDoc, EventsDoc;
     if (!Load("Conv.json", &ConvDoc) || !Load("Ops.json", &OpsDoc) || !Load("Types.json", &TypesDoc)
-        || !Load("Events.json", &EventsDoc) || !Load("NotCallable.json", &NotCallableDoc)) return false;
+        || !Load("Events.json", &EventsDoc)) return false;
     for (auto It = EventsDoc.begin(); It != EventsDoc.end(); ++It) EventFlags[It.key()] = It->get<uint32>();
-    for (const Json& Key : NotCallableDoc) NotCallable.insert(Key.get<std::string>());
     const Json OutArraysDoc = Json::parse(ReadText(IncludeDir + "/OutArrays.json"), nullptr, false);
     if (OutArraysDoc.is_object())
         for (auto It = OutArraysDoc.begin(); It != OutArraysDoc.end(); ++It)
