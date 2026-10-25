@@ -83,11 +83,33 @@ Build AssetGen as the [README](README.md) describes. You get `x64\Release\assetg
 on Linux, where `cmake -B build && cmake --build build -j` in the AssetGen folder builds it with GCC or clang. The compiler parses every mod with LLVM's `clang++`, so that has to be on `PATH`. The build driver,
 `tools/bpbuild.py`, needs Python 3 with `pyyaml`, and UE 4.27's UnrealPak to make the pak.
 
-Then clone the SDK beside the AssetGen folder:
+Then clone the SDK beside the AssetGen folder, and make a folder for your mods beside both:
 
 ```
 git clone https://github.com/Elytras/DRG-Blueprint-Cpp-SDK ../DRG-Blueprint-Cpp-SDK
+mkdir ../mymods
 ```
+
+The three folders, with the names this guide uses:
+
+```
+<any folder>/
+├── AssetGen/                    this repo: the compiler, tools/, include/, examples/
+├── DRG-Blueprint-Cpp-SDK/       the SDK
+│   ├── UeApi/                   the headers a mod includes, and the JSON tables the compiler reads
+│   └── UeAssets/                every game asset, by path (optional)
+└── mymods/                      your mods
+    ├── mods.yaml                which mods to build, for bpbuild
+    ├── HelloWorld.cpp
+    ├── build/                   bpbuild writes each mod's cooked assets here
+    └── out/                     and each mod's pak here
+```
+
+Any other layout works as long as the paths you pass match it. A compile has two include dirs: the `UeApi` folder
+you pass it, and the folder that holds it. That is why a mod writes `#include "UeApi/Engine.h"` and
+`#include "UeAssets/USoundWave.h"` wherever its source is. AssetGen's own `include/` folder (`Objects.h`) is not an
+include dir: include it by its path from your source (`"../AssetGen/include/Objects.h"` from `mymods/`), or copy it
+beside your source.
 
 Its `UeApi/` folder is what a mod includes and what every compile takes as its include dir: one header per engine or
 game module (`Engine.h`, `FSD.h`, ...), one per game Blueprint under `Game/`, and the JSON tables the compiler reads.
@@ -97,7 +119,7 @@ The commands below run from the AssetGen folder.
 
 ### Write the mod
 
-Make a folder for your mods, `mymods/` here, and copy [examples/HelloWorld.cpp](examples/HelloWorld.cpp) into it:
+Copy [examples/HelloWorld.cpp](examples/HelloWorld.cpp) into `mymods/`:
 
 ```cpp
 /* HelloWorld: the smallest mod that runs on its own.
@@ -172,7 +194,7 @@ What each part does:
 A pak does not need this step, but it shows what AssetGen writes:
 
 ```
-assetgen compile mymods/HelloWorld.cpp ../DRG-Blueprint-Cpp-SDK/UeApi out/HelloWorld
+assetgen compile ../mymods/HelloWorld.cpp ../DRG-Blueprint-Cpp-SDK/UeApi out/HelloWorld
 ```
 
 `assetgen` stands for `x64\Release\assetgen.exe` on Windows and `build/assetgen` on Linux. The arguments are the
@@ -213,10 +235,10 @@ mods:
 and run it:
 
 ```
-python tools\bpbuild.py mymods ..\DRG-Blueprint-Cpp-SDK\UeApi x64\Release\assetgen.exe
+python tools\bpbuild.py ..\mymods ..\DRG-Blueprint-Cpp-SDK\UeApi x64\Release\assetgen.exe
 ```
 
-or on Linux `python3 tools/bpbuild.py mymods ../DRG-Blueprint-Cpp-SDK/UeApi build/assetgen`. bpbuild reads the
+or on Linux `python3 tools/bpbuild.py ../mymods ../DRG-Blueprint-Cpp-SDK/UeApi build/assetgen`. bpbuild reads the
 package from the first source's `UE_MOD_PACKAGE`, compiles into
 `mymods/build/HelloWorld/FSD/Content/_AssetGenExamples/HelloWorld/`, and packs the whole `FSD` folder. On Windows it
 prints:
@@ -483,7 +505,7 @@ only the engine calls inside it. The wrong kind of class for a helper, such as `
 the calling line.
 
 ```cpp
-#include "../include/Objects.h"   // AssetGen's include/ folder: SpawnActor, NewObject, AddComponentByType, ...
+#include "../AssetGen/include/Objects.h"   // from mymods/: SpawnActor, NewObject, AddComponentByType, ...
 
 UE_ASSET_AT(UStaticMesh, SM_Crate_B, "/Game/Art/Environments/SpaceRig/SM_Crate_B");   // a game mesh
 
