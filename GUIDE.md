@@ -83,11 +83,33 @@ Build AssetGen as the [README](README.md) describes. You get `x64\Release\assetg
 on Linux, where `cmake -B build && cmake --build build -j` in the AssetGen folder builds it with GCC or clang. The compiler parses every mod with LLVM's `clang++`, so that has to be on `PATH`. The build driver,
 `tools/bpbuild.py`, needs Python 3 with `pyyaml`, and UE 4.27's UnrealPak to make the pak.
 
-Then clone the SDK beside the AssetGen folder:
+Then clone the SDK beside the AssetGen folder, and make a folder for your mods beside both:
 
 ```
 git clone https://github.com/Elytras/DRG-Blueprint-Cpp-SDK ../DRG-Blueprint-Cpp-SDK
+mkdir ../mymods
 ```
+
+The three folders, with the names this guide uses:
+
+```
+<any folder>/
+├── AssetGen/                    this repo: the compiler, tools/, include/, examples/
+├── DRG-Blueprint-Cpp-SDK/       the SDK
+│   ├── UeApi/                   the headers a mod includes, and the JSON tables the compiler reads
+│   └── UeAssets/                every game asset, by path (optional)
+└── mymods/                      your mods
+    ├── mods.yaml                which mods to build, for bpbuild
+    ├── HelloWorld.cpp
+    ├── build/                   bpbuild writes each mod's cooked assets here
+    └── out/                     and each mod's pak here
+```
+
+Any other layout works as long as the paths you pass match it. A compile has two include dirs: the `UeApi` folder
+you pass it, and the folder that holds it. That is why a mod writes `#include "UeApi/Engine.h"` and
+`#include "UeAssets/USoundWave.h"` wherever its source is. AssetGen's own `include/` folder (`Objects.h`) is not an
+include dir: include it by its path from your source (`"../AssetGen/include/Objects.h"` from `mymods/`), or copy it
+beside your source.
 
 Its `UeApi/` folder is what a mod includes and what every compile takes as its include dir: one header per engine or
 game module (`Engine.h`, `FSD.h`, ...), one per game Blueprint under `Game/`, and the JSON tables the compiler reads.
@@ -97,7 +119,7 @@ The commands below run from the AssetGen folder.
 
 ### Write the mod
 
-Make a folder for your mods, `mymods/` here, and copy [examples/HelloWorld.cpp](examples/HelloWorld.cpp) into it:
+Copy [examples/HelloWorld.cpp](examples/HelloWorld.cpp) into `mymods/`:
 
 ```cpp
 /* HelloWorld: the smallest mod that runs on its own.
@@ -172,7 +194,7 @@ What each part does:
 A pak does not need this step, but it shows what AssetGen writes:
 
 ```
-assetgen compile mymods/HelloWorld.cpp ../DRG-Blueprint-Cpp-SDK/UeApi out/HelloWorld
+assetgen compile ../mymods/HelloWorld.cpp ../DRG-Blueprint-Cpp-SDK/UeApi out/HelloWorld
 ```
 
 `assetgen` stands for `x64\Release\assetgen.exe` on Windows and `build/assetgen` on Linux. The arguments are the
@@ -213,10 +235,10 @@ mods:
 and run it:
 
 ```
-python tools\bpbuild.py mymods ..\DRG-Blueprint-Cpp-SDK\UeApi x64\Release\assetgen.exe
+python tools\bpbuild.py ..\mymods ..\DRG-Blueprint-Cpp-SDK\UeApi x64\Release\assetgen.exe
 ```
 
-or on Linux `python3 tools/bpbuild.py mymods ../DRG-Blueprint-Cpp-SDK/UeApi build/assetgen`. bpbuild reads the
+or on Linux `python3 tools/bpbuild.py ../mymods ../DRG-Blueprint-Cpp-SDK/UeApi build/assetgen`. bpbuild reads the
 package from the first source's `UE_MOD_PACKAGE`, compiles into
 `mymods/build/HelloWorld/FSD/Content/_AssetGenExamples/HelloWorld/`, and packs the whole `FSD` folder. On Windows it
 prints:
@@ -483,7 +505,7 @@ only the engine calls inside it. The wrong kind of class for a helper, such as `
 the calling line.
 
 ```cpp
-#include "../include/Objects.h"   // AssetGen's include/ folder: SpawnActor, NewObject, AddComponentByType, ...
+#include "../AssetGen/include/Objects.h"   // from mymods/: SpawnActor, NewObject, AddComponentByType, ...
 
 UE_ASSET_AT(UStaticMesh, SM_Crate_B, "/Game/Art/Environments/SpaceRig/SM_Crate_B");   // a game mesh
 
@@ -1216,7 +1238,7 @@ building a mod.
 | Argument                      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `<source.cpp>`                | One translation unit. It must contain `UE_MOD_PACKAGE("/Game/...")`, which names the mod's own package folder.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `<include-dir>`               | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json`, `Events.json` and `NotCallable.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. Its `Version.json` must name a genueapi this compiler can use; a folder an older one wrote, or one without the file, stops the compile before clang runs, with `<dir> was written by an older genueapi (...) - regenerate it with AssetGen/tools/genueapi.py`. A folder with none of the three (no UeApi at all, or a path that does not exist) stops it with `missing or invalid <dir>/Conv.json (run genueapi.py)`. |
+| `<include-dir>`               | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json` and `Events.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. Its `Version.json` must name a genueapi this compiler can use; a folder an older one wrote, or one without the file, stops the compile before clang runs, with `<dir> was written by an older genueapi (...) - regenerate it with AssetGen/tools/genueapi.py`. A folder with none of the three (no UeApi at all, or a path that does not exist) stops it with `missing or invalid <dir>/Conv.json (run genueapi.py)`. |
 | `<out-dir>`                   | Where the mod's own packages go. The compiler creates it, and the folder of every package it writes, when missing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `--api <api-dir>`             | Optional, after the out dir. Also writes an editor stub for each class, interface, struct and enum into this folder (see [Editor API stubs](#editor-api-stubs)). It is an output folder for the editor, not the SDK folder. It must already exist: without it a class gets no stub and prints `<Class> -> no API asset: cannot write .uasset`, and a struct or enum fails the compile.                                                                                                                                                                                                                                          |
 | `--game <folder /Game is in>` | Optional, after the out dir. The `Content` folder of the extracted game pak, which `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH` read the game's packages from, and a game asset's values read when the mod is built. Without it, an edit or such a read is refused.                                                                                                                                                                                                                                                                                                                                                         |
@@ -1515,8 +1537,7 @@ use a newer SDK or regenerate your own.
 | `Ops.json`            | The Kismet functions behind operators on structs and soft pointers (`==`, `+`, ...).                                                                                                                                                                                                                                                                 |
 | `Containers.h`        | The Kismet `Array_*`, `Set_*` and `Map_*` functions, as methods of `TArray`, `TSet` and `TMap`.                                                                                                                                                                                                                                                      |
 | `Types.json`          | Every enum and struct: package, engine name, size, alignment and fields, and whether an enum is an `enum class` (`form`), read off how the dump's properties of it are reflected.                                                                                                                                                                    |
-| `Events.json`         | The function flags of every `BlueprintEvent`, which an override inherits.                                                                                                                                                                                                                                                                            |
-| `NotCallable.json`    | Every other function the engine does not mark BlueprintCallable (most RPCs, RepNotifies, `ExecuteUbergraph_*`), which a delegate cannot bind. An RPC that is BlueprintCallable is not listed, and binds.                                                                                                                                             |
+| `Events.json`         | The function flags of every native `BlueprintEvent`, which an override inherits. A game Blueprint's functions have no row: each is an event, and its header's marks (`UE_PROTECTED`, `UE_PRIVATE`, `UE_BLUEPRINT_PURE`, `const`, ...) give its flags. |
 | `Version.json`        | Which genueapi wrote the folder, and whether it had `--game`, written last. A compiler that needs a later one refuses the folder, saying to regenerate it, rather than compile against what the older one did not write. Without `--game` it refuses a class deriving from a game Blueprint, whose default subobjects the folder then does not list. |
 | `UeMeta.h`            | The `UE_*` macros. Written by hand.                                                                                                                                                                                                                                                                                                                  |
 | `Types.h`             | The integer spellings, `FString`, `FName`, `FText` and the container templates. Written by hand.                                                                                                                                                                                                                                                     |
@@ -1998,7 +2019,6 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | `static Calls lives in the ubergraph's frame, which only a function that makes a latent call runs in; make Calls a member`                                                                    | A Blueprint function keeps nothing between calls (the ubergraph is the class's event graph).                                                                | A member variable                                                                                                                                               | [Latent calls](REFERENCE.md#latent-calls)                                           |
 | ``a delegate cannot bind Handle: an inline function is expanded where it is called, no UFunction (drop `inline`)``                                                                            | An inline method is pasted into its callers and is no function of the class.                                                                                | Drop `inline` from the handler                                                                                                                                  | [Event dispatchers](REFERENCE.md#event-dispatchers)                                 |
 | `a delegate on a Helper cannot bind Other::Handle: the engine looks it up by name on that object, whose class has no such function`                                                           | A binding is an object and a function name, and the object's class has no function of that name, so the broadcast would skip it.                            | Bind a function of the object's own class: `OnHit.Add(H, &Helper::Handle)`                                                                                      | [Event dispatchers](REFERENCE.md#event-dispatchers)                                 |
-| `a delegate cannot bind AItem::Server_StartUsing on another object: the editor binds a BlueprintCallable function that is not pure or latent, and Server_StartUsing is not BlueprintCallable` | The editor's Create Event takes only a function Blueprint code can call; an event the engine calls, an RPC or a RepNotify is none.                          | Bind a method of your own class that calls it                                                                                                                   | [Event dispatchers](REFERENCE.md#event-dispatchers)                                 |
 | `OnDestroyed.Broadcast: OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable, ...`                                                                          | The editor's Call node refuses a native dispatcher the engine does not mark BlueprintCallable.                                                              | Call what makes the event happen, such as `K2_DestroyActor()`, or write `UE_FORCE_BROADCAST(OnDestroyed).Broadcast(this)` to run the handlers anyway (it warns) | [Event dispatchers](REFERENCE.md#event-dispatchers)                                 |
 | `a container operation needs a variable, not a computed value: Length`                                                                                                                        | A container node works on a variable, not on the result of a call.                                                                                          | `TArray<int32> L = GetItems(); return L.Num();`                                                                                                                 | [Containers](REFERENCE.md#containers)                                               |
 | `TODO: lambda L used as a value: ...`                                                                                                                                                         | A lambda was passed to a function that is not expanded, stored or returned: it is a body expanded at each call, not a value.                                | Call it where it is, or pass it to an inline function or template                                                                                               | [Lambdas](REFERENCE.md#lambdas)                                                     |
