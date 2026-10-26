@@ -197,13 +197,18 @@ protected:
     bool Remap(FIndex Src, FIndex& Out);
     bool PinTypeOf(const FPropertyDef& Prop, FPinType& Out);
     /* A widget default with its object references re-imported here. False drops it: what it names is an export of
-       the cooked package, an instanced object, or an asset under ModRoot, the mod's own, which ships cooked only. */
-    bool RemapDefault(FPropertyDef& D, const std::string& ModRoot);
-    bool RemapValue(FDefaultValue& V, const std::string& ModRoot);
+       the cooked package or an instanced object. A mod asset (a font, a texture) stays named: an uncooked copy
+       shipped beside the stubs draws in the designer (the editor refuses a cooked package). */
+    bool RemapDefault(FPropertyDef& D);
+    bool RemapValue(FDefaultValue& V);
 
     const FPackage& Source;
     FPackage P;
     std::map<std::string, int32> ImportCache;
+    /* The cooked class itself (a dispatcher's or function's `ColorPicker* Picker`), an export of Source: Remap
+       names it SelfRef until the stub's own generated class has its export row. */
+    std::string SelfClass;
+    static constexpr int32 SelfRef = 0x3fffffff;
 };
 
 class FApiWriter : public FEditorPackage
@@ -246,6 +251,12 @@ FIndex FEditorPackage::Object(const std::string& Package, const std::string& Cla
 bool FEditorPackage::Remap(FIndex Src, FIndex& Out)
 {
     if (Src.V == 0) { Out = Null(); return true; }
+    if (Src.V > 0 && !SelfClass.empty() && size_t(Src.V) <= Source.ExportRows().size()
+        && Source.ExportRows()[size_t(Src.V) - 1].ObjectName == SelfClass)
+    {
+        Out.V = SelfRef;
+        return true;
+    }
     const FImport* In = Source.ImportAt(Src);
     if (!In) return false;
     const FImport* Outer = Source.ImportAt(In->Outer);
@@ -257,39 +268,32 @@ bool FEditorPackage::Remap(FIndex Src, FIndex& Out)
     return true;
 }
 
-bool FEditorPackage::RemapValue(FDefaultValue& V, const std::string& ModRoot)
+bool FEditorPackage::RemapValue(FDefaultValue& V)
 {
-    if (V.K == FDefaultValue::Obj)
-    {
-        if (V.Instanced || V.Object.V > 0) return false;
-        const FImport* In = Source.ImportAt(V.Object);
-        const FImport* Outer = In ? Source.ImportAt(In->Outer) : nullptr;
-        if (Outer && Outer->ObjectName.compare(0, ModRoot.size(), ModRoot) == 0) return false;
-        if (!Remap(V.Object, V.Object)) return false;
-    }
+    if (V.K == FDefaultValue::Obj && (V.Instanced || V.Object.V > 0 || !Remap(V.Object, V.Object))) return false;
     for (FDefaultValue& Item : V.Items)
-        if (!RemapValue(Item, ModRoot)) return false;
+        if (!RemapValue(Item)) return false;
     if (V.Members)
     {
         auto Kept = std::make_shared<std::vector<FPropertyDef>>();
         for (FPropertyDef M : *V.Members)
-            if (RemapDefault(M, ModRoot)) Kept->push_back(std::move(M));
+            if (RemapDefault(M)) Kept->push_back(std::move(M));
         V.Members = Kept;
     }
     return true;
 }
 
-bool FEditorPackage::RemapDefault(FPropertyDef& D, const std::string& ModRoot)
+bool FEditorPackage::RemapDefault(FPropertyDef& D)
 {
     if (D.Members)
     {
         auto Kept = std::make_shared<std::vector<FPropertyDef>>();
         for (FPropertyDef M : *D.Members)
-            if (RemapDefault(M, ModRoot)) Kept->push_back(std::move(M));
+            if (RemapDefault(M)) Kept->push_back(std::move(M));
         if (Kept->empty() && !D.Members->empty()) return false;
         D.Members = Kept;
     }
-    return RemapValue(D.Default, ModRoot);
+    return RemapValue(D.Default);
 }
 
 bool FEditorPackage::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
@@ -316,6 +320,9 @@ bool FEditorPackage::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
                      : T == "SoftObjectProperty" ? "softobject" : "object";
         if (!Remap(Prop.Extra, Out.SubCategoryObject)) return false;
     }
+    /* A dispatcher. The compiler finds its signature by name, <Name>__DelegateSignature from the graph of that name
+       in DelegateSignatureGraphs, so the pin carries no member reference. */
+    else if (T == "MulticastInlineDelegateProperty" || T == "MulticastDelegateProperty") Out.Category = "mcdelegate";
     else if (T == "ClassProperty" || T == "SoftClassProperty")
     {
         // The pin carries the subclass filter, not UClass itself.
@@ -345,6 +352,7 @@ bool FEditorPackage::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
 bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
 {
     const std::string ClassName = Class.AssetName + "_C";
+    SelfClass = ClassName;
     const bool bFunctionLibrary = Class.ParentClass == "BlueprintFunctionLibrary";
 
     /* An actor needs nothing extra here: UBlueprint::PostLoad builds the SimpleConstructionScript,
@@ -374,20 +382,41 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         std::string Category, ToolTip, Keywords;
         uint32 Flags = 0;
         bool bPure = false;
+        bool bDelegate = false;     // a dispatcher's signature, one of DelegateSignatureGraphs
         std::vector<FPinDef> EntryPins, ResultPins;
     };
     std::vector<FGraph> Graphs;
 
+    /* A dispatcher is its variable (below) and a signature graph named as it is, whose entry node carries the
+       parameters, as the editor's "Add Event Dispatcher" makes them; the compiler names the function
+       <Name>__DelegateSignature. A signature with no visible dispatcher of that name is left out. */
+    const std::string SignatureSuffix = "__DelegateSignature";
+    auto DispatcherOf = [&](const FApiFunction& Fn) {
+        if (!(Fn.Flags & (FUNC_Delegate | FUNC_MulticastDelegate)) || Fn.Name.size() <= SignatureSuffix.size()
+            || Fn.Name.compare(Fn.Name.size() - SignatureSuffix.size(), SignatureSuffix.size(), SignatureSuffix) != 0)
+            return std::string();
+        const std::string Name = Fn.Name.substr(0, Fn.Name.size() - SignatureSuffix.size());
+        for (const FPropertyDef& Prop : Class.Variables)
+            if (Prop.Name == Name && Prop.Type.compare(0, 9, "Multicast") == 0) return Name;
+        return std::string();
+    };
+
     for (const FApiFunction& Fn : Class.Functions)
     {
-        if (!(Fn.Flags & FUNC_BlueprintCallable)) continue;
-        if (Fn.Flags & (FUNC_UbergraphFunction | FUNC_Delegate | FUNC_MulticastDelegate)) continue;
+        const std::string Dispatcher = DispatcherOf(Fn);
+        if (Dispatcher.empty())
+        {
+            if (!(Fn.Flags & FUNC_BlueprintCallable)) continue;
+            if (Fn.Flags & (FUNC_UbergraphFunction | FUNC_Delegate | FUNC_MulticastDelegate)) continue;
+        }
 
         FGraph G;
-        G.Name = Fn.Name;
+        G.Name = Dispatcher.empty() ? Fn.Name : Dispatcher;
+        G.bDelegate = !Dispatcher.empty();
         if (auto Cat = Class.Categories.find(Fn.Name); Cat != Class.Categories.end()) G.Category = Cat->second;
         if (auto Doc = Class.Docs.find(Fn.Name); Doc != Class.Docs.end()) std::tie(G.ToolTip, G.Keywords) = Doc->second;
-        G.Flags = Fn.Flags;
+        // The flags the editor's new dispatcher gets (FBlueprintEditor::OnAddNewDelegate).
+        G.Flags = G.bDelegate ? FUNC_BlueprintCallable | FUNC_BlueprintEvent | FUNC_Public : Fn.Flags;
         /* A pure function draws without exec pins, so UE_PURE decides the node shape here and
            not just the flag: an entry node with a `then` pin would compile back as impure. */
         G.bPure = (Fn.Flags & FUNC_BlueprintPure) != 0;
@@ -453,6 +482,15 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
        plus its CDO - the editor's deferred loading needs the CDO export to exist. */
     const int32 ExClass = Next;
     const int32 ExCdo = Next + 1;
+    auto FixSelf = [&](FPinType& T) {
+        if (T.SubCategoryObject.V == SelfRef) T.SubCategoryObject = Exp(ExClass);
+        if (T.ValueType && T.ValueType->SubCategoryObject.V == SelfRef) T.ValueType->SubCategoryObject = Exp(ExClass);
+    };
+    for (FGraph& G : Graphs)
+    {
+        for (FPinDef& Pin : G.EntryPins) FixSelf(Pin.Type);
+        for (FPinDef& Pin : G.ResultPins) FixSelf(Pin.Type);
+    }
 
     /* Class variables: the same FEdGraphPinType, plus the flags that decide how the editor treats
        each one - visible/read-only, replicated, its RepNotify and condition. */
@@ -481,18 +519,29 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
             printf("  %-14s skipped: variable has no editor-side type yet\n", Prop.Name.c_str());
             continue;
         }
+        if (Var.Type.Category == "mcdelegate"
+            && std::none_of(Graphs.begin(), Graphs.end(), [&](const FGraph& G) { return G.bDelegate && G.Name == Prop.Name; }))
+        {
+            printf("  %-14s skipped: dispatcher's signature has a parameter with no editor-side type yet\n",
+                   Prop.Name.c_str());
+            continue;
+        }
         /* The editor's own set. CPF_Parm and the compiler-internal bits mean nothing on a variable,
            and a flag the details panel cannot show would only be lost on the next compile anyway. */
         Var.Flags = Prop.PropertyFlags & (CPF_Edit | CPF_BlueprintVisible | CPF_BlueprintReadOnly
                                           | CPF_DisableEditOnInstance | CPF_DisableEditOnTemplate
                                           | CPF_EditConst | CPF_Net | CPF_RepNotify | CPF_Transient
                                           | CPF_Config | CPF_SaveGame | CPF_Interp | CPF_AdvancedDisplay
-                                          | CPF_ExposeOnSpawn | CPF_NonTransactional);
+                                          | CPF_ExposeOnSpawn | CPF_NonTransactional
+                                          | CPF_BlueprintAssignable | CPF_BlueprintCallable);
+        // What lists a dispatcher under the designer's Events and lets a graph bind and call it.
+        if (Var.Type.Category == "mcdelegate") Var.Flags |= CPF_BlueprintAssignable | CPF_BlueprintCallable;
         Var.RepNotify = Prop.RepNotify;
         Var.RepCondition = Prop.RepCondition;
         Var.Default = DefaultString(Prop);
         if (auto Cat = Class.Categories.find(Prop.Name); Cat != Class.Categories.end()) Var.Category = Cat->second;
         MakeGuid(Class.AssetName + ".var." + Prop.Name, Var.Guid);
+        FixSelf(Var.Type);
         Vars.push_back(std::move(Var));
     }
 
@@ -510,7 +559,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
 
     /* A class with neither is not an API surface - most often a pure data holder or a class whose
        whole body is inlined - and an empty Blueprint would only be clutter in someone's project. */
-    if (Graphs.empty() && Vars.empty() && !bWidget)
+    if (Graphs.empty() && Vars.empty() && !bWidget && !Class.bOverrides)
     {
         if (Err) *Err = Class.AssetName + " exposes no callable function or variable";
         return false;
@@ -527,7 +576,8 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     Blueprint.ObjectName = Class.AssetName;
     Blueprint.ObjectFlags = RF_Public | RF_Standalone | RF_Transactional;
     Blueprint.bIsAsset = true;
-    const std::vector<int32> GraphRows = GraphExports;
+    std::vector<int32> GraphRows, SignatureRows;
+    for (size_t I = 0; I < Graphs.size(); ++I) (Graphs[I].bDelegate ? SignatureRows : GraphRows).push_back(GraphExports[I]);
     /* The designer tree follows the class and its default object: UWidgetBlueprint's WidgetTree default subobject,
        then each widget, then each slot (WriteWidgetTree). */
     const int32 ExTree = Class.Widgets.empty() ? 0 : ExCdo + 1;
@@ -545,6 +595,11 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
             Tag(Ar, "FunctionGraphs", "ArrayProperty", [=](FArc& V) {
                 V.I32(int32(GraphRows.size()));
                 for (int32 Row : GraphRows) V.Idx(Exp(Row));
+            }, "ObjectProperty");
+        if (!SignatureRows.empty())
+            Tag(Ar, "DelegateSignatureGraphs", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(SignatureRows.size()));
+                for (int32 Row : SignatureRows) V.Idx(Exp(Row));
             }, "ObjectProperty");
         if (!Vars.empty())
             Tag(Ar, "NewVariables", "ArrayProperty", [=](FArc& V) {
@@ -605,6 +660,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
                 V.Idx(Exp(ExEntry));
                 if (ExResult) V.Idx(Exp(ExResult));
             }, "ObjectProperty");
+            if (G.bDelegate) TagBool(Ar, "bEditable", false);   // a signature is edited through its dispatcher
             Tag(Ar, "GraphGuid", "StructProperty", [=](FArc& V) { V.Raw(GraphGuid, 16); }, "Guid");
             TagEnd(Ar);
             Ar.Bool(false);
@@ -750,12 +806,10 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
    every widget under the tree and every slot under its panel, the hierarchy in the slots' Parent and Content, the
    panel's Slots and the child's Slot, and the tree's editor-only AllWidgets. The cooked class's widget defaults ride
    along, so the designer draws the layout and what the constructor sets; what PreConstruct sets at run time is not
-   there. Each widget is a variable (bIsVariable), as its C++ member is. */
+   there. Each widget is a variable (bIsVariable), as its C++ member is; one the game starts hidden is hidden in the
+   designer too. */
 void FApiWriter::WriteWidgetTree(int32 ExBlueprint, int32 ExTree)
 {
-    const std::string& Pkg = Class.PackageName;
-    const size_t Cut = Pkg.find('/', Pkg.find('/', 1) + 1);
-    const std::string ModRoot = Pkg.substr(0, Cut);         // /Game/_MyMods
     const int32 ExFirstWidget = ExTree + 1;
     const int32 ExFirstSlot = ExFirstWidget + int32(Class.Widgets.size());
     auto WidgetRow = [&](const std::string& Name) {
@@ -766,7 +820,7 @@ void FApiWriter::WriteWidgetTree(int32 ExBlueprint, int32 ExTree)
     auto Defaults = [&](const std::vector<FPropertyDef>& In) {
         std::vector<FPropertyDef> Out;
         for (FPropertyDef D : In)
-            if (RemapDefault(D, ModRoot)) Out.push_back(std::move(D));
+            if (RemapDefault(D)) Out.push_back(std::move(D));
         return Out;
     };
     auto ClassOf = [&](FIndex Src) {
@@ -810,12 +864,17 @@ void FApiWriter::WriteWidgetTree(int32 ExBlueprint, int32 ExTree)
         for (const FApiClass::FWidgetSlotFill& F : Class.WidgetSlotFills)
             if (F.Host == W.Name) Fills.push_back({ F.Slot, Exp(WidgetRow(F.Content)) });
         E.Serialize = [=, Kept = Defaults(W.Defaults)](FArc& Ar) {
-            bool bVariable = false;
+            /* The designer draws every widget whatever its Visibility, so one the game starts without (a button's
+               glyph, collapsed until set) is hidden there instead: bHiddenInDesigner. */
+            bool bVariable = false, bHidden = false;
             for (const FPropertyDef& D : Kept)
             {
                 WriteDefaultTag(Ar, D);
                 bVariable |= D.Name == "bIsVariable";
+                bHidden |= D.Name == "Visibility"
+                    && (D.Default.S == "ESlateVisibility::Collapsed" || D.Default.S == "ESlateVisibility::Hidden");
             }
+            if (bHidden) TagBool(Ar, "bHiddenInDesigner", true);
             if (!Fills.empty())
                 Tag(Ar, "NamedSlotBindings", "ArrayProperty", [&](FArc& V) {
                     FArc Elements(V.Owner());

@@ -32,6 +32,7 @@ struct FApiClass
     std::string AssetName;                   // ReadProperty (the .uasset)
     std::string ParentPackage, ParentClass;  // /Script/Engine, BlueprintFunctionLibrary
     std::vector<FApiFunction> Functions;
+    bool bOverrides = false;                 // overrides a function (left to the parent's stub): it still gets a stub
     std::vector<FPropertyDef> Variables;
     std::map<std::string, std::string> Categories;   // function or variable -> its editor category, "A|B"
     std::map<std::string, std::pair<std::string, std::string>> Docs;   // function -> (tooltip, keywords)
