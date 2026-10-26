@@ -220,6 +220,19 @@ void TagBool(FArc& Ar, const std::string& Name, bool Value)
     Ar.U8(0);                                     // HasPropertyGuid
 }
 
+void StructArray(FArc& V, const std::string& Name, const std::string& StructName, int32 Count, const FArc& Elements)
+{
+    V.I32(Count);
+    V.Name(Name);
+    V.Name("StructProperty");
+    V.I32(int32(Elements.B.size()));
+    V.I32(0);                       // ArrayIndex
+    V.Name(StructName);
+    for (int32 I = 0; I < 4; ++I) V.U32(0);      // StructGuid
+    V.U8(0);                        // HasPropertyGuid
+    V.Append(Elements);
+}
+
 /* The type a tag names is the property's GetID(), not its class: FObjectPropertyBase::GetID is ObjectProperty for
    a class or weak property too, and FSoftObjectProperty's is SoftObjectProperty for a soft class (4.27
    PropertyBaseObject.cpp, PropertySoftObjectPtr.cpp). A tag naming the class instead is skipped at load as a type

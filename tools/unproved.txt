@@ -148,7 +148,6 @@ what-the-optimizer.return-x-a-b
 what-the-optimizer.if-isready-item
 methods-as-blueprint.int32-getcharges-const
 methods-as-blueprint.ue-pure-static-int32-clamp01
-methods-as-blueprint.generate-api-true
 calling-your-own.other-twice-3
 parameters-and-return.auto-half-int32-v-return
 parameters-and-return.int32-byval-tarray-int32-a

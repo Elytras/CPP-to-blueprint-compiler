@@ -2,6 +2,7 @@
 // K2Node_EditablePinBase.cpp, and checked against an editor-saved 4.27.2 Blueprint byte for byte.
 #include "Uncooked.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <map>
@@ -195,6 +196,10 @@ protected:
        package - a type that lives inside the mod's own package has no editor-side asset yet. */
     bool Remap(FIndex Src, FIndex& Out);
     bool PinTypeOf(const FPropertyDef& Prop, FPinType& Out);
+    /* A widget default with its object references re-imported here. False drops it: what it names is an export of
+       the cooked package, an instanced object, or an asset under ModRoot, the mod's own, which ships cooked only. */
+    bool RemapDefault(FPropertyDef& D, const std::string& ModRoot);
+    bool RemapValue(FDefaultValue& V, const std::string& ModRoot);
 
     const FPackage& Source;
     FPackage P;
@@ -212,6 +217,7 @@ public:
     bool Write(const std::string& OutDir, std::string* Err);
 
 private:
+    void WriteWidgetTree(int32 ExBlueprint, int32 ExTree);
     const FApiClass& Class;
 };
 
@@ -249,6 +255,41 @@ bool FEditorPackage::Remap(FIndex Src, FIndex& Out)
        hard ref for a class variable's pin, a soft path (ObjectPath) for a struct member's VarDesc. */
     Out = Object(Outer->ObjectName, In->ClassName, In->ObjectName, In->ClassPackage);
     return true;
+}
+
+bool FEditorPackage::RemapValue(FDefaultValue& V, const std::string& ModRoot)
+{
+    if (V.K == FDefaultValue::Obj)
+    {
+        if (V.Instanced || V.Object.V > 0) return false;
+        const FImport* In = Source.ImportAt(V.Object);
+        const FImport* Outer = In ? Source.ImportAt(In->Outer) : nullptr;
+        if (Outer && Outer->ObjectName.compare(0, ModRoot.size(), ModRoot) == 0) return false;
+        if (!Remap(V.Object, V.Object)) return false;
+    }
+    for (FDefaultValue& Item : V.Items)
+        if (!RemapValue(Item, ModRoot)) return false;
+    if (V.Members)
+    {
+        auto Kept = std::make_shared<std::vector<FPropertyDef>>();
+        for (FPropertyDef M : *V.Members)
+            if (RemapDefault(M, ModRoot)) Kept->push_back(std::move(M));
+        V.Members = Kept;
+    }
+    return true;
+}
+
+bool FEditorPackage::RemapDefault(FPropertyDef& D, const std::string& ModRoot)
+{
+    if (D.Members)
+    {
+        auto Kept = std::make_shared<std::vector<FPropertyDef>>();
+        for (FPropertyDef M : *D.Members)
+            if (RemapDefault(M, ModRoot)) Kept->push_back(std::move(M));
+        if (Kept->empty() && !D.Members->empty()) return false;
+        D.Members = Kept;
+    }
+    return RemapValue(D.Default, ModRoot);
 }
 
 bool FEditorPackage::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
@@ -310,7 +351,9 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
        its SCS_Node and the DefaultSceneRoot itself, once there is a GeneratedClass to outer them to
        and a CDO export for the deferred loader. Both are emitted below. */
 
-    const FIndex ImpBlueprint = Object("/Script/Engine", "Class", "Blueprint");
+    const bool bWidget = Class.bWidget;
+    const FIndex ImpBlueprint = bWidget ? Object("/Script/UMGEditor", "Class", "WidgetBlueprint")
+                                        : Object("/Script/Engine", "Class", "Blueprint");
     const FIndex ImpEdGraph = Object("/Script/Engine", "Class", "EdGraph");
     const FIndex ImpSchema = Object("/Script/BlueprintGraph", "Class", "EdGraphSchema_K2");
     const FIndex ImpEntry = Object("/Script/BlueprintGraph", "Class", "K2Node_FunctionEntry");
@@ -319,7 +362,8 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     const bool bModParent = Class.ParentPackage.compare(0, 6, "/Game/") == 0;
     const FIndex ImpParent = bModParent ? Object(Class.ParentPackage, "BlueprintGeneratedClass", Class.ParentClass, "/Script/Engine")
                                         : Object(Class.ParentPackage, "Class", Class.ParentClass);
-    const FIndex ImpBpgc = Object("/Script/Engine", "Class", "BlueprintGeneratedClass");
+    const FIndex ImpBpgc = bWidget ? Object("/Script/UMG", "Class", "WidgetBlueprintGeneratedClass")
+                                   : Object("/Script/Engine", "Class", "BlueprintGeneratedClass");
     const FIndex ImpObjectClass = Object("/Script/CoreUObject", "Class", "Object");
     const FIndex ImpParentCdo = Object(Class.ParentPackage, Class.ParentClass,
                                        "Default__" + Class.ParentClass, Class.ParentPackage);
@@ -426,6 +470,10 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     std::vector<FApiVar> Vars;
     for (const FPropertyDef& Prop : Class.Variables)
     {
+        /* A designer widget is its own variable once the editor compiles the tree (bIsVariable, below). */
+        if (std::any_of(Class.Widgets.begin(), Class.Widgets.end(),
+                        [&](const FApiClass::FWidget& W) { return W.Name == Prop.Name; }))
+            continue;
         FApiVar Var;
         Var.Name = Prop.Name;
         if (!PinTypeOf(Prop, Var.Type))
@@ -462,7 +510,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
 
     /* A class with neither is not an API surface - most often a pure data holder or a class whose
        whole body is inlined - and an empty Blueprint would only be clutter in someone's project. */
-    if (Graphs.empty() && Vars.empty())
+    if (Graphs.empty() && Vars.empty() && !bWidget)
     {
         if (Err) *Err = Class.AssetName + " exposes no callable function or variable";
         return false;
@@ -480,7 +528,11 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     Blueprint.ObjectFlags = RF_Public | RF_Standalone | RF_Transactional;
     Blueprint.bIsAsset = true;
     const std::vector<int32> GraphRows = GraphExports;
+    /* The designer tree follows the class and its default object: UWidgetBlueprint's WidgetTree default subobject,
+       then each widget, then each slot (WriteWidgetTree). */
+    const int32 ExTree = Class.Widgets.empty() ? 0 : ExCdo + 1;
     Blueprint.Serialize = [=](FArc& Ar) {
+        if (ExTree) Tag(Ar, "WidgetTree", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(ExTree)); });
         Tag(Ar, "ParentClass", "ObjectProperty", [=](FArc& V) { V.Idx(ImpParent); });
         if (bFunctionLibrary || Class.bInterface)
             Tag(Ar, "BlueprintType", "ByteProperty",
@@ -519,15 +571,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
                     TagEnd(Elements);
                 }
 
-                V.I32(int32(Vars.size()));
-                V.Name("NewVariables");
-                V.Name("StructProperty");
-                V.I32(int32(Elements.B.size()));
-                V.I32(0);                       // ArrayIndex
-                V.Name("BPVariableDescription");
-                for (int32 I = 0; I < 4; ++I) V.U32(0);      // StructGuid
-                V.U8(0);                        // HasPropertyGuid
-                V.Append(Elements);
+                StructArray(V, "NewVariables", "BPVariableDescription", int32(Vars.size()), Elements);
             }, "StructProperty");
         Tag(Ar, "GeneratedClass", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(ExClass)); });
         TagBool(Ar, "bLegacyNeedToPurgeSkelRefs", false);
@@ -680,16 +724,19 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     Cdo.Serialize = [](FArc& Ar) { TagEnd(Ar); };   // a CDO omits the lazy-object guid
     P.AddExport(std::move(Cdo));
 
+    if (ExTree) WriteWidgetTree(ExBlueprint, ExTree);
+
     /* Without registry rows the content browser sees a package with nothing in it. */
     FRegistryObject Row;
     Row.ObjectPath = Class.AssetName;
-    Row.ClassName = "Blueprint";
+    Row.ClassName = bWidget ? "WidgetBlueprint" : "Blueprint";
     const std::string ParentPath = "Class'" + Class.ParentPackage + "." + Class.ParentClass + "'";
     Row.Tags = {
         { "BlueprintType", Class.bInterface ? "BPTYPE_Interface" : bFunctionLibrary ? "BPTYPE_FunctionLibrary" : "BPTYPE_Normal" },
         { "ParentClass", ParentPath },
         { "NativeParentClass", ParentPath },
-        { "GeneratedClass", "BlueprintGeneratedClass'" + P.Name() + "." + ClassName + "'" },
+        { "GeneratedClass", std::string(bWidget ? "WidgetBlueprintGeneratedClass'" : "BlueprintGeneratedClass'")
+                            + P.Name() + "." + ClassName + "'" },
         { "NumReplicatedProperties", "0" },
         { "IsDataOnly", "False" },
     };
@@ -697,6 +744,123 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     P.SetRegistryObjects({ Row });
 
     return P.Save(OutDir + "/" + Class.AssetName, Err);
+}
+
+/* The designer tree as the 4.27 editor saves a Widget Blueprint's (measured on an editor-saved one): no templates,
+   every widget under the tree and every slot under its panel, the hierarchy in the slots' Parent and Content, the
+   panel's Slots and the child's Slot, and the tree's editor-only AllWidgets. The cooked class's widget defaults ride
+   along, so the designer draws the layout and what the constructor sets; what PreConstruct sets at run time is not
+   there. Each widget is a variable (bIsVariable), as its C++ member is. */
+void FApiWriter::WriteWidgetTree(int32 ExBlueprint, int32 ExTree)
+{
+    const std::string& Pkg = Class.PackageName;
+    const size_t Cut = Pkg.find('/', Pkg.find('/', 1) + 1);
+    const std::string ModRoot = Pkg.substr(0, Cut);         // /Game/_MyMods
+    const int32 ExFirstWidget = ExTree + 1;
+    const int32 ExFirstSlot = ExFirstWidget + int32(Class.Widgets.size());
+    auto WidgetRow = [&](const std::string& Name) {
+        for (size_t I = 0; I < Class.Widgets.size(); ++I)
+            if (Class.Widgets[I].Name == Name) return ExFirstWidget + int32(I);
+        return ExFirstWidget;
+    };
+    auto Defaults = [&](const std::vector<FPropertyDef>& In) {
+        std::vector<FPropertyDef> Out;
+        for (FPropertyDef D : In)
+            if (RemapDefault(D, ModRoot)) Out.push_back(std::move(D));
+        return Out;
+    };
+    auto ClassOf = [&](FIndex Src) {
+        FIndex Out;
+        return Remap(Src, Out) ? Out : Object("/Script/UMG", "Class", "Widget");
+    };
+
+    const int32 Count = int32(Class.Widgets.size());
+    FExport Tree;
+    Tree.ClassIndex = Object("/Script/UMG", "Class", "WidgetTree");
+    Tree.OuterIndex = Exp(ExBlueprint);
+    Tree.ObjectName = "WidgetTree";
+    Tree.ObjectFlags = RF_Public | RF_Transactional | RF_DefaultSubObject;
+    Tree.Serialize = [=](FArc& Ar) {
+        Tag(Ar, "RootWidget", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(ExFirstWidget)); });
+        Tag(Ar, "AllWidgets", "ArrayProperty", [=](FArc& V) {
+            V.I32(Count);
+            for (int32 I = 0; I < Count; ++I) V.Idx(Exp(ExFirstWidget + I));
+        }, "ObjectProperty");
+        TagEnd(Ar);
+        Ar.Bool(false);
+    };
+    P.AddExport(std::move(Tree));
+
+    for (const FApiClass::FWidget& W : Class.Widgets)
+    {
+        std::vector<FIndex> Slots;
+        FIndex Own;
+        for (size_t I = 0; I < Class.WidgetSlots.size(); ++I)
+        {
+            if (Class.WidgetSlots[I].Panel == W.Name) Slots.push_back(Exp(ExFirstSlot + int32(I)));
+            if (Class.WidgetSlots[I].Child == W.Name) Own = Exp(ExFirstSlot + int32(I));
+        }
+        FExport E;
+        E.ClassIndex = ClassOf(W.Class);
+        E.OuterIndex = Exp(ExTree);
+        E.ObjectName = W.Name;
+        E.ObjectFlags = RF_Transactional;
+        /* A nested user widget's named slots this tree fills, {slot name, content}: UUserWidget's NamedSlotBindings. */
+        std::vector<std::pair<std::string, FIndex>> Fills;
+        for (const FApiClass::FWidgetSlotFill& F : Class.WidgetSlotFills)
+            if (F.Host == W.Name) Fills.push_back({ F.Slot, Exp(WidgetRow(F.Content)) });
+        E.Serialize = [=, Kept = Defaults(W.Defaults)](FArc& Ar) {
+            bool bVariable = false;
+            for (const FPropertyDef& D : Kept)
+            {
+                WriteDefaultTag(Ar, D);
+                bVariable |= D.Name == "bIsVariable";
+            }
+            if (!Fills.empty())
+                Tag(Ar, "NamedSlotBindings", "ArrayProperty", [&](FArc& V) {
+                    FArc Elements(V.Owner());
+                    for (const auto& F : Fills)
+                    {
+                        Tag(Elements, "Name", "NameProperty", [&](FArc& N) { N.Name(F.first); });
+                        Tag(Elements, "Content", "ObjectProperty", [&](FArc& N) { N.Idx(F.second); });
+                        TagEnd(Elements);
+                    }
+                    StructArray(V, "NamedSlotBindings", "NamedSlotBinding", int32(Fills.size()), Elements);
+                }, "StructProperty");
+            if (!Slots.empty())
+                Tag(Ar, "Slots", "ArrayProperty", [=](FArc& V) {
+                    V.I32(int32(Slots.size()));
+                    for (const FIndex& S : Slots) V.Idx(S);
+                }, "ObjectProperty");
+            if (Own.V != 0) Tag(Ar, "Slot", "ObjectProperty", [=](FArc& V) { V.Idx(Own); });
+            if (!bVariable) TagBool(Ar, "bIsVariable", true);
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(E));
+    }
+
+    /* A slot is named <SlotClass>_<n>, counted per panel and class, as the cooked tree names it. */
+    std::map<std::string, int32> Counts;
+    for (const FApiClass::FWidgetSlot& S : Class.WidgetSlots)
+    {
+        const FImport* Of = Source.ImportAt(S.Class);
+        const std::string SlotClass = Of ? Of->ObjectName : "PanelSlot";
+        const FIndex Panel = Exp(WidgetRow(S.Panel)), Content = Exp(WidgetRow(S.Child));
+        FExport E;
+        E.ClassIndex = ClassOf(S.Class);
+        E.OuterIndex = Panel;
+        E.ObjectName = SlotClass + "_" + std::to_string(Counts[S.Panel + "." + SlotClass]++);
+        E.ObjectFlags = RF_Transactional;
+        E.Serialize = [=, Kept = Defaults(S.Defaults)](FArc& Ar) {
+            for (const FPropertyDef& D : Kept) WriteDefaultTag(Ar, D);
+            Tag(Ar, "Parent", "ObjectProperty", [=](FArc& V) { V.Idx(Panel); });
+            Tag(Ar, "Content", "ObjectProperty", [=](FArc& V) { V.Idx(Content); });
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(E));
+    }
 }
 
 /* One StructVariableDescription the editor recompiles a member from. */
@@ -881,15 +1045,7 @@ bool FApiStructWriter::Write(const std::string& OutDir, std::string* Err)
         Tag(Ar, "VariablesDescriptions", "ArrayProperty", [=](FArc& V) {
             FArc Elements(V.Owner());
             for (const FVarDesc& VD : VarDescs) WriteVarDesc(Elements, VD);
-            V.I32(int32(VarDescs.size()));
-            V.Name("VariablesDescriptions");
-            V.Name("StructProperty");
-            V.I32(int32(Elements.B.size()));
-            V.I32(0);                           // ArrayIndex
-            V.Name("StructVariableDescription");
-            for (int32 I = 0; I < 4; ++I) V.U32(0);     // StructGuid
-            V.U8(0);                            // HasPropertyGuid
-            V.Append(Elements);
+            StructArray(V, "VariablesDescriptions", "StructVariableDescription", int32(VarDescs.size()), Elements);
         }, "StructProperty");
         TagEnd(Ar);
         Ar.Bool(false);

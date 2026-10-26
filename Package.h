@@ -67,6 +67,10 @@ void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
 /* A bool's value lives in the tag (BoolVal) with zero payload; writing one via Tag() loads as false. */
 void TagBool(FArc& Ar, const std::string& Name, bool Value);
 
+/* An array of structs as the cook writes one: the count, one inner FPropertyTag whose Size is all the elements' bytes,
+   then the elements, each written whole (no defaults to leave a field out against). */
+void StructArray(FArc& V, const std::string& Name, const std::string& StructName, int32 Count, const FArc& Elements);
+
 inline void TagEnd(FArc& Ar)
 {
     Ar.Name("None");
