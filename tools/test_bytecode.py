@@ -4562,6 +4562,9 @@ def api_stub_widget():
     assert cls(widgets['Frame']) == "WidgetBlueprintGeneratedClass'UWtFrame_C'", cls(widgets['Frame'])
     variable = struct.pack('<ii', names.index('bIsVariable'), 0) + struct.pack('<ii', names.index('BoolProperty'), 0)
     assert all(variable in blob(e) for e in widgets.values()), 'bIsVariable'
+    # Note starts Hidden, which the designer ignores: it is hidden there by bHiddenInDesigner, and only it is.
+    hidden = struct.pack('<ii', names.index('bHiddenInDesigner'), 0) if 'bHiddenInDesigner' in names else b'?'
+    assert [w for w, e in widgets.items() if hidden in blob(e)] == ['Note'], 'bHiddenInDesigner'
     slots = sorted((outer(e), cls(e)) for e in exports if outer(e) in widgets)
     assert slots == [('Play', "Class'ButtonSlot'")] + [('Root', "Class'CanvasPanelSlot'")] * 3, slots
     # Note sits in no panel: it fills Frame's named slot Body, a NamedSlotBindings entry on Frame.
@@ -4573,6 +4576,20 @@ def api_stub_widget():
         return struct.pack('<ii', names.index('VarName'), 0) + struct.pack('<ii', names.index('NameProperty'), 0) \
             + struct.pack('<iib', 8, 0, 0) + struct.pack('<ii', names.index(name), 0)
     assert var('Clicks') in blob(exports[0]) and not any(w in names and var(w) in blob(exports[0]) for w in widgets)
+    # OnPlayed is a dispatcher, as the editor's Add Event Dispatcher makes one: a variable of pin category mcdelegate and
+    # the Blueprint's one DelegateSignatureGraphs entry, a graph of its name whose entry node takes Card, typed as the
+    # stub's own generated class, and Count.
+    proves('methods-as-blueprint.generate-api-dispatcher')
+    # FNames match case-insensitively, so the table holds `object` as the first spelling it met (CoreUObject's Object):
+    n = lambda s: struct.pack('<ii', [x.lower() for x in names].index(s.lower()), 0)
+    assert var('OnPlayed') in blob(exports[0]) and n('mcdelegate') in blob(exports[0]), 'OnPlayed variable'
+    played = [i for i, e in enumerate(exports) if e['name'] == 'OnPlayed' and cls(e) == "Class'EdGraph'"]
+    assert len(played) == 1 and outer(exports[played[0]]) == 'UWtCard', played
+    assert n('DelegateSignatureGraphs') + n('ArrayProperty') + struct.pack('<ii', 8, 0) + n('ObjectProperty') + b'\0' \
+        + struct.pack('<ii', 1, played[0] + 1) in blob(exports[0]), 'DelegateSignatureGraphs'
+    entry = next(e for e in exports if outer(e) == 'OnPlayed' and cls(e) == "Class'K2Node_FunctionEntry'")
+    own = next(i for i, e in enumerate(exports) if e['name'] == 'UWtCard_C')
+    assert n('Card') + n('object') + n('None') + struct.pack('<i', own + 1) in blob(entry) and n('Count') in blob(entry), 'Card'
     # NsTest: each stub in its namespace's folder, under the mod's own or a /Game path of its own (Pistol).
     proves('methods-as-blueprint.generate-api-folders')
     assert {'_ElytrasMods/NsTest/NsTest.uasset', '_ElytrasMods/NsTest/Weapons/Rifle.uasset',

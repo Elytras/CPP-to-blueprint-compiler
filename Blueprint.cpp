@@ -1571,8 +1571,11 @@ bool FBlueprintClass::WriteApi(const std::string& OutDir, std::string* Err) cons
     Api.PackageName = P.Name().substr(0, P.Name().rfind('/'));
     Api.ParentPackage = ParentPackage;
     Api.ParentClass = ParentClass;
+    /* An override is the parent's or the interface's function, which the editor already gives the stub; a graph of
+       our own with its name fails the stub's compile ("The function name ... is already used"). */
     for (const FPending& Fn : Functions)
-        Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags });
+        if (Fn.Def.Super.V == 0) Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags });
+        else Api.bOverrides = true;
     Api.Categories = ApiCategory;
     Api.Docs = ApiDocs;
     Api.Description = ApiDescription;
