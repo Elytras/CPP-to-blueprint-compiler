@@ -374,7 +374,13 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
                                    : Object("/Script/Engine", "Class", "BlueprintGeneratedClass");
     const FIndex ImpObjectClass = Object("/Script/CoreUObject", "Class", "Object");
     const FIndex ImpParentCdo = Object(Class.ParentPackage, Class.ParentClass,
-                                       "Default__" + Class.ParentClass, Class.ParentPackage);
+                                        "Default__" + Class.ParentClass, Class.ParentPackage);
+    std::vector<FIndex> Interfaces;
+    for (FIndex SourceInterface : Class.Interfaces)
+    {
+        FIndex Interface;
+        if (Remap(SourceInterface, Interface)) Interfaces.push_back(Interface);
+    }
 
     struct FGraph
     {
@@ -383,6 +389,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         uint32 Flags = 0;
         bool bPure = false;
         bool bDelegate = false;     // a dispatcher's signature, one of DelegateSignatureGraphs
+        FIndex Interface;
         std::vector<FPinDef> EntryPins, ResultPins;
     };
     std::vector<FGraph> Graphs;
@@ -408,11 +415,13 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         {
             if (!(Fn.Flags & FUNC_BlueprintCallable)) continue;
             if (Fn.Flags & (FUNC_UbergraphFunction | FUNC_Delegate | FUNC_MulticastDelegate)) continue;
+            if (bFunctionLibrary && (Fn.Flags & (FUNC_Private | FUNC_Protected))) continue;
         }
 
         FGraph G;
         G.Name = Dispatcher.empty() ? Fn.Name : Dispatcher;
         G.bDelegate = !Dispatcher.empty();
+        if (Fn.Interface.V && !Remap(Fn.Interface, G.Interface)) continue;
         if (auto Cat = Class.Categories.find(Fn.Name); Cat != Class.Categories.end()) G.Category = Cat->second;
         if (auto Doc = Class.Docs.find(Fn.Name); Doc != Class.Docs.end()) std::tie(G.ToolTip, G.Keywords) = Doc->second;
         // The flags the editor's new dispatcher gets (FBlueprintEditor::OnAddNewDelegate).
@@ -577,7 +586,11 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     Blueprint.ObjectFlags = RF_Public | RF_Standalone | RF_Transactional;
     Blueprint.bIsAsset = true;
     std::vector<int32> GraphRows, SignatureRows;
-    for (size_t I = 0; I < Graphs.size(); ++I) (Graphs[I].bDelegate ? SignatureRows : GraphRows).push_back(GraphExports[I]);
+    /* An interface implementation belongs to that interface's Graphs, not FunctionGraphs. Otherwise
+       ConformImplementedInterfaces creates a second graph of its name when the editor compiles it. */
+    for (size_t I = 0; I < Graphs.size(); ++I)
+        if (Graphs[I].bDelegate) SignatureRows.push_back(GraphExports[I]);
+        else if (!Graphs[I].Interface.V) GraphRows.push_back(GraphExports[I]);
     /* The designer tree follows the class and its default object: UWidgetBlueprint's WidgetTree default subobject,
        then each widget, then each slot (WriteWidgetTree). */
     const int32 ExTree = Class.Widgets.empty() ? 0 : ExCdo + 1;
@@ -591,6 +604,24 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         if (!Class.Description.empty())
             Tag(Ar, "BlueprintDescription", "StrProperty", [&](FArc& V) { V.Str(Class.Description); });
         Tag(Ar, "BlueprintSystemVersion", "IntProperty", [](FArc& V) { V.I32(2); });
+        if (!Interfaces.empty())
+            Tag(Ar, "ImplementedInterfaces", "ArrayProperty", [=](FArc& V) {
+                FArc Elements(V.Owner());
+                for (FIndex Interface : Interfaces)
+                {
+                    Tag(Elements, "Interface", "ObjectProperty", [&](FArc& E) { E.Idx(Interface); });
+                    std::vector<int32> Rows;
+                    for (size_t I = 0; I < Graphs.size(); ++I)
+                        if (Graphs[I].Interface.V == Interface.V) Rows.push_back(GraphExports[I]);
+                    if (!Rows.empty())
+                        Tag(Elements, "Graphs", "ArrayProperty", [&](FArc& E) {
+                            E.I32(int32(Rows.size()));
+                            for (int32 Row : Rows) E.Idx(Exp(Row));
+                        }, "ObjectProperty");
+                    TagEnd(Elements);
+                }
+                StructArray(V, "ImplementedInterfaces", "BPInterfaceDescription", int32(Interfaces.size()), Elements);
+            }, "StructProperty");
         if (!GraphRows.empty())
             Tag(Ar, "FunctionGraphs", "ArrayProperty", [=](FArc& V) {
                 V.I32(int32(GraphRows.size()));
@@ -688,11 +719,13 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Entry.ObjectName = "K2Node_FunctionEntry_0";
         Entry.ObjectFlags = RF_Transactional;
         const std::string FnName = G.Name;
+        const FIndex FnInterface = G.Interface;
         const std::string FnCategory = G.Category, FnToolTip = G.ToolTip, FnKeywords = G.Keywords;
         Entry.Serialize = [=](FArc& Ar) {
             /* Not decoration: ConformFunctionNames renames a graph to its entry node's member name
                on load, so an entry without one turns every function into "None". */
             Tag(Ar, "FunctionReference", "StructProperty", [=](FArc& V) {
+                if (FnInterface.V) Tag(V, "MemberParent", "ObjectProperty", [=](FArc& N) { N.Idx(FnInterface); });
                 Tag(V, "MemberName", "NameProperty", [=](FArc& N) { N.Name(FnName); });
                 TagEnd(V);
             }, "MemberReference");
@@ -728,6 +761,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Result.ObjectFlags = RF_Transactional;
         Result.Serialize = [=](FArc& Ar) {
             Tag(Ar, "FunctionReference", "StructProperty", [=](FArc& V) {
+                if (FnInterface.V) Tag(V, "MemberParent", "ObjectProperty", [=](FArc& N) { N.Idx(FnInterface); });
                 Tag(V, "MemberName", "NameProperty", [=](FArc& N) { N.Name(FnName); });
                 TagEnd(V);
             }, "MemberReference");
@@ -764,7 +798,13 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Ar.Idx(ImpObjectClass);                     // ClassWithin
         Ar.Name("Engine");                          // ClassConfigName
         Ar.Idx(Exp(ExBlueprint));                   // ClassGeneratedBy
-        Ar.I32(0);                                  // Interfaces
+        Ar.I32(int32(Interfaces.size()));
+        for (FIndex Interface : Interfaces)
+        {
+            Ar.Idx(Interface);
+            Ar.I32(0);
+            Ar.Bool(true);                          // bImplementedByK2
+        }
         Ar.Bool(false);                             // bDeprecatedForceScriptOrder
         Ar.Name("None");
         Ar.Bool(false);                             // bCooked

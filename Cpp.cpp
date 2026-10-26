@@ -20458,6 +20458,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         if (Mine == Theirs)
                         { *Err = R.CppName + " implements " + Other + " and " + I + ", which both extend " + Mine->CppName; return false; }
         BP.AddInterface(ClassImportOf(*IR, BP));
+        for (const FRecord* Decl : InterfaceChain(IR))
+            for (const auto& Method : Decl->Methods)
+                BP.ApiInterfaceMethods[UeNameOf(Decl, Method.first)] = ClassImportOf(*IR, BP);
         if (R.bIsPatch) PatchInterfaces.push_back(ClassImportOf(*IR, BP));
     }
     if (!AddInputBindings(R, bIsActor, BP, Err)) return false;

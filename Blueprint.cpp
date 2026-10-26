@@ -1571,15 +1571,18 @@ bool FBlueprintClass::WriteApi(const std::string& OutDir, std::string* Err) cons
     Api.PackageName = P.Name().substr(0, P.Name().rfind('/'));
     Api.ParentPackage = ParentPackage;
     Api.ParentClass = ParentClass;
-    /* An override is the parent's or the interface's function, which the editor already gives the stub; a graph of
-       our own with its name fails the stub's compile ("The function name ... is already used"). */
+    /* Parent overrides are inherited from the parent's stub. An implementation of this class's own
+       interface has a graph too, owned by ImplementedInterfaces rather than FunctionGraphs. */
     for (const FPending& Fn : Functions)
-        if (Fn.Def.Super.V == 0) Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags });
+        if (auto Interface = ApiInterfaceMethods.find(Fn.Def.Name); Interface != ApiInterfaceMethods.end())
+            Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags, Interface->second });
+        else if (Fn.Def.Super.V == 0) Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags });
         else Api.bOverrides = true;
     Api.Categories = ApiCategory;
     Api.Docs = ApiDocs;
     Api.Description = ApiDescription;
     Api.bInterface = (ClassFlags & CLASS_Interface) != 0;
+    Api.Interfaces = Interfaces;
     /* Only what the outside can see. The rest - the UberGraphFrame pointer above all - is
        compiler plumbing that would show up as a broken variable in the editor. */
     for (const FPropertyDef& Var : Vars)

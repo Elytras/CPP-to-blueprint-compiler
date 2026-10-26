@@ -4638,6 +4638,38 @@ def api_stub_interface():
           'parent and tooltip, and no variables')
 
 
+def api_stub_library():
+    """A public getter is a static interface-valued library node; internal library helpers stay
+    out, and an exported mod actor keeps its implemented interfaces for editor subclasses."""
+    import struct, tempfile
+    from invariants import Package
+    with tempfile.TemporaryDirectory() as tmp:
+        api = os.path.join(tmp, 'api')
+        os.makedirs(api)
+        proc = assetgen_compile([os.path.join(TESTS, 'ApiLibrary.cpp'), UEAPI,
+                                 os.path.join(tmp, 'cooked'), '--api', api])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        lib = Package(os.path.join(api, 'ApiLibrary'))
+        graphs = {e['name'] for i, e in enumerate(lib.exports) if lib.class_of(i + 1) == 'EdGraph'}
+        proves('methods-as-blueprint.generate-api-library')
+        assert graphs == {'GetComponent'}, graphs
+        bp_type = struct.unpack_from('<i', lib.tag(0, 'BlueprintType')['value'])[0]
+        assert lib.names[bp_type] == 'BPTYPE_FunctionLibrary'
+        result = next(i for i, e in enumerate(lib.exports) if lib.class_of(i + 1) == 'K2Node_FunctionResult')
+        interface_name = struct.pack('<ii', next(i for i, n in enumerate(lib.names) if n.lower() == 'interface'), 0)
+        assert interface_name in lib.blob(result), 'the getter result is an interface pin'
+        actor = Package(os.path.join(api, 'ApiActor'))
+        cls = actor.find('ApiActor_C')
+        proves('methods-as-blueprint.generate-api-interfaces')
+        assert actor.tag(0, 'ImplementedInterfaces') is not None
+        interfaces = actor.struct(cls).interfaces
+        assert len(interfaces) == 1 and actor.path(interfaces[0][0]).endswith('/IApiProbe.IApiProbe_C'), interfaces
+        assert actor.tag(0, 'FunctionGraphs') is None, 'Ping belongs to ImplementedInterfaces.Graphs'
+        ping = next(i for i, e in enumerate(actor.exports) if e['name'] == 'Ping')
+        assert struct.pack('<i', ping + 1) in actor.tag(0, 'ImplementedInterfaces')['value']
+    print('ok  ApiLibrary: public static getter and interface result; ApiActor: editor stub keeps its interface')
+
+
 def static_assets():
     """AssetTest: namespace-scope objects cook as assets of their class holding exactly the members their braces
     name; `&Asset` anywhere is a reference to that asset's package path."""
@@ -5674,6 +5706,7 @@ object_forwards()
 api_stub()
 api_stub_interface()
 api_stub_widget()
+api_stub_library()
 static_assets()
 ue_assets()
 asset_elsewhere()
