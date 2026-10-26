@@ -24,6 +24,7 @@ struct FApiFunction
     std::string Name;
     std::vector<FPropertyDef> Params;
     uint32 Flags = 0;
+    FIndex Interface;
 };
 
 struct FApiClass
@@ -38,6 +39,7 @@ struct FApiClass
     std::map<std::string, std::pair<std::string, std::string>> Docs;   // function -> (tooltip, keywords)
     std::string Description;                 // the Blueprint's, which the editor compiles into the class's ToolTip
     bool bInterface = false;                 // a UE_INTERFACE: written as a Blueprint Interface
+    std::vector<FIndex> Interfaces;          // implemented interfaces, remapped from the cooked source
     /* A user widget: written as a Widget Blueprint, its designer tree (first widget the root) carrying the cooked
        class's widget defaults, so the editor's designer shows the widget's layout and another Widget Blueprint can
        place it. FIndexes point into Source, as a parameter's do. */
