@@ -2682,6 +2682,15 @@ private:
         const std::string In = Shown(Package);
         return In != Package ? std::filesystem::path(OutDir) / In : ContentDir(OutDir) / Package.substr(6);
     }
+    /* Where Package's editor stub goes: `--api` stands for the mod's folder, so a stub of a package in a subfolder lands
+       in the same subfolder, and the editor finds it at the /Game path the pak gives the cooked one. */
+    std::string ApiDirOf(const std::string& Package) const
+    {
+        const std::filesystem::path Dir = FileOf(*ApiDir, Package).parent_path();
+        std::error_code Ec;
+        if (std::filesystem::is_directory(*ApiDir, Ec)) std::filesystem::create_directories(Dir, Ec);
+        return Dir.string();
+    }
     bool SavePackage(FPackage& P, const std::string& OutDir, const std::string& Package, std::string* Err) const
     {
         const std::filesystem::path File = FileOf(OutDir, Package);
@@ -18343,7 +18352,7 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
        per function, as the editor saves one. Its variables, AssetGen's own idea, are not there: the editor's interfaces
        hold none. */
     BP.ApiDescription = R.Doc;
-    if (ApiDir && !BP.WriteApi(*ApiDir, Err))
+    if (ApiDir && !BP.WriteApi(ApiDirOf(PackageName), Err))
     {
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
         Err->clear();
@@ -18389,7 +18398,7 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     const uint32 Guid[4] = { ~H, H * 2654435761u, H ^ 0x9E3779B9u, H };
     /* The editor stub reads the members before FinishStruct consumes them; both share the same Guid,
        so the cooked and uncooked assets carry identical member names and struct identity. */
-    if (ApiDir && !IsInternalViewStruct(R.CppName) && !BP.WriteApiStruct(*ApiDir, Guid, Err))
+    if (ApiDir && !IsInternalViewStruct(R.CppName) && !BP.WriteApiStruct(ApiDirOf(PackageName), Guid, Err))
         return false;
     BP.FinishStruct(Guid);
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
@@ -18407,7 +18416,7 @@ bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir,
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, Name, "", "", false);
-    if (ApiDir && !BP.WriteApiEnum(*ApiDir, ModEnums[Enum], Err)) return false;
+    if (ApiDir && !BP.WriteApiEnum(ApiDirOf(PackageName), ModEnums[Enum], Err)) return false;
     std::vector<std::pair<std::string, int64>> Cooked;
     std::vector<std::pair<std::string, std::string>> Display;     // cooked name -> display name, for a renamed or labelled one
     for (const auto& [Cpp, Value] : ModEnums[Enum])
@@ -22672,7 +22681,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (R.bIsPatch) return TransplantFunctions(R, *B, P, BP.ClassIndex(), Err);
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     BP.ApiDescription = R.Doc;
-    if (ApiDir && !BP.WriteApi(*ApiDir, Err))
+    if (ApiDir && !BP.WriteApi(ApiDirOf(PackageName), Err))
     {
         /* A class with nothing callable is not a build failure; the mod simply has no API surface. */
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());

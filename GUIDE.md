@@ -1672,9 +1672,10 @@ mods:
     api_dir: D:/UeProjects/MyProject/Content    # optional; the default is out/api/Content in the mods dir
 ```
 
-Each stub is written straight into the `--api` folder as `<Name>.uasset`, one file with no `.uexp`. bpbuild points
-`--api` at `<api_dir>/<package path without /Game>/`, so a mod's top-level classes sit at the same `/Game` path as the
-cooked classes they stand for, and what an editor Blueprint references is what the pak provides. `api_dir` can name
+Each stub is one `<Name>.uasset` with no `.uexp`. The `--api` folder stands for the mod's own folder, so a stub sits
+where the pak puts the cooked class: a class in `namespace A::B` lands in `A/B`. bpbuild points `--api` at
+`<api_dir>/<package path without /Game>/`, so every stub has the same `/Game` path as the cooked class it stands for,
+and what an editor Blueprint references is what the pak provides. `api_dir` can name
 several projects; see [Building mods](#building-mods) for its forms. Only UE 4.27 has a writer, and an `api_dir` entry
 that asks for another version stops the build.
 
@@ -1690,6 +1691,11 @@ A class stub holds:
 - the class's variables that are not private, with their flags, replication, RepNotify, category and literal defaults;
 - an empty generated class and default object, which the editor fills in on load, and registry tags, so that the
   Content Browser lists the asset.
+
+A `UUserWidget` class's stub is a Widget Blueprint, and it also holds the class's designer tree: each `UE_WIDGET` with
+the values its constructor gives it, so the editor's designer draws the widget and another Widget Blueprint can place it
+([the row](REFERENCE.md#methods-as-blueprint.generate-api-widget)). It previews what the constructor sets, not what
+runs later.
 
 For example, with `--api` this class gets a stub with the variable `Charges` and the functions `Recharge` and `Left`,
 all three carrying the category `Turret`, and `Recharge` its tooltip:

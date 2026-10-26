@@ -4526,6 +4526,61 @@ def api_stub():
     print('ok  NameTest: the API stub carries UE_CATEGORY, UE_TOOLTIP, UE_KEYWORDS, access and purity, and leaves a private field out')
 
 
+def api_stub_widget():
+    """The editor API stubs of WidgetTree's widget classes, and of NsTest's namespaced ones: a user widget's stub is a
+    Widget Blueprint holding its designer tree, and every stub sits in the folder its package names."""
+    import struct, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        api = os.path.join(tmp, 'Content', '_ElytrasMods', 'WidgetTree')
+        os.makedirs(api)
+        proc = assetgen_compile([os.path.join(TESTS, 'WidgetTree.cpp'), UEAPI, os.path.join(tmp, 'cooked'), '--api', api])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        card = dumpexp.load(os.path.join(api, 'UWtCard'))
+        kid = dumpexp.load(os.path.join(api, 'UWtCardKid'))
+        title = [dump('dumptags.py', os.path.join(api, 'UWtCard'), i) for i, e in enumerate(card[5]) if e['name'] == 'Title']
+        nsapi = os.path.join(tmp, 'ns', 'Content', '_ElytrasMods', 'NsTest')
+        os.makedirs(nsapi)
+        proc = assetgen_compile([os.path.join(TESTS, 'NsTest.cpp'), UEAPI, os.path.join(tmp, 'nscooked'), '--api', nsapi])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        stubs = sorted(os.path.relpath(f, os.path.join(tmp, 'ns', 'Content')).replace(os.sep, '/')
+                       for f in glob.glob(os.path.join(tmp, 'ns', 'Content', '**', '*.uasset'), recursive=True))
+    ua, ue, total, names, imports, exports = card
+    cls = lambda e: str(imports[-e['cls'] - 1]) if e['cls'] < 0 else exports[e['cls'] - 1]['name']
+    outer = lambda e: exports[e['outer'] - 1]['name'] if e['outer'] > 0 else None
+    blob = lambda e: ue[e['off'] - total: e['off'] - total + e['size']]
+    # The Blueprint is a WidgetBlueprint, its class a WidgetBlueprintGeneratedClass, as UWtCardKid's is below it.
+    proves('methods-as-blueprint.generate-api-true', 'methods-as-blueprint.generate-api-widget')
+    assert cls(exports[0]) == "Class'WidgetBlueprint'" and any(cls(e) == "Class'WidgetBlueprintGeneratedClass'" for e in exports), \
+        [cls(e) for e in exports]
+    assert cls(kid[5][0]) == "Class'WidgetBlueprint'", cls(kid[5][0])
+    # The tree: a WidgetTree default subobject of the Blueprint (RF_Public|RF_Transactional|RF_DefaultSubObject), every
+    # UE_WIDGET under it and a variable (bIsVariable), each slot under its panel; Frame is UWtFrame's generated class.
+    tree = [e for e in exports if cls(e) == "Class'WidgetTree'"]
+    assert len(tree) == 1 and outer(tree[0]) == 'UWtCard' and tree[0]['flags'] == 0x40009, tree
+    widgets = {e['name']: e for e in exports if outer(e) == 'WidgetTree'}
+    assert set(widgets) == {'Root', 'Title', 'Play', 'Label', 'Frame', 'Note'}, set(widgets)
+    assert cls(widgets['Frame']) == "WidgetBlueprintGeneratedClass'UWtFrame_C'", cls(widgets['Frame'])
+    variable = struct.pack('<ii', names.index('bIsVariable'), 0) + struct.pack('<ii', names.index('BoolProperty'), 0)
+    assert all(variable in blob(e) for e in widgets.values()), 'bIsVariable'
+    slots = sorted((outer(e), cls(e)) for e in exports if outer(e) in widgets)
+    assert slots == [('Play', "Class'ButtonSlot'")] + [('Root', "Class'CanvasPanelSlot'")] * 3, slots
+    # Note sits in no panel: it fills Frame's named slot Body, a NamedSlotBindings entry on Frame.
+    assert struct.pack('<ii', names.index('NamedSlotBindings'), 0) in blob(widgets['Frame']) and 'Body' in names, 'Body'
+    # The constructor's defaults ride along: Title's text reads Score in the designer.
+    assert b'Score'.hex() in title[0], title[0]
+    # Clicks is a variable of the stub; the widgets are not there twice, as NewVariables entries.
+    def var(name):
+        return struct.pack('<ii', names.index('VarName'), 0) + struct.pack('<ii', names.index('NameProperty'), 0) \
+            + struct.pack('<iib', 8, 0, 0) + struct.pack('<ii', names.index(name), 0)
+    assert var('Clicks') in blob(exports[0]) and not any(w in names and var(w) in blob(exports[0]) for w in widgets)
+    # NsTest: each stub in its namespace's folder, under the mod's own or a /Game path of its own (Pistol).
+    proves('methods-as-blueprint.generate-api-folders')
+    assert {'_ElytrasMods/NsTest/NsTest.uasset', '_ElytrasMods/NsTest/Weapons/Rifle.uasset',
+            '_ElytrasMods/NsTest/Weapons/FAmmo.uasset', '_ElytrasMods/NsTest/Weapons/EKind.uasset',
+            'NsTestAbs/Pistol.uasset'} <= set(stubs), stubs
+    print('ok  WidgetTree: a user widget\'s API stub is a Widget Blueprint with its designer tree; NsTest: stubs sit in their packages\' folders')
+
+
 def api_stub_interface():
     """The editor API stub of a mod interface (IfaceStub): a Blueprint Interface, as the UE 4.27 editor saves one - the
     Blueprint's type BPTYPE_Interface, its parent the engine's Interface (or the interface it extends), a function graph
@@ -5593,6 +5648,7 @@ engine_names()
 object_forwards()
 api_stub()
 api_stub_interface()
+api_stub_widget()
 static_assets()
 ue_assets()
 asset_elsewhere()
