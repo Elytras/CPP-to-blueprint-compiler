@@ -4789,15 +4789,21 @@ def asset_elsewhere():
             'OtherData at /Game/_ElytrasMods/Other/OtherData is a UOtherDef, which this mod cooks its own copy of, so it '
             'would load as null: name the class\'s owner where it is declared, e.g. '
             'UE_CLASS("/Game/_ElytrasMods/Other/UOtherDef", "UOtherDef_C")', top=top % '')
+    # Each compiles into tmp/FSD/Content/_ElytrasMods/<mod>, the layout bpbuild stages: a class cooked at another /Game
+    # path lands under the content root that out's package path implies: out given as a bare tmp under tests/, that
+    # root is AssetGen/, and the run leaves AssetGen/_ElytrasMods/Other behind.
     with tempfile.TemporaryDirectory(dir=TESTS) as tmp:
         with open(os.path.join(tmp, 'AssetPinned.cpp'), 'w') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/AssetPinned");\n'
                     + top % '  UE_CLASS("/Game/_ElytrasMods/Other/UOtherDef", "UOtherDef_C");\n'
                     + 'class AssetPinned : public AActor {\npublic:\n  UOtherDef *Picked = &OtherData;\n};\n')
-        proc = assetgen_compile([os.path.join(tmp, 'AssetPinned.cpp'), UEAPI, tmp])
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetPinned')
+        os.makedirs(out)
+        proc = assetgen_compile([os.path.join(tmp, 'AssetPinned.cpp'), UEAPI, out])
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert not os.path.exists(os.path.join(tmp, 'UOtherDef.uasset')), os.listdir(tmp)
-        imports = dict(import_paths(os.path.join(tmp, 'AssetPinned'), classes=True))
+        assert os.listdir(os.path.dirname(out)) == ['AssetPinned'], os.listdir(os.path.dirname(out))
+        assert not os.path.exists(os.path.join(out, 'UOtherDef.uasset')), os.listdir(out)
+        imports = dict(import_paths(os.path.join(out, 'AssetPinned'), classes=True))
         proves('sharing-a-class.ue-class-game-mymods-turrets')
         assert imports['/Game/_ElytrasMods/Other/OtherData.OtherData'] == '/Game/_ElytrasMods/Other/UOtherDef.UOtherDef_C', imports
     # A class in a `Game::` namespace is cooked at its own /Game path, the one the asset's import names: no copy, so no
@@ -4808,9 +4814,11 @@ def asset_elsewhere():
                     'namespace Game::_ElytrasMods::Other {\n' + top % '' + '}\n'
                     'class AssetSecondRoot : public AActor {\npublic:\n'
                     '  Game::_ElytrasMods::Other::UOtherDef *Picked = &Game::_ElytrasMods::Other::OtherData;\n};\n')
-        proc = assetgen_compile([os.path.join(tmp, 'AssetSecondRoot.cpp'), UEAPI, tmp])
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetSecondRoot')
+        os.makedirs(out)
+        proc = assetgen_compile([os.path.join(tmp, 'AssetSecondRoot.cpp'), UEAPI, out])
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        imports = dict(import_paths(os.path.join(tmp, 'AssetSecondRoot'), classes=True))
+        imports = dict(import_paths(os.path.join(out, 'AssetSecondRoot'), classes=True))
         assert imports['/Game/_ElytrasMods/Other/OtherData.OtherData'] == '/Game/_ElytrasMods/Other/UOtherDef.UOtherDef_C', imports
     print("ok  AssetTest: another mod's asset of a class this mod would cook is refused; with the class pinned to its "
           "owner, the import names the owner's class, as it does for a class cooked at its own /Game path")
