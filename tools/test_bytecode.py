@@ -4652,22 +4652,106 @@ def api_stub_library():
         lib = Package(os.path.join(api, 'ApiLibrary'))
         graphs = {e['name'] for i, e in enumerate(lib.exports) if lib.class_of(i + 1) == 'EdGraph'}
         proves('methods-as-blueprint.generate-api-library')
-        assert graphs == {'GetComponent'}, graphs
+        assert graphs == {'GetComponent', 'GetInterface', 'KeepReference', 'WriteNumber', 'CheckOutput'}, graphs
         bp_type = struct.unpack_from('<i', lib.tag(0, 'BlueprintType')['value'])[0]
         assert lib.names[bp_type] == 'BPTYPE_FunctionLibrary'
-        result = next(i for i, e in enumerate(lib.exports) if lib.class_of(i + 1) == 'K2Node_FunctionResult')
+        result = next(i for i, e in enumerate(lib.exports) if lib.class_of(i + 1) == 'K2Node_FunctionResult'
+                      and lib.exports[e['outer'] - 1]['name'] == 'GetComponent')
         interface_name = struct.pack('<ii', next(i for i, n in enumerate(lib.names) if n.lower() == 'interface'), 0)
         assert interface_name in lib.blob(result), 'the getter result is an interface pin'
+        proves('parameters-and-return.ue-out')
+        nodes = {(lib.exports[e['outer'] - 1]['name'], lib.class_of(i + 1)): lib.blob(i)
+                 for i, e in enumerate(lib.exports) if e['outer'] > 0
+                 and lib.class_of(i + 1) in ('K2Node_FunctionEntry', 'K2Node_FunctionResult')}
+        pin = interface_name * 2
+        output = nodes['GetInterface', 'K2Node_FunctionResult']
+        reference = nodes['KeepReference', 'K2Node_FunctionEntry']
+        assert pin in output and pin not in nodes['GetInterface', 'K2Node_FunctionEntry']
+        assert pin in reference
+        assert struct.unpack_from('<i', output, output.index(pin) + 29)[0] == 0
+        assert struct.unpack_from('<i', reference, reference.index(pin) + 29)[0] == 1
+        cooked = os.path.join(tmp, 'cooked', 'ApiLibrary')
+        provider = Package(cooked)
+        out = next(p for p in provider.struct(provider.find('GetInterface')).props if p.name == 'Interface')
+        ref = next(p for p in provider.struct(provider.find('KeepReference')).props if p.name == 'Interface')
+        assert out.flags & 0x100 and not out.flags & 0x8000000
+        assert ref.flags & 0x100 and ref.flags & 0x8000000
+        assert run(cooked, 'CheckOutput')[0] == 42
         actor = Package(os.path.join(api, 'ApiActor'))
         cls = actor.find('ApiActor_C')
         proves('methods-as-blueprint.generate-api-interfaces')
         assert actor.tag(0, 'ImplementedInterfaces') is not None
         interfaces = actor.struct(cls).interfaces
         assert len(interfaces) == 1 and actor.path(interfaces[0][0]).endswith('/IApiProbe.IApiProbe_C'), interfaces
-        assert actor.tag(0, 'FunctionGraphs') is None, 'Ping belongs to ImplementedInterfaces.Graphs'
+        graphs_value = actor.tag(0, 'FunctionGraphs')['value']
+        own_graphs = {actor.exports[struct.unpack_from('<i', graphs_value, 4 + 4 * k)[0] - 1]['name']
+                      for k in range(struct.unpack_from('<i', graphs_value)[0])}
+        assert own_graphs == {'WhenDone'}, ('Ping, Level and Later belong to ImplementedInterfaces.Graphs', own_graphs)
         ping = next(i for i, e in enumerate(actor.exports) if e['name'] == 'Ping')
         assert struct.pack('<i', ping + 1) in actor.tag(0, 'ImplementedInterfaces')['value']
-    print('ok  ApiLibrary: public static getter and interface result; ApiActor: editor stub keeps its interface')
+
+        # IApiProbe::Level is const: pure in the interface, and in ApiActor, whose Level is not const.
+        proves('declaring-an-interface.pure')
+        for pkg in ('IApiProbe', 'ApiActor'):
+            cooked_pkg = Package(os.path.join(tmp, 'cooked', pkg))
+            assert cooked_pkg.struct(cooked_pkg.find('Level')).function_flags & 0x10000000, pkg   # FUNC_BlueprintPure
+            stub = Package(os.path.join(api, pkg))
+            entry = next(i for i, e in enumerate(stub.exports) if e['outer'] > 0
+                         and stub.exports[e['outer'] - 1]['name'] == 'Level' and stub.class_of(i + 1) == 'K2Node_FunctionEntry')
+            assert struct.unpack_from('<i', stub.tag(entry, 'ExtraFlags')['value'])[0] & 0x10000000, pkg
+
+        # Delegate parameters: each pin names its signature (MemberParent, then MemberName), a signature of the class's
+        # own a signature graph of the stub; the delegate variable Pending stays out.
+        proves('methods-as-blueprint.generate-api-delegate-params')
+        probe = Package(os.path.join(api, 'IApiProbe'))
+
+        def member_parent(pkg, fn, signature):
+            entry = next(i for i, e in enumerate(pkg.exports) if e['outer'] > 0
+                         and pkg.exports[e['outer'] - 1]['name'] == fn and pkg.class_of(i + 1) == 'K2Node_FunctionEntry')
+            # The pin type after its category: SubCategory (8), SubCategoryObject (4), the container byte, bIsReference
+            # and bIsWeakPointer (4 each), then PinSubCategoryMemberReference's MemberParent and MemberName.
+            blob = pkg.blob(entry)
+            at = blob.index(struct.pack('<ii', pkg.names.index('delegate'), 0)) + 8 + 8 + 4 + 1 + 4 + 4
+            parent, name = struct.unpack_from('<ii', blob, at)
+            assert pkg.names[name] == signature, (fn, pkg.names[name])
+            return parent
+
+        def signature_graphs(pkg):
+            value = pkg.tag(0, 'DelegateSignatureGraphs')['value']
+            return {pkg.exports[struct.unpack_from('<i', value, 4 + 4 * k)[0] - 1]['name']
+                    for k in range(struct.unpack_from('<i', value)[0])}
+
+        assert member_parent(probe, 'Later', 'Call__DelegateSignature') == probe.find('IApiProbe_C') + 1
+        assert signature_graphs(probe) == {'Call'}
+        # WhenDone's own signature numbers past the Call__DelegateSignature of the interface ApiActor lists.
+        assert member_parent(actor, 'WhenDone', 'Call_2__DelegateSignature') == actor.find('ApiActor_C') + 1
+        assert actor.path(member_parent(actor, 'Later', 'Call__DelegateSignature')).endswith('/IApiProbe.IApiProbe_C')
+        assert signature_graphs(actor) == {'Call_2'}, 'Pending is a variable only, and that one is left out'
+        assert 'Pending' not in actor.names
+        assert 'Pending        skipped: a Blueprint variable cannot hold a delegate' in proc.stdout, proc.stdout
+    print('ok  ApiLibrary: public static getter and interface result; ApiActor: editor stub keeps its interface, '
+          'pure through it, delegate parameters')
+
+
+def output_param_refusals():
+    """An output marker must name a mutable reference on its method; malformed declarations
+    must fail instead of silently exporting the original input pin."""
+    import tempfile
+    for parameter, marker, why in (
+            ('int32 Value', 'Value', 'requires a non-const reference'),
+            ('const int32& Value', 'Value', 'requires a non-const reference'),
+            ('int32& Value', 'Missing', 'must name a parameter')):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, 'BadOutput.cpp')
+            with open(source, 'w', encoding='utf-8-sig') as out:
+                out.write('#include "UeMeta.h"\n#include "Engine.h"\n'
+                          'UE_MOD_PACKAGE("/Game/BadOutput");\n'
+                          'class BadOutput : public UObject { public:\n'
+                          'UE_OUT(' + marker + '); void Set(' + parameter + ') {}\n};\n')
+            proc = assetgen_compile([source, UEAPI, os.path.join(tmp, 'cooked')])
+            proves('parameters-and-return.ue-out-invalid')
+            assert proc.returncode != 0 and why in proc.stdout + proc.stderr, proc.stdout + proc.stderr
+    print('ok  UE_OUT: value, const reference and unknown parameters are refused')
 
 
 def static_assets():
@@ -5707,6 +5791,7 @@ api_stub()
 api_stub_interface()
 api_stub_widget()
 api_stub_library()
+output_param_refusals()
 static_assets()
 ue_assets()
 asset_elsewhere()
