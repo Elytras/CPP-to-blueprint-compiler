@@ -13504,10 +13504,17 @@ void FCompiler::IndexLambdas(const Json& N)
 /* `L(x)` is a CXXOperatorCallExpr [operator(), L, x]. Rewritten here, once, into the CallExpr [operator(), x] of an
    ordinary inline call, the object L kept in "lambdaObj" (ExpandInline reads what it is): so HoistComma, the
    impurity and eager-safety predicates, ResumesLater and the argument-order code see an inline call, which is what
-   it is, and none of them has a lambda case. Run after IndexLambdas has seen every closure. */
+   it is, and none of them has a lambda case. Run after IndexLambdas has seen every closure.
+   `A != B` over a type with only an operator== (FKey: Kismet has EqualEqual_KeyKey and no NotEqual) is C++20's
+   CXXRewrittenBinaryOperator, whose one child is the call it stands for, `!(A == B)`: it is replaced by that here too. */
 void FCompiler::RewriteLambdaCalls(Json& N)
 {
     if (!N.is_object()) return;
+    while (Kind(N) == "CXXRewrittenBinaryOperator" && N.contains("inner") && N["inner"].size() == 1)
+    {
+        Json Semantic = std::move(N["inner"][0]);
+        N = std::move(Semantic);
+    }
     if (auto In = N.find("inner"); In != N.end() && In->is_array())
         for (Json& C : *In) RewriteLambdaCalls(C);
     if (Kind(N) != "CXXOperatorCallExpr" || !N.contains("inner") || N["inner"].size() < 2) return;

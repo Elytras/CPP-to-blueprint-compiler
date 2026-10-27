@@ -1169,6 +1169,7 @@ Notes:
 | <a id="struct-operators.facing-aim"></a>`Facing == Aim` with two FRotators or two FQuats | The Equal node with a tolerance of 0, with a warning: it compares rotations, so angles 360 degrees apart (a quaternion and its negation) are equal, where UE C++ compares the components. | Warns |
 | <a id="struct-operators.home-0"></a>`Home == 0`, `Home != 0.5f` | The number fills all three components first (Conv_FloatToVector), so `Home == 0` is true for the zero vector. UE C++ has no such operator: its FVector constructor from a float is explicit. | Yes |
 | <a id="struct-operators.tint-other"></a>`Tint == Other` | FLinearColor, FTransform and other structs use their own Kismet Equal node. FLinearColor's has no tolerance. | Yes |
+| <a id="struct-operators.key-other"></a>`Key != Other` with two FKeys or two FInputChords | Kismet has only their Equal node, so this is Not of it (C++20 rewrites `!=` to `!(Key == Other)`, and that is what is compiled). | Yes |
 | <a id="struct-operators.home-w"></a>`Home += W;` | Refused by clang (`no viable overloaded '+='`): structs have no compound assignment. Write `Home = Home + W;`. | Refused |
 | <a id="struct-operators.v"></a>`-V` | Refused by clang (`invalid argument type 'FVector' to unary expression`). Call `UKismetMathLibrary::NegateVector(V)`. | Refused |
 | <a id="struct-operators.a-b"></a>`A + B` with two FRotators | Kismet has no such node. Stored in or returned as an FRotator it is a clang error. Call `UKismetMathLibrary::ComposeRotators(A, B)`. | Refused |
