@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <tuple>
 
@@ -23,6 +24,9 @@ struct FPinType
     bool bIsReference = false;
     bool bIsConst = false;
     std::shared_ptr<FPinType> ValueType;    // map only
+    /* A delegate pin's signature function: the class it lives in and its name (PinSubCategoryMemberReference). */
+    FIndex MemberParent;
+    std::string MemberName;
 };
 
 struct FPinDef
@@ -80,8 +84,8 @@ void WritePinType(FArc& Ar, const FPinType& T)
     }
     Ar.Bool(T.bIsReference);
     Ar.Bool(false);                     // bIsWeakPointer
-    Ar.Idx(Null());                     // PinSubCategoryMemberReference: MemberParent
-    Ar.Name("None");                    //                                MemberName
+    Ar.Idx(T.MemberParent);             // PinSubCategoryMemberReference: MemberParent
+    Ar.Name(T.MemberName.empty() ? "None" : T.MemberName);  //            MemberName
     for (int32 I = 0; I < 4; ++I) Ar.U32(0);   //                         MemberGuid
     Ar.Bool(T.bIsConst);
     Ar.Bool(false);                     // bIsUObjectWrapper
@@ -195,6 +199,9 @@ protected:
     /* The same object as Source names it, re-imported here. False when its outer is not a plain
        package - a type that lives inside the mod's own package has no editor-side asset yet. */
     bool Remap(FIndex Src, FIndex& Out);
+    /* A signature function as a delegate pin names it: its class re-imported (SelfRef for this class's own, one the
+       cooked class makes per delegate type) and its name. */
+    bool SignatureOf(FIndex Fn, FIndex& Parent, std::string& Name);
     bool PinTypeOf(const FPropertyDef& Prop, FPinType& Out);
     /* A widget default with its object references re-imported here. False drops it: what it names is an export of
        the cooked package or an instanced object. A mod asset (a font, a texture) stays named: an uncooked copy
@@ -268,6 +275,20 @@ bool FEditorPackage::Remap(FIndex Src, FIndex& Out)
     return true;
 }
 
+bool FEditorPackage::SignatureOf(FIndex Fn, FIndex& Parent, std::string& Name)
+{
+    if (Fn.V > 0 && size_t(Fn.V) <= Source.ExportRows().size())
+    {
+        const FExport& Row = Source.ExportRows()[size_t(Fn.V) - 1];
+        Name = Row.ObjectName;
+        return Remap(Row.OuterIndex, Parent);
+    }
+    const FImport* In = Source.ImportAt(Fn);
+    if (!In) return false;
+    Name = In->ObjectName;
+    return Remap(In->Outer, Parent);
+}
+
 bool FEditorPackage::RemapValue(FDefaultValue& V)
 {
     if (V.K == FDefaultValue::Obj && (V.Instanced || V.Object.V > 0 || !Remap(V.Object, V.Object))) return false;
@@ -323,6 +344,12 @@ bool FEditorPackage::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
     /* A dispatcher. The compiler finds its signature by name, <Name>__DelegateSignature from the graph of that name
        in DelegateSignatureGraphs, so the pin carries no member reference. */
     else if (T == "MulticastInlineDelegateProperty" || T == "MulticastDelegateProperty") Out.Category = "mcdelegate";
+    /* A delegate value names its signature (PinSubCategoryMemberReference), as CreatePropertyOnScope resolves it. */
+    else if (T == "DelegateProperty")
+    {
+        Out.Category = "delegate";
+        if (!SignatureOf(Prop.Extra, Out.MemberParent, Out.MemberName)) return false;
+    }
     else if (T == "ClassProperty" || T == "SoftClassProperty")
     {
         // The pin carries the subclass filter, not UClass itself.
@@ -336,7 +363,8 @@ bool FEditorPackage::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
         if (Out.Container == 3)
         {
             auto Value = std::make_shared<FPinType>();
-            if (!Prop.Value || !PinTypeOf(*Prop.Value, *Value)) return false;
+            // FEdGraphTerminalType has no member reference, so a map's value is no delegate.
+            if (!Prop.Value || !PinTypeOf(*Prop.Value, *Value) || Value->Category == "delegate") return false;
             Out.ValueType = Value;
         }
     }
@@ -408,20 +436,13 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         return std::string();
     };
 
-    for (const FApiFunction& Fn : Class.Functions)
-    {
-        const std::string Dispatcher = DispatcherOf(Fn);
-        if (Dispatcher.empty())
-        {
-            if (!(Fn.Flags & FUNC_BlueprintCallable)) continue;
-            if (Fn.Flags & (FUNC_UbergraphFunction | FUNC_Delegate | FUNC_MulticastDelegate)) continue;
-            if (bFunctionLibrary && (Fn.Flags & (FUNC_Private | FUNC_Protected))) continue;
-        }
-
+    /* One graph per kept function. A signature graph (Signature, the name without the suffix) takes the flags the
+       editor's new dispatcher gets (FBlueprintEditor::OnAddNewDelegate). False when a parameter has no pin type. */
+    auto AddGraph = [&](const FApiFunction& Fn, const std::string& Signature) {
         FGraph G;
-        G.Name = Dispatcher.empty() ? Fn.Name : Dispatcher;
-        G.bDelegate = !Dispatcher.empty();
-        if (Fn.Interface.V && !Remap(Fn.Interface, G.Interface)) continue;
+        G.Name = Signature.empty() ? Fn.Name : Signature;
+        G.bDelegate = !Signature.empty();
+        if (Fn.Interface.V && !Remap(Fn.Interface, G.Interface)) return false;
         if (auto Cat = Class.Categories.find(Fn.Name); Cat != Class.Categories.end()) G.Category = Cat->second;
         if (auto Doc = Class.Docs.find(Fn.Name); Doc != Class.Docs.end()) std::tie(G.ToolTip, G.Keywords) = Doc->second;
         // The flags the editor's new dispatcher gets (FBlueprintEditor::OnAddNewDelegate).
@@ -472,33 +493,20 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
             Pin.Direction = bOutput ? 0 : 1;
             (bOutput ? G.ResultPins : G.EntryPins).push_back(Pin);
         }
-        if (!bOk) continue;
-
-        Graphs.push_back(std::move(G));
-    }
-
-    // Export rows, in the order the engine's own saves use: the Blueprint, then each graph with its nodes.
-    const int32 ExBlueprint = 0;
-    std::vector<int32> GraphExports;
-    int32 Next = 1;
-    for (const FGraph& G : Graphs)
-    {
-        GraphExports.push_back(Next);
-        Next += G.ResultPins.size() > (G.bPure ? size_t(0) : size_t(1)) ? 3 : 2;
-    }
-    /* FAssetTypeActions_Blueprint::OpenAssetEditor warns "derives from an invalid class" on a null
-       GeneratedClass, so the stub carries an empty one (compile-on-load fills it from the graphs)
-       plus its CDO - the editor's deferred loading needs the CDO export to exist. */
-    const int32 ExClass = Next;
-    const int32 ExCdo = Next + 1;
-    auto FixSelf = [&](FPinType& T) {
-        if (T.SubCategoryObject.V == SelfRef) T.SubCategoryObject = Exp(ExClass);
-        if (T.ValueType && T.ValueType->SubCategoryObject.V == SelfRef) T.ValueType->SubCategoryObject = Exp(ExClass);
+        if (bOk) Graphs.push_back(std::move(G));
+        return bOk;
     };
-    for (FGraph& G : Graphs)
+
+    for (const FApiFunction& Fn : Class.Functions)
     {
-        for (FPinDef& Pin : G.EntryPins) FixSelf(Pin.Type);
-        for (FPinDef& Pin : G.ResultPins) FixSelf(Pin.Type);
+        const std::string Dispatcher = DispatcherOf(Fn);
+        if (Dispatcher.empty())
+        {
+            if (!(Fn.Flags & FUNC_BlueprintCallable)) continue;
+            if (Fn.Flags & (FUNC_UbergraphFunction | FUNC_Delegate | FUNC_MulticastDelegate)) continue;
+            if (bFunctionLibrary && (Fn.Flags & (FUNC_Private | FUNC_Protected))) continue;
+        }
+        AddGraph(Fn, Dispatcher);
     }
 
     /* Class variables: the same FEdGraphPinType, plus the flags that decide how the editor treats
@@ -528,6 +536,12 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
             printf("  %-14s skipped: variable has no editor-side type yet\n", Prop.Name.c_str());
             continue;
         }
+        /* The editor's compiler refuses one ("has an invalid type Array of Delegates"): only a parameter carries one. */
+        if (Var.Type.Category == "delegate")
+        {
+            printf("  %-14s skipped: a Blueprint variable cannot hold a delegate\n", Prop.Name.c_str());
+            continue;
+        }
         if (Var.Type.Category == "mcdelegate"
             && std::none_of(Graphs.begin(), Graphs.end(), [&](const FGraph& G) { return G.bDelegate && G.Name == Prop.Name; }))
         {
@@ -550,9 +564,52 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Var.Default = DefaultString(Prop);
         if (auto Cat = Class.Categories.find(Prop.Name); Cat != Class.Categories.end()) Var.Category = Cat->second;
         MakeGuid(Class.AssetName + ".var." + Prop.Name, Var.Guid);
-        FixSelf(Var.Type);
         Vars.push_back(std::move(Var));
     }
+
+    /* A delegate pin of this class's own type names a signature function the cooked class made for it (one per
+       delegate type, named after its first user). The stub makes it the way the compiler makes a dispatcher's: a
+       signature graph of that name without the suffix. The compiler warns it finds no dispatcher of that name, and
+       makes the function all the same (FinishCompilingFunction). */
+    std::set<std::string> OwnSignatures;
+    auto NoteSignature = [&](const FPinType& T) { if (T.MemberParent.V == SelfRef) OwnSignatures.insert(T.MemberName); };
+    for (const FGraph& G : Graphs)
+    {
+        for (const FPinDef& Pin : G.EntryPins) NoteSignature(Pin.Type);
+        for (const FPinDef& Pin : G.ResultPins) NoteSignature(Pin.Type);
+    }
+    for (const FApiVar& Var : Vars) NoteSignature(Var.Type);
+    for (const FApiFunction& Fn : Class.Functions)
+        if (OwnSignatures.count(Fn.Name) && Fn.Name.size() > SignatureSuffix.size()
+            && !AddGraph(Fn, Fn.Name.substr(0, Fn.Name.size() - SignatureSuffix.size())))
+            printf("  %-14s the signature has a parameter with no editor-side type yet: what names it will not"
+                   " compile\n", Fn.Name.c_str());
+
+    // Export rows, in the order the engine's own saves use: the Blueprint, then each graph with its nodes.
+    const int32 ExBlueprint = 0;
+    std::vector<int32> GraphExports;
+    int32 Next = 1;
+    for (const FGraph& G : Graphs)
+    {
+        GraphExports.push_back(Next);
+        Next += G.ResultPins.size() > (G.bPure ? size_t(0) : size_t(1)) ? 3 : 2;
+    }
+    /* FAssetTypeActions_Blueprint::OpenAssetEditor warns "derives from an invalid class" on a null
+       GeneratedClass, so the stub carries an empty one (compile-on-load fills it from the graphs)
+       plus its CDO - the editor's deferred loading needs the CDO export to exist. */
+    const int32 ExClass = Next;
+    const int32 ExCdo = Next + 1;
+    auto FixSelf = [&](FPinType& T) {
+        if (T.SubCategoryObject.V == SelfRef) T.SubCategoryObject = Exp(ExClass);
+        if (T.ValueType && T.ValueType->SubCategoryObject.V == SelfRef) T.ValueType->SubCategoryObject = Exp(ExClass);
+        if (T.MemberParent.V == SelfRef) T.MemberParent = Exp(ExClass);
+    };
+    for (FGraph& G : Graphs)
+    {
+        for (FPinDef& Pin : G.EntryPins) FixSelf(Pin.Type);
+        for (FPinDef& Pin : G.ResultPins) FixSelf(Pin.Type);
+    }
+    for (FApiVar& Var : Vars) FixSelf(Var.Type);
 
     /* A field the mod assigns from its construction script or BeginPlay has no literal default to
        carry: the value is a call, and only a real compiled graph could express it. Say so rather

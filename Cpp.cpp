@@ -1148,6 +1148,7 @@ struct FRecord
     std::vector<std::pair<std::string, std::string>> TemplateSubobjects;   // UeTemplateSubobjects: (path under the class, class path)
     std::set<std::string> IchRecords;   // UeIchRecords: the inherited components a game Blueprint has a template of, lower case
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
+    std::map<std::string, std::set<size_t>> OutputParams;   // UE_OUT: method -> declaration parameter ordinals
     std::set<std::string> FinalMethods;             // `virtual T F() final`: no subclass has an F of its own
     std::set<std::string> Forwarders;               // Methods AssetGen declared, not the source: see SynthesizeForwarders
     std::vector<FInputMark> InputMarks;             // UE_INPUT_KEY / UE_INPUT_ACTION, in the order written
@@ -2605,6 +2606,7 @@ private:
     std::pair<const FRecord*, const Json*> ReplacedDecl(const FRecord& Self, const std::string& Method) const;
     /* The mod interface R lists (or one it extends) that declares Method, or null: R's stub of Method is Generate's. */
     const FRecord* ModInterfaceWith(const FRecord& R, const std::string& Method) const;
+    bool ImplementsPure(const FRecord& R, const std::string& Method) const;
     std::string Unreplicable(const Json& Typed, int32 Depth = 0) const;
 
     /* Records are keyed by qualified name; Bare holds only leaf names exactly one class claims,
@@ -3567,6 +3569,7 @@ bool FCompiler::Collect(std::string* Err)
         std::vector<FInputMark> PendingInput;   // UE_INPUT_KEY / UE_INPUT_ACTION mark the member that follows them
         std::vector<FTimelineMark> PendingTimeline;     // and so do UE_TIMELINE_UPDATE / _FINISHED / _EVENT
         std::vector<std::pair<bool, std::string>> PendingDocs;  // and UE_TOOLTIP (true) / UE_KEYWORDS (false)
+        std::vector<std::string> PendingOutputParams;
         std::function<void(const Json&)> Member = [&](const Json& C) {
             /* genueapi puts a class's markers in a private `struct UeMarkers` at its bottom, out of IntelliSense's
                member list: they are the class's own. */
@@ -3598,6 +3601,28 @@ bool FCompiler::Collect(std::string* Err)
                 PendingDocs.emplace_back(Name(C)[2] == 'T', std::string());
                 FindLiteral(C, PendingDocs.back().second);
                 return;
+            }
+            if (Kind(C) == "VarDecl" && Name(C).compare(0, 12, "UeOutParam__") == 0)
+            {
+                std::string Param;
+                FindLiteral(C, Param);
+                PendingOutputParams.push_back(Param);
+                return;
+            }
+            if (!PendingOutputParams.empty() && !C.value("isImplicit", false))
+            {
+                const std::vector<std::string> Parms = ParmNames(C);
+                for (const std::string& Param : PendingOutputParams)
+                {
+                    const auto Found = std::find(Parms.begin(), Parms.end(), Param);
+                    if (Kind(C) != "CXXMethodDecl" || Found == Parms.end())
+                    {
+                        if (bMetaOk) *Err = R.CppName + ": UE_OUT(" + Param + ") must name a parameter of the next method";
+                        bMetaOk = false;
+                    }
+                    else R.OutputParams[Name(C)].insert(size_t(Found - Parms.begin()));
+                }
+                PendingOutputParams.clear();
             }
             if (!PendingDocs.empty() && !C.value("isImplicit", false))
             {
@@ -3840,6 +3865,11 @@ bool FCompiler::Collect(std::string* Err)
                 });
         };
         ForEach(N, Member);
+        if (!PendingOutputParams.empty())
+        {
+            if (bMetaOk) *Err = R.CppName + ": UE_OUT(" + PendingOutputParams.front() + ") must precede a method";
+            bMetaOk = false;
+        }
         if (!PendingInput.empty() && R.InputMisplaced.empty()) R.InputMisplaced = InputMarkText(PendingInput.front());
         if (!PendingTimeline.empty() && R.TimelineMisplaced.empty()) R.TimelineMisplaced = TimelineMarkText(PendingTimeline.front());
         if (!PendingDocs.empty() && R.DocMisplaced.empty())
@@ -4569,10 +4599,20 @@ uint32 FCompiler::ModMethodFlags(const FRecord& Owner, const std::string& Method
     uint32 Flags = Inherited ? Inherited & kOverrideInherits : kPlainMethodFlags;
     if (auto A = Owner.MethodAccess.find(Method); !Inherited && A != Owner.MethodAccess.end())
         Flags = (Flags & ~uint32(FUNC_Public | FUNC_Protected | FUNC_Private)) | A->second;
-    if (IsPureDecl(Def) || (!Inherited && IsModPureDecl(Decl))) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
+    if (IsPureDecl(Def) || (!Inherited && (IsModPureDecl(Decl) || ImplementsPure(Owner, Method))))
+        Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
     const std::string DeclType = TypeOf(Decl);
     if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;
     return Flags | NetFlagsOf(Decl) | NetFlagsOf(Def) | AccessFlagsOf(Decl) | AccessFlagsOf(Def);
+}
+
+/* An implementation of a pure function of a mod interface the class lists is pure too, as the Kismet compiler copies
+   FUNC_BlueprintPure from the interface function it implements (KismetCompiler.cpp:1857): the C++ method need not say
+   `const` again. */
+bool FCompiler::ImplementsPure(const FRecord& R, const std::string& Method) const
+{
+    const FRecord* IR = ModInterfaceWith(R, Method);
+    return IR && IsModPureDecl(*IR->Methods.at(Method));
 }
 
 /* The flags of a game Blueprint's function (or of another mod's class, from the header it shares), with no table
@@ -17921,12 +17961,28 @@ bool FCompiler::SignatureNameTaken(const FRecord& For, const std::string& N) con
     if (&For == Cur && (std::any_of(CurSignatures.begin(), CurSignatures.end(), [&](const auto& D) { return D.first + "__DelegateSignature" == N; })
                         || std::any_of(DelegateSigs.begin(), DelegateSigs.end(), [&](const auto& D) { return D.second.first == N; })))
         return true;
-    if (Has(For)) return true;
+    /* The interfaces a class lists count as its chain too: FindFunctionByName looks in them (Class.cpp:5281-5323), and
+       invariants.py func_override_params takes a same-named function for an implementation of theirs. */
+    auto Lists = [&](const FRecord& A, const FRecord& Interface) {
+        for (const std::string& I : A.Interfaces)
+            for (const FRecord* IR : InterfaceChain(Find(I)))
+                if (IR == &Interface) return true;
+        return false;
+    };
+    auto HasOrItsInterfaces = [&](const FRecord& A) {
+        if (Has(A)) return true;
+        for (const std::string& I : A.Interfaces)
+            for (const FRecord* IR : InterfaceChain(Find(I)))
+                if (IR && Has(*IR)) return true;
+        return false;
+    };
+    if (HasOrItsInterfaces(For)) return true;
     for (const FRecord* A = For.Base.empty() ? nullptr : Find(For.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
-        if (Has(*A)) return true;
+        if (HasOrItsInterfaces(*A)) return true;
     for (const auto& [CppName, D] : Records)
     {
         if (&D == &For || !D.IsGenerated() || D.bIsStruct || D.bIsInterface) continue;
+        if (For.bIsInterface && Lists(D, For) && Has(D)) return true;
         for (const FRecord* A = D.Base.empty() ? nullptr : Find(D.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
             if (A == &For) { if (Has(D)) return true; break; }
     }
@@ -18244,7 +18300,26 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
            IsSignatureCompatibleWith reads it, and ignores it (Class.h 1914-1921). A pointer to const is no Blueprint type. */
         const bool bConstRef = bOutParm && ((Type.compare(0, 6, "const ") == 0 && Type.back() != '*')
                                             || (Type.size() >= 5 && Type.compare(Type.size() - 5, 5, "const") == 0));
-        const uint64 Flags = bOutParm ? uint64(CPF_OutParm | CPF_ReferenceParm | (bConstRef ? CPF_ConstParm : 0)) : 0;
+        bool bOutputOnly = false;
+        auto MarkedOutput = [&](const FRecord* Owner) {
+            if (!Owner) return false;
+            const auto Out = Owner->OutputParams.find(Fn);
+            return Out != Owner->OutputParams.end() && Out->second.count(Index - 1) != 0;
+        };
+        for (const FRecord* A = Cur; A && !bOutputOnly; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            bOutputOnly = MarkedOutput(A);
+            for (const std::string& Interface : A->Interfaces)
+                for (const FRecord* Decl : InterfaceChain(Find(Interface))) bOutputOnly = bOutputOnly || MarkedOutput(Decl);
+        }
+        if (bOutputOnly && (!bOutParm || bConstRef))
+        {
+            *Err = Fn + ": UE_OUT(" + PName + ") requires a non-const reference parameter";
+            bOk = false;
+            return;
+        }
+        const uint64 Flags = bOutParm ? uint64(CPF_OutParm | (bOutputOnly ? 0 : CPF_ReferenceParm)
+                                               | (bConstRef ? CPF_ConstParm : 0)) : 0;
         /* An override's delegate parameter is its parent's: that one's signature function (ImportedParamSignature). */
         if (FIndex Sig; Cur && StripTypeKeywords(Type).compare(0, 10, "TDelegate<") == 0
                         && ImportedParamSignature(*Cur, Fn, Index - 1, BP, &Sig))
@@ -18336,12 +18411,16 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
            are the ones a caller dispatches through. */
         const bool bOut = std::any_of(Params.begin(), Params.end(),
                                       [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
-        /* Named as its implementations and callers name it: by its `__UeName` marker where it has one. */
+        /* Named as its implementations and callers name it: by its `__UeName` marker where it has one. A `const` or
+           UE_PURE one is pure, which UHT refuses on an interface ("BlueprintPure specifier is not allowed for interface
+           functions") and the editor hides from an interface's details, yet the Kismet compiler keeps it from the entry
+           node (KismetCompiler.cpp:1833) and copies it to each implementation (1857): a call on an interface pin
+           draws without exec pins. */
         const std::string UeFn = UeNameOf(&R, Entry.first);
         BP.AddFunction(UeFn, Null(), Params,
                        [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
                        FUNC_Public | FUNC_BlueprintCallable | FUNC_BlueprintEvent
-                           | (bOut ? FUNC_HasOutParms : 0));
+                           | (bOut ? FUNC_HasOutParms : 0) | (IsModPureDecl(*Entry.second) ? FUNC_BlueprintPure : 0));
         if (auto Cat = R.Categories.find(Entry.first); Cat != R.Categories.end()) BP.ApiCategory[UeFn] = Cat->second;
         if (auto Doc = R.Docs.find(Entry.first); Doc != R.Docs.end()) BP.ApiDocs[UeFn] = Doc->second;
     }
@@ -22451,7 +22530,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            nothing, and clang has already refused what C++ forbids. */
         if (auto A = R.MethodAccess.find(Fn.Name); !Inherited && A != R.MethodAccess.end())
             Flags = (Flags & ~uint32(FUNC_Public | FUNC_Protected | FUNC_Private)) | A->second;
-        if (IsPureDecl(M) || (!Inherited && IsModPureDecl(Decl))) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
+        if (IsPureDecl(M) || (!Inherited && (IsModPureDecl(Decl) || ImplementsPure(R, Fn.Name))))
+            Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
         const std::string DeclType = TypeOf(Decl);
         if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;
         /* ProcessEvent only lists a script function's out-parms for EX_LocalOutVariable when this is set
