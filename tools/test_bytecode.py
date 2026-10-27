@@ -2125,7 +2125,8 @@ def vec(x, y, z): return {'X': f32(x), 'Y': f32(y), 'Z': f32(z)}
 def equals(a, b, tol): return all(abs(a[k] - b[k]) <= tol for k in a)     # FVector::Equals, what the Kismet node runs
 SUGAR = {'EqualEqual_VectorVector': lambda vm, ctx, a, b, tol: equals(a, b, tol),
          'NotEqual_VectorVector': lambda vm, ctx, a, b, tol: not equals(a, b, tol),
-         'Conv_FloatToVector': lambda vm, ctx, f: vec(f, f, f), 'IsValidClass': lambda vm, ctx, c: c is not None}
+         'Conv_FloatToVector': lambda vm, ctx, f: vec(f, f, f), 'IsValidClass': lambda vm, ctx, c: c is not None,
+         'EqualEqual_KeyKey': lambda vm, ctx, a, b: a == b}
 proves('finding-actors-and.a-getcomponentsbyclass')
 for own, other in ((0, 0), (2, 3), (1, 0)):
     them = Obj('Actor')
@@ -2155,6 +2156,11 @@ for a, b in ((vec(1, 2, 3), vec(1, 2, 3)), (vec(1, 2, 3), vec(1, 2, near)), (vec
     want = (a == b) + 10 * (a != b) + 100 * (a == vec(0, 0, 0))
     proves('struct-operators.home-twice', 'struct-operators.home-0')
     assert VM(asset('SugarForms'), natives=SUGAR).call('VecCompare', A=a, B=b) == want, (a, b)
+for a, b in (('F8', 'F8'), ('F8', 'F9')):
+    proves('struct-operators.key-other')
+    assert VM(asset('SugarForms'), natives=SUGAR).call('KeyCompare', A={'KeyName': a}, B={'KeyName': b}) \
+        == (1 if a == b else 10), (a, b)
+print('ok  SugarForms.KeyCompare: FKey != is the negated EqualEqual_KeyKey, Kismet having no NotEqual  (2 cases)')
 proves('struct-conversions.fvector-v-2-0f')
 assert VM(asset('SugarForms'), natives=SUGAR).call('Twos') == vec(2, 2, 2)
 print('ok  SugarForms.VecCompare: FVector == and != are exact, as in UE C++; `V == 0` and `FVector V = 2` fill all three '
