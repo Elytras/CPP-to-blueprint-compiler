@@ -12325,6 +12325,32 @@ defaults_braces_other_mod()
 print('ok  DefaultsBracesOther: another mod\'s struct is no engine struct to braces: a member left out takes its initializer')
 
 
+def other_struct_read():
+    """OtherStructRead: `O.A * 10 + O.B` and a braced local of another mod's UE_STRUCT_IN struct name its members as
+    DboOtherMod cooked them (A_<n>_<guid>), so each resolves there (field_paths_resolve) and the read finds the values
+    the CDO holds (A 1, B 2). Wrote the plain `A` and `B` before 2026-10-28: the struct has an import package, which
+    LowerField took for an engine struct's. The CDO's tags may say `A`: the loader finds a UserDefinedStruct member by
+    its authored name too (UUserDefinedStruct::CustomFindProperty), which a field path never does."""
+    import struct
+    cooked = [n for n in dumpexp.load(os.path.join(os.path.dirname(asset('DboOtherMod')), 'FDboOther'))[3]
+              if re.fullmatch(r'[AB]_\d+_[0-9A-F]{32}', n)]
+    base = asset('OtherStructRead')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__OtherStructRead_C')
+    o = next(t for t in pkg.tags(cdo) if t['name'] == 'O')
+    held = {m['name'].split('_')[0]: struct.unpack('<i', m['value'])[0] for m in pkg.tags(cdo, o['at'])}
+    fields = {'O': {n: held[n.split('_')[0]] for n in cooked}}
+    proves('mod-structs-ue.return-s-kills')
+    assert run(base, 'Read', fields)[0] == 12, fields
+    for m in (0, 7):
+        assert run(base, 'Built', {}, M=m)[0] == m * 10 + 5, m
+
+
+other_struct_read()
+print('ok  OtherStructRead: another mod\'s struct\'s members are read and written by the names its owner cooked')
+
+
 def defaults_other_ctor():
     """`O = FDboOther();` and `P = {};` of another mod's UE_STRUCT_IN struct are its value-initialisation, which C++
     makes from each member's initializer (the implicit default constructor, [class.base.init]/9; empty braces of an
