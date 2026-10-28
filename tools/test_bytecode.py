@@ -4053,6 +4053,36 @@ def ue_name_marker():
 ue_name_marker()
 
 
+def type_ue_name():
+    """TypeUeName: `FTunRow__UeName = "TunRow"` beside a struct, and the same beside an enum, is the name it cooks
+    under: its package, its object and every reference to it - a variable, a container, a replicated variable, an RPC's
+    and a function's parameters, an enum default, the registry row. TypeUeNameOther imports both (UE_STRUCT_IN /
+    UE_ENUM_IN) by those names. A type with no marker keeps its C++ name, prefix and all (every other test)."""
+    import dumpexp
+    base, other = asset('TypeUeName'), asset('TypeUeNameOther')
+    here = os.path.dirname(base)
+    proves('mod-structs-ue.static-constexpr-const-char-fboolarray-uename')
+    for cooked, cpp in (('TunRow', 'FTunRow'), ('TunMood', 'ETunMood')):
+        assert os.path.exists(os.path.join(here, cooked + '.uasset')), cooked
+        assert not os.path.exists(os.path.join(here, cpp + '.uasset')), cpp
+    assert {'TunMood::Angry', 'TunMood::Calm', 'TunMood::TunMood_MAX'} <= set(dumpexp.load(os.path.join(here, 'TunMood'))[3])
+    rows = {p for p, _ in registry_rows(registry_of('TypeUeName'))}
+    assert {'/Game/_ElytrasMods/TypeUeName/TunRow.TunRow', '/Game/_ElytrasMods/TypeUeName/TunMood.TunMood'} <= rows, rows
+    for b in (base, other):
+        keeps_invariants(b)
+        names = dumpexp.load(b)[3]
+        assert {'/Game/_ElytrasMods/TypeUeName/TunRow', 'TunRow', '/Game/_ElytrasMods/TypeUeName/TunMood', 'TunMood',
+                'TunMood::Angry'} <= set(names), b
+        assert not [n for n in names if 'FTunRow' in n or 'ETunMood' in n], b
+    assert run(base, 'Call')[0] == 5
+    refused('TypeUeNameNone', '  int32 X;\n', 'FNothing__UeName: names no struct or enum declared here',
+            'static constexpr const char *FNothing__UeName = "Nothing";\n')
+    print('ok  TypeUeName: a struct and an enum cook, and are named by this mod and another, under their __UeName names')
+
+
+type_ue_name()
+
+
 def map_pairs(pkg, tag):
     """A TMap tag's (key, value) pairs in order, each FName (an enum's, as a ByteProperty in a container writes it, too)
     or FString as text; it lists no removals."""

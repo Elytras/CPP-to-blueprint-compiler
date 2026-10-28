@@ -2660,11 +2660,15 @@ private:
         return A == Aliases.end() || A->second == CppName ? nullptr : Find(A->second);
     }
     /* A record's package and UClass / UScriptStruct name. A mod's own is cooked where its namespace says (PathIn),
-       named after its leaf, a class with _C; the engine's and the game's carry theirs in UE_CLASS. */
-    std::string PackageOf(const FRecord& R) const { return R.UePackage.empty() ? PathIn(ModPackage, R.CppName) : R.UePackage; }
+       named after its leaf, a class with _C, a struct by its `__UeName` marker where it has one; the engine's and the
+       game's carry theirs in UE_CLASS. */
+    std::string PackageOf(const FRecord& R) const
+    {
+        return R.UePackage.empty() ? PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName) : R.UePackage;
+    }
     std::string ClassOf(const FRecord& R) const
     {
-        return !R.UePackage.empty() ? R.UeName : LeafOf(R.CppName) + (R.bIsStruct ? "" : "_C");
+        return !R.UePackage.empty() ? R.UeName : R.bIsStruct ? LeafOf(CookedQual(R.CppName)) : LeafOf(R.CppName) + "_C";
     }
     /* OutDir holds UE_MOD_PACKAGE, and is <Content>/<that path without /Game>, as bpbuild stages a mod. A package under
        the mod's is saved under OutDir, any other /Game one under Content. The log names the first relative to OutDir. */
@@ -2720,6 +2724,15 @@ private:
     std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;   // C++ name -> its enumerators, in order
     std::map<std::string, std::map<std::string, std::string>> EnumUeNames;        // `<Enum>__UeEnumNames`: C++ -> cooked
     std::map<std::string, std::map<std::string, std::string>> EnumUeDisplay;      // and C++ -> display
+    /* `<Type>__UeName` beside a mod struct or enum: C++ name -> the name it is cooked under (CookedQual). */
+    std::map<std::string, std::string> TypeUeNames;
+    /* `A::FBoolArray` is `A::BoolArray` when a marker renames it: the C++ name a mod type's package path and object name
+       are made from. Any other name is itself. */
+    std::string CookedQual(const std::string& Qual) const
+    {
+        const auto It = TypeUeNames.find(Qual);
+        return It == TypeUeNames.end() ? Qual : Qual.substr(0, Qual.size() - LeafOf(Qual).size()) + It->second;
+    }
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     /* UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags of each native BlueprintEvent. A UeApi from before
        genueapi 6 lists the game Blueprints' functions too, and GameFunctionFlags takes those rows where they are. */
@@ -3461,6 +3474,14 @@ bool FCompiler::Collect(std::string* Err)
             }
             return;
         }
+        /* `static constexpr const char *FBoolArray__UeName = "BoolArray";` beside a mod struct or enum: the name it is
+           cooked under, which its package path and object name take and every import of it holds - one rebuilt from
+           an editor's, or renamed in C++ after it shipped. */
+        if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 8 && Name(N).compare(Name(N).size() - 8, 8, "__UeName") == 0)
+        {
+            FindLiteral(N, TypeUeNames[Ns + Name(N).substr(0, Name(N).size() - 8)]);
+            return;
+        }
         if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 8 && Name(N).compare(Name(N).size() - 8, 8, "__UeEnum") == 0)
         {
             std::string Owner;
@@ -4001,6 +4022,21 @@ bool FCompiler::Collect(std::string* Err)
         if (T.find('<') != std::string::npos || Records.count(StripTypeKeywords(T)) || EnumDecls.count(StripTypeKeywords(T))) Expand[A] = T;
     ExpandAliases(const_cast<Json&>(Doc), Expand);   // with none to expand it still drops a global `::`
     InferFromSources(EnumMarks, EnumUnderlying);
+    /* A `__UeName` marker names a struct or enum the source declares, or it would rename nothing. Another mod's struct
+       (UE_STRUCT_IN, or a folder's) was given the path its C++ name makes; the marker's name replaces that leaf. */
+    for (const auto& [Type, Ue] : TypeUeNames)
+        if (Ue.empty() || (!Records.count(Type) && !EnumDecls.count(Type)))
+        { *Err = Type + "__UeName: " + (Ue.empty() ? "give the name it is cooked under" : "names no struct or enum declared here"); return false; }
+    for (auto& [Key, R] : Records)
+    {
+        const std::string Natural = PathIn("", R.CppName);
+        if (R.bIsStruct && R.UeName == LeafOf(R.CppName) && R.UePackage.size() > Natural.size()
+            && R.UePackage.compare(R.UePackage.size() - Natural.size(), Natural.size(), Natural) == 0)
+        {
+            R.UePackage = PathIn(R.UePackage.substr(0, R.UePackage.size() - Natural.size()), CookedQual(R.CppName));
+            R.UeName = LeafOf(CookedQual(R.CppName));
+        }
+    }
     /* UE_FINAL_AS: the leaf's base is final in all but name. Its own code runs only on the leaf, which brings nothing
        of its own, so the base is compiled as `final` (FinalOwner, FUNC_Final) and cooked Abstract; a second subclass,
        here or in a mod that includes the header, would break that, so it is refused. */
@@ -4112,16 +4148,16 @@ bool FCompiler::Collect(std::string* Err)
         for (const auto& En : D->second)
             if (En.second < Bottom || En.second > Top)
             { *Err = "UE_ENUM(" + Enum + "): " + En.first + " is out of range (the largest value is _MAX's)"; return false; }
-        const std::string Leaf = LeafOf(Enum);
+        const std::string Leaf = LeafOf(Enum), UeLeaf = LeafOf(CookedQual(Enum));
         /* An enumerator's FName is <Enum>::<Name>, kept in one global map where the first enum loaded wins
            (UEnum::AddNamesToMasterList, Enum.cpp 83-94): the game's enum of that name would answer every lookup. */
-        if (auto N = Enums.find(Leaf); (Owner.empty() || Owner == ModPackage) && N != Enums.end()
+        if (auto N = Enums.find(UeLeaf); (Owner.empty() || Owner == ModPackage) && N != Enums.end()
             && N->second.Package.compare(0, ModPackage.size(), ModPackage) != 0)
-        { *Err = "UE_ENUM(" + Enum + "): " + N->second.Package + " already has an enum " + Leaf + ", whose enumerator names ("
-                 + Leaf + "::...) the engine keeps in one global table; rename it"; return false; }
+        { *Err = "UE_ENUM(" + Enum + "): " + N->second.Package + " already has an enum " + UeLeaf + ", whose enumerator names ("
+                 + UeLeaf + "::...) the engine keeps in one global table; rename it"; return false; }
         std::string First = D->second.front().first;
         for (const auto& En : D->second) if (En.second == 0) { First = En.first; break; }
-        Enums[Enum] = { PathIn(Owner.empty() ? ModPackage : Owner, Enum), Leaf, U, First };
+        Enums[Enum] = { PathIn(Owner.empty() ? ModPackage : Owner, CookedQual(Enum)), UeLeaf, U, First };
         if (const auto R = EnumUeNames.find(Enum); R != EnumUeNames.end())
         {
             for (const auto& [Cpp, Ue] : R->second)
@@ -4205,7 +4241,7 @@ bool FCompiler::Collect(std::string* Err)
             return false;
         }
         if (R.UePackage.empty() || R.bCooked) continue;          // a UE_COOKED class is imported, as another mod's is
-        if (R.UePackage != PathIn(ModPackage, R.CppName)) continue;
+        if (R.UePackage != PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName)) continue;
         if (!R.bIsStruct && R.UeName != LeafOf(R.CppName) + "_C")
         {
             *Err = "UE_CLASS on " + R.CppName + " says \"" + R.UeName
@@ -18498,7 +18534,7 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
    cook identical packages at the same path. A wrapper's own member may need a deeper one. */
 bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir, std::string* Err)
 {
-    const std::string PackageName = PathIn(ModPackage, Enum), Name = LeafOf(Enum);
+    const std::string PackageName = Enums[Enum].Package, Name = Enums[Enum].UeName;
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, Name, "", "", false);
