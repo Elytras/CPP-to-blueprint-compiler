@@ -5390,7 +5390,8 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
     std::string Tmp;
     if (!MakeTemp(Type, BP, &Tmp, Err)) return false;
 
-    const bool bPlainName = R->IsNative() || IsInternalViewStruct(R->CppName);
+    /* Another mod's struct (UE_STRUCT_IN) is a UserDefinedStruct too: its members are the minted names its owner cooked. */
+    const bool bPlainName = (R->IsNative() && !R->IsModStruct()) || IsInternalViewStruct(R->CppName);
     const FIndex Struct = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
     auto Body = std::make_shared<std::vector<FStmtIR>>();
     size_t I = 0;
@@ -5560,7 +5561,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
     {
         if (!ObjRaw) { *Err = "struct member access with no object: " + Name(MemberNode); return false; }
         Out.K = FArgIR::Member;
-        Out.S = (R->IsNative() || IsInternalViewStruct(R->CppName))
+        Out.S = ((R->IsNative() && !R->IsModStruct()) || IsInternalViewStruct(R->CppName))
                     ? UeNameOf(R, Name(MemberNode))
                     : ModFieldNameOf(*R, PackageOf(*R), Name(MemberNode));
         Out.Owner = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
