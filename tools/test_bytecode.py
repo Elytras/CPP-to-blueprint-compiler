@@ -13051,6 +13051,38 @@ print('ok  UnlikeCppRefusals: a UE_STRUCT method that is not inline, and a quali
       'name, a call or a cast, are refused')
 
 
+def source_of_a_location():
+    """A location in clang's dump is an offset into its own file, and every source of a mod has that offset. Os.cpp's
+    other source, Aa.h (a comment, sorted first), has `OsBase::Bump` where Os.cpp's unqualified `GetOther()->Bump` is,
+    and a comment above where Go begins. Read in the first source that fit, the call was refused as qualified on another
+    object and Go took Aa.h's comment as its tooltip (EMM, 2026-10-29); read in Os.cpp, Go compiles with its own."""
+    main = ('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\n#include "Aa.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Os");\n'
+            'class OsBase : public AActor {\npublic:\n  int32 Bump(int32 V) { return V + 1; }\n};\n'
+            'class Os : public AActor {\npublic:\n  OsBase *Other;\n  OsBase *GetOther() { return Other; }\n'
+            '  // Bumps the other one.\n  int32 Go() { return GetOther()->Bump(1); }\n};\n')
+    go, bump = main.index('int32 Go'), main.index('Bump(1)')
+    decoy = list('/*' + ' ' * (bump + 2))
+    for at, text in ((go - 16, '\n// Stray words\n'), (go, 'Go;'), (bump - 8, 'OsBase::Bump')):
+        decoy[at:at + len(text)] = text
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, 'Aa.h'), 'w', encoding='utf-8', newline='\n') as f:
+            f.write(''.join(decoy) + '*/\n')
+        src = os.path.join(tmp, 'Os.cpp')
+        with open(src, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(main)
+        os.makedirs(os.path.join(tmp, 'api'))
+        proc = assetgen_compile([src, UEAPI, tmp, '--api', os.path.join(tmp, 'api')])
+        proves('calling-the-parent.other-superbase-bump-1')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        api = b''.join(open(p, 'rb').read() for p in glob.glob(os.path.join(tmp, 'api', '**', '*.u*'), recursive=True))
+    proves('access-read-only.doc-comment-tooltip')
+    assert b'Bumps the other one.' in api and b'Stray words' not in api, 'Go: a tooltip from the wrong source'
+
+
+source_of_a_location()
+print("ok  SourceOfALocation: a qualifier and a tooltip are read in the node's own source, not another at the same offset")
+
+
 def widget_no_tree_warns():
     """A widget shows its tree's root (UserWidget.cpp 745), and the engine makes a tree only for a
     WidgetBlueprintGeneratedClass (Initialize, 109-151). Every widget class AssetGen cooks is a BlueprintGeneratedClass,
