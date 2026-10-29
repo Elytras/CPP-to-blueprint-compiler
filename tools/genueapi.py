@@ -421,7 +421,7 @@ def game_structs(own, content):
             del STRUCTS[st.cpp]
     while True:
         held = [st for st in STRUCTS.values() if st.is_game and any(d not in STRUCTS for d in
-                [w for t, _ in st.fields for w in type_words(t, "F") if w != st.cpp])]
+                [w for t, _ in st.fields for w in type_words(t, "F") if w != st.cpp and w not in CONV_STRUCTS])]
         if not held:
             break
         for st in held:
@@ -492,12 +492,19 @@ def game_enum_types(own, content):
     namespace (path_namespace). Its path is known only where the comment gives it (bFullAssetPaths) or the short name
     is its alone: Dumper-7's `_0` follows no package order."""
     dropped = []
+    # Names that differ only in case (CD2's EJSONType, EMM's EJsonType) Dumper-7 leaves apart, but their headers are one
+    # file on Windows: each goes in its path's namespace as a shared name does, and all in the header of the first.
+    spellings = {}
+    for en in GAME_ENUMS.values():
+        leaf = en.cpp.rsplit("::", 1)[-1]
+        spellings.setdefault(leaf.lower(), set()).add(leaf)
     for en in sorted(GAME_ENUMS.values(), key=lambda e: e.cpp):
         paths = [en.pkg] if en.pkg.startswith("/") else GAME_ENUM_PATHS.get((en.pkg, en.ue_name), [])
         path = paths[0] if len(paths) == 1 else None
         values = en.values
         dumped, leaf = en.cpp, en.cpp.rsplit("::", 1)[-1]
-        ns = path_namespace(path) if path and dumped != leaf else None
+        twins = spellings[leaf.lower()]
+        ns = path_namespace(path) if path and (dumped != leaf or len(twins) > 1) else None
         cpp = ns + "::" + leaf if ns else dumped
         # UE_ENUM_IN names the owner, the folder: the package must be named as the enum is.
         why = "no /Game path" if not paths else "shared name" if not path \
@@ -526,7 +533,7 @@ def game_enum_types(own, content):
             continue
         if cpp != dumped:
             QUALIFIED[dumped] = cpp
-        en.cpp, en.values, en.path, en.pkg = cpp, values, path, "Game/" + leaf
+        en.cpp, en.values, en.path, en.pkg = cpp, values, path, "Game/" + min(twins)
         ENUMS[cpp] = en
     kept = sum(1 for e in ENUMS.values() if e.path)
     print("  game enums: %d kept, %d left out (%s)" % (kept, len(dropped), ", ".join(
