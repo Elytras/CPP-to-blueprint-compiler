@@ -9255,7 +9255,9 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     /* A static member template's instantiation is its class's function under the name its arguments give it. */
     if (const auto Inst = InstanceNames.find(DeclId); Inst != InstanceNames.end()) MethodName = Inst->second;
     /* A child struct for its parent, as an argument or as the object of the parent's method (StructUpcastBelow). The
-       way out is the child's own conversion, where UeApi declares one (FPointerEvent::GetInputEventFromPointerEvent). */
+       slice C++ makes is the child's own conversion, where UeApi declares one: `E.GetInputEventFromPointerEvent()`, the
+       editor's To Input Event node, a native that copies out the parent. The call is lowered with it in the child's
+       place; with none, it is refused. */
     for (size_t I = 0; const Json* A = Nth(CallExprNode, I); ++I)
     {
         const Json* Of = I > 0 ? A : K == "CXXMemberCallExpr" ? First(*Callee) : nullptr;
@@ -9269,10 +9271,31 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             continue;
         const std::string Conv = "Get" + Parent.substr(1) + "From" + Child.substr(1);
         const FRecord* CR = Find(Child);
+        // ponytail: one step only; FAnalogInputEvent to FInputEvent (via GetKeyEventFromAnalogInputEvent) is refused.
+        const Json* ConvDecl = nullptr;
+        if (CR)
+            if (const auto M = CR->Methods.find(Conv); M != CR->Methods.end()) ConvDecl = M->second;
+        if (ConvDecl)
+        {
+            const Json Sliced = { {"kind", "CXXMemberCallExpr"}, {"type", {{"qualType", Parent}}}, {"valueCategory", "prvalue"},
+                                  {"inner", Json::array({ { {"kind", "MemberExpr"}, {"name", Conv}, {"isArrow", false},
+                                      {"type", {{"qualType", "<bound member function type>"}}},
+                                      {"referencedMemberDecl", ConvDecl->value("id", std::string())},
+                                      {"inner", Json::array({ *First(*Up) })} } })} };
+            Json Call = CallExprNode;
+            if (I > 0) Call["inner"][I] = Sliced;
+            else
+            {
+                Json Member = *Callee;
+                Member["inner"][0] = Sliced;
+                Call["inner"][0] = std::move(Member);
+            }
+            return LowerCall(Call, BP, Out, Err);
+        }
         *Err = MethodName + (I == 0 ? "'s object" : " argument " + std::to_string(I)) + " is an " + Child
              + " where an " + Parent + " is wanted: Blueprint passes only the exact struct (the editor disallows a derived "
-             "one), and the VM would copy the whole " + Child + " into an " + Parent + "-sized slot, past its end; "
-             + (CR && CR->Methods.count(Conv) ? "pass " + Child + "'s " + Conv + "()" : "convert it to an " + Parent + " first");
+             "one), the VM would copy the whole " + Child + " into an " + Parent + "-sized slot, past its end, and UeApi "
+             "declares no " + Child + "::" + Conv + " to make the slice; convert it to an " + Parent + " first";
         return false;
     }
     /* SpawnActor returns None while a construction script runs (bIsRunningConstructionScript, LevelActor.cpp), and the
