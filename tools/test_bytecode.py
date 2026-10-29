@@ -14649,32 +14649,29 @@ def input_refusals():
         refused(mod, body, why, base=base)
 
 
-def struct_upcast_refusals():
-    """A struct passed where its parent struct is wanted is refused, naming both: the VM would copy the whole child into
-    the parent-sized slot (a native's const reference, a function's by-value parameter, the object of a method the
-    parent declares). The control is the child's own conversion, which the message names: it compiles."""
-    import tempfile
+def struct_slices():
+    """A struct passed where its parent struct is wanted is the slice C++ makes: the child's own conversion
+    (GetInputEventFromPointerEvent, a native that copies out the parent) runs on it, and the call takes what it returns,
+    never the child itself, which the VM would copy whole into the parent-sized slot. So for a native's const reference,
+    the object of a method the parent declares and a function's by-value parameter. A child with no conversion is
+    refused, naming both."""
     proves('struct-conversions.ukismetinputlibrary-inputevent-iscontroldown-mouseevent')
-    top = '#include "UeApi/SlateCore.h"\n'
-    wanted = 'is an FPointerEvent where an FInputEvent is wanted'
-    for mod, body, why in (
-            ('UpcastNative', '  bool F(const FPointerEvent &E) { return UKismetInputLibrary::InputEvent_IsControlDown(E); }\n',
-             'InputEvent_IsControlDown argument 1 ' + wanted),
-            ('UpcastSugar', '  bool F(const FPointerEvent &E) { return E.InputEvent_IsControlDown(); }\n',
-             "InputEvent_IsControlDown's object " + wanted),
-            ('UpcastHint', '  bool F(const FPointerEvent &E) { return E.InputEvent_IsControlDown(); }\n',
-             "past its end; pass FPointerEvent's GetInputEventFromPointerEvent()"),
-            ('UpcastByValue', '  void Take(FInputEvent E) {}\n  void F(const FKeyEvent &K) { Take(K); }\n',
-             'Take argument 1 is an FKeyEvent where an FInputEvent is wanted')):
-        refused(mod, body, why, top=top)
-    with tempfile.TemporaryDirectory() as tmp:
-        src = os.path.join(tmp, 'UpcastConverted.cpp')
-        with open(src, 'w', encoding='utf-8') as f:
-            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\n' + top
-                    + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/UpcastConverted");\nclass UpcastConverted : public AActor {\n'
-                    'public:\n  bool F(const FPointerEvent &E) { return E.GetInputEventFromPointerEvent().InputEvent_IsControlDown(); }\n};\n')
-        proc = assetgen_compile([src, UEAPI, tmp])
-    assert proc.returncode == 0, proc.stdout
+    tmp, out, _ = compile_to(EDIT_HEAD + '#include "UeApi/SlateCore.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/StructSlice");\n'
+                             'class StructSlice : public AActor {\npublic:\n'
+                             '  bool Native(const FPointerEvent &E) { return UKismetInputLibrary::InputEvent_IsControlDown(E); }\n'
+                             '  bool Sugar(const FPointerEvent &E) { return E.InputEvent_IsControlDown(); }\n'
+                             '  void Take(FInputEvent In) {}\n  void ByValue(const FKeyEvent &K) { Take(K); }\n};\n', 'StructSlice')
+    base = os.path.join(out, 'StructSlice')
+    for fn, conv, arg, callee in (('Native', 'GetInputEventFromPointerEvent', 'E', "Function'InputEvent_IsControlDown'"),
+                                  ('Sugar', 'GetInputEventFromPointerEvent', 'E', "Function'InputEvent_IsControlDown'"),
+                                  ('ByValue', 'GetInputEventFromKeyEvent', 'K', r'LocalVirtualFunction\s+Take')):
+        text = dump('walkscript.py', base, export_index(base, fn))
+        assert re.search(r"Function'%s'\s*\n.*LocalOutVariable\s+%s@" % (conv, arg), text), (fn, text)
+        assert not re.search(r"%s\s*\n.*Local\w*Variable\s+%s@" % (callee, arg), text), (fn, text)
+    shutil.rmtree(tmp, ignore_errors=True)
+    proves('struct-conversions.take-motion')
+    refused('SliceNoConv', '  void Take(const FInputEvent &E) {}\n  void F(const FMotionEvent &M) { Take(M); }\n',
+            'Take argument 1 is an FMotionEvent where an FInputEvent is wanted', top='#include "UeApi/SlateCore.h"\n')
 
 
 def input_key_names():
@@ -14717,9 +14714,9 @@ input_refusals()
 print('ok  InputRefusals: a key or action marker on no actor, a static or inline method, one returning a value or taking '
       'more than the key, an unknown option or an action\'s modifier, a key the engine does not have, or marking no '
       'method is refused')
-struct_upcast_refusals()
-print('ok  StructUpcast: a child struct passed for its parent - to a native\'s const reference, a by-value parameter, '
-      'or as the object of the parent\'s method - is refused, and the child\'s own conversion compiles')
+struct_slices()
+print('ok  StructSlice: a child struct passed for its parent - to a native\'s const reference, a by-value parameter, '
+      'or as the object of the parent\'s method - is sliced by its own conversion; one with none is refused')
 with_ini = input_key_names()
 print('ok  InputKeyNames: a key the engine has compiles whatever its case, a character key too, and its FKey literal '
       'says nothing; a literal of no key warns, naming the closest; ' + (
