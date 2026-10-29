@@ -225,11 +225,15 @@ class Enum(object):
         self.cpp, self.pkg, self.underlying = cpp, pkg, underlying
         self.values = []
         self.form = None         # "EnumClass" / "TEnumAsByte" off its properties (read_enum_forms), None if none says
+        self.path = None         # a game Blueprint's enum (UserDefinedEnum): its /Game package, Game/<cpp>.h (game_enum_types)
+        self.cooked = {}         # and enumerator -> its cooked name (NewEnumeratorN), where that is not the C++ one
 
 
 ENUM_COMMENT = re.compile(r"^// Enum (\S+)\.(\w+)\s*$")
 BP_ENUM_COMMENT = re.compile(r"^// UserDefinedEnum (\S+)\.(\w+)\s*$")
 BP_ENUMS = set()     # the C++ names of the game's Blueprint enums (UserDefinedEnum), filled by parse_structs
+GAME_ENUMS = {}      # cpp name -> Enum of each unqualified one, its pkg the package's short name: game_enum_types keeps some
+GAME_ENUM_PATHS = {}     # (package short name, object name) -> [/Game package paths] of each UserDefinedEnum, off the object dump
 ENUM_DECL = re.compile(r"^enum class ((?:\w+::)*\w+) : (\w+)\s*$")
 ENUM_VALUE = re.compile(r"^\t(\w+)\s*=\s*(-?\d+),?\s*$")
 STRUCT_COMMENT = re.compile(r"^// ScriptStruct (\S+)\.(\w+)\s*$")
@@ -274,6 +278,10 @@ def parse_structs(path, pkg):
                 cur_enum.ue_name = pending[2]     # `TextureGroup`, where Dumper-7 says ETextureGroup
             elif pending and pending[0] == "bpenum":
                 BP_ENUMS.add(m.group(1))
+                # Dumper-7 qualifies one whose name another enum takes (`ELogLevel_0::ELogLevel`): no C++ type for those.
+                if "::" not in m.group(1):
+                    cur_enum = GAME_ENUMS[m.group(1)] = Enum(m.group(1), pending[1], m.group(2))
+                    cur_enum.ue_name = pending[2]
             pending = None
             continue
         m = STRUCT_DECL.match(line)
@@ -380,6 +388,68 @@ def game_structs(own, content):
         "%s %d" % (w, c) for w, c in collections.Counter(w for _, w in dropped).most_common())))
 
 
+def cooked_enum_names(content, path):
+    """{value: cooked enumerator name, `NewEnumerator0`} of the UserDefinedEnum in the game's package at path, under
+    content (--game), the closing _MAX among them; None when there is no such package."""
+    import invariants
+    base = os.path.join(content, path[len("/Game/"):])
+    p = invariants.Package(base) if os.path.exists(base + ".uasset") else None
+    ex = [i for i in range(len(p.exports)) if p.class_of(i + 1) == "UserDefinedEnum"] if p else []
+    if not ex:
+        return None
+    # UEnum::Serialize after the tags: an object-GUID flag, then int32 count x (FName, int64) (Enum.cpp 33-90).
+    r = invariants.Rd(p.blob(ex[0]), p.tags(ex[0]).end)
+    if r.i32():
+        r.o += 16
+    out = {}
+    for _ in range(r.i32()):
+        name = p._name(r).split("::")[-1]
+        out[r.i64()] = name
+    return out
+
+
+def game_enum_types(own, content):
+    """Gives a game Blueprint's enum (UserDefinedEnum) a C++ type, Game/<cpp>.h, where AssetGen can import it as another
+    mod's UE_ENUM_IN enum: its /Game package off the object dump (the `// UserDefinedEnum` comment names only the
+    package's short name), and its cooked enumerator names off that package (--game), joined to the dump's by value -
+    Dumper-7's fork writes the display names, so `Closed` is cooked NewEnumerator0 (EnumManager.cpp BlueprintEnumNames).
+    Into ENUMS, so map_type takes every member, parameter and dispatcher of one; the rest stay out, as before."""
+    dropped = []
+    for en in sorted(GAME_ENUMS.values(), key=lambda e: e.cpp):
+        paths = GAME_ENUM_PATHS.get((en.pkg, en.ue_name), [])
+        path = paths[0] if len(paths) == 1 else None
+        values = en.values
+        # UE_ENUM_IN names the owner, the folder: the package must be named as the enum is.
+        why = "no /Game path" if not paths else "shared name" if not path \
+            else "package name" if path.rsplit("/", 1)[-1] != en.ue_name \
+            else "ours" if (path + "/").startswith(own) else "no --game" if not content \
+            else "name taken" if en.cpp in ENUMS or en.cpp in STRUCTS \
+            else "%s underlying" % en.underlying if en.underlying != "uint8" else None
+        if not why:
+            by_value = cooked_enum_names(content, path)
+            # The sentinel the engine adds is named off the enum's prefix (Minehead_State's is Minehead_MAX): the dump
+            # writes it as the last, largest value, and the header leaves it out as UE_ENUM's would.
+            top = max(by_value) if by_value else None
+            values = [(n, v) for n, v in en.values if not (v == top and n == by_value[top])]
+            # Each of the dump's other values once, and the cooked _MAX beside them.
+            if by_value is None:
+                why = "no package"
+            elif not values or len(by_value) != len(values) + 1 or any(v not in by_value for _, v in values):
+                why = "entries"
+            else:
+                en.cooked = dict((n, by_value[v]) for n, v in values if by_value[v] != n)
+        if why:
+            dropped.append(why)
+            if why != "ours":
+                GAPS.append(("game enum", en, "", "", why))
+            continue
+        en.values, en.path, en.pkg = values, path, "Game/" + en.cpp
+        ENUMS[en.cpp] = en
+    kept = sum(1 for e in ENUMS.values() if e.path)
+    print("  game enums: %d kept, %d left out (%s)" % (kept, len(dropped), ", ".join(
+        "%s %d" % (w, c) for w, c in collections.Counter(dropped).most_common())))
+
+
 def resolve_structs():
     """Second pass: map field types now that every struct and enum name is known. `fields` are C++'s order, the super's
     members first, which the stub's constructor takes; `link` is what EX_StructConst writes: UStruct::Link fills
@@ -467,6 +537,11 @@ def struct_deps(st):
     return out
 
 
+def game_enum_words(t):
+    """The game Blueprint enums type t names, anywhere in it."""
+    return [w for w in re.findall(r"\bE\w+", t) if w in ENUMS and ENUMS[w].path]
+
+
 def beside(pkg, target):
     """target's header as pkg's header spells it: relative to its own folder ("../UeMeta" from Game/X), so a
     header resolves with no include path at all - an editor's IntelliSense has none."""
@@ -510,6 +585,14 @@ def emit_enum(en):
     body = ["enum class %s : %s" % (en.cpp, en.underlying), "{"]
     body += ["    %-*s = %d," % (width, n, v) for n, v in en.values]
     body.append("};")
+    if en.path:
+        # A game Blueprint's enum is imported as another mod's would be: its owner, its object name, its cooked names.
+        body.append('UE_ENUM_IN(%s, "%s");' % (en.cpp, en.path.rsplit("/", 1)[0]))
+        if en.ue_name != en.cpp:
+            body.append('static constexpr const char* %s__UeName = "%s";' % (en.cpp, en.ue_name))
+        if en.cooked:
+            body.append('static constexpr const char* %s__UeEnumNames = "%s";'
+                        % (en.cpp, "|".join("%s=%s" % (n, en.cooked[n]) for n, _ in en.values if n in en.cooked)))
     return "\n".join(body)
 
 
@@ -570,7 +653,8 @@ def write_operators(classes, out_dir):
 
 def write_types(out_dir):
     rows = ['{', '  "enums": {']
-    ens = sorted(ENUMS.values(), key=lambda e: e.cpp)
+    # A game Blueprint's enum is not here: its header's UE_ENUM_IN says what the compiler needs (emit_enum).
+    ens = sorted((e for e in ENUMS.values() if not e.path), key=lambda e: e.cpp)
     rows += ['    "%s": {"package": "/Script/%s", "name": "%s", "underlying": "%s", "first": "%s"%s}%s'
              % (e.cpp, e.pkg, e.ue_name, e.underlying, e.values[0][0] if e.values else "",
                 ', "form": "%s"' % e.form if e.form else "", "," if i + 1 < len(ens) else "")
@@ -889,6 +973,9 @@ def read_real_fields(sdk_dir):
             continue
         m = DUMP_OBJECT.match(line)
         owner = m.group(2).rstrip("\r\n") if m else None
+        if m and m.group(1) == "UserDefinedEnum":
+            package, name = owner.rsplit(".", 1)
+            GAME_ENUM_PATHS.setdefault((package.rsplit("/", 1)[-1], name), []).append(package)
         cur = REAL_FIELDS.setdefault(owner, {}) if m and (m.group(1).endswith("Class") or m.group(1) == "UserDefinedStruct") \
             else None
         sig = SIGNATURES.setdefault(owner, []) if m and m.group(1) in ("DelegateFunction", "SparseDelegateFunction") else None
@@ -1290,8 +1377,8 @@ def parse_header(path):
         ret_raw, params_raw = m.group(2), m.group(4)
         if m.group(1):
             # ponytail: a static's Blueprint enum is passed as the byte the VM passes (a function library's static has no
-            # override to carry the property's Enum to). Every other member of one stays out, and the enum has no C++
-            # type: that needs its cooked NewEnumeratorN names off --game, as Dumper-7 writes the display names (TODO.md).
+            # override to carry the property's Enum to), even where game_enum_types gave the enum a C++ type, so the
+            # mods written against the byte keep compiling. Typing it would need TEnum<E> to take a uint8.
             as_byte = lambda t: re.sub(r"\b(?:\w+::)*E\w+\b",
                                        lambda e: "uint8" if e.group(0) in BP_ENUMS else e.group(0), t)
             ret_raw, params_raw = as_byte(ret_raw), as_byte(params_raw)
@@ -1864,16 +1951,18 @@ def main():
 
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_structs.hpp")):
         parse_structs(os.path.join(sdk_dir, name), name[: -len("_structs.hpp")])
-    resolve_structs()
     read_real_fields(sdk_dir)
-
-    headers = sorted(f for f in os.listdir(sdk_dir) if f.endswith("_classes.hpp"))
-    classes, totals, pathless = [], dict((k, 0) for k in KINDS), 0
     # The packages the mods next to UeApi cook (UE_MOD_PACKAGE), not the rest of /Game/_ElytrasMods.
     mod_dir = os.path.dirname(os.path.abspath(out_dir))
     own = ("/Game/_ElytrasMods/_NestedContainerStructs/",) + tuple(sorted(set(
         m + "/" for f in os.listdir(mod_dir) if f.endswith((".cpp", ".h"))
         for m in re.findall(r'UE_MOD_PACKAGE\("([^"]+)"', io.open(os.path.join(mod_dir, f), encoding="utf-8-sig").read()))))
+    # Before the struct members are mapped: a game struct may hold a game enum.
+    game_enum_types(own, game_dir)
+    resolve_structs()
+
+    headers = sorted(f for f in os.listdir(sdk_dir) if f.endswith("_classes.hpp"))
+    classes, totals, pathless = [], dict((k, 0) for k in KINDS), 0
     game_structs(own, game_dir)
     read_ref_parms(sdk_dir)
     for name in headers:
@@ -1978,8 +2067,11 @@ def main():
     for st in STRUCTS.values():
         deps[st.pkg].update(STRUCTS[d].pkg for d in struct_deps(st) if STRUCTS[d].pkg != st.pkg)
         deps[st.pkg].update(ENUMS[t].pkg for t, _ in st.fields if t in ENUMS and ENUMS[t].pkg != st.pkg)
+        deps[st.pkg].update(ENUMS[w].pkg for t, _ in st.fields for w in game_enum_words(t))
     for k in ordered:
         for t in [t for _, r, _, ps in k.funcs for t in [r] + [pt for pt, _ in ps]] + [t for t, _ in k.fields]:
+            # A game enum in a container or a dispatcher's signature (`TMulticastInlineDelegate<void(EDroppodDoorState)>`).
+            deps[k.header].update(ENUMS[w].pkg for w in game_enum_words(t))
             for w in re.findall(r"\bF\w+", t):
                 if w != t and w in STRUCTS and STRUCTS[w].is_game:
                     deps[k.header].add(STRUCTS[w].pkg)
@@ -2261,7 +2353,8 @@ def main():
             if k.ns and k.ue_name in old_unique:
                 body.append("using %s = %s;" % (k.ue_name, k.emit))
 
-        title = ("Blueprint struct " if pkg[len("Game/"):] in STRUCTS else "Blueprint class ") + pkg[len("Game/"):] \
+        title = ("Blueprint struct " if pkg[len("Game/"):] in STRUCTS else "Blueprint enum " if pkg[len("Game/"):] in ENUMS
+                 else "Blueprint class ") + pkg[len("Game/"):] \
             if pkg.startswith("Game/") else "Package /Script/" + pkg
         out = ["#pragma once",
                "/*",
