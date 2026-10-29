@@ -241,6 +241,16 @@ def dep_stage(dep, by_name, bp):
     return content_dir(fsd, package), package, fsd
 
 
+def net_contract_holds(stage_content, baseline, name):
+    """A mod with a `net_contract` keeps the replicated surface its released version shipped (netsurface.py): a pak
+    that changes or drops any of it would disconnect that version's clients, so it is not packed."""
+    import netsurface
+    problems = netsurface.check(json.load(io.open(baseline, encoding="utf-8")), netsurface.surface(stage_content))
+    for line in problems:
+        print("%-16s %s" % (name, line))
+    return not problems
+
+
 def embed_deps(dep_stages, stage_fsd, assetgen):
     """Copy each dep's staged assets into this mod's FSD tree so the pak is self-contained, and its
     registry rows into the pak's one FSD/AssetRegistry.bin. Clears each dest first so a
@@ -814,6 +824,9 @@ def main():
         if no_pak:
             continue
         if embed and not embed_deps(dep_stages, stage_fsd, assetgen):
+            failed.append(name)
+            continue
+        if mod.get("net_contract") and not net_contract_holds(stage_content, os.path.join(bp, mod["net_contract"]), name):
             failed.append(name)
             continue
         stage_bundle(bundle, stage_fsd)
