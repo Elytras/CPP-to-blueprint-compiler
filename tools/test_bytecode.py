@@ -9384,6 +9384,33 @@ def game_bp_enum():
 print('ok  GameBpEnum: a game Blueprint enum, its member and dispatcher - %s' % game_bp_enum())
 
 
+def game_bp_enum_namespaced():
+    """A game Blueprint enum whose name another type takes is written by genueapi in its /Game path's namespace
+    (emit_enum's own text here), and the compiler imports it from that path: the namespace is the folder, the
+    __UeName the object, as for any `Game::` type (PathIn)."""
+    import genueapi
+    en = genueapi.Enum('Game::Art::DropPod::EDroppodDoorState', 'Game/EDroppodDoorState', 'uint8')
+    en.values, en.path, en.ue_name = [('Closed', 0), ('OuterOpen', 1), ('Open', 2)], '/Game/Art/DropPod/DroppodDoorState', 'DroppodDoorState'
+    en.cooked = {'Closed': 'NewEnumerator0', 'OuterOpen': 'NewEnumerator1', 'Open': 'NewEnumerator2'}
+    tmp, out, _ = compile_to(EDIT_HEAD + genueapi.emit_enum(en) + '\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GameBpEnumNs");\n'
+                             'class GbnWatch : public AActor {\npublic:\n'
+                             '  ::Game::Art::DropPod::EDroppodDoorState Last = ::Game::Art::DropPod::EDroppodDoorState::Open;\n'
+                             '  bool IsOpen() { return Last == ::Game::Art::DropPod::EDroppodDoorState::Open; }\n};\n',
+                             'GameBpEnumNs')
+    assert sorted(os.listdir(out)) == ['GbnWatch.uasset', 'GbnWatch.uexp'], os.listdir(out)
+    pkg = os.path.join(out, 'GbnWatch')
+    keeps_invariants(pkg)
+    imports, names = import_paths(pkg, classes=True), dumpexp.load(pkg)[3]
+    shutil.rmtree(tmp, ignore_errors=True)
+    proves('game-enums.shared-name')
+    assert ('/Game/Art/DropPod/DroppodDoorState.DroppodDoorState', '/Script/Engine.UserDefinedEnum') in imports, imports
+    assert 'DroppodDoorState::NewEnumerator2' in names, names
+
+
+game_bp_enum_namespaced()
+print('ok  GameBpEnumNs: a game Blueprint enum in its path\'s namespace is imported from that path')
+
+
 def object_through_interface():
     """`TScriptInterface<ITargetable>(Player)->Fn()` on an object UeApi does not know implements the interface is the
     editor's call of it: InterfaceContext of the object itself, no ObjToInterfaceCast (execInterfaceContext takes the object

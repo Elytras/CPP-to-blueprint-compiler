@@ -149,9 +149,49 @@ TEXT_TYPES = {
 STRUCTS = {}     # cpp name -> Struct, filled by parse_structs before any class header is mapped
 ENUMS = {}       # cpp name -> Enum
 GAME_STRUCT_NAMES = {}   # Dumper-7's name of a game struct -> its own, where they differ (game_structs)
+# Dumper-7 qualifies an enum or struct whose name another one takes (`BoolArray_0::FBoolArray`, `Engine::EModuleType`).
+# Ours, by the user's rule: a native one keeps the plain name, `EModuleType`; a game Blueprint's goes in its /Game
+# path's namespace, as a game Blueprint class sharing a name does (`Game::_ElytrasMods::_Shared::FBoolArray`).
+QUALIFIED = {}           # Dumper-7's qualified spelling -> ours
 OUT_PTR = re.compile(r"^((?:struct\s+)?[A-Za-z_][\w<>, \*:]*?)\s*\*$")     # Dumper-7 spells a non-object out-parm as T*
-STRUCT_REF = re.compile(r"^(?:const\s+)?struct\s+(F\w+)\s*&?$")
-ENUM_REF = re.compile(r"^(?:const\s+)?(?:TEnumAsByte<)?(E\w+)>?\s*&?$")
+STRUCT_REF = re.compile(r"^(?:const\s+)?struct\s+((?:\w+::)?F\w+)\s*&?$")
+ENUM_REF = re.compile(r"^(?:const\s+)?(?:TEnumAsByte<)?((?:\w+::)?E\w+)>?\s*&?$")
+
+
+def enum_ref(t):
+    """The enum t names as its whole type, by our spelling of it (QUALIFIED), else None."""
+    m = ENUM_REF.match(t)
+    return QUALIFIED.get(m.group(1), m.group(1)) if m else None
+
+
+def type_words(t, prefix):
+    """The structs (prefix F) or enums (E) a mapped type names anywhere in it, a namespaced one whole."""
+    return re.findall(r"(?<![\w:])(?:\w+::)*%s\w+" % prefix, t)
+
+
+def path_namespace(path):
+    """`Game::A::B` for the package /Game/A/B/Name: the namespace a game Blueprint's type takes when its name is shared.
+    None where a folder is no C++ identifier, or the path is outside /Game, since the compiler reads the path back off
+    the namespace (Cpp.cpp PathIn)."""
+    parts = path.strip("/").split("/")[:-1]
+    if parts[:1] != ["Game"] or not all(re.match(r"^[A-Za-z_]\w*$", p) for p in parts):
+        return None
+    return "::".join(parts)
+
+
+def namespaced(cpp, body):
+    """body's lines, inside the namespace of the qualified name cpp, if it has one."""
+    if "::" not in cpp:
+        return body
+    ns = cpp.rsplit("::", 1)[0].split("::")
+    return ["namespace " + " { namespace ".join(ns) + " {"] + body + ["}" * len(ns) + "   // namespace " + "::".join(ns)]
+
+
+def rooted(t):
+    """t with each namespaced enum or struct written from the root, `::Game::...`: inside a Blueprint's own namespace
+    a bare `Game::` can find an inner one (main's `written`)."""
+    return re.sub(r"(?<![\w:])(Game::(?:\w+::)*\w+)",
+                  lambda m: "::" + m.group(1) if m.group(1) in ENUMS or m.group(1) in STRUCTS else m.group(1), t)
 
 
 def map_type(raw):
@@ -199,11 +239,11 @@ def map_type(raw):
         inner = map_type(m.group(1))
         return "other" if inner == "void" else inner if inner in KINDS else inner + "&"
     m = STRUCT_REF.match(t)
-    if m and GAME_STRUCT_NAMES.get(m.group(1), m.group(1)) in STRUCTS:
-        return GAME_STRUCT_NAMES.get(m.group(1), m.group(1))
-    m = ENUM_REF.match(t)
-    if m and m.group(1) in ENUMS:
-        return m.group(1)
+    name = QUALIFIED.get(m.group(1), m.group(1)) if m else None
+    if m and GAME_STRUCT_NAMES.get(name, name) in STRUCTS:
+        return GAME_STRUCT_NAMES.get(name, name)
+    if enum_ref(t) in ENUMS:
+        return enum_ref(t)
     return classify(t)
 
 
@@ -232,7 +272,9 @@ class Enum(object):
 ENUM_COMMENT = re.compile(r"^// Enum (\S+)\.(\w+)\s*$")
 BP_ENUM_COMMENT = re.compile(r"^// UserDefinedEnum (\S+)\.(\w+)\s*$")
 BP_ENUMS = set()     # the C++ names of the game's Blueprint enums (UserDefinedEnum), filled by parse_structs
-GAME_ENUMS = {}      # cpp name -> Enum of each unqualified one, its pkg the package's short name: game_enum_types keeps some
+# cpp name (Dumper-7's) -> Enum of each, its pkg the comment's package: the short name, or with Dumper-7's
+# bFullAssetPaths the /Game path. game_enum_types keeps some.
+GAME_ENUMS = {}
 GAME_ENUM_PATHS = {}     # (package short name, object name) -> [/Game package paths] of each UserDefinedEnum, off the object dump
 ENUM_DECL = re.compile(r"^enum class ((?:\w+::)*\w+) : (\w+)\s*$")
 ENUM_VALUE = re.compile(r"^\t(\w+)\s*=\s*(-?\d+),?\s*$")
@@ -240,7 +282,7 @@ STRUCT_COMMENT = re.compile(r"^// ScriptStruct (\S+)\.(\w+)\s*$")
 GAME_STRUCT_COMMENT = re.compile(r"^// UserDefinedStruct (/Game/\S+)\.(\w+)\s*$")
 STRUCT_SIZE = re.compile(r"^// 0x([0-9A-Fa-f]+) \(0x([0-9A-Fa-f]+) - 0x([0-9A-Fa-f]+)\)")
 # Dumper-7 writes alignas(N) when the struct's MinAlignment is more than its members give (FQuat, FPlane).
-STRUCT_DECL = re.compile(r"^struct (?:alignas\((0x[0-9A-Fa-f]+)\)\s+)?(\w+)(?:\s+final)?(?:\s*:\s*public\s+(\w+))?\s*$")
+STRUCT_DECL = re.compile(r"^struct (?:alignas\((0x[0-9A-Fa-f]+)\)\s+)?((?:\w+::)?\w+)(?:\s+final)?(?:\s*:\s*public\s+(\w+))?\s*$")
 TRANSIENT = re.compile(r"[(,]\s*Transient\s*[,)]")     # CPF_Transient, not DuplicateTransient / TextExportTransient
 
 
@@ -273,25 +315,39 @@ def parse_structs(path, pkg):
         m = ENUM_DECL.match(line)
         if m:
             cur_struct, cur_enum = None, None
-            if pending and pending[0] == "enum" and "/" not in pending[1] and "::" not in m.group(1):
-                cur_enum = ENUMS[m.group(1)] = Enum(m.group(1), pkg, m.group(2))
-                cur_enum.ue_name = pending[2]     # `TextureGroup`, where Dumper-7 says ETextureGroup
+            # With bFullAssetPaths a native's comment says /Script/Engine, where it said Engine.
+            if pending and pending[0] == "enum" and ("/" not in pending[1] or pending[1].startswith("/Script/")):
+                cpp = m.group(1).rsplit("::", 1)[-1]
+                # ponytail: a native qualified because a Blueprint enum shares its name keeps the plain one; two natives
+                # of one name (none in the FSD dump) would want their package's namespace, and the second is left out.
+                if cpp not in ENUMS:
+                    if cpp != m.group(1):
+                        QUALIFIED[m.group(1)] = cpp
+                    cur_enum = ENUMS[cpp] = Enum(cpp, pkg, m.group(2))
+                    cur_enum.ue_name = pending[2]     # `TextureGroup`, where Dumper-7 says ETextureGroup
             elif pending and pending[0] == "bpenum":
                 BP_ENUMS.add(m.group(1))
-                # Dumper-7 qualifies one whose name another enum takes (`ELogLevel_0::ELogLevel`): no C++ type for those.
-                if "::" not in m.group(1):
-                    cur_enum = GAME_ENUMS[m.group(1)] = Enum(m.group(1), pending[1], m.group(2))
-                    cur_enum.ue_name = pending[2]
+                cur_enum = GAME_ENUMS[m.group(1)] = Enum(m.group(1), pending[1], m.group(2))
+                cur_enum.ue_name = pending[2]
             pending = None
             continue
         m = STRUCT_DECL.match(line)
         if m:
             cur_struct, cur_enum = None, None
-            if pending and (pending[0] == "struct" and pending[1].startswith("/Script/") or pending[0] == "gstruct"):
-                cur_struct = STRUCTS[m.group(2)] = Struct(m.group(2), m.group(3) or "", pending[1], pending[2], size)
+            cpp, leaf = m.group(2), m.group(2).rsplit("::", 1)[-1]
+            # A game struct whose name another takes goes in its path's namespace; a native one (none in the FSD dump)
+            # is left out.
+            if pending and pending[0] == "gstruct" and cpp != leaf:
+                ns = path_namespace(pending[1])
+                if ns:
+                    QUALIFIED[cpp] = ns + "::" + leaf
+                cpp = QUALIFIED.get(cpp)
+            if cpp and pending and (pending[0] == "struct" and pending[1].startswith("/Script/") and cpp == leaf
+                                    or pending[0] == "gstruct"):
+                cur_struct = STRUCTS[cpp] = Struct(cpp, m.group(3) or "", pending[1], pending[2], size)
                 cur_struct.explicit_align = int(m.group(1), 16) if m.group(1) else 1
                 if pending[0] == "gstruct":
-                    cur_struct.is_game, cur_struct.pkg = True, "Game/" + m.group(2)
+                    cur_struct.is_game, cur_struct.pkg = True, "Game/" + leaf
             pending = None
             continue
         if line.startswith("};"):
@@ -358,7 +414,7 @@ def game_structs(own, content):
             del STRUCTS[st.cpp]
     while True:
         held = [st for st in STRUCTS.values() if st.is_game and any(d not in STRUCTS for d in
-                [w for t, _ in st.fields for w in re.findall(r"\bF\w+", t) if w != st.cpp])]
+                [w for t, _ in st.fields for w in type_words(t, "F") if w != st.cpp])]
         if not held:
             break
         for st in held:
@@ -368,17 +424,18 @@ def game_structs(own, content):
     # Dumper-7 puts F on every struct's name, one that has it already too (FEventSpawnEntry is FFEventSpawnEntry):
     # a game struct is named by prefixed(), unless that is another struct's name. Every spelling of it follows.
     for st in [s for s in STRUCTS.values() if s.is_game]:
-        name = prefixed("F", st.ue_name)
+        ns = st.cpp.rsplit("::", 1)[0] + "::" if "::" in st.cpp else ""
+        name = ns + prefixed("F", st.ue_name)
         if name != st.cpp and name not in STRUCTS:
             GAME_STRUCT_NAMES[st.cpp] = name
     if GAME_STRUCT_NAMES:
-        word = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, GAME_STRUCT_NAMES)))
+        word = re.compile(r"(?<![\w:])(%s)\b" % "|".join(map(re.escape, GAME_STRUCT_NAMES)))
         respell = lambda t: word.sub(lambda m: GAME_STRUCT_NAMES[m.group(1)], t)
         for st in list(STRUCTS.values()):
             if st.cpp in GAME_STRUCT_NAMES:
                 del STRUCTS[st.cpp]
                 st.cpp = GAME_STRUCT_NAMES[st.cpp]
-                st.pkg = "Game/" + st.cpp
+                st.pkg = "Game/" + st.cpp.rsplit("::", 1)[-1]
                 STRUCTS[st.cpp] = st
             st.base = respell(st.base)
             st.fields = [(respell(t), n) for t, n in st.fields]
@@ -413,17 +470,24 @@ def game_enum_types(own, content):
     mod's UE_ENUM_IN enum: its /Game package off the object dump (the `// UserDefinedEnum` comment names only the
     package's short name), and its cooked enumerator names off that package (--game), joined to the dump's by value -
     Dumper-7's fork writes the display names, so `Closed` is cooked NewEnumerator0 (EnumManager.cpp BlueprintEnumNames).
-    Into ENUMS, so map_type takes every member, parameter and dispatcher of one; the rest stay out, as before."""
+    Into ENUMS, so map_type takes every member, parameter and dispatcher of one; the rest stay out, as before.
+    One whose name another enum takes, which Dumper-7 qualifies (`ELogLevel_0::ELogLevel`), goes in its path's
+    namespace (path_namespace). Its path is known only where the comment gives it (bFullAssetPaths) or the short name
+    is its alone: Dumper-7's `_0` follows no package order."""
     dropped = []
     for en in sorted(GAME_ENUMS.values(), key=lambda e: e.cpp):
-        paths = GAME_ENUM_PATHS.get((en.pkg, en.ue_name), [])
+        paths = [en.pkg] if en.pkg.startswith("/") else GAME_ENUM_PATHS.get((en.pkg, en.ue_name), [])
         path = paths[0] if len(paths) == 1 else None
         values = en.values
+        dumped, leaf = en.cpp, en.cpp.rsplit("::", 1)[-1]
+        ns = path_namespace(path) if path and dumped != leaf else None
+        cpp = ns + "::" + leaf if ns else dumped
         # UE_ENUM_IN names the owner, the folder: the package must be named as the enum is.
         why = "no /Game path" if not paths else "shared name" if not path \
             else "package name" if path.rsplit("/", 1)[-1] != en.ue_name \
-            else "ours" if (path + "/").startswith(own) else "no --game" if not content \
-            else "name taken" if en.cpp in ENUMS or en.cpp in STRUCTS \
+            else "ours" if (path + "/").startswith(own) else "path" if dumped != leaf and not ns \
+            else "no --game" if not content \
+            else "name taken" if cpp in ENUMS or cpp in STRUCTS \
             else "%s underlying" % en.underlying if en.underlying != "uint8" else None
         if not why:
             by_value = cooked_enum_names(content, path)
@@ -443,8 +507,10 @@ def game_enum_types(own, content):
             if why != "ours":
                 GAPS.append(("game enum", en, "", "", why))
             continue
-        en.values, en.path, en.pkg = values, path, "Game/" + en.cpp
-        ENUMS[en.cpp] = en
+        if cpp != dumped:
+            QUALIFIED[dumped] = cpp
+        en.cpp, en.values, en.path, en.pkg = cpp, values, path, "Game/" + leaf
+        ENUMS[cpp] = en
     kept = sum(1 for e in ENUMS.values() if e.path)
     print("  game enums: %d kept, %d left out (%s)" % (kept, len(dropped), ", ".join(
         "%s %d" % (w, c) for w, c in collections.Counter(dropped).most_common())))
@@ -531,7 +597,7 @@ def struct_deps(st):
     """Struct names this one must be declared after."""
     out = [st.base] if st.base in STRUCTS else []
     for t, _ in st.fields:
-        for word in re.findall(r"\bF\w+", t):          # the struct itself, or a container's element / key / value
+        for word in type_words(t, "F"):          # the struct itself, or a container's element / key / value
             if word in STRUCTS and word != st.cpp:
                 out.append(word)
     return out
@@ -539,7 +605,7 @@ def struct_deps(st):
 
 def game_enum_words(t):
     """The game Blueprint enums type t names, anywhere in it."""
-    return [w for w in re.findall(r"\bE\w+", t) if w in ENUMS and ENUMS[w].path]
+    return [w for w in type_words(t, "E") if w in ENUMS and ENUMS[w].path]
 
 
 def beside(pkg, target):
@@ -551,11 +617,12 @@ def beside(pkg, target):
 def emit_struct(st, conv_names, methods, spell):
     body = ["struct %s%s" % (st.cpp, (" : public %s" % st.base) if st.base in STRUCTS else ""), "{"]
     if st.is_game:
+        body[0] = "struct " + st.cpp.rsplit("::", 1)[-1]
         body.append('    UE_GAME_STRUCT("%s", "%s");' % (st.path, st.ue_name))
-        body += ["    %s %s%s;" % (t, n, " = " + st.inits[n] if n in st.inits else "") for t, n in st.fields]
+        body += ["    %s %s%s;" % (rooted(t), n, " = " + st.inits[n] if n in st.inits else "") for t, n in st.fields]
         body += hidden(['static constexpr const char* %s__UeName = "%s";' % (n, st.real[n]) for _, n in st.fields])
         body.append("};")
-        return "\n".join(body)
+        return "\n".join(namespaced(st.cpp, body))
     base = STRUCTS.get(st.base)
     own = st.fields[len(base.fields):] if base else st.fields
     for t, n in own:
@@ -582,18 +649,20 @@ def emit_struct(st, conv_names, methods, spell):
 
 def emit_enum(en):
     width = max([len(n) for n, _ in en.values] + [1])
-    body = ["enum class %s : %s" % (en.cpp, en.underlying), "{"]
+    leaf = en.cpp.rsplit("::", 1)[-1]
+    body = ["enum class %s : %s" % (leaf, en.underlying), "{"]
     body += ["    %-*s = %d," % (width, n, v) for n, v in en.values]
     body.append("};")
     if en.path:
         # A game Blueprint's enum is imported as another mod's would be: its owner, its object name, its cooked names.
-        body.append('UE_ENUM_IN(%s, "%s");' % (en.cpp, en.path.rsplit("/", 1)[0]))
-        if en.ue_name != en.cpp:
-            body.append('static constexpr const char* %s__UeName = "%s";' % (en.cpp, en.ue_name))
+        # A namespaced one's path is its namespace's (Cpp.cpp PathIn reads a `Game::` name as the path).
+        body.append('UE_ENUM_IN(%s, "%s");' % (leaf, en.path.rsplit("/", 1)[0]))
+        if en.ue_name != leaf:
+            body.append('static constexpr const char* %s__UeName = "%s";' % (leaf, en.ue_name))
         if en.cooked:
             body.append('static constexpr const char* %s__UeEnumNames = "%s";'
-                        % (en.cpp, "|".join("%s=%s" % (n, en.cooked[n]) for n, _ in en.values if n in en.cooked)))
-    return "\n".join(body)
+                        % (leaf, "|".join("%s=%s" % (n, en.cooked[n]) for n, _ in en.values if n in en.cooked)))
+    return "\n".join(namespaced(en.cpp, body))
 
 
 OPS = {"Add": "+", "Subtract": "-", "Multiply": "*", "Divide": "/", "EqualEqual": "==", "NotEqual": "!=",
@@ -1001,7 +1070,7 @@ def read_real_fields(sdk_dir):
 # without. AssetGen keeps an enum with no form a ByteProperty.
 ENUM_PROPS = {}      # (owner path, offset) -> [(property name, "EnumProperty" / "ByteProperty")], off the object dump
 ENUM_OWNER = re.compile(r"^// \w+ (/.*?)\s*$")     # "// Class /Script/Engine.Actor", "// Function /Game/A.B_C.Do It"
-ENUM_MEMBER = re.compile(r"^\t(?:const\s+)?(E\w+)\s*&?\s+(\w+)(?:\[\w+\])?;\s+// 0x([0-9A-Fa-f]+)\(")
+ENUM_MEMBER = re.compile(r"^\t(?:const\s+)?((?:\w+::)?E\w+)\s*&?\s+(\w+)(?:\[\w+\])?;\s+// 0x([0-9A-Fa-f]+)\(")
 DELEGATE_PARAMS = re.compile(r"(?:TDelegate|TMulticastInlineDelegate|TMulticastSparseDelegate)<[^()<>]*\(([^()]*)\)")
 # The field class each spelling of a delegate's parameter can be, where one alone fits: the control on the join below.
 FIELD_OF_PREFIX = (("TArray<", "ArrayProperty"), ("TSet<", "SetProperty"), ("TMap<", "MapProperty"),
@@ -1016,8 +1085,7 @@ FIELD_OF_TYPE = {"bool": "BoolProperty", "float": "FloatProperty", "double": "Do
 
 def field_fits(ctype, field):
     """Whether a parameter the SDK spells ctype can be a property of the dump's field class `field`."""
-    m = ENUM_REF.match(ctype.strip())
-    if m and m.group(1) in ENUMS:
+    if enum_ref(ctype.strip()) in ENUMS:
         return field in ("EnumProperty", "ByteProperty")
     t = re.sub(r"\s*&$", "", re.sub(r"^const\s+", "", ctype.strip()))
     for prefix, want in FIELD_OF_PREFIX:
@@ -1050,10 +1118,10 @@ def delegate_enum_kinds(signatures):
             if found:
                 break
         for at, (t, _) in enumerate(params):
-            m = ENUM_REF.match(t.strip())
+            e = enum_ref(t.strip())
             seen = set(sig[at][0] for sig in found)
-            if m and m.group(1) in ENUMS and len(seen) == 1:
-                kinds.setdefault(m.group(1), set()).update(seen)
+            if e in ENUMS and len(seen) == 1:
+                kinds.setdefault(e, set()).update(seen)
     return kinds
 
 
@@ -1079,16 +1147,17 @@ def read_enum_forms(sdk_dir, game_forms):
             for d in DELEGATE_PARAMS.finditer(line):
                 params = tuple((p.group(1).strip(), p.group(2)) for p in
                                (re.match(r"^(.*?)\s*\b([A-Za-z_]\w*)$", a) for a in split_args(d.group(1))) if p)
-                if any(ENUM_REF.match(t) and ENUM_REF.match(t).group(1) in ENUMS for t, _ in params):
+                if any(enum_ref(t) in ENUMS for t, _ in params):
                     signatures.add((owner or "", params))
             m = ENUM_MEMBER.match(line) if owner else None
-            if not m or m.group(1) not in ENUMS:
+            e = QUALIFIED.get(m.group(1), m.group(1)) if m else None
+            if e not in ENUMS:
                 continue
             # Dumper-7's own UObject members (Object.Flags) are no property, and have none at their offset.
             props = ENUM_PROPS.get((owner, int(m.group(3), 16)), ())
             kind = next((k for real, k in props if is_spelling_of(m.group(2), real)), None)
             if kind:
-                seen.setdefault(m.group(1), set()).add(kind)
+                seen.setdefault(e, set()).add(kind)
     added, agree, differ = 0, 0, []
     for cpp, kinds in sorted(delegate_enum_kinds(signatures).items()):
         if kinds and cpp not in seen:
@@ -2072,7 +2141,7 @@ def main():
         for t in [t for _, r, _, ps in k.funcs for t in [r] + [pt for pt, _ in ps]] + [t for t, _ in k.fields]:
             # A game enum in a container or a dispatcher's signature (`TMulticastInlineDelegate<void(EDroppodDoorState)>`).
             deps[k.header].update(ENUMS[w].pkg for w in game_enum_words(t))
-            for w in re.findall(r"\bF\w+", t):
+            for w in type_words(t, "F"):
                 if w != t and w in STRUCTS and STRUCTS[w].is_game:
                     deps[k.header].add(STRUCTS[w].pkg)
             if t in STRUCTS and STRUCTS[t].pkg != k.header:
@@ -2120,7 +2189,7 @@ def main():
             if target and target.ns and (target is me or (short or {}).get(target.name) == target.emit):
                 return target.name                  # a Blueprint class's own name, or a `using` the class opens with
             return "class %s" % written(target, me) if target else m.group(0)
-        return CLASS_WORD.sub(one, ctype)
+        return rooted(CLASS_WORD.sub(one, ctype))
 
     def named(ctype):
         """An enum field, return value or by-value parameter as TEnum<E> (Types.h): still E to AssetGen, plus
@@ -2353,7 +2422,8 @@ def main():
             if k.ns and k.ue_name in old_unique:
                 body.append("using %s = %s;" % (k.ue_name, k.emit))
 
-        title = ("Blueprint struct " if pkg[len("Game/"):] in STRUCTS else "Blueprint enum " if pkg[len("Game/"):] in ENUMS
+        title = ("Blueprint struct " if any(s.pkg == pkg for s in STRUCTS.values())
+                 else "Blueprint enum " if any(e.pkg == pkg for e in ENUMS.values())
                  else "Blueprint class ") + pkg[len("Game/"):] \
             if pkg.startswith("Game/") else "Package /Script/" + pkg
         out = ["#pragma once",

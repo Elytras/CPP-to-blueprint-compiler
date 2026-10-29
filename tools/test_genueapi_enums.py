@@ -1,5 +1,6 @@
 ﻿"""Regressions for the game's Blueprint enums (UserDefinedEnum): a static library call whose dumped enum has a
 qualified name, and an enum genueapi gives a C++ type with the members that use it (BP_DropPod_Base_C's DoorState)."""
+from contextlib import ExitStack
 from pathlib import Path
 import tempfile
 import unittest
@@ -27,6 +28,24 @@ DROP_POD = ('// BlueprintGeneratedClass /Game/LevelElements/Droppod/BP_DropPod_B
 COOKED = {0: 'NewEnumerator0', 1: 'NewEnumerator1', 2: 'NewEnumerator2', 3: 'DroppodDoorState_MAX'}
 
 
+def fresh():
+    """genueapi's tables, empty for one test."""
+    stack = ExitStack()
+    for name, empty in (('BP_ENUMS', set()), ('GAPS', []), ('ENUMS', {}), ('GAME_ENUMS', {}), ('GAME_ENUM_PATHS', {}),
+                        ('QUALIFIED', {}), ('STRUCTS', {}), ('GAME_STRUCT_NAMES', {})):
+        stack.enter_context(patch.object(genueapi, name, empty))
+    return stack
+
+
+def parse(text, name='Types_structs.hpp'):
+    with tempfile.TemporaryDirectory() as temp:
+        path = Path(temp) / name
+        path.write_text(text)
+        if name.endswith('_classes.hpp'):
+            return genueapi.parse_header(str(path))[0]
+        genueapi.parse_structs(str(path), name.split('_')[0])
+
+
 class BlueprintEnumTests(unittest.TestCase):
     def test_static_enum_fallback_accepts_qualified_and_plain_names(self):
         for spelling in ('ELogLevel', 'ELogLevel::ELogLevel'):
@@ -41,10 +60,9 @@ class BlueprintEnumTests(unittest.TestCase):
                                    'class UEmmApi_C\n{\n'
                                    f'\tstatic void Log({spelling} Level);\n'
                                    f'\tvoid InstanceLog({spelling} Level);\n}};\n')
-                with patch.object(genueapi, 'BP_ENUMS', set()), patch.object(genueapi, 'GAPS', []), \
-                        patch.object(genueapi, 'ENUMS', {}), patch.object(genueapi, 'GAME_ENUMS', {}):
+                with fresh():
                     genueapi.parse_structs(str(enums), 'ELogLevel')
-                    self.assertEqual(genueapi.ENUMS, {})
+                    self.assertEqual(list(genueapi.ENUMS), ['ENative'])     # a qualified native keeps its plain name
                     found, _, _ = genueapi.parse_header(str(classes))
                     self.assertEqual(found[0].funcs, [(True, 'void', 'Log', [('uint8', 'Level')])])
                     self.assertTrue(any(row[2] == 'InstanceLog' for row in genueapi.GAPS))
@@ -105,6 +123,71 @@ class BlueprintEnumTests(unittest.TestCase):
             self.assertIsNone(en)
             self.assertEqual(k.fields, [])
             self.assertIn(('game enum', 'no --game'), [(g[0], g[4]) for g in genueapi.GAPS])
+
+
+class SharedNameTests(unittest.TestCase):
+    """Types whose name another one takes, which Dumper-7 qualifies, named by the user's rule: a native keeps the plain
+    name, a game Blueprint's goes in its /Game path's namespace, as a game Blueprint class sharing a name does."""
+
+    def test_native_keeps_its_name_blueprint_namespaced(self):
+        with fresh():
+            parse('// Enum Engine.EModuleType\nenum class Engine::EModuleType : uint8\n{\n\tEMT_A = 0,\n};\n'
+                  '// UserDefinedEnum EModuleType.EModuleType\nenum class EModuleType::EModuleType : uint8\n{\n'
+                  '\tNone = 0,\n\tCarver = 1,\n\tEModuleType_MAX = 2,\n};\n')
+            genueapi.GAME_ENUM_PATHS[('EModuleType', 'EModuleType')] = ['/Game/Mods/Enemy/EModuleType']
+            cooked = {0: 'NewEnumerator0', 1: 'NewEnumerator1', 2: 'EModuleType_MAX'}
+            with patch.object(genueapi, 'cooked_enum_names', lambda c, p: cooked):
+                genueapi.game_enum_types((), 'Content')
+            self.assertEqual(sorted(genueapi.ENUMS), ['EModuleType', 'Game::Mods::Enemy::EModuleType'])
+            k = parse('// BlueprintGeneratedClass /Game/Mods/Enemy/Module.Module_C\nclass AModule_C : public AActor\n{\n'
+                      '\tEngine::EModuleType                           Native;                                            '
+                      '// 0x0228(0x0001)(Edit, BlueprintVisible)\n'
+                      '\tEModuleType::EModuleType                      Bp;                                                '
+                      '// 0x0229(0x0001)(Edit, BlueprintVisible)\n};\n', 'Module_classes.hpp')[0]
+            self.assertEqual(k.fields, [('EModuleType', 'Native'), ('Game::Mods::Enemy::EModuleType', 'Bp')])
+            text = genueapi.emit_enum(genueapi.ENUMS['Game::Mods::Enemy::EModuleType'])
+            self.assertIn('namespace Game { namespace Mods { namespace Enemy {\nenum class EModuleType : uint8', text)
+            self.assertIn('UE_ENUM_IN(EModuleType, "/Game/Mods/Enemy");', text)
+            self.assertEqual(genueapi.ENUMS['Game::Mods::Enemy::EModuleType'].pkg, 'Game/EModuleType')
+            # Spelled from the root in a header: inside a Blueprint's own namespace a bare Game:: may be another one.
+            self.assertEqual(genueapi.rooted('TEnum<Game::Mods::Enemy::EModuleType>'),
+                             'TEnum<::Game::Mods::Enemy::EModuleType>')
+
+    def test_blueprint_enum_pair_by_full_path(self):
+        """Dumper-7's bFullAssetPaths comment gives each one's package, so each takes its own folder's namespace."""
+        with fresh():
+            parse('// UserDefinedEnum /Game/A/ELevel.ELevel\nenum class ELevel_0::ELevel : uint8\n{\n\tLow = 0,\n'
+                  '\tELevel_MAX = 1,\n};\n'
+                  '// UserDefinedEnum /Game/B/ELevel.ELevel\nenum class ELevel::ELevel : uint8\n{\n\tHigh = 0,\n'
+                  '\tELevel_MAX = 1,\n};\n')
+            with patch.object(genueapi, 'cooked_enum_names', lambda c, p: {0: 'NewEnumerator0', 1: 'ELevel_MAX'}):
+                genueapi.game_enum_types((), 'Content')
+            self.assertEqual(genueapi.QUALIFIED, {'ELevel_0::ELevel': 'Game::A::ELevel', 'ELevel::ELevel': 'Game::B::ELevel'})
+            self.assertEqual(genueapi.ENUMS['Game::A::ELevel'].values, [('Low', 0)])
+            self.assertEqual(genueapi.map_type('ELevel::ELevel'), 'Game::B::ELevel')
+
+    def test_blueprint_enum_pair_without_paths_left_out(self):
+        """Without bFullAssetPaths a pair's short name names both packages, and `_0` follows no package order."""
+        with fresh():
+            parse('// UserDefinedEnum ELevel.ELevel\nenum class ELevel_0::ELevel : uint8\n{\n\tLow = 0,\n};\n')
+            genueapi.GAME_ENUM_PATHS[('ELevel', 'ELevel')] = ['/Game/A/ELevel', '/Game/B/ELevel']
+            genueapi.game_enum_types((), 'Content')
+            self.assertEqual(genueapi.ENUMS, {})
+            self.assertEqual([g[4] for g in genueapi.GAPS], ['shared name'])
+
+    def test_blueprint_struct_pair(self):
+        with fresh():
+            parse('// UserDefinedStruct /Game/A/Shared/Pair.Pair\n// 0x0004 (0x0004 - 0x0000)\nstruct Pair_0::FPair final\n'
+                  '{\npublic:\n\tint32 Count_2_0123;  // 0x0000(0x0004)(Edit)\n};\n'
+                  '// UserDefinedStruct /Game/B/Pair.Pair\n// 0x0004 (0x0004 - 0x0000)\nstruct Pair::FPair final\n'
+                  '{\npublic:\n\tint32 Count_2_4567;  // 0x0000(0x0004)(Edit)\n};\n'
+                  '// UserDefinedStruct /Game/9Lives/Pair.Pair\n// 0x0004 (0x0004 - 0x0000)\nstruct Pair_1::FPair final\n'
+                  '{\npublic:\n\tint32 Count_2_89AB;  // 0x0000(0x0004)(Edit)\n};\n')
+            # /Game/9Lives is no C++ namespace, so that one has no type.
+            self.assertEqual(sorted(genueapi.STRUCTS), ['Game::A::Shared::FPair', 'Game::B::FPair'])
+            self.assertEqual({s.pkg for s in genueapi.STRUCTS.values()}, {'Game/FPair'})
+            self.assertEqual(genueapi.map_type('struct Pair_0::FPair'), 'Game::A::Shared::FPair')
+            self.assertEqual(genueapi.type_words('TArray<Game::B::FPair>', 'F'), ['Game::B::FPair'])
 
 
 if __name__ == '__main__':
