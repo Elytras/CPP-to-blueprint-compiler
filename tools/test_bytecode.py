@@ -2125,7 +2125,8 @@ def vec(x, y, z): return {'X': f32(x), 'Y': f32(y), 'Z': f32(z)}
 def equals(a, b, tol): return all(abs(a[k] - b[k]) <= tol for k in a)     # FVector::Equals, what the Kismet node runs
 SUGAR = {'EqualEqual_VectorVector': lambda vm, ctx, a, b, tol: equals(a, b, tol),
          'NotEqual_VectorVector': lambda vm, ctx, a, b, tol: not equals(a, b, tol),
-         'Conv_FloatToVector': lambda vm, ctx, f: vec(f, f, f), 'IsValidClass': lambda vm, ctx, c: c is not None}
+         'Conv_FloatToVector': lambda vm, ctx, f: vec(f, f, f), 'IsValidClass': lambda vm, ctx, c: c is not None,
+         'EqualEqual_KeyKey': lambda vm, ctx, a, b: a == b}
 proves('finding-actors-and.a-getcomponentsbyclass')
 for own, other in ((0, 0), (2, 3), (1, 0)):
     them = Obj('Actor')
@@ -2155,6 +2156,11 @@ for a, b in ((vec(1, 2, 3), vec(1, 2, 3)), (vec(1, 2, 3), vec(1, 2, near)), (vec
     want = (a == b) + 10 * (a != b) + 100 * (a == vec(0, 0, 0))
     proves('struct-operators.home-twice', 'struct-operators.home-0')
     assert VM(asset('SugarForms'), natives=SUGAR).call('VecCompare', A=a, B=b) == want, (a, b)
+for a, b in (('F8', 'F8'), ('F8', 'F9')):
+    proves('struct-operators.key-other')
+    assert VM(asset('SugarForms'), natives=SUGAR).call('KeyCompare', A={'KeyName': a}, B={'KeyName': b}) \
+        == (1 if a == b else 10), (a, b)
+print('ok  SugarForms.KeyCompare: FKey != is the negated EqualEqual_KeyKey, Kismet having no NotEqual  (2 cases)')
 proves('struct-conversions.fvector-v-2-0f')
 assert VM(asset('SugarForms'), natives=SUGAR).call('Twos') == vec(2, 2, 2)
 print('ok  SugarForms.VecCompare: FVector == and != are exact, as in UE C++; `V == 0` and `FVector V = 2` fill all three '
@@ -4047,6 +4053,36 @@ def ue_name_marker():
 ue_name_marker()
 
 
+def type_ue_name():
+    """TypeUeName: `FTunRow__UeName = "TunRow"` beside a struct, and the same beside an enum, is the name it cooks
+    under: its package, its object and every reference to it - a variable, a container, a replicated variable, an RPC's
+    and a function's parameters, an enum default, the registry row. TypeUeNameOther imports both (UE_STRUCT_IN /
+    UE_ENUM_IN) by those names. A type with no marker keeps its C++ name, prefix and all (every other test)."""
+    import dumpexp
+    base, other = asset('TypeUeName'), asset('TypeUeNameOther')
+    here = os.path.dirname(base)
+    proves('mod-structs-ue.static-constexpr-const-char-fboolarray-uename')
+    for cooked, cpp in (('TunRow', 'FTunRow'), ('TunMood', 'ETunMood')):
+        assert os.path.exists(os.path.join(here, cooked + '.uasset')), cooked
+        assert not os.path.exists(os.path.join(here, cpp + '.uasset')), cpp
+    assert {'TunMood::Angry', 'TunMood::Calm', 'TunMood::TunMood_MAX'} <= set(dumpexp.load(os.path.join(here, 'TunMood'))[3])
+    rows = {p for p, _ in registry_rows(registry_of('TypeUeName'))}
+    assert {'/Game/_ElytrasMods/TypeUeName/TunRow.TunRow', '/Game/_ElytrasMods/TypeUeName/TunMood.TunMood'} <= rows, rows
+    for b in (base, other):
+        keeps_invariants(b)
+        names = dumpexp.load(b)[3]
+        assert {'/Game/_ElytrasMods/TypeUeName/TunRow', 'TunRow', '/Game/_ElytrasMods/TypeUeName/TunMood', 'TunMood',
+                'TunMood::Angry'} <= set(names), b
+        assert not [n for n in names if 'FTunRow' in n or 'ETunMood' in n], b
+    assert run(base, 'Call')[0] == 5
+    refused('TypeUeNameNone', '  int32 X;\n', 'FNothing__UeName: names no struct or enum declared here',
+            'static constexpr const char *FNothing__UeName = "Nothing";\n')
+    print('ok  TypeUeName: a struct and an enum cook, and are named by this mod and another, under their __UeName names')
+
+
+type_ue_name()
+
+
 def map_pairs(pkg, tag):
     """A TMap tag's (key, value) pairs in order, each FName (an enum's, as a ByteProperty in a container writes it, too)
     or FString as text; it lists no removals."""
@@ -4526,6 +4562,78 @@ def api_stub():
     print('ok  NameTest: the API stub carries UE_CATEGORY, UE_TOOLTIP, UE_KEYWORDS, access and purity, and leaves a private field out')
 
 
+def api_stub_widget():
+    """The editor API stubs of WidgetTree's widget classes, and of NsTest's namespaced ones: a user widget's stub is a
+    Widget Blueprint holding its designer tree, and every stub sits in the folder its package names."""
+    import struct, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        api = os.path.join(tmp, 'Content', '_ElytrasMods', 'WidgetTree')
+        os.makedirs(api)
+        proc = assetgen_compile([os.path.join(TESTS, 'WidgetTree.cpp'), UEAPI, os.path.join(tmp, 'cooked'), '--api', api])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        card = dumpexp.load(os.path.join(api, 'UWtCard'))
+        kid = dumpexp.load(os.path.join(api, 'UWtCardKid'))
+        title = [dump('dumptags.py', os.path.join(api, 'UWtCard'), i) for i, e in enumerate(card[5]) if e['name'] == 'Title']
+        nsapi = os.path.join(tmp, 'ns', 'Content', '_ElytrasMods', 'NsTest')
+        os.makedirs(nsapi)
+        proc = assetgen_compile([os.path.join(TESTS, 'NsTest.cpp'), UEAPI, os.path.join(tmp, 'nscooked'), '--api', nsapi])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        stubs = sorted(os.path.relpath(f, os.path.join(tmp, 'ns', 'Content')).replace(os.sep, '/')
+                       for f in glob.glob(os.path.join(tmp, 'ns', 'Content', '**', '*.uasset'), recursive=True))
+    ua, ue, total, names, imports, exports = card
+    cls = lambda e: str(imports[-e['cls'] - 1]) if e['cls'] < 0 else exports[e['cls'] - 1]['name']
+    outer = lambda e: exports[e['outer'] - 1]['name'] if e['outer'] > 0 else None
+    blob = lambda e: ue[e['off'] - total: e['off'] - total + e['size']]
+    # The Blueprint is a WidgetBlueprint, its class a WidgetBlueprintGeneratedClass, as UWtCardKid's is below it.
+    proves('methods-as-blueprint.generate-api-true', 'methods-as-blueprint.generate-api-widget')
+    assert cls(exports[0]) == "Class'WidgetBlueprint'" and any(cls(e) == "Class'WidgetBlueprintGeneratedClass'" for e in exports), \
+        [cls(e) for e in exports]
+    assert cls(kid[5][0]) == "Class'WidgetBlueprint'", cls(kid[5][0])
+    # The tree: a WidgetTree default subobject of the Blueprint (RF_Public|RF_Transactional|RF_DefaultSubObject), every
+    # UE_WIDGET under it and a variable (bIsVariable), each slot under its panel; Frame is UWtFrame's generated class.
+    tree = [e for e in exports if cls(e) == "Class'WidgetTree'"]
+    assert len(tree) == 1 and outer(tree[0]) == 'UWtCard' and tree[0]['flags'] == 0x40009, tree
+    widgets = {e['name']: e for e in exports if outer(e) == 'WidgetTree'}
+    assert set(widgets) == {'Root', 'Title', 'Play', 'Label', 'Frame', 'Note'}, set(widgets)
+    assert cls(widgets['Frame']) == "WidgetBlueprintGeneratedClass'UWtFrame_C'", cls(widgets['Frame'])
+    variable = struct.pack('<ii', names.index('bIsVariable'), 0) + struct.pack('<ii', names.index('BoolProperty'), 0)
+    assert all(variable in blob(e) for e in widgets.values()), 'bIsVariable'
+    # Note starts Hidden, which the designer ignores: it is hidden there by bHiddenInDesigner, and only it is.
+    hidden = struct.pack('<ii', names.index('bHiddenInDesigner'), 0) if 'bHiddenInDesigner' in names else b'?'
+    assert [w for w, e in widgets.items() if hidden in blob(e)] == ['Note'], 'bHiddenInDesigner'
+    slots = sorted((outer(e), cls(e)) for e in exports if outer(e) in widgets)
+    assert slots == [('Play', "Class'ButtonSlot'")] + [('Root', "Class'CanvasPanelSlot'")] * 3, slots
+    # Note sits in no panel: it fills Frame's named slot Body, a NamedSlotBindings entry on Frame.
+    assert struct.pack('<ii', names.index('NamedSlotBindings'), 0) in blob(widgets['Frame']) and 'Body' in names, 'Body'
+    # The constructor's defaults ride along: Title's text reads Score in the designer.
+    assert b'Score'.hex() in title[0], title[0]
+    # Clicks is a variable of the stub; the widgets are not there twice, as NewVariables entries.
+    def var(name):
+        return struct.pack('<ii', names.index('VarName'), 0) + struct.pack('<ii', names.index('NameProperty'), 0) \
+            + struct.pack('<iib', 8, 0, 0) + struct.pack('<ii', names.index(name), 0)
+    assert var('Clicks') in blob(exports[0]) and not any(w in names and var(w) in blob(exports[0]) for w in widgets)
+    # OnPlayed is a dispatcher, as the editor's Add Event Dispatcher makes one: a variable of pin category mcdelegate and
+    # the Blueprint's one DelegateSignatureGraphs entry, a graph of its name whose entry node takes Card, typed as the
+    # stub's own generated class, and Count.
+    proves('methods-as-blueprint.generate-api-dispatcher')
+    # FNames match case-insensitively, so the table holds `object` as the first spelling it met (CoreUObject's Object):
+    n = lambda s: struct.pack('<ii', [x.lower() for x in names].index(s.lower()), 0)
+    assert var('OnPlayed') in blob(exports[0]) and n('mcdelegate') in blob(exports[0]), 'OnPlayed variable'
+    played = [i for i, e in enumerate(exports) if e['name'] == 'OnPlayed' and cls(e) == "Class'EdGraph'"]
+    assert len(played) == 1 and outer(exports[played[0]]) == 'UWtCard', played
+    assert n('DelegateSignatureGraphs') + n('ArrayProperty') + struct.pack('<ii', 8, 0) + n('ObjectProperty') + b'\0' \
+        + struct.pack('<ii', 1, played[0] + 1) in blob(exports[0]), 'DelegateSignatureGraphs'
+    entry = next(e for e in exports if outer(e) == 'OnPlayed' and cls(e) == "Class'K2Node_FunctionEntry'")
+    own = next(i for i, e in enumerate(exports) if e['name'] == 'UWtCard_C')
+    assert n('Card') + n('object') + n('None') + struct.pack('<i', own + 1) in blob(entry) and n('Count') in blob(entry), 'Card'
+    # NsTest: each stub in its namespace's folder, under the mod's own or a /Game path of its own (Pistol).
+    proves('methods-as-blueprint.generate-api-folders')
+    assert {'_ElytrasMods/NsTest/NsTest.uasset', '_ElytrasMods/NsTest/Weapons/Rifle.uasset',
+            '_ElytrasMods/NsTest/Weapons/FAmmo.uasset', '_ElytrasMods/NsTest/Weapons/EKind.uasset',
+            'NsTestAbs/Pistol.uasset'} <= set(stubs), stubs
+    print('ok  WidgetTree: a user widget\'s API stub is a Widget Blueprint with its designer tree; NsTest: stubs sit in their packages\' folders')
+
+
 def api_stub_interface():
     """The editor API stub of a mod interface (IfaceStub): a Blueprint Interface, as the UE 4.27 editor saves one - the
     Blueprint's type BPTYPE_Interface, its parent the engine's Interface (or the interface it extends), a function graph
@@ -4564,6 +4672,122 @@ def api_stub_interface():
         assert text.hex() in ping['graphs']['Ping'] and text.hex() not in ping['graphs']['Note'], text
     print('ok  IfaceStub: a mod interface\'s API stub is a Blueprint Interface with a graph per function, its flags, '
           'parent and tooltip, and no variables')
+
+
+def api_stub_library():
+    """A public getter is a static interface-valued library node; internal library helpers stay
+    out, and an exported mod actor keeps its implemented interfaces for editor subclasses."""
+    import struct, tempfile
+    from invariants import Package
+    with tempfile.TemporaryDirectory() as tmp:
+        api = os.path.join(tmp, 'api')
+        os.makedirs(api)
+        proc = assetgen_compile([os.path.join(TESTS, 'ApiLibrary.cpp'), UEAPI,
+                                 os.path.join(tmp, 'cooked'), '--api', api])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        lib = Package(os.path.join(api, 'ApiLibrary'))
+        graphs = {e['name'] for i, e in enumerate(lib.exports) if lib.class_of(i + 1) == 'EdGraph'}
+        proves('methods-as-blueprint.generate-api-library')
+        assert graphs == {'GetComponent', 'GetInterface', 'KeepReference', 'WriteNumber', 'CheckOutput'}, graphs
+        bp_type = struct.unpack_from('<i', lib.tag(0, 'BlueprintType')['value'])[0]
+        assert lib.names[bp_type] == 'BPTYPE_FunctionLibrary'
+        result = next(i for i, e in enumerate(lib.exports) if lib.class_of(i + 1) == 'K2Node_FunctionResult'
+                      and lib.exports[e['outer'] - 1]['name'] == 'GetComponent')
+        interface_name = struct.pack('<ii', next(i for i, n in enumerate(lib.names) if n.lower() == 'interface'), 0)
+        assert interface_name in lib.blob(result), 'the getter result is an interface pin'
+        proves('parameters-and-return.ue-out')
+        nodes = {(lib.exports[e['outer'] - 1]['name'], lib.class_of(i + 1)): lib.blob(i)
+                 for i, e in enumerate(lib.exports) if e['outer'] > 0
+                 and lib.class_of(i + 1) in ('K2Node_FunctionEntry', 'K2Node_FunctionResult')}
+        pin = interface_name * 2
+        output = nodes['GetInterface', 'K2Node_FunctionResult']
+        reference = nodes['KeepReference', 'K2Node_FunctionEntry']
+        assert pin in output and pin not in nodes['GetInterface', 'K2Node_FunctionEntry']
+        assert pin in reference
+        assert struct.unpack_from('<i', output, output.index(pin) + 29)[0] == 0
+        assert struct.unpack_from('<i', reference, reference.index(pin) + 29)[0] == 1
+        cooked = os.path.join(tmp, 'cooked', 'ApiLibrary')
+        provider = Package(cooked)
+        out = next(p for p in provider.struct(provider.find('GetInterface')).props if p.name == 'Interface')
+        ref = next(p for p in provider.struct(provider.find('KeepReference')).props if p.name == 'Interface')
+        assert out.flags & 0x100 and not out.flags & 0x8000000
+        assert ref.flags & 0x100 and ref.flags & 0x8000000
+        assert run(cooked, 'CheckOutput')[0] == 42
+        actor = Package(os.path.join(api, 'ApiActor'))
+        cls = actor.find('ApiActor_C')
+        proves('methods-as-blueprint.generate-api-interfaces')
+        assert actor.tag(0, 'ImplementedInterfaces') is not None
+        interfaces = actor.struct(cls).interfaces
+        assert len(interfaces) == 1 and actor.path(interfaces[0][0]).endswith('/IApiProbe.IApiProbe_C'), interfaces
+        graphs_value = actor.tag(0, 'FunctionGraphs')['value']
+        own_graphs = {actor.exports[struct.unpack_from('<i', graphs_value, 4 + 4 * k)[0] - 1]['name']
+                      for k in range(struct.unpack_from('<i', graphs_value)[0])}
+        assert own_graphs == {'WhenDone'}, ('Ping, Level and Later belong to ImplementedInterfaces.Graphs', own_graphs)
+        ping = next(i for i, e in enumerate(actor.exports) if e['name'] == 'Ping')
+        assert struct.pack('<i', ping + 1) in actor.tag(0, 'ImplementedInterfaces')['value']
+
+        # IApiProbe::Level is const: pure in the interface, and in ApiActor, whose Level is not const.
+        proves('declaring-an-interface.pure')
+        for pkg in ('IApiProbe', 'ApiActor'):
+            cooked_pkg = Package(os.path.join(tmp, 'cooked', pkg))
+            assert cooked_pkg.struct(cooked_pkg.find('Level')).function_flags & 0x10000000, pkg   # FUNC_BlueprintPure
+            stub = Package(os.path.join(api, pkg))
+            entry = next(i for i, e in enumerate(stub.exports) if e['outer'] > 0
+                         and stub.exports[e['outer'] - 1]['name'] == 'Level' and stub.class_of(i + 1) == 'K2Node_FunctionEntry')
+            assert struct.unpack_from('<i', stub.tag(entry, 'ExtraFlags')['value'])[0] & 0x10000000, pkg
+
+        # Delegate parameters: each pin names its signature (MemberParent, then MemberName), a signature of the class's
+        # own a signature graph of the stub; the delegate variable Pending stays out.
+        proves('methods-as-blueprint.generate-api-delegate-params')
+        probe = Package(os.path.join(api, 'IApiProbe'))
+
+        def member_parent(pkg, fn, signature):
+            entry = next(i for i, e in enumerate(pkg.exports) if e['outer'] > 0
+                         and pkg.exports[e['outer'] - 1]['name'] == fn and pkg.class_of(i + 1) == 'K2Node_FunctionEntry')
+            # The pin type after its category: SubCategory (8), SubCategoryObject (4), the container byte, bIsReference
+            # and bIsWeakPointer (4 each), then PinSubCategoryMemberReference's MemberParent and MemberName.
+            blob = pkg.blob(entry)
+            at = blob.index(struct.pack('<ii', pkg.names.index('delegate'), 0)) + 8 + 8 + 4 + 1 + 4 + 4
+            parent, name = struct.unpack_from('<ii', blob, at)
+            assert pkg.names[name] == signature, (fn, pkg.names[name])
+            return parent
+
+        def signature_graphs(pkg):
+            value = pkg.tag(0, 'DelegateSignatureGraphs')['value']
+            return {pkg.exports[struct.unpack_from('<i', value, 4 + 4 * k)[0] - 1]['name']
+                    for k in range(struct.unpack_from('<i', value)[0])}
+
+        assert member_parent(probe, 'Later', 'Call__DelegateSignature') == probe.find('IApiProbe_C') + 1
+        assert signature_graphs(probe) == {'Call'}
+        # WhenDone's own signature numbers past the Call__DelegateSignature of the interface ApiActor lists.
+        assert member_parent(actor, 'WhenDone', 'Call_2__DelegateSignature') == actor.find('ApiActor_C') + 1
+        assert actor.path(member_parent(actor, 'Later', 'Call__DelegateSignature')).endswith('/IApiProbe.IApiProbe_C')
+        assert signature_graphs(actor) == {'Call_2'}, 'Pending is a variable only, and that one is left out'
+        assert 'Pending' not in actor.names
+        assert 'Pending        skipped: a Blueprint variable cannot hold a delegate' in proc.stdout, proc.stdout
+    print('ok  ApiLibrary: public static getter and interface result; ApiActor: editor stub keeps its interface, '
+          'pure through it, delegate parameters')
+
+
+def output_param_refusals():
+    """An output marker must name a mutable reference on its method; malformed declarations
+    must fail instead of silently exporting the original input pin."""
+    import tempfile
+    for parameter, marker, why in (
+            ('int32 Value', 'Value', 'requires a non-const reference'),
+            ('const int32& Value', 'Value', 'requires a non-const reference'),
+            ('int32& Value', 'Missing', 'must name a parameter')):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, 'BadOutput.cpp')
+            with open(source, 'w', encoding='utf-8-sig') as out:
+                out.write('#include "UeMeta.h"\n#include "Engine.h"\n'
+                          'UE_MOD_PACKAGE("/Game/BadOutput");\n'
+                          'class BadOutput : public UObject { public:\n'
+                          'UE_OUT(' + marker + '); void Set(' + parameter + ') {}\n};\n')
+            proc = assetgen_compile([source, UEAPI, os.path.join(tmp, 'cooked')])
+            proves('parameters-and-return.ue-out-invalid')
+            assert proc.returncode != 0 and why in proc.stdout + proc.stderr, proc.stdout + proc.stderr
+    print('ok  UE_OUT: value, const reference and unknown parameters are refused')
 
 
 def static_assets():
@@ -4717,15 +4941,21 @@ def asset_elsewhere():
             'OtherData at /Game/_ElytrasMods/Other/OtherData is a UOtherDef, which this mod cooks its own copy of, so it '
             'would load as null: name the class\'s owner where it is declared, e.g. '
             'UE_CLASS("/Game/_ElytrasMods/Other/UOtherDef", "UOtherDef_C")', top=top % '')
+    # Each compiles into tmp/FSD/Content/_ElytrasMods/<mod>, the layout bpbuild stages: a class cooked at another /Game
+    # path lands under the content root that out's package path implies: out given as a bare tmp under tests/, that
+    # root is AssetGen/, and the run leaves AssetGen/_ElytrasMods/Other behind.
     with tempfile.TemporaryDirectory(dir=TESTS) as tmp:
         with open(os.path.join(tmp, 'AssetPinned.cpp'), 'w') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/AssetPinned");\n'
                     + top % '  UE_CLASS("/Game/_ElytrasMods/Other/UOtherDef", "UOtherDef_C");\n'
                     + 'class AssetPinned : public AActor {\npublic:\n  UOtherDef *Picked = &OtherData;\n};\n')
-        proc = assetgen_compile([os.path.join(tmp, 'AssetPinned.cpp'), UEAPI, tmp])
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetPinned')
+        os.makedirs(out)
+        proc = assetgen_compile([os.path.join(tmp, 'AssetPinned.cpp'), UEAPI, out])
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert not os.path.exists(os.path.join(tmp, 'UOtherDef.uasset')), os.listdir(tmp)
-        imports = dict(import_paths(os.path.join(tmp, 'AssetPinned'), classes=True))
+        assert os.listdir(os.path.dirname(out)) == ['AssetPinned'], os.listdir(os.path.dirname(out))
+        assert not os.path.exists(os.path.join(out, 'UOtherDef.uasset')), os.listdir(out)
+        imports = dict(import_paths(os.path.join(out, 'AssetPinned'), classes=True))
         proves('sharing-a-class.ue-class-game-mymods-turrets')
         assert imports['/Game/_ElytrasMods/Other/OtherData.OtherData'] == '/Game/_ElytrasMods/Other/UOtherDef.UOtherDef_C', imports
     # A class in a `Game::` namespace is cooked at its own /Game path, the one the asset's import names: no copy, so no
@@ -4736,9 +4966,11 @@ def asset_elsewhere():
                     'namespace Game::_ElytrasMods::Other {\n' + top % '' + '}\n'
                     'class AssetSecondRoot : public AActor {\npublic:\n'
                     '  Game::_ElytrasMods::Other::UOtherDef *Picked = &Game::_ElytrasMods::Other::OtherData;\n};\n')
-        proc = assetgen_compile([os.path.join(tmp, 'AssetSecondRoot.cpp'), UEAPI, tmp])
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetSecondRoot')
+        os.makedirs(out)
+        proc = assetgen_compile([os.path.join(tmp, 'AssetSecondRoot.cpp'), UEAPI, out])
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        imports = dict(import_paths(os.path.join(tmp, 'AssetSecondRoot'), classes=True))
+        imports = dict(import_paths(os.path.join(out, 'AssetSecondRoot'), classes=True))
         assert imports['/Game/_ElytrasMods/Other/OtherData.OtherData'] == '/Game/_ElytrasMods/Other/UOtherDef.UOtherDef_C', imports
     print("ok  AssetTest: another mod's asset of a class this mod would cook is refused; with the class pinned to its "
           "owner, the import names the owner's class, as it does for a class cooked at its own /Game path")
@@ -5593,6 +5825,9 @@ engine_names()
 object_forwards()
 api_stub()
 api_stub_interface()
+api_stub_widget()
+api_stub_library()
+output_param_refusals()
 static_assets()
 ue_assets()
 asset_elsewhere()
@@ -6572,6 +6807,75 @@ print('ok  a UeApi made without --game refuses a class deriving from a game Blue
       '--game; a native parent still compiles')
 
 
+def game_blueprint_names():
+    """UeApi spells a game Blueprint class with UE's prefix and no _C (genueapi's bp_name): AENE_Spider_Grunt_Normal in
+    Game/AENE_Spider_Grunt_Normal.h, an interface IHubMod, and a game struct named FFoo keeps one F (Dumper-7 writes
+    FFFoo). The cooked names come from UE_CLASS / UE_GAME_STRUCT, so a mod spelled the new way cooks the same bytes as
+    one spelled the old way, ENE_Spider_Grunt_Normal_C from Game/ENE_Spider_Grunt_Normal_C.h, an alias of the class."""
+    proves('blueprint-classes.game-blueprint-names')
+    src = ('#include "UeApi/Types.h"\n#include "UeApi/Game/%s.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GameBpNames");\n'
+           'class GameBpNames : public %s {\npublic:\n    TSubclassOf<%s> Kind;\n    int32 Count;\n};\n')
+    cooked = []
+    for name in ('AENE_Spider_Grunt_Normal', 'ENE_Spider_Grunt_Normal_C'):
+        tmp, out, _ = compile_to(src % (name, name, name), 'GameBpNames')
+        cooked.append(dict((f, open(os.path.join(out, f), 'rb').read()) for f in sorted(os.listdir(out))))
+        if name.endswith('_C'):
+            assert '/Game/Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal.ENE_Spider_Grunt_Normal_C' in \
+                import_paths(os.path.join(out, 'GameBpNames')), import_paths(os.path.join(out, 'GameBpNames'))
+        shutil.rmtree(tmp, ignore_errors=True)
+    assert cooked[0] == cooked[1], 'the two spellings cook differently'
+    # IHubMod is ModHub's, so only a dump with mods loaded has it; the public SDK's vanilla one does not.
+    hub_mod = os.path.join(UEAPI, 'Game', 'IHubMod.h')
+    if os.path.exists(hub_mod):
+        assert 'class IHubMod\n' in open(hub_mod, encoding='utf-8-sig').read()
+    import genueapi     # no game struct this dump keeps has its F already: the rule itself
+    assert [genueapi.prefixed('F', n) for n in ('FloatArray', 'FModListEntry', 'Fire')] == \
+        ['FFloatArray', 'FModListEntry', 'FFire']
+
+
+game_blueprint_names()
+print('ok  UeApi names a game Blueprint UE\'s way, AENE_Spider_Grunt_Normal, and the old ENE_Spider_Grunt_Normal_C cooks '
+      'the same bytes')
+
+
+def override_marks_hooks():
+    """UeApi declares a game Blueprint's UFunctions virtual, so an override of one may say `override`: in a subclass,
+    and with --game in a UE_PATCH replacement. Either cooks the bytes it cooks without. A native class's stay plain (a
+    polymorphic class is no aggregate, and UE_ASSET_EDIT's braces need one), so on an engine event clang refuses it."""
+    def cooked(src_text, mod, extra=()):
+        tmp, _, _ = compile_to(src_text, mod, extra)
+        files = {os.path.relpath(os.path.join(d, f), tmp): open(os.path.join(d, f), 'rb').read()
+                 for d, _, fs in os.walk(tmp) for f in fs if not f.endswith('.cpp')}
+        shutil.rmtree(tmp, ignore_errors=True)
+        return files
+    head = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
+            '#include "UeApi/Game/AENE_Spider_Grunt_Normal.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n')
+    fn = ('  void GetEnemySpawnedCount(int& SpawnCount)%s {\n'
+          '    AENE_Spider_Grunt_Normal::GetEnemySpawnedCount(SpawnCount);\n    SpawnCount = SpawnCount + 41;\n  }\n};\n')
+    kid = head % 'OverrideKid' + 'class OverrideKid : public AENE_Spider_Grunt_Normal {\npublic:\n' + fn
+    proves('replacing-a-game.override')
+    assert cooked(kid % ' override', 'OverrideKid') == cooked(kid % '', 'OverrideKid'), '`override` changed the cook'
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'OverrideTick.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(head % 'OverrideTick' + 'class OverrideTick : public AActor {\npublic:\n'
+                    '  void ReceiveTick(float DeltaSeconds) override {}\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        proves('overriding-engine-and.void-receivetick-float-2')
+        assert proc.returncode != 0 and "only virtual member functions can be marked 'override'" in proc.stdout + proc.stderr, \
+            proc.stdout + proc.stderr
+    if not GAME:
+        return 'the UE_PATCH half skipped (needs --game)'
+    patch = head % 'OverridePatch' + 'class OverridePatch : public AENE_Spider_Grunt_Normal {\n  UE_PATCH;\n' + fn
+    assert cooked(patch % ' override', 'OverridePatch', ['--game', GAME]) == \
+        cooked(patch % '', 'OverridePatch', ['--game', GAME]), '`override` changed the patch'
+    return 'a UE_PATCH replacement too'
+
+
+print('ok  `override` on a game Blueprint\'s function cooks as without it, on an engine event is refused - %s'
+      % override_marks_hooks())
+
+
 def subobject_bomber():
     """SubobjectBomber restates two of ABomber's own members that two default subobjects each fit, neither named for
     the member: GooSoundComponent is GooAudioComponent, AcidEmitterLeft is GooEmitterLeft, as the game's ENE_Bomber_C
@@ -6889,10 +7193,11 @@ def infer_meta():
         head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\n'
         files = {
             'Owner/Shared.h': '#pragma once\n' + head + 'struct FShared { int32 A; };\nenum class EShared : uint8 { One, Two };\n'
-                              'class UShared : public UObject { public: FShared S; EShared E; };\n',
+                              'struct FMarked { UE_STRUCT; int32 B; };\nenum class EMarked : uint8 { X, Y };\nUE_ENUM(EMarked);\n'
+                              'class UShared : public UObject { public: FShared S; EShared E; FMarked M; EMarked K; };\n',
             'Owner/Owner.cpp': '#include "Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Owner");\n',
             'User/User.cpp': '#include "../Owner/Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/User");\n'
-                             'class AUser : public AActor { FShared S; EShared E; UShared *D; };\n',
+                             'class AUser : public AActor { FShared S; EShared E; FMarked M; EMarked K; UShared *D; };\n',
             'Mixed/Mixed.h': '#pragma once\n' + head + 'struct FMixed { int32 A; };\n',
             'Mixed/A.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixA");\nclass AMixA : public AActor { FMixed M; };\n',
             'Mixed/B.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixB");\nclass AMixB : public AActor {};\n'}
@@ -6904,11 +7209,15 @@ def infer_meta():
             proc = assetgen_compile([os.path.join(tmp, src), UEAPI, out(mod)])
             assert proc.returncode == 0, proc.stdout + proc.stderr
         proves('sharing-a-class.include-turrets-turrets-h')
-        assert {'EShared.uasset', 'FShared.uasset', 'UShared.uasset'} <= set(os.listdir(out('Owner'))), os.listdir(out('Owner'))
+        assert {'EShared.uasset', 'FShared.uasset', 'UShared.uasset', 'FMarked.uasset', 'EMarked.uasset'} \
+            <= set(os.listdir(out('Owner'))), os.listdir(out('Owner'))
         assert {f for f in os.listdir(out('User')) if f.endswith('.uasset')} == {'AUser.uasset'}, os.listdir(out('User'))
         imports = set(import_paths(os.path.join(out('User'), 'AUser')))
         assert {'/Game/_ElytrasMods/Owner/FShared.FShared', '/Game/_ElytrasMods/Owner/EShared.EShared',
                 '/Game/_ElytrasMods/Owner/UShared.UShared_C'} <= imports, sorted(imports)
+        # Its UE_STRUCT and UE_ENUM too, never cooked again here:
+        proves('sharing-a-class.include-marked')
+        assert {'/Game/_ElytrasMods/Owner/FMarked.FMarked', '/Game/_ElytrasMods/Owner/EMarked.EMarked'} <= imports, sorted(imports)
         proves('sharing-a-class.a-header-in-a-folder')
         proc = assetgen_compile([os.path.join(tmp, 'Mixed/A.cpp'), UEAPI, out('MixA')])
         assert proc.returncode != 0 and 'unimplemented property M: FMixed' in proc.stdout, proc.stdout
@@ -9027,10 +9336,10 @@ def game_enum_static_arg():
     """A game function library's static with a Blueprint enum parameter (DRGLib's LIB_F_Log_C::AddLogEntry, whose
     LogSeverity is LIB_E_LogSeverity) is in UeApi, the enum a uint8, and a call passes the byte. Only a UeApi from a
     dump with DRGLib loaded has the class; a vanilla one skips."""
-    hdr = os.path.join(UEAPI, 'Game', 'LIB_F_Log_C.h')
+    hdr = os.path.join(UEAPI, 'Game', 'ULIB_F_Log.h')
     if not os.path.exists(hdr):
         return 'skipped: this UeApi has no DRGLib'
-    assert 'AddLogEntry' in open(hdr, encoding='utf-8-sig').read(), 'LIB_F_Log_C.h has no AddLogEntry'
+    assert 'AddLogEntry' in open(hdr, encoding='utf-8-sig').read(), 'ULIB_F_Log.h has no AddLogEntry'
     tmp, out, _ = compile_to('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/Game/LIB_F_Log_C.h"\n'
                              'UE_MOD_PACKAGE("/Game/_ElytrasMods/GameEnumStaticArg");\n'
                              'class GameEnumStaticArg : public AActor {\npublic:\n  void Log(uint8 Severity) {\n'
@@ -9045,6 +9354,37 @@ def game_enum_static_arg():
 
 proves('static-functions-and.lib-f-log-c-addlogentry')
 print('ok  GameEnumStaticArg: LIB_F_Log_C::AddLogEntry, a Blueprint enum parameter as uint8 - %s' % game_enum_static_arg())
+
+
+def game_bp_enum():
+    """A game Blueprint's enum (EDroppodDoorState, the UserDefinedEnum /Game/Art/DropPod/DroppodDoorState) has a UeApi
+    type, and with it the members of one: BP_DropPod_Base_C's DoorState and its DoorStateChanged dispatcher, which a mod
+    binds. The enum is imported from the game's package, never cooked, and a default names its cooked enumerator
+    (DroppodDoorState::NewEnumerator2 for Open, where Dumper-7 writes the display name)."""
+    hdr = os.path.join(UEAPI, 'Game', 'ABP_DropPod_Base.h')
+    if not os.path.exists(hdr) or 'DoorStateChanged' not in open(hdr, encoding='utf-8-sig').read():
+        return 'skipped: this UeApi has no DoorStateChanged (genueapi without --game)'
+    tmp, out, _ = compile_to(EDIT_HEAD + '#include "UeApi/Game/ABP_DropPod_Base.h"\n'
+                             'UE_MOD_PACKAGE("/Game/_ElytrasMods/GameBpEnum");\n'
+                             'class GbeWatch : public AActor {\npublic:\n'
+                             '  EDroppodDoorState Last = EDroppodDoorState::Open;\n'
+                             '  ABP_DropPod_Base *Pod;\n'
+                             '  void Watch(ABP_DropPod_Base *P) { Pod = P; P->DoorStateChanged.Add(this, &GbeWatch::OnDoor); }\n'
+                             '  void OnDoor(EDroppodDoorState State) { Last = State; }\n'
+                             '  bool IsOpen() { return Pod->DoorState == EDroppodDoorState::Open; }\n};\n', 'GameBpEnum')
+    assert sorted(os.listdir(out)) == ['GbeWatch.uasset', 'GbeWatch.uexp'], os.listdir(out)
+    pkg = os.path.join(out, 'GbeWatch')
+    keeps_invariants(pkg)
+    imports = import_paths(pkg, classes=True)
+    names = dumpexp.load(pkg)[3]
+    shutil.rmtree(tmp, ignore_errors=True)
+    proves('game-enums.game-blueprint-enum')
+    assert ('/Game/Art/DropPod/DroppodDoorState.DroppodDoorState', '/Script/Engine.UserDefinedEnum') in imports, imports
+    assert 'DroppodDoorState::NewEnumerator2' in names, names
+    return 'imported, its cooked names, the dispatcher bound'
+
+
+print('ok  GameBpEnum: a game Blueprint enum, its member and dispatcher - %s' % game_bp_enum())
 
 
 def object_through_interface():
@@ -12090,6 +12430,32 @@ defaults_braces_other_mod()
 print('ok  DefaultsBracesOther: another mod\'s struct is no engine struct to braces: a member left out takes its initializer')
 
 
+def other_struct_read():
+    """OtherStructRead: `O.A * 10 + O.B` and a braced local of another mod's UE_STRUCT_IN struct name its members as
+    DboOtherMod cooked them (A_<n>_<guid>), so each resolves there (field_paths_resolve) and the read finds the values
+    the CDO holds (A 1, B 2). Wrote the plain `A` and `B` before 2026-10-28: the struct has an import package, which
+    LowerField took for an engine struct's. The CDO's tags may say `A`: the loader finds a UserDefinedStruct member by
+    its authored name too (UUserDefinedStruct::CustomFindProperty), which a field path never does."""
+    import struct
+    cooked = [n for n in dumpexp.load(os.path.join(os.path.dirname(asset('DboOtherMod')), 'FDboOther'))[3]
+              if re.fullmatch(r'[AB]_\d+_[0-9A-F]{32}', n)]
+    base = asset('OtherStructRead')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__OtherStructRead_C')
+    o = next(t for t in pkg.tags(cdo) if t['name'] == 'O')
+    held = {m['name'].split('_')[0]: struct.unpack('<i', m['value'])[0] for m in pkg.tags(cdo, o['at'])}
+    fields = {'O': {n: held[n.split('_')[0]] for n in cooked}}
+    proves('mod-structs-ue.return-s-kills')
+    assert run(base, 'Read', fields)[0] == 12, fields
+    for m in (0, 7):
+        assert run(base, 'Built', {}, M=m)[0] == m * 10 + 5, m
+
+
+other_struct_read()
+print('ok  OtherStructRead: another mod\'s struct\'s members are read and written by the names its owner cooked')
+
+
 def defaults_other_ctor():
     """`O = FDboOther();` and `P = {};` of another mod's UE_STRUCT_IN struct are its value-initialisation, which C++
     makes from each member's initializer (the implicit default constructor, [class.base.init]/9; empty braces of an
@@ -12790,6 +13156,38 @@ print('ok  UnlikeCppRefusals: a UE_STRUCT method that is not inline, and a quali
       'name, a call or a cast, are refused')
 
 
+def source_of_a_location():
+    """A location in clang's dump is an offset into its own file, and every source of a mod has that offset. Os.cpp's
+    other source, Aa.h (a comment, sorted first), has `OsBase::Bump` where Os.cpp's unqualified `GetOther()->Bump` is,
+    and a comment above where Go begins. Read in the first source that fit, the call was refused as qualified on another
+    object and Go took Aa.h's comment as its tooltip (EMM, 2026-10-29); read in Os.cpp, Go compiles with its own."""
+    main = ('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\n#include "Aa.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Os");\n'
+            'class OsBase : public AActor {\npublic:\n  int32 Bump(int32 V) { return V + 1; }\n};\n'
+            'class Os : public AActor {\npublic:\n  OsBase *Other;\n  OsBase *GetOther() { return Other; }\n'
+            '  // Bumps the other one.\n  int32 Go() { return GetOther()->Bump(1); }\n};\n')
+    go, bump = main.index('int32 Go'), main.index('Bump(1)')
+    decoy = list('/*' + ' ' * (bump + 2))
+    for at, text in ((go - 16, '\n// Stray words\n'), (go, 'Go;'), (bump - 8, 'OsBase::Bump')):
+        decoy[at:at + len(text)] = text
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, 'Aa.h'), 'w', encoding='utf-8', newline='\n') as f:
+            f.write(''.join(decoy) + '*/\n')
+        src = os.path.join(tmp, 'Os.cpp')
+        with open(src, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(main)
+        os.makedirs(os.path.join(tmp, 'api'))
+        proc = assetgen_compile([src, UEAPI, tmp, '--api', os.path.join(tmp, 'api')])
+        proves('calling-the-parent.other-superbase-bump-1')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        api = b''.join(open(p, 'rb').read() for p in glob.glob(os.path.join(tmp, 'api', '**', '*.u*'), recursive=True))
+    proves('access-read-only.doc-comment-tooltip')
+    assert b'Bumps the other one.' in api and b'Stray words' not in api, 'Go: a tooltip from the wrong source'
+
+
+source_of_a_location()
+print("ok  SourceOfALocation: a qualifier and a tooltip are read in the node's own source, not another at the same offset")
+
+
 def widget_no_tree_warns():
     """A widget shows its tree's root (UserWidget.cpp 745), and the engine makes a tree only for a
     WidgetBlueprintGeneratedClass (Initialize, 109-151). Every widget class AssetGen cooks is a BlueprintGeneratedClass,
@@ -13019,7 +13417,7 @@ def widget_event_flags():
         assert got == want, got
         warned = set(re.findall(r'warning: (\w+): the (\w+) it inherits from (\w+) never runs', proc.stdout))
         proves('parent-classes.void-tick-fgeometry-mygeometry')
-        assert warned == {('UWfKid', 'Tick', 'UWfTick'), ('UWfPerkKid', 'Tick', 'UI_AvailablePerkPoints_C')}, proc.stdout
+        assert warned == {('UWfKid', 'Tick', 'UWfTick'), ('UWfPerkKid', 'Tick', 'UI_AvailablePerkPoints')}, proc.stdout
 
         if GAME:
             src = os.path.join(tmp, 'WfPatch.cpp')
@@ -13388,7 +13786,7 @@ def asset_delegate_value():
     # A struct makes no signature function, so a delegate in one is refused, though the class generated just before it
     # (by name) left one of that type in DelegateSigs: the struct cooked with that package's index.
     refused('AdvStructDel', '  TDelegate<void()> Mine;\n',
-            'member D: TDelegate<void ()> needs a signature function, which only a class holds, not a struct or an interface',
+            'member D: TDelegate<void ()> needs a signature function, which a class or an interface holds, not a struct',
             top='struct FZzAdvHeld {\n  UE_STRUCT;\n  TDelegate<void()> D;\n  int32 N = 0;\n};\n')
 
 
@@ -13396,6 +13794,38 @@ asset_delegate_value()
 print('ok  AssetDelegateValue: an unbound delegate in an asset\'s braces, a TMap\'s value and a mod interface\'s variable '
       'is written as an FScriptDelegate, null and None, and the asset names no signature function of another package; '
       'a UE_STRUCT\'s delegate is refused whatever class was built before it')
+
+
+def iface_delegate():
+    """IfaceDelegate: a TDelegate parameter of a mod interface's function names a signature function the interface's
+    package exports, a delegate function, so it loads; the implementer and a caller through the interface compile and
+    keep their own."""
+    here = os.path.dirname(asset('IfaceDelegate'))
+    base = os.path.join(here, 'IIfdSchedules')
+    keeps_invariants(base)
+    names = exports_of(base)
+    for fn, parm in (('Schedule', 'Call'), ('Count', 'Each')):
+        out = dump('dumpstruct.py', base, names.index(fn))
+        sig = re.search(r'DelegateProperty %s .* exp\[(\d+)\]' % parm, out)
+        proves('delegate-values.void-schedule-tdelegate-void-call')
+        assert sig, out
+        target = names[int(sig.group(1))]
+        assert target.endswith('__DelegateSignature'), (fn, target)
+        flags = int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', base, int(sig.group(1)))).group(1), 16)
+        assert flags & 0x100000, (target, hex(flags))           # FUNC_Delegate
+    # The implementation's parameters name the interface's, imported; the caller, binding values straight into the
+    # call, holds no delegate property.
+    keeps_invariants(os.path.join(here, 'AIfdCaller'))
+    clock = os.path.join(here, 'AIfdClock')
+    keeps_invariants(clock)
+    imported = {p.rsplit(':', 1)[-1] for p in import_paths(clock) if 'IIfdSchedules_C:' in p}
+    proves('delegate-values.void-schedule-tdelegate-void-call')
+    assert {'Call__DelegateSignature', 'Each__DelegateSignature'} <= imported, imported
+
+
+iface_delegate()
+print('ok  IfaceDelegate: a mod interface function\'s TDelegate parameter names the interface\'s own signature function, '
+      'which its implementer imports; a caller through it compiles')
 
 
 def interface_var_names():
@@ -14253,6 +14683,31 @@ def input_refusals():
         refused(mod, body, why, base=base)
 
 
+def struct_slices():
+    """A struct passed where its parent struct is wanted is the slice C++ makes: the child's own conversion
+    (GetInputEventFromPointerEvent, a native that copies out the parent) runs on it, and the call takes what it returns,
+    never the child itself, which the VM would copy whole into the parent-sized slot. So for a native's const reference,
+    the object of a method the parent declares and a function's by-value parameter. A child with no conversion is
+    refused, naming both."""
+    proves('struct-conversions.ukismetinputlibrary-inputevent-iscontroldown-mouseevent')
+    tmp, out, _ = compile_to(EDIT_HEAD + '#include "UeApi/SlateCore.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/StructSlice");\n'
+                             'class StructSlice : public AActor {\npublic:\n'
+                             '  bool Native(const FPointerEvent &E) { return UKismetInputLibrary::InputEvent_IsControlDown(E); }\n'
+                             '  bool Sugar(const FPointerEvent &E) { return E.InputEvent_IsControlDown(); }\n'
+                             '  void Take(FInputEvent In) {}\n  void ByValue(const FKeyEvent &K) { Take(K); }\n};\n', 'StructSlice')
+    base = os.path.join(out, 'StructSlice')
+    for fn, conv, arg, callee in (('Native', 'GetInputEventFromPointerEvent', 'E', "Function'InputEvent_IsControlDown'"),
+                                  ('Sugar', 'GetInputEventFromPointerEvent', 'E', "Function'InputEvent_IsControlDown'"),
+                                  ('ByValue', 'GetInputEventFromKeyEvent', 'K', r'LocalVirtualFunction\s+Take')):
+        text = dump('walkscript.py', base, export_index(base, fn))
+        assert re.search(r"Function'%s'\s*\n.*LocalOutVariable\s+%s@" % (conv, arg), text), (fn, text)
+        assert not re.search(r"%s\s*\n.*Local\w*Variable\s+%s@" % (callee, arg), text), (fn, text)
+    shutil.rmtree(tmp, ignore_errors=True)
+    proves('struct-conversions.take-motion')
+    refused('SliceNoConv', '  void Take(const FInputEvent &E) {}\n  void F(const FMotionEvent &M) { Take(M); }\n',
+            'Take argument 1 is an FMotionEvent where an FInputEvent is wanted', top='#include "UeApi/SlateCore.h"\n')
+
+
 def input_key_names():
     """A key is named as the engine names it, case aside (FName's match): EKeys', or an input plugin's DRG ships, its
     FSDRawInput's GenericUSBController keys among them; or by its character, as a non-US layout names a key it has no
@@ -14293,6 +14748,9 @@ input_refusals()
 print('ok  InputRefusals: a key or action marker on no actor, a static or inline method, one returning a value or taking '
       'more than the key, an unknown option or an action\'s modifier, a key the engine does not have, or marking no '
       'method is refused')
+struct_slices()
+print('ok  StructSlice: a child struct passed for its parent - to a native\'s const reference, a by-value parameter, '
+      'or as the object of the parent\'s method - is sliced by its own conversion; one with none is refused')
 with_ini = input_key_names()
 print('ok  InputKeyNames: a key the engine has compiles whatever its case, a character key too, and its FKey literal '
       'says nothing; a literal of no key warns, naming the closest; ' + (

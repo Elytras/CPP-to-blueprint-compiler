@@ -86,6 +86,7 @@ public:
     std::map<std::string, std::pair<std::string, std::string>> ApiDocs;
     /* The class's comment: the stub Blueprint's description, which the editor makes the class's tooltip. */
     std::string ApiDescription;
+    std::map<std::string, FIndex> ApiInterfaceMethods;   // function -> the interface whose editor graph owns it
 
     FIndex AddFunction(const std::string& Name, FIndex Super,
                        const std::vector<FPropertyDef>& Params,

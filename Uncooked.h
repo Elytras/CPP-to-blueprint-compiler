@@ -24,6 +24,7 @@ struct FApiFunction
     std::string Name;
     std::vector<FPropertyDef> Params;
     uint32 Flags = 0;
+    FIndex Interface;
 };
 
 struct FApiClass
@@ -32,11 +33,23 @@ struct FApiClass
     std::string AssetName;                   // ReadProperty (the .uasset)
     std::string ParentPackage, ParentClass;  // /Script/Engine, BlueprintFunctionLibrary
     std::vector<FApiFunction> Functions;
+    bool bOverrides = false;                 // overrides a function (left to the parent's stub): it still gets a stub
     std::vector<FPropertyDef> Variables;
     std::map<std::string, std::string> Categories;   // function or variable -> its editor category, "A|B"
     std::map<std::string, std::pair<std::string, std::string>> Docs;   // function -> (tooltip, keywords)
     std::string Description;                 // the Blueprint's, which the editor compiles into the class's ToolTip
     bool bInterface = false;                 // a UE_INTERFACE: written as a Blueprint Interface
+    std::vector<FIndex> Interfaces;          // implemented interfaces, remapped from the cooked source
+    /* A user widget: written as a Widget Blueprint, its designer tree (first widget the root) carrying the cooked
+       class's widget defaults, so the editor's designer shows the widget's layout and another Widget Blueprint can
+       place it. FIndexes point into Source, as a parameter's do. */
+    struct FWidget { std::string Name; FIndex Class; std::vector<FPropertyDef> Defaults; };
+    struct FWidgetSlot { std::string Panel, Child; FIndex Class; std::vector<FPropertyDef> Defaults; };
+    bool bWidget = false;
+    std::vector<FWidget> Widgets;
+    std::vector<FWidgetSlot> WidgetSlots;
+    struct FWidgetSlotFill { std::string Host, Slot, Content; };     // Content fills the named slot Slot of the widget Host
+    std::vector<FWidgetSlotFill> WidgetSlotFills;
 };
 
 /*
