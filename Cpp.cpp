@@ -8470,6 +8470,19 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
                 R.bClassIn = true;
             }
 
+    /* So is a UE_STRUCT or UE_ENUM there, as UE_STRUCT_IN / UE_ENUM_IN would say: its owner cooks it, and a copy cooked
+       here would be another type, which the owner's saves and results do not hold. */
+    for (auto& [Key, R] : Records)
+        if (R.bIsStruct && R.UePackage.empty() && !R.bIsPatch && !R.bCooked)
+            if (const std::string O = OwnerOf(LeafOf(R.CppName)); !O.empty() && O != Mine)
+            {
+                R.UePackage = PathIn(O, R.CppName);
+                R.UeName = LeafOf(R.CppName);
+            }
+    for (auto& [Enum, Owner] : EnumMarks)
+        if (const std::string O = OwnerOf(LeafOf(Enum)); Owner.empty() && !O.empty() && O != Mine)
+            Owner = O;
+
     /* The candidates: a plain struct, its members values a struct holds (no text pointer, array or reference), and a
        uint8 enum, of a mod's folder. */
     std::map<std::string, std::vector<FRecord*>> Plain;      // by name, the last segment
