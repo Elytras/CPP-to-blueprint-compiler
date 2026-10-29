@@ -7124,10 +7124,11 @@ def infer_meta():
         head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\n'
         files = {
             'Owner/Shared.h': '#pragma once\n' + head + 'struct FShared { int32 A; };\nenum class EShared : uint8 { One, Two };\n'
-                              'class UShared : public UObject { public: FShared S; EShared E; };\n',
+                              'struct FMarked { UE_STRUCT; int32 B; };\nenum class EMarked : uint8 { X, Y };\nUE_ENUM(EMarked);\n'
+                              'class UShared : public UObject { public: FShared S; EShared E; FMarked M; EMarked K; };\n',
             'Owner/Owner.cpp': '#include "Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Owner");\n',
             'User/User.cpp': '#include "../Owner/Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/User");\n'
-                             'class AUser : public AActor { FShared S; EShared E; UShared *D; };\n',
+                             'class AUser : public AActor { FShared S; EShared E; FMarked M; EMarked K; UShared *D; };\n',
             'Mixed/Mixed.h': '#pragma once\n' + head + 'struct FMixed { int32 A; };\n',
             'Mixed/A.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixA");\nclass AMixA : public AActor { FMixed M; };\n',
             'Mixed/B.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixB");\nclass AMixB : public AActor {};\n'}
@@ -7139,11 +7140,15 @@ def infer_meta():
             proc = assetgen_compile([os.path.join(tmp, src), UEAPI, out(mod)])
             assert proc.returncode == 0, proc.stdout + proc.stderr
         proves('sharing-a-class.include-turrets-turrets-h')
-        assert {'EShared.uasset', 'FShared.uasset', 'UShared.uasset'} <= set(os.listdir(out('Owner'))), os.listdir(out('Owner'))
+        assert {'EShared.uasset', 'FShared.uasset', 'UShared.uasset', 'FMarked.uasset', 'EMarked.uasset'} \
+            <= set(os.listdir(out('Owner'))), os.listdir(out('Owner'))
         assert {f for f in os.listdir(out('User')) if f.endswith('.uasset')} == {'AUser.uasset'}, os.listdir(out('User'))
         imports = set(import_paths(os.path.join(out('User'), 'AUser')))
         assert {'/Game/_ElytrasMods/Owner/FShared.FShared', '/Game/_ElytrasMods/Owner/EShared.EShared',
                 '/Game/_ElytrasMods/Owner/UShared.UShared_C'} <= imports, sorted(imports)
+        # Its UE_STRUCT and UE_ENUM too, never cooked again here:
+        proves('sharing-a-class.include-marked')
+        assert {'/Game/_ElytrasMods/Owner/FMarked.FMarked', '/Game/_ElytrasMods/Owner/EMarked.EMarked'} <= imports, sorted(imports)
         proves('sharing-a-class.a-header-in-a-folder')
         proc = assetgen_compile([os.path.join(tmp, 'Mixed/A.cpp'), UEAPI, out('MixA')])
         assert proc.returncode != 0 and 'unimplemented property M: FMixed' in proc.stdout, proc.stdout
