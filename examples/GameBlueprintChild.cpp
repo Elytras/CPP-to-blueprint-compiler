@@ -7,7 +7,7 @@
 
 #include "UeApi/Engine.h"
 #include "UeApi/FSD.h"
-#include "UeApi/Game/BP_LightPost01_C.h"
+#include "UeApi/Game/ABP_LightPost01.h"
 
 #include "../include/Objects.h" // AssetGen's include/ folder, by its path from this file
 
@@ -21,7 +21,7 @@ namespace Game::Art::Environments::SpaceRig {
 
 /* The child class. Its parent is the game's BP_LightPost01_C, imported from the game's package, so it keeps the
    lamp's components, variables, construction script and events, and changes only what it names here. */
-class BP_LightPost01_Alarm : public BP_LightPost01_C {
+class BP_LightPost01_Alarm : public ABP_LightPost01 {
   /* First we change the lamp's own variables, as you would under Class Defaults in the editor. The lamp's
      construction script sets its PointLight's colour and intensity from Light_Color and Light_Intensity, so we set
      these rather than the PointLight's own values, which the script would overwrite. Flicker is read by the lamp's
@@ -37,7 +37,7 @@ public:
      starts the flicker, so we call it first: BP_LightPost01_C::ReceiveBeginPlay() is the editor's "Add call to
      parent function". Without it the lamp would still be red, but it would never flicker. */
   void ReceiveBeginPlay() {
-    BP_LightPost01_C::ReceiveBeginPlay();
+    ABP_LightPost01::ReceiveBeginPlay();
     UGameFunctionLibrary::GetFSDGameState(this)->PostGameMessage("The alarm lamp is on");
   }
 };

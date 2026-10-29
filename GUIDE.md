@@ -978,10 +978,10 @@ parent function does. `UE_DEFAULTS` sets the defaults of inherited variables, as
 inherited components, including the ones the game Blueprint adds in its Components panel.
 
 ```cpp
-#include "UeApi/Game/BP_ExplosiveBarrel_C.h"
+#include "UeApi/Game/ABP_ExplosiveBarrel.h"
 
 namespace Game::GameElements::GameEvents::ExplosiveBarrelsEvent {
-class BP_ExplosiveBarrel_Big : public BP_ExplosiveBarrel_C {
+class BP_ExplosiveBarrel_Big : public ABP_ExplosiveBarrel {
   UE_DEFAULTS {
     SpeedThreshold = 2000.0f;                                  // a variable the game Blueprint declares
     StaticMesh->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f);   // a component it adds
@@ -991,12 +991,12 @@ public:
   int32 Starts = 0;
 
   void ReceiveBeginPlay() {                     // an event the game Blueprint implements
-    BP_ExplosiveBarrel_C::ReceiveBeginPlay();   // run the game's own graph first
+    ABP_ExplosiveBarrel::ReceiveBeginPlay();    // run the game's own graph first
     Starts += 1;
   }
 
   void Throw(FVector force) {                   // a function it declares
-    BP_ExplosiveBarrel_C::Throw(force * 2.0f);
+    ABP_ExplosiveBarrel::Throw(force * 2.0f);
   }
 };
 }
@@ -1043,12 +1043,12 @@ what the source names, and writes the whole package back at its own path, so the
 Pass the extracted pak's `Content` folder as `--game` (bpbuild: `game_content` in `mods.yaml`).
 
 ```cpp
-#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"
+#include "UeApi/Game/AENE_Spider_Grunt_Normal.h"
 #include "UeAssets/UEnemyDescriptor.h"
 
 UE_ASSET_EDIT(UeAssets::UEnemyDescriptor::Game::Enemies::Spider::Grunt::ED_Spider_Grunt) {.SpawnSpread = 800.0f};
 
-class SlowGrunt : public ENE_Spider_Grunt_Normal_C {
+class SlowGrunt : public AENE_Spider_Grunt_Normal {
   UE_PATCH;
   UE_DEFAULTS {
     CustomTimeDilation = 0.5f;            // every grunt spawned from this Blueprint moves at half speed
@@ -1531,7 +1531,7 @@ use a newer SDK or regenerate your own.
 | File                  | What it holds                                                                                                                                                                                                                                                                                                                                        |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `<Module>.h`          | One per native package `/Script/<Module>` (`Engine.h`, `FSD.h`, ...): its enums, structs and classes, with the operators on its structs.                                                                                                                                                                                                             |
-| `Game/<Name>_C.h`     | One per game Blueprint class. The class sits in a namespace that mirrors its `/Game` folder.                                                                                                                                                                                                                                                         |
+| `Game/<Name>.h`       | One per game Blueprint class or struct, named UE's way (`ABP_Foo`). The class sits in a namespace that mirrors its `/Game` folder.                                                                                                                                                                                                                   |
 | `UeApi.h`             | Includes every native package header, not the `Game/` ones. It is slow to parse; include the headers you use instead.                                                                                                                                                                                                                                |
 | `Conv.h`, `Conv.json` | Every Kismet `Conv_XToY` the compiler can use as an implicit conversion or an explicit cast.                                                                                                                                                                                                                                                         |
 | `Ops.json`            | The Kismet functions behind operators on structs and soft pointers (`==`, `+`, ...).                                                                                                                                                                                                                                                                 |
@@ -1559,10 +1559,14 @@ another overload drops both and returns the delegate's value. See
 
 `UeApi/Game/` declares each game Blueprint class in the namespace of its folder:
 `/Game/GameElements/GameEvents/ExplosiveBarrelsEvent/BP_ExplosiveBarrel` is
-`Game::GameElements::GameEvents::ExplosiveBarrelsEvent::BP_ExplosiveBarrel_C`, in `Game/BP_ExplosiveBarrel_C.h`. In a
-folder name, a character that C++ does not allow becomes `_`, and a leading digit gets a `_` in front. A class name that
-only one asset uses is also aliased at global scope, so `BP_ExplosiveBarrel_C` works bare. A name that several assets
-share gets no alias, and naming it bare fails to compile: write the namespaced spelling. See
+`Game::GameElements::GameEvents::ExplosiveBarrelsEvent::ABP_ExplosiveBarrel`, in `Game/ABP_ExplosiveBarrel.h`. The class
+is named as native code names one: UE's prefix (A an actor, I an interface, U any other object; F a game struct) on the
+asset's name, without the cooked `_C`, and a name that has its prefix already keeps it
+([how](REFERENCE.md#blueprint-classes.game-blueprint-names)). In a folder name, a character that C++ does not allow
+becomes `_`, and a leading digit gets a `_` in front. A class name that only one asset uses, and no native class, is
+also aliased at global scope, so `ABP_ExplosiveBarrel` works bare. A name that several assets or a native class share
+gets no alias, and naming it bare fails to compile or names the native one: write the namespaced spelling. The spelling
+before genueapi 7, `BP_ExplosiveBarrel_C` in `Game/BP_ExplosiveBarrel_C.h`, still names the class. See
 [Extending a game Blueprint](#extending-a-game-blueprint).
 
 ### Names the SDK respells
