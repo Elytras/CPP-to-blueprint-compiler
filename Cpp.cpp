@@ -1171,6 +1171,7 @@ struct FRecord
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
     bool bIsPatch = false;      // UE_PATCH: not a class of its own; its UE_DEFAULTS edit its parent's, in the parent's package
     bool bCooked = false;       // UE_COOKED: shipped as the cooked package it was built from; imported here, never cooked
+    bool bUeApi = false;        // declared in a UeApi header: the game's (or another mod's) class, imported, never cooked here
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
     /* A game Blueprint from UeApi's Game/, or another mod's class from the header it shares: every function of one is a
@@ -2588,6 +2589,7 @@ private:
     const std::string* SourceOf(const Json& Loc) const;
     /* The comment written right above Decl in a mod source, as tooltip text; empty when none. */
     std::string DocAbove(const Json& Decl) const;
+    bool InUeApi(const Json& Decl) const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
     /* The nearest declaration of some method along R's chain is `= 0`: the class Generate cooks CLASS_Abstract. */
     bool IsAbstract(const FRecord& R) const;
@@ -2805,9 +2807,23 @@ private:
        int32 depending on where it comes from: one name for both. */
     std::string TypeTag(const std::string& Type) const
     {
+        /* First a game Blueprint class is spelled by its cooked name, Game::JSON::JSONValue_C for UeApi's
+           Game::JSON::UJSONValue: the tag names a cooked struct, which a rename in UeApi must not move. */
+        std::string Spelled, Ident;
+        auto Cooked = [&]() {
+            const FRecord* R = Ident.empty() ? nullptr : Find(Ident);
+            if (R && R->bUeApi && !R->bIsStruct && R->IsGameBlueprint() && LeafOf(Ident) == LeafOf(R->CppName))
+                Ident = Ident.substr(0, Ident.size() - LeafOf(Ident).size()) + R->UeName;
+            Spelled += Ident;
+            Ident.clear();
+        };
+        for (char C : StripTypeKeywords(Type))
+            if (std::isalnum(uint8(C)) || C == '_' || C == ':') Ident += C;
+            else { Cooked(); Spelled += C; }
+        Cooked();
         std::string Name, Word;
         auto Flush = [&]() { Name += Word == "int32" ? "int" : Word == "long" ? "int64" : Word; Word.clear(); };
-        for (char C : StripTypeKeywords(Type) + " ")
+        for (char C : Spelled + " ")
             if (std::isalnum(uint8(C)) || C == '_') Word += C;
             else
             {
@@ -3572,6 +3588,7 @@ bool FCompiler::Collect(std::string* Err)
         FRecord R;
         R.CppName = Ns + Name(N);
         R.Doc = DocAbove(N);
+        R.bUeApi = InUeApi(N);
         if (auto SI = Structs.find(Name(N)); Ns.empty() && SI != Structs.end())
         {
             R.UePackage = SI->second.Package;
@@ -4061,9 +4078,9 @@ bool FCompiler::Collect(std::string* Err)
                                   && Base->UePackage.compare(Base->UePackage.size() - Natural.size(), Natural.size(), Natural) == 0;
         if (!bCookedHere && !bOwnerPinned)
         {
-            const std::string B = LeafOf(Base->CppName);
+            const std::string B = Base->bUeApi ? Base->UeName : LeafOf(Base->CppName);
             *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): " + B
-                 + (Base->UeName == B ? " is the game's Blueprint (" + Base->UePackage + "), which no mod cooks"
+                 + (Base->bUeApi ? " is the game's Blueprint ("+ Base->UePackage + "), which no mod cooks"
                                       : " is cooked at " + Base->UePackage + ", not by this mod")
                  + ": it stays as it is cooked there, its functions not final and its other subclasses kept, so calls "
                    "bound to them as final would skip their overrides; derive " + LeafOf(Leaf.CppName) + " from it as a "
@@ -4244,6 +4261,8 @@ bool FCompiler::Collect(std::string* Err)
             return false;
         }
         if (R.UePackage.empty() || R.bCooked) continue;          // a UE_COOKED class is imported, as another mod's is
+        /* UeApi's Game::_ModHub::IHubMod is at the path its namespace and name give, as a mod's class there would be. */
+        if (R.bUeApi) continue;
         if (R.UePackage != PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName)) continue;
         if (!R.bIsStruct && R.UeName != LeafOf(R.CppName) + "_C")
         {
@@ -8246,6 +8265,18 @@ const std::string* FCompiler::SourceOf(const Json& Loc) const
         }
     const int32 Id = Loc.value("fileId", -1);
     return Id >= 0 && size_t(Id) < FileTexts.size() ? FileTexts[Id] : nullptr;
+}
+
+/* Decl is written in a file of a UeApi folder (the path ReachedByIncludes does not follow either): read off its range's
+   begin, which FAstSax keeps for a record. */
+bool FCompiler::InUeApi(const Json& Decl) const
+{
+    const auto Range = Decl.find("range");
+    if (Range == Decl.end() || !Range->contains("begin") || !Doc.contains("files")) return false;
+    const int32 Id = (*Range)["begin"].value("fileId", -1);
+    if (Id < 0 || size_t(Id) >= Doc["files"].size()) return false;
+    const std::filesystem::path File = Doc["files"][Id].get<std::string>();
+    return std::any_of(File.begin(), File.end(), [](const std::filesystem::path& Part) { return Part == "UeApi"; });
 }
 
 /* The comment on the lines right above the line At is on, written as a doc comment is: one `/* ... *\/` block that begins
@@ -17619,12 +17650,13 @@ bool FCompiler::NestedWrapperOut(const std::string& ContainerType, size_t OutArg
 }
 
 /* A class the headers only forward-declare has no record, so nothing says what package to import it from. A
-   Blueprint class's header is named after it. */
+   Blueprint class's header is named after it: UBP_Foo in its Game:: namespace, or the older spelling BP_Foo_C. */
 static std::string UnknownClass(const std::string& Where, const std::string& QualType, std::string Class)
 {
     Class = StripTypeKeywords(Class);
     const size_t Leaf = Class.rfind("::");
-    if (Class.size() > 2 && Class.compare(Class.size() - 2, 2, "_C") == 0)
+    if ((Class.size() > 2 && Class.compare(Class.size() - 2, 2, "_C") == 0) || Class.rfind("Game::", 0) == 0
+        || Class.rfind("::Game::", 0) == 0)
         return Where + ": " + Class + " is only forward-declared here - #include \"UeApi/Game/"
              + Class.substr(Leaf == std::string::npos ? 0 : Leaf + 2) + ".h\"";
     return "TODO: unimplemented " + Where + ": " + QualType;
