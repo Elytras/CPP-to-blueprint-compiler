@@ -57,7 +57,8 @@ CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
 # 5: UeIchRecords, the inherited components a game Blueprint has a template of its own for.
 # 6: a game Blueprint's functions marked UE_PROTECTED / UE_PRIVATE / UE_BLUEPRINT_PURE / UE_BLUEPRINT_CALLABLE, and left out of Events.json;
 #    no NotCallable.json. The compiler still takes 5: it reads an older Events.json's game rows where they are.
-GENUEAPI_VERSION = 6
+# 7: a game Blueprint class is UE-prefixed without _C (bp_name), Foo_C an alias of it. The compiler still takes 6.
+GENUEAPI_VERSION = 7
 
 
 def dump_identity(sdk_dir):
@@ -147,6 +148,7 @@ TEXT_TYPES = {
 
 STRUCTS = {}     # cpp name -> Struct, filled by parse_structs before any class header is mapped
 ENUMS = {}       # cpp name -> Enum
+GAME_STRUCT_NAMES = {}   # Dumper-7's name of a game struct -> its own, where they differ (game_structs)
 OUT_PTR = re.compile(r"^((?:struct\s+)?[A-Za-z_][\w<>, \*:]*?)\s*\*$")     # Dumper-7 spells a non-object out-parm as T*
 STRUCT_REF = re.compile(r"^(?:const\s+)?struct\s+(F\w+)\s*&?$")
 ENUM_REF = re.compile(r"^(?:const\s+)?(?:TEnumAsByte<)?(E\w+)>?\s*&?$")
@@ -197,8 +199,8 @@ def map_type(raw):
         inner = map_type(m.group(1))
         return "other" if inner == "void" else inner if inner in KINDS else inner + "&"
     m = STRUCT_REF.match(t)
-    if m and m.group(1) in STRUCTS:
-        return m.group(1)
+    if m and GAME_STRUCT_NAMES.get(m.group(1), m.group(1)) in STRUCTS:
+        return GAME_STRUCT_NAMES.get(m.group(1), m.group(1))
     m = ENUM_REF.match(t)
     if m and m.group(1) in ENUMS:
         return m.group(1)
@@ -355,6 +357,24 @@ def game_structs(own, content):
             dropped.append((st.cpp, "holds a dropped one"))
             GAPS.append(("game struct", st, "", "", "holds a dropped one"))
             del STRUCTS[st.cpp]
+    # Dumper-7 puts F on every struct's name, one that has it already too (FEventSpawnEntry is FFEventSpawnEntry):
+    # a game struct is named by prefixed(), unless that is another struct's name. Every spelling of it follows.
+    for st in [s for s in STRUCTS.values() if s.is_game]:
+        name = prefixed("F", st.ue_name)
+        if name != st.cpp and name not in STRUCTS:
+            GAME_STRUCT_NAMES[st.cpp] = name
+    if GAME_STRUCT_NAMES:
+        word = re.compile(r"\b(%s)\b" % "|".join(map(re.escape, GAME_STRUCT_NAMES)))
+        respell = lambda t: word.sub(lambda m: GAME_STRUCT_NAMES[m.group(1)], t)
+        for st in list(STRUCTS.values()):
+            if st.cpp in GAME_STRUCT_NAMES:
+                del STRUCTS[st.cpp]
+                st.cpp = GAME_STRUCT_NAMES[st.cpp]
+                st.pkg = "Game/" + st.cpp
+                STRUCTS[st.cpp] = st
+            st.base = respell(st.base)
+            st.fields = [(respell(t), n) for t, n in st.fields]
+            st.raw_fields = [(respell(t), n, tr) for t, n, tr in st.raw_fields]
     kept = sum(1 for st in STRUCTS.values() if st.is_game)
     print("  game structs: %d kept, %d left out (%s)" % (kept, len(dropped), ", ".join(
         "%s %d" % (w, c) for w, c in collections.Counter(w for _, w in dropped).most_common())))
@@ -809,7 +829,7 @@ def subsystem_get(k, by_name, kinds, rewrite):
         return [], []
     # A Blueprint's whole path only where the definition starts, at global scope: inside `namespace Game::Game::X` (or
     # after `X::Get(`, in X's scope) `Game::` names the inner Game. There X is X's own name.
-    me = k.ue_name if k.is_bp else k.cpp
+    me = k.name
     decls, defs = [], []
     for getter, params, cls in kinds[kind.cpp]:
         own, args = [], []
@@ -1203,6 +1223,7 @@ class Klass(object):
         self.cpp, self.base, self.path, self.ue_name = cpp, base, path, ue_name
         self.is_bp = is_bp
         self.ns = ""
+        self.name = cpp           # the C++ name the header declares: bp_name for a game Blueprint
         self.emit = ""
         self.header = ""
         self.funcs = []
@@ -1215,6 +1236,19 @@ class Klass(object):
         self.scs_nodes = {}      # component variable -> its SCS node's VariableGuid, 32 hex digits
         self.dispatchers = {}    # a native class's dispatcher -> "Assignable Callable", what of the two it is
         self.stem = ""           # the SDK file it came from: <stem>_classes.hpp pairs with <stem>_functions.cpp
+
+
+def prefixed(prefix, name):
+    """name with UE's prefix letter: kept where it has it already, the letter followed by a capital (FModListEntry,
+    IHubPlugin), added otherwise (FloatArray -> FFloatArray, Fire -> FFire)."""
+    return name if len(name) > 1 and name[0] == prefix and name[1].isupper() else prefix + name
+
+
+def bp_name(k):
+    """A game Blueprint class's C++ name: the asset's name, without the cooked class's `_C`, under the prefix Dumper-7
+    gives the class (A an actor, I an interface, U any other object). UE_CLASS still names the cooked class."""
+    stem = k.ue_name[:-2] if k.ue_name.endswith("_C") else k.ue_name
+    return prefixed(k.cpp.split("::")[-1][0], stem)
 
 
 def parse_header(path):
@@ -1867,13 +1901,30 @@ def main():
             parts.append("_" + seg if seg[:1].isdigit() else seg)
         return "::".join(parts)
 
-    name_count = collections.Counter(k.ue_name for k in classes)
     for k in classes:
         k.ns = namespace_of(k.path) if k.is_bp else ""
+        k.name = bp_name(k) if k.is_bp else k.cpp
+    # A Blueprint may take a native class's name (/Game/_Mods/X/Actor_C is _Mods::X::AActor): its namespace keeps them
+    # apart. Inside that namespace the native is written rooted, `::AActor` (written()).
+    natives = set(k.cpp for k in classes if not k.is_bp)
+    bp_names = set(k.name for k in classes if k.is_bp)
+    shadows = {}
+    for k in classes:
+        if k.is_bp and k.name in natives:
+            shadows.setdefault(k.name, []).append(k.ns)
+    clash = collections.Counter((k.ns, k.name) for k in classes if k.is_bp)
+    if any(c > 1 for c in clash.values()):
+        sys.exit("two Blueprints of one folder take one C++ name: %s"
+                 % ", ".join("%s::%s" % key for key, c in clash.items() if c > 1))
+    for k in classes:
         # Rooted: a /Game/Game Blueprint opens Game::Game, inside which a bare `Game::X` finds that inner Game.
-        k.emit = ("::" + k.ns + "::" + k.ue_name) if k.ns else (k.ue_name if k.is_bp else k.cpp)
-        k.header = ("Game/" + k.ue_name) if k.is_bp else k.path[len("/Script/"):]
-    unique = set(n for n, c in name_count.items() if c == 1)
+        k.emit = ("::" + k.ns + "::" + k.name) if k.ns else k.name
+        k.header = ("Game/" + k.name) if k.is_bp else k.path[len("/Script/"):]
+    name_count = collections.Counter(k.name for k in classes if k.is_bp)
+    unique = set(n for n, c in name_count.items() if c == 1 and n not in natives)
+    # The spelling before genueapi 7, `Foo_C`, stays an alias of each Blueprint class for the sources written with it.
+    old_count = collections.Counter(k.ue_name for k in classes if k.is_bp)
+    old_unique = set(n for n, c in old_count.items() if c == 1 and n not in natives and n not in bp_names)
 
     by_name = dict((k.cpp, k) for k in classes)
     game, overrides, game_enums = scan_game(game_dir, container_enum_members(classes, by_name)) if game_dir \
@@ -1965,12 +2016,18 @@ def main():
     ops_by_pkg = write_operators(ordered, out_dir)
     write_types(out_dir)
 
+    def written(target, me):
+        """target's spelling in me's namespace: rooted where a Blueprint there or above takes the native's name."""
+        if me and me.ns and any(me.ns == s or me.ns.startswith(s + "::") for s in shadows.get(target.cpp, ())):
+            return "::" + target.cpp
+        return target.emit
+
     def rewrite(ctype, short=None, me=None):
         def one(m):
             target = by_name.get(m.group(1))
-            if target and target.ns and (target is me or (short or {}).get(target.ue_name) == target.emit):
-                return target.ue_name               # a Blueprint class's own name, or a `using` the class opens with
-            return "class %s" % target.emit if target else m.group(0)
+            if target and target.ns and (target is me or (short or {}).get(target.name) == target.emit):
+                return target.name                  # a Blueprint class's own name, or a `using` the class opens with
+            return "class %s" % written(target, me) if target else m.group(0)
         return CLASS_WORD.sub(one, ctype)
 
     def named(ctype):
@@ -1995,8 +2052,9 @@ def main():
             for c in class_refs(ctype):
                 target = by_name.get(c)
                 if target and target.ns and target is not k:
-                    found.setdefault(target.ue_name, set()).add(target.emit)
-        taken = set(n for _, n in k.fields) | set(f for _, _, f, _ in k.funcs) | {k.ue_name, k.cpp}
+                    found.setdefault(target.name, set()).add(target.emit)
+        # A native class's name too: `class AActor*` in the class cannot then mean the alias.
+        taken = set(n for _, n in k.fields) | set(f for _, _, f, _ in k.funcs) | {k.name, k.cpp} | natives
         return dict((leaf, next(iter(e))) for leaf, e in found.items() if len(e) == 1 and leaf not in taken)
 
     # `namespace A { namespace B {`, not C++17's `namespace A::B {`: an editor parsing at an older standard (a Visual
@@ -2037,7 +2095,7 @@ def main():
                 if k.ns:
                     body.append(ns_begin(k.ns) + "\n")
                 ns_open = k.ns
-            base = by_name[k.base].emit if k.base else ""
+            base = written(by_name[k.base], k) if k.base else ""
             bases = ([base] if base else []) + [by_name[interface].emit for interface in bp_ifaces.get(k.cpp, ())]
             inherits = " : " + ", ".join("public " + name for name in bases) if bases else ""
             if k.cpp == "UObject":
@@ -2050,7 +2108,7 @@ def main():
                 body.append("class UObject *__ReadObject__(int64 Addr);")
                 body.append("inline class UObject *UObject_GetOuter(class UObject *Obj) { return __ReadObject__(__AddrOf__(Obj) + 0x20); }\n")
             body.append("class %s%s\n{\npublic:\n    UE_CLASS(\"%s\", \"%s\");"
-                        % (k.ue_name if k.is_bp else k.cpp, inherits, k.path, k.ue_name))
+                        % (k.name, inherits, k.path, k.ue_name))
             short = short_names(k)
             body += ["    using %s = %s;" % (leaf, short[leaf]) for leaf in sorted(short)]
             marks = []      # hidden() at the bottom
@@ -2141,10 +2199,13 @@ def main():
                     # graph. Matched by name: the compiler reads the mark only on an override.
                     if (k.ue_name, real_fn) in BP_CALLABLE and real_fn in UNCALLABLE_EVENTS:
                         flags += "UE_BLUEPRINT_CALLABLE "
-                for vret, plist in variants:
+                # A game Blueprint's UFunction is virtual in its own signature, so a UE_PATCH replacement can say
+                # `override`; the overloads after it are call sugar. A native class's stay plain: a polymorphic class
+                # is no aggregate, and UE_ASSET_EDIT's `{.Field = v}` needs one.
+                for i, (vret, plist) in enumerate(variants):
                     args = ", ".join("%s %s" % (rewrite(named(t), short, k), n) for t, n in plist)
-                    body.append("    %s%s%s%s %s(%s)%s;" % (flags,
-                                                             "UE_PURE " if pure else "", "static " if is_static else "",
+                    body.append("    %s%s%s%s %s(%s)%s;" % (flags, "UE_PURE " if pure else "",
+                                                             "static " if is_static else "virtual " if k.is_bp and not i else "",
                                                            rewrite(named(vret), short, k), fname, args,
                                                            " const" if fname in k.const_funcs else ""))
                 if real_fn != fname:
@@ -2176,6 +2237,9 @@ def main():
             getters += bool(decls)
             body += hidden(marks)
             body.append("};\n")
+            if k.is_bp and (k.ns, k.ue_name) not in clash:
+                # Rooted: the compiler reads an alias's target as written, and a leaf two assets share names neither.
+                body.append("using %s = %s;\n" % (k.ue_name, k.emit))
         if ns_open:
             body.append(ns_end(ns_open) + "\n")
         forward_defs += [line for target in sorted(FORWARD_HOME) if FORWARD_HOME[target] == pkg
@@ -2191,9 +2255,11 @@ def main():
         # An ambiguous name gets no alias, so naming it bare fails to compile instead of resolving
         # to whichever asset was emitted last.
         for k in members:
-            if k.ns and k.ue_name in unique:
-                body.append("using %s = %s;" % (k.ue_name, k.emit))
+            if k.ns and k.name in unique:
+                body.append("using %s = %s;" % (k.name, k.emit))
                 aliased += 1
+            if k.ns and k.ue_name in old_unique:
+                body.append("using %s = %s;" % (k.ue_name, k.emit))
 
         title = ("Blueprint struct " if pkg[len("Game/"):] in STRUCTS else "Blueprint class ") + pkg[len("Game/"):] \
             if pkg.startswith("Game/") else "Package /Script/" + pkg
@@ -2213,7 +2279,7 @@ def main():
         for c in sorted(referenced - defined):
             target = by_name.get(c)
             if target:
-                fwd.setdefault(target.ns, []).append(target.ue_name if target.is_bp else target.cpp)
+                fwd.setdefault(target.ns, []).append(target.name)
         for ns in sorted(fwd):
             decls = ["class %s;" % n for n in fwd[ns]]
             out += ["%s %s %s" % (ns_begin(ns), " ".join(decls), "}" * (ns.count("::") + 1))] if ns else decls
@@ -2225,7 +2291,17 @@ def main():
             os.makedirs(os.path.dirname(dest))
         io.open(dest, "w", encoding="utf-8-sig", newline="\n").write("\n".join(out))
 
-    reach = ", ".join("%s %d" % (k, totals[k]) for k in KINDS if totals[k])
+    # Game/Foo_C.h, the header's name before genueapi 7, includes the one that declares Foo_C's class now.
+    old_headers = {}
+    for k in ordered:
+        if k.is_bp and "Game/" + k.ue_name not in by_pkg:
+            old_headers.setdefault(k.ue_name, set()).add(k.name)
+    for old, news in old_headers.items():
+        io.open(os.path.join(out_dir, "Game", old + ".h"), "w", encoding="utf-8-sig", newline="\n").write(
+            "#pragma once\n/* %s, the spelling before genueapi 7. Generated by AssetGen/tools/genueapi.py. Do not edit. */\n%s"
+            % (old, "".join('#include "%s.h"\n' % n for n in sorted(news))))
+
+    reach =", ".join("%s %d" % (k, totals[k]) for k in KINDS if totals[k])
     umbrella = ["#pragma once",
                 "/*",
                 "UeApi.h - every UE class a Blueprint mod can address.",
@@ -2239,8 +2315,9 @@ def main():
                 "",
                 "Native packages only. A Blueprint class lives in a header of its own name under",
                 "Game/, because there are thousands of them and a mod wants one: include",
-                "\"Game/BP_Foo_C.h\" and write BP_Foo_C, or its namespaced spelling if the name is",
-                "one of the few that several assets share.",
+                "\"Game/ABP_Foo.h\" and write ABP_Foo (UE's prefix, no _C), or its namespaced spelling",
+                "if the name is one of the few that several assets or a native class share.",
+                "The cooked BP_Foo_C, and Game/BP_Foo_C.h, still name it, for older sources.",
                 "",
                 "Including this pulls in all of them, which is convenient and slow: it costs clang a",
                 "56 MB AST dump for a twenty-line mod. Prefer naming the two or three packages the",

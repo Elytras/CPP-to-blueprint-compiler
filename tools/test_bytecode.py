@@ -6807,6 +6807,72 @@ print('ok  a UeApi made without --game refuses a class deriving from a game Blue
       '--game; a native parent still compiles')
 
 
+def game_blueprint_names():
+    """UeApi spells a game Blueprint class with UE's prefix and no _C (genueapi's bp_name): AENE_Spider_Grunt_Normal in
+    Game/AENE_Spider_Grunt_Normal.h, an interface IHubMod, and a game struct named FFoo keeps one F (Dumper-7 writes
+    FFFoo). The cooked names come from UE_CLASS / UE_GAME_STRUCT, so a mod spelled the new way cooks the same bytes as
+    one spelled the old way, ENE_Spider_Grunt_Normal_C from Game/ENE_Spider_Grunt_Normal_C.h, an alias of the class."""
+    proves('blueprint-classes.game-blueprint-names')
+    src = ('#include "UeApi/Types.h"\n#include "UeApi/Game/%s.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GameBpNames");\n'
+           'class GameBpNames : public %s {\npublic:\n    TSubclassOf<%s> Kind;\n    int32 Count;\n};\n')
+    cooked = []
+    for name in ('AENE_Spider_Grunt_Normal', 'ENE_Spider_Grunt_Normal_C'):
+        tmp, out, _ = compile_to(src % (name, name, name), 'GameBpNames')
+        cooked.append(dict((f, open(os.path.join(out, f), 'rb').read()) for f in sorted(os.listdir(out))))
+        if name.endswith('_C'):
+            assert '/Game/Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal.ENE_Spider_Grunt_Normal_C' in \
+                import_paths(os.path.join(out, 'GameBpNames')), import_paths(os.path.join(out, 'GameBpNames'))
+        shutil.rmtree(tmp, ignore_errors=True)
+    assert cooked[0] == cooked[1], 'the two spellings cook differently'
+    assert 'class IHubMod\n' in open(os.path.join(UEAPI, 'Game', 'IHubMod.h'), encoding='utf-8-sig').read()
+    import genueapi     # no game struct this dump keeps has its F already: the rule itself
+    assert [genueapi.prefixed('F', n) for n in ('FloatArray', 'FModListEntry', 'Fire')] == \
+        ['FFloatArray', 'FModListEntry', 'FFire']
+
+
+game_blueprint_names()
+print('ok  UeApi names a game Blueprint UE\'s way, AENE_Spider_Grunt_Normal, and the old ENE_Spider_Grunt_Normal_C cooks '
+      'the same bytes')
+
+
+def override_marks_hooks():
+    """UeApi declares a game Blueprint's UFunctions virtual, so an override of one may say `override`: in a subclass,
+    and with --game in a UE_PATCH replacement. Either cooks the bytes it cooks without. A native class's stay plain (a
+    polymorphic class is no aggregate, and UE_ASSET_EDIT's braces need one), so on an engine event clang refuses it."""
+    def cooked(src_text, mod, extra=()):
+        tmp, _, _ = compile_to(src_text, mod, extra)
+        files = {os.path.relpath(os.path.join(d, f), tmp): open(os.path.join(d, f), 'rb').read()
+                 for d, _, fs in os.walk(tmp) for f in fs if not f.endswith('.cpp')}
+        shutil.rmtree(tmp, ignore_errors=True)
+        return files
+    head = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
+            '#include "UeApi/Game/AENE_Spider_Grunt_Normal.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n')
+    fn = ('  void GetEnemySpawnedCount(int& SpawnCount)%s {\n'
+          '    AENE_Spider_Grunt_Normal::GetEnemySpawnedCount(SpawnCount);\n    SpawnCount = SpawnCount + 41;\n  }\n};\n')
+    kid = head % 'OverrideKid' + 'class OverrideKid : public AENE_Spider_Grunt_Normal {\npublic:\n' + fn
+    proves('replacing-a-game.override')
+    assert cooked(kid % ' override', 'OverrideKid') == cooked(kid % '', 'OverrideKid'), '`override` changed the cook'
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'OverrideTick.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(head % 'OverrideTick' + 'class OverrideTick : public AActor {\npublic:\n'
+                    '  void ReceiveTick(float DeltaSeconds) override {}\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        proves('overriding-engine-and.void-receivetick-float-2')
+        assert proc.returncode != 0 and "only virtual member functions can be marked 'override'" in proc.stdout + proc.stderr, \
+            proc.stdout + proc.stderr
+    if not GAME:
+        return 'the UE_PATCH half skipped (needs --game)'
+    patch = head % 'OverridePatch' + 'class OverridePatch : public AENE_Spider_Grunt_Normal {\n  UE_PATCH;\n' + fn
+    assert cooked(patch % ' override', 'OverridePatch', ['--game', GAME]) == \
+        cooked(patch % '', 'OverridePatch', ['--game', GAME]), '`override` changed the patch'
+    return 'a UE_PATCH replacement too'
+
+
+print('ok  `override` on a game Blueprint\'s function cooks as without it, on an engine event is refused - %s'
+      % override_marks_hooks())
+
+
 def subobject_bomber():
     """SubobjectBomber restates two of ABomber's own members that two default subobjects each fit, neither named for
     the member: GooSoundComponent is GooAudioComponent, AcidEmitterLeft is GooEmitterLeft, as the game's ENE_Bomber_C
@@ -9262,10 +9328,10 @@ def game_enum_static_arg():
     """A game function library's static with a Blueprint enum parameter (DRGLib's LIB_F_Log_C::AddLogEntry, whose
     LogSeverity is LIB_E_LogSeverity) is in UeApi, the enum a uint8, and a call passes the byte. Only a UeApi from a
     dump with DRGLib loaded has the class; a vanilla one skips."""
-    hdr = os.path.join(UEAPI, 'Game', 'LIB_F_Log_C.h')
+    hdr = os.path.join(UEAPI, 'Game', 'ULIB_F_Log.h')
     if not os.path.exists(hdr):
         return 'skipped: this UeApi has no DRGLib'
-    assert 'AddLogEntry' in open(hdr, encoding='utf-8-sig').read(), 'LIB_F_Log_C.h has no AddLogEntry'
+    assert 'AddLogEntry' in open(hdr, encoding='utf-8-sig').read(), 'ULIB_F_Log.h has no AddLogEntry'
     tmp, out, _ = compile_to('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/Game/LIB_F_Log_C.h"\n'
                              'UE_MOD_PACKAGE("/Game/_ElytrasMods/GameEnumStaticArg");\n'
                              'class GameEnumStaticArg : public AActor {\npublic:\n  void Log(uint8 Severity) {\n'
@@ -13312,7 +13378,7 @@ def widget_event_flags():
         assert got == want, got
         warned = set(re.findall(r'warning: (\w+): the (\w+) it inherits from (\w+) never runs', proc.stdout))
         proves('parent-classes.void-tick-fgeometry-mygeometry')
-        assert warned == {('UWfKid', 'Tick', 'UWfTick'), ('UWfPerkKid', 'Tick', 'UI_AvailablePerkPoints_C')}, proc.stdout
+        assert warned == {('UWfKid', 'Tick', 'UWfTick'), ('UWfPerkKid', 'Tick', 'UI_AvailablePerkPoints')}, proc.stdout
 
         if GAME:
             src = os.path.join(tmp, 'WfPatch.cpp')
