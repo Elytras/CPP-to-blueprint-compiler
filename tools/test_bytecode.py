@@ -9353,6 +9353,37 @@ proves('static-functions-and.lib-f-log-c-addlogentry')
 print('ok  GameEnumStaticArg: LIB_F_Log_C::AddLogEntry, a Blueprint enum parameter as uint8 - %s' % game_enum_static_arg())
 
 
+def game_bp_enum():
+    """A game Blueprint's enum (EDroppodDoorState, the UserDefinedEnum /Game/Art/DropPod/DroppodDoorState) has a UeApi
+    type, and with it the members of one: BP_DropPod_Base_C's DoorState and its DoorStateChanged dispatcher, which a mod
+    binds. The enum is imported from the game's package, never cooked, and a default names its cooked enumerator
+    (DroppodDoorState::NewEnumerator2 for Open, where Dumper-7 writes the display name)."""
+    hdr = os.path.join(UEAPI, 'Game', 'ABP_DropPod_Base.h')
+    if not os.path.exists(hdr) or 'DoorStateChanged' not in open(hdr, encoding='utf-8-sig').read():
+        return 'skipped: this UeApi has no DoorStateChanged (genueapi without --game)'
+    tmp, out, _ = compile_to(EDIT_HEAD + '#include "UeApi/Game/ABP_DropPod_Base.h"\n'
+                             'UE_MOD_PACKAGE("/Game/_ElytrasMods/GameBpEnum");\n'
+                             'class GbeWatch : public AActor {\npublic:\n'
+                             '  EDroppodDoorState Last = EDroppodDoorState::Open;\n'
+                             '  ABP_DropPod_Base *Pod;\n'
+                             '  void Watch(ABP_DropPod_Base *P) { Pod = P; P->DoorStateChanged.Add(this, &GbeWatch::OnDoor); }\n'
+                             '  void OnDoor(EDroppodDoorState State) { Last = State; }\n'
+                             '  bool IsOpen() { return Pod->DoorState == EDroppodDoorState::Open; }\n};\n', 'GameBpEnum')
+    assert sorted(os.listdir(out)) == ['GbeWatch.uasset', 'GbeWatch.uexp'], os.listdir(out)
+    pkg = os.path.join(out, 'GbeWatch')
+    keeps_invariants(pkg)
+    imports = import_paths(pkg, classes=True)
+    names = dumpexp.load(pkg)[3]
+    shutil.rmtree(tmp, ignore_errors=True)
+    proves('game-enums.game-blueprint-enum')
+    assert ('/Game/Art/DropPod/DroppodDoorState.DroppodDoorState', '/Script/Engine.UserDefinedEnum') in imports, imports
+    assert 'DroppodDoorState::NewEnumerator2' in names, names
+    return 'imported, its cooked names, the dispatcher bound'
+
+
+print('ok  GameBpEnum: a game Blueprint enum, its member and dispatcher - %s' % game_bp_enum())
+
+
 def object_through_interface():
     """`TScriptInterface<ITargetable>(Player)->Fn()` on an object UeApi does not know implements the interface is the
     editor's call of it: InterfaceContext of the object itself, no ObjToInterfaceCast (execInterfaceContext takes the object
