@@ -2,10 +2,12 @@
 // K2Node_EditablePinBase.cpp, and checked against an editor-saved 4.27.2 Blueprint byte for byte.
 #include "Uncooked.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <tuple>
 
@@ -22,6 +24,9 @@ struct FPinType
     bool bIsReference = false;
     bool bIsConst = false;
     std::shared_ptr<FPinType> ValueType;    // map only
+    /* A delegate pin's signature function: the class it lives in and its name (PinSubCategoryMemberReference). */
+    FIndex MemberParent;
+    std::string MemberName;
 };
 
 struct FPinDef
@@ -79,8 +84,8 @@ void WritePinType(FArc& Ar, const FPinType& T)
     }
     Ar.Bool(T.bIsReference);
     Ar.Bool(false);                     // bIsWeakPointer
-    Ar.Idx(Null());                     // PinSubCategoryMemberReference: MemberParent
-    Ar.Name("None");                    //                                MemberName
+    Ar.Idx(T.MemberParent);             // PinSubCategoryMemberReference: MemberParent
+    Ar.Name(T.MemberName.empty() ? "None" : T.MemberName);  //            MemberName
     for (int32 I = 0; I < 4; ++I) Ar.U32(0);   //                         MemberGuid
     Ar.Bool(T.bIsConst);
     Ar.Bool(false);                     // bIsUObjectWrapper
@@ -194,11 +199,23 @@ protected:
     /* The same object as Source names it, re-imported here. False when its outer is not a plain
        package - a type that lives inside the mod's own package has no editor-side asset yet. */
     bool Remap(FIndex Src, FIndex& Out);
+    /* A signature function as a delegate pin names it: its class re-imported (SelfRef for this class's own, one the
+       cooked class makes per delegate type) and its name. */
+    bool SignatureOf(FIndex Fn, FIndex& Parent, std::string& Name);
     bool PinTypeOf(const FPropertyDef& Prop, FPinType& Out);
+    /* A widget default with its object references re-imported here. False drops it: what it names is an export of
+       the cooked package or an instanced object. A mod asset (a font, a texture) stays named: an uncooked copy
+       shipped beside the stubs draws in the designer (the editor refuses a cooked package). */
+    bool RemapDefault(FPropertyDef& D);
+    bool RemapValue(FDefaultValue& V);
 
     const FPackage& Source;
     FPackage P;
     std::map<std::string, int32> ImportCache;
+    /* The cooked class itself (a dispatcher's or function's `ColorPicker* Picker`), an export of Source: Remap
+       names it SelfRef until the stub's own generated class has its export row. */
+    std::string SelfClass;
+    static constexpr int32 SelfRef = 0x3fffffff;
 };
 
 class FApiWriter : public FEditorPackage
@@ -212,6 +229,7 @@ public:
     bool Write(const std::string& OutDir, std::string* Err);
 
 private:
+    void WriteWidgetTree(int32 ExBlueprint, int32 ExTree);
     const FApiClass& Class;
 };
 
@@ -240,6 +258,12 @@ FIndex FEditorPackage::Object(const std::string& Package, const std::string& Cla
 bool FEditorPackage::Remap(FIndex Src, FIndex& Out)
 {
     if (Src.V == 0) { Out = Null(); return true; }
+    if (Src.V > 0 && !SelfClass.empty() && size_t(Src.V) <= Source.ExportRows().size()
+        && Source.ExportRows()[size_t(Src.V) - 1].ObjectName == SelfClass)
+    {
+        Out.V = SelfRef;
+        return true;
+    }
     const FImport* In = Source.ImportAt(Src);
     if (!In) return false;
     const FImport* Outer = Source.ImportAt(In->Outer);
@@ -249,6 +273,48 @@ bool FEditorPackage::Remap(FIndex Src, FIndex& Out)
        hard ref for a class variable's pin, a soft path (ObjectPath) for a struct member's VarDesc. */
     Out = Object(Outer->ObjectName, In->ClassName, In->ObjectName, In->ClassPackage);
     return true;
+}
+
+bool FEditorPackage::SignatureOf(FIndex Fn, FIndex& Parent, std::string& Name)
+{
+    if (Fn.V > 0 && size_t(Fn.V) <= Source.ExportRows().size())
+    {
+        const FExport& Row = Source.ExportRows()[size_t(Fn.V) - 1];
+        Name = Row.ObjectName;
+        return Remap(Row.OuterIndex, Parent);
+    }
+    const FImport* In = Source.ImportAt(Fn);
+    if (!In) return false;
+    Name = In->ObjectName;
+    return Remap(In->Outer, Parent);
+}
+
+bool FEditorPackage::RemapValue(FDefaultValue& V)
+{
+    if (V.K == FDefaultValue::Obj && (V.Instanced || V.Object.V > 0 || !Remap(V.Object, V.Object))) return false;
+    for (FDefaultValue& Item : V.Items)
+        if (!RemapValue(Item)) return false;
+    if (V.Members)
+    {
+        auto Kept = std::make_shared<std::vector<FPropertyDef>>();
+        for (FPropertyDef M : *V.Members)
+            if (RemapDefault(M)) Kept->push_back(std::move(M));
+        V.Members = Kept;
+    }
+    return true;
+}
+
+bool FEditorPackage::RemapDefault(FPropertyDef& D)
+{
+    if (D.Members)
+    {
+        auto Kept = std::make_shared<std::vector<FPropertyDef>>();
+        for (FPropertyDef M : *D.Members)
+            if (RemapDefault(M)) Kept->push_back(std::move(M));
+        if (Kept->empty() && !D.Members->empty()) return false;
+        D.Members = Kept;
+    }
+    return RemapValue(D.Default);
 }
 
 bool FEditorPackage::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
@@ -275,6 +341,15 @@ bool FEditorPackage::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
                      : T == "SoftObjectProperty" ? "softobject" : "object";
         if (!Remap(Prop.Extra, Out.SubCategoryObject)) return false;
     }
+    /* A dispatcher. The compiler finds its signature by name, <Name>__DelegateSignature from the graph of that name
+       in DelegateSignatureGraphs, so the pin carries no member reference. */
+    else if (T == "MulticastInlineDelegateProperty" || T == "MulticastDelegateProperty") Out.Category = "mcdelegate";
+    /* A delegate value names its signature (PinSubCategoryMemberReference), as CreatePropertyOnScope resolves it. */
+    else if (T == "DelegateProperty")
+    {
+        Out.Category = "delegate";
+        if (!SignatureOf(Prop.Extra, Out.MemberParent, Out.MemberName)) return false;
+    }
     else if (T == "ClassProperty" || T == "SoftClassProperty")
     {
         // The pin carries the subclass filter, not UClass itself.
@@ -288,7 +363,8 @@ bool FEditorPackage::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
         if (Out.Container == 3)
         {
             auto Value = std::make_shared<FPinType>();
-            if (!Prop.Value || !PinTypeOf(*Prop.Value, *Value)) return false;
+            // FEdGraphTerminalType has no member reference, so a map's value is no delegate.
+            if (!Prop.Value || !PinTypeOf(*Prop.Value, *Value) || Value->Category == "delegate") return false;
             Out.ValueType = Value;
         }
     }
@@ -304,13 +380,16 @@ bool FEditorPackage::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
 bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
 {
     const std::string ClassName = Class.AssetName + "_C";
+    SelfClass = ClassName;
     const bool bFunctionLibrary = Class.ParentClass == "BlueprintFunctionLibrary";
 
     /* An actor needs nothing extra here: UBlueprint::PostLoad builds the SimpleConstructionScript,
        its SCS_Node and the DefaultSceneRoot itself, once there is a GeneratedClass to outer them to
        and a CDO export for the deferred loader. Both are emitted below. */
 
-    const FIndex ImpBlueprint = Object("/Script/Engine", "Class", "Blueprint");
+    const bool bWidget = Class.bWidget;
+    const FIndex ImpBlueprint = bWidget ? Object("/Script/UMGEditor", "Class", "WidgetBlueprint")
+                                        : Object("/Script/Engine", "Class", "Blueprint");
     const FIndex ImpEdGraph = Object("/Script/Engine", "Class", "EdGraph");
     const FIndex ImpSchema = Object("/Script/BlueprintGraph", "Class", "EdGraphSchema_K2");
     const FIndex ImpEntry = Object("/Script/BlueprintGraph", "Class", "K2Node_FunctionEntry");
@@ -319,10 +398,17 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     const bool bModParent = Class.ParentPackage.compare(0, 6, "/Game/") == 0;
     const FIndex ImpParent = bModParent ? Object(Class.ParentPackage, "BlueprintGeneratedClass", Class.ParentClass, "/Script/Engine")
                                         : Object(Class.ParentPackage, "Class", Class.ParentClass);
-    const FIndex ImpBpgc = Object("/Script/Engine", "Class", "BlueprintGeneratedClass");
+    const FIndex ImpBpgc = bWidget ? Object("/Script/UMG", "Class", "WidgetBlueprintGeneratedClass")
+                                   : Object("/Script/Engine", "Class", "BlueprintGeneratedClass");
     const FIndex ImpObjectClass = Object("/Script/CoreUObject", "Class", "Object");
     const FIndex ImpParentCdo = Object(Class.ParentPackage, Class.ParentClass,
-                                       "Default__" + Class.ParentClass, Class.ParentPackage);
+                                        "Default__" + Class.ParentClass, Class.ParentPackage);
+    std::vector<FIndex> Interfaces;
+    for (FIndex SourceInterface : Class.Interfaces)
+    {
+        FIndex Interface;
+        if (Remap(SourceInterface, Interface)) Interfaces.push_back(Interface);
+    }
 
     struct FGraph
     {
@@ -330,20 +416,37 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         std::string Category, ToolTip, Keywords;
         uint32 Flags = 0;
         bool bPure = false;
+        bool bDelegate = false;     // a dispatcher's signature, one of DelegateSignatureGraphs
+        FIndex Interface;
         std::vector<FPinDef> EntryPins, ResultPins;
     };
     std::vector<FGraph> Graphs;
 
-    for (const FApiFunction& Fn : Class.Functions)
-    {
-        if (!(Fn.Flags & FUNC_BlueprintCallable)) continue;
-        if (Fn.Flags & (FUNC_UbergraphFunction | FUNC_Delegate | FUNC_MulticastDelegate)) continue;
+    /* A dispatcher is its variable (below) and a signature graph named as it is, whose entry node carries the
+       parameters, as the editor's "Add Event Dispatcher" makes them; the compiler names the function
+       <Name>__DelegateSignature. A signature with no visible dispatcher of that name is left out. */
+    const std::string SignatureSuffix = "__DelegateSignature";
+    auto DispatcherOf = [&](const FApiFunction& Fn) {
+        if (!(Fn.Flags & (FUNC_Delegate | FUNC_MulticastDelegate)) || Fn.Name.size() <= SignatureSuffix.size()
+            || Fn.Name.compare(Fn.Name.size() - SignatureSuffix.size(), SignatureSuffix.size(), SignatureSuffix) != 0)
+            return std::string();
+        const std::string Name = Fn.Name.substr(0, Fn.Name.size() - SignatureSuffix.size());
+        for (const FPropertyDef& Prop : Class.Variables)
+            if (Prop.Name == Name && Prop.Type.compare(0, 9, "Multicast") == 0) return Name;
+        return std::string();
+    };
 
+    /* One graph per kept function. A signature graph (Signature, the name without the suffix) takes the flags the
+       editor's new dispatcher gets (FBlueprintEditor::OnAddNewDelegate). False when a parameter has no pin type. */
+    auto AddGraph = [&](const FApiFunction& Fn, const std::string& Signature) {
         FGraph G;
-        G.Name = Fn.Name;
+        G.Name = Signature.empty() ? Fn.Name : Signature;
+        G.bDelegate = !Signature.empty();
+        if (Fn.Interface.V && !Remap(Fn.Interface, G.Interface)) return false;
         if (auto Cat = Class.Categories.find(Fn.Name); Cat != Class.Categories.end()) G.Category = Cat->second;
         if (auto Doc = Class.Docs.find(Fn.Name); Doc != Class.Docs.end()) std::tie(G.ToolTip, G.Keywords) = Doc->second;
-        G.Flags = Fn.Flags;
+        // The flags the editor's new dispatcher gets (FBlueprintEditor::OnAddNewDelegate).
+        G.Flags = G.bDelegate ? FUNC_BlueprintCallable | FUNC_BlueprintEvent | FUNC_Public : Fn.Flags;
         /* A pure function draws without exec pins, so UE_PURE decides the node shape here and
            not just the flag: an entry node with a `then` pin would compile back as impure. */
         G.bPure = (Fn.Flags & FUNC_BlueprintPure) != 0;
@@ -390,25 +493,21 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
             Pin.Direction = bOutput ? 0 : 1;
             (bOutput ? G.ResultPins : G.EntryPins).push_back(Pin);
         }
-        if (!bOk) continue;
+        if (bOk) Graphs.push_back(std::move(G));
+        return bOk;
+    };
 
-        Graphs.push_back(std::move(G));
-    }
-
-    // Export rows, in the order the engine's own saves use: the Blueprint, then each graph with its nodes.
-    const int32 ExBlueprint = 0;
-    std::vector<int32> GraphExports;
-    int32 Next = 1;
-    for (const FGraph& G : Graphs)
+    for (const FApiFunction& Fn : Class.Functions)
     {
-        GraphExports.push_back(Next);
-        Next += G.ResultPins.size() > (G.bPure ? size_t(0) : size_t(1)) ? 3 : 2;
+        const std::string Dispatcher = DispatcherOf(Fn);
+        if (Dispatcher.empty())
+        {
+            if (!(Fn.Flags & FUNC_BlueprintCallable)) continue;
+            if (Fn.Flags & (FUNC_UbergraphFunction | FUNC_Delegate | FUNC_MulticastDelegate)) continue;
+            if (bFunctionLibrary && (Fn.Flags & (FUNC_Private | FUNC_Protected))) continue;
+        }
+        AddGraph(Fn, Dispatcher);
     }
-    /* FAssetTypeActions_Blueprint::OpenAssetEditor warns "derives from an invalid class" on a null
-       GeneratedClass, so the stub carries an empty one (compile-on-load fills it from the graphs)
-       plus its CDO - the editor's deferred loading needs the CDO export to exist. */
-    const int32 ExClass = Next;
-    const int32 ExCdo = Next + 1;
 
     /* Class variables: the same FEdGraphPinType, plus the flags that decide how the editor treats
        each one - visible/read-only, replicated, its RepNotify and condition. */
@@ -426,11 +525,28 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     std::vector<FApiVar> Vars;
     for (const FPropertyDef& Prop : Class.Variables)
     {
+        /* A designer widget is its own variable once the editor compiles the tree (bIsVariable, below). */
+        if (std::any_of(Class.Widgets.begin(), Class.Widgets.end(),
+                        [&](const FApiClass::FWidget& W) { return W.Name == Prop.Name; }))
+            continue;
         FApiVar Var;
         Var.Name = Prop.Name;
         if (!PinTypeOf(Prop, Var.Type))
         {
             printf("  %-14s skipped: variable has no editor-side type yet\n", Prop.Name.c_str());
+            continue;
+        }
+        /* The editor's compiler refuses one ("has an invalid type Array of Delegates"): only a parameter carries one. */
+        if (Var.Type.Category == "delegate")
+        {
+            printf("  %-14s skipped: a Blueprint variable cannot hold a delegate\n", Prop.Name.c_str());
+            continue;
+        }
+        if (Var.Type.Category == "mcdelegate"
+            && std::none_of(Graphs.begin(), Graphs.end(), [&](const FGraph& G) { return G.bDelegate && G.Name == Prop.Name; }))
+        {
+            printf("  %-14s skipped: dispatcher's signature has a parameter with no editor-side type yet\n",
+                   Prop.Name.c_str());
             continue;
         }
         /* The editor's own set. CPF_Parm and the compiler-internal bits mean nothing on a variable,
@@ -439,7 +555,10 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
                                           | CPF_DisableEditOnInstance | CPF_DisableEditOnTemplate
                                           | CPF_EditConst | CPF_Net | CPF_RepNotify | CPF_Transient
                                           | CPF_Config | CPF_SaveGame | CPF_Interp | CPF_AdvancedDisplay
-                                          | CPF_ExposeOnSpawn | CPF_NonTransactional);
+                                          | CPF_ExposeOnSpawn | CPF_NonTransactional
+                                          | CPF_BlueprintAssignable | CPF_BlueprintCallable);
+        // What lists a dispatcher under the designer's Events and lets a graph bind and call it.
+        if (Var.Type.Category == "mcdelegate") Var.Flags |= CPF_BlueprintAssignable | CPF_BlueprintCallable;
         Var.RepNotify = Prop.RepNotify;
         Var.RepCondition = Prop.RepCondition;
         Var.Default = DefaultString(Prop);
@@ -447,6 +566,50 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         MakeGuid(Class.AssetName + ".var." + Prop.Name, Var.Guid);
         Vars.push_back(std::move(Var));
     }
+
+    /* A delegate pin of this class's own type names a signature function the cooked class made for it (one per
+       delegate type, named after its first user). The stub makes it the way the compiler makes a dispatcher's: a
+       signature graph of that name without the suffix. The compiler warns it finds no dispatcher of that name, and
+       makes the function all the same (FinishCompilingFunction). */
+    std::set<std::string> OwnSignatures;
+    auto NoteSignature = [&](const FPinType& T) { if (T.MemberParent.V == SelfRef) OwnSignatures.insert(T.MemberName); };
+    for (const FGraph& G : Graphs)
+    {
+        for (const FPinDef& Pin : G.EntryPins) NoteSignature(Pin.Type);
+        for (const FPinDef& Pin : G.ResultPins) NoteSignature(Pin.Type);
+    }
+    for (const FApiVar& Var : Vars) NoteSignature(Var.Type);
+    for (const FApiFunction& Fn : Class.Functions)
+        if (OwnSignatures.count(Fn.Name) && Fn.Name.size() > SignatureSuffix.size()
+            && !AddGraph(Fn, Fn.Name.substr(0, Fn.Name.size() - SignatureSuffix.size())))
+            printf("  %-14s the signature has a parameter with no editor-side type yet: what names it will not"
+                   " compile\n", Fn.Name.c_str());
+
+    // Export rows, in the order the engine's own saves use: the Blueprint, then each graph with its nodes.
+    const int32 ExBlueprint = 0;
+    std::vector<int32> GraphExports;
+    int32 Next = 1;
+    for (const FGraph& G : Graphs)
+    {
+        GraphExports.push_back(Next);
+        Next += G.ResultPins.size() > (G.bPure ? size_t(0) : size_t(1)) ? 3 : 2;
+    }
+    /* FAssetTypeActions_Blueprint::OpenAssetEditor warns "derives from an invalid class" on a null
+       GeneratedClass, so the stub carries an empty one (compile-on-load fills it from the graphs)
+       plus its CDO - the editor's deferred loading needs the CDO export to exist. */
+    const int32 ExClass = Next;
+    const int32 ExCdo = Next + 1;
+    auto FixSelf = [&](FPinType& T) {
+        if (T.SubCategoryObject.V == SelfRef) T.SubCategoryObject = Exp(ExClass);
+        if (T.ValueType && T.ValueType->SubCategoryObject.V == SelfRef) T.ValueType->SubCategoryObject = Exp(ExClass);
+        if (T.MemberParent.V == SelfRef) T.MemberParent = Exp(ExClass);
+    };
+    for (FGraph& G : Graphs)
+    {
+        for (FPinDef& Pin : G.EntryPins) FixSelf(Pin.Type);
+        for (FPinDef& Pin : G.ResultPins) FixSelf(Pin.Type);
+    }
+    for (FApiVar& Var : Vars) FixSelf(Var.Type);
 
     /* A field the mod assigns from its construction script or BeginPlay has no literal default to
        carry: the value is a call, and only a real compiled graph could express it. Say so rather
@@ -462,7 +625,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
 
     /* A class with neither is not an API surface - most often a pure data holder or a class whose
        whole body is inlined - and an empty Blueprint would only be clutter in someone's project. */
-    if (Graphs.empty() && Vars.empty())
+    if (Graphs.empty() && Vars.empty() && !bWidget && !Class.bOverrides)
     {
         if (Err) *Err = Class.AssetName + " exposes no callable function or variable";
         return false;
@@ -479,8 +642,17 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     Blueprint.ObjectName = Class.AssetName;
     Blueprint.ObjectFlags = RF_Public | RF_Standalone | RF_Transactional;
     Blueprint.bIsAsset = true;
-    const std::vector<int32> GraphRows = GraphExports;
+    std::vector<int32> GraphRows, SignatureRows;
+    /* An interface implementation belongs to that interface's Graphs, not FunctionGraphs. Otherwise
+       ConformImplementedInterfaces creates a second graph of its name when the editor compiles it. */
+    for (size_t I = 0; I < Graphs.size(); ++I)
+        if (Graphs[I].bDelegate) SignatureRows.push_back(GraphExports[I]);
+        else if (!Graphs[I].Interface.V) GraphRows.push_back(GraphExports[I]);
+    /* The designer tree follows the class and its default object: UWidgetBlueprint's WidgetTree default subobject,
+       then each widget, then each slot (WriteWidgetTree). */
+    const int32 ExTree = Class.Widgets.empty() ? 0 : ExCdo + 1;
     Blueprint.Serialize = [=](FArc& Ar) {
+        if (ExTree) Tag(Ar, "WidgetTree", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(ExTree)); });
         Tag(Ar, "ParentClass", "ObjectProperty", [=](FArc& V) { V.Idx(ImpParent); });
         if (bFunctionLibrary || Class.bInterface)
             Tag(Ar, "BlueprintType", "ByteProperty",
@@ -489,10 +661,33 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         if (!Class.Description.empty())
             Tag(Ar, "BlueprintDescription", "StrProperty", [&](FArc& V) { V.Str(Class.Description); });
         Tag(Ar, "BlueprintSystemVersion", "IntProperty", [](FArc& V) { V.I32(2); });
+        if (!Interfaces.empty())
+            Tag(Ar, "ImplementedInterfaces", "ArrayProperty", [=](FArc& V) {
+                FArc Elements(V.Owner());
+                for (FIndex Interface : Interfaces)
+                {
+                    Tag(Elements, "Interface", "ObjectProperty", [&](FArc& E) { E.Idx(Interface); });
+                    std::vector<int32> Rows;
+                    for (size_t I = 0; I < Graphs.size(); ++I)
+                        if (Graphs[I].Interface.V == Interface.V) Rows.push_back(GraphExports[I]);
+                    if (!Rows.empty())
+                        Tag(Elements, "Graphs", "ArrayProperty", [&](FArc& E) {
+                            E.I32(int32(Rows.size()));
+                            for (int32 Row : Rows) E.Idx(Exp(Row));
+                        }, "ObjectProperty");
+                    TagEnd(Elements);
+                }
+                StructArray(V, "ImplementedInterfaces", "BPInterfaceDescription", int32(Interfaces.size()), Elements);
+            }, "StructProperty");
         if (!GraphRows.empty())
             Tag(Ar, "FunctionGraphs", "ArrayProperty", [=](FArc& V) {
                 V.I32(int32(GraphRows.size()));
                 for (int32 Row : GraphRows) V.Idx(Exp(Row));
+            }, "ObjectProperty");
+        if (!SignatureRows.empty())
+            Tag(Ar, "DelegateSignatureGraphs", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(SignatureRows.size()));
+                for (int32 Row : SignatureRows) V.Idx(Exp(Row));
             }, "ObjectProperty");
         if (!Vars.empty())
             Tag(Ar, "NewVariables", "ArrayProperty", [=](FArc& V) {
@@ -519,15 +714,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
                     TagEnd(Elements);
                 }
 
-                V.I32(int32(Vars.size()));
-                V.Name("NewVariables");
-                V.Name("StructProperty");
-                V.I32(int32(Elements.B.size()));
-                V.I32(0);                       // ArrayIndex
-                V.Name("BPVariableDescription");
-                for (int32 I = 0; I < 4; ++I) V.U32(0);      // StructGuid
-                V.U8(0);                        // HasPropertyGuid
-                V.Append(Elements);
+                StructArray(V, "NewVariables", "BPVariableDescription", int32(Vars.size()), Elements);
             }, "StructProperty");
         Tag(Ar, "GeneratedClass", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(ExClass)); });
         TagBool(Ar, "bLegacyNeedToPurgeSkelRefs", false);
@@ -561,6 +748,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
                 V.Idx(Exp(ExEntry));
                 if (ExResult) V.Idx(Exp(ExResult));
             }, "ObjectProperty");
+            if (G.bDelegate) TagBool(Ar, "bEditable", false);   // a signature is edited through its dispatcher
             Tag(Ar, "GraphGuid", "StructProperty", [=](FArc& V) { V.Raw(GraphGuid, 16); }, "Guid");
             TagEnd(Ar);
             Ar.Bool(false);
@@ -588,11 +776,13 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Entry.ObjectName = "K2Node_FunctionEntry_0";
         Entry.ObjectFlags = RF_Transactional;
         const std::string FnName = G.Name;
+        const FIndex FnInterface = G.Interface;
         const std::string FnCategory = G.Category, FnToolTip = G.ToolTip, FnKeywords = G.Keywords;
         Entry.Serialize = [=](FArc& Ar) {
             /* Not decoration: ConformFunctionNames renames a graph to its entry node's member name
                on load, so an entry without one turns every function into "None". */
             Tag(Ar, "FunctionReference", "StructProperty", [=](FArc& V) {
+                if (FnInterface.V) Tag(V, "MemberParent", "ObjectProperty", [=](FArc& N) { N.Idx(FnInterface); });
                 Tag(V, "MemberName", "NameProperty", [=](FArc& N) { N.Name(FnName); });
                 TagEnd(V);
             }, "MemberReference");
@@ -628,6 +818,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Result.ObjectFlags = RF_Transactional;
         Result.Serialize = [=](FArc& Ar) {
             Tag(Ar, "FunctionReference", "StructProperty", [=](FArc& V) {
+                if (FnInterface.V) Tag(V, "MemberParent", "ObjectProperty", [=](FArc& N) { N.Idx(FnInterface); });
                 Tag(V, "MemberName", "NameProperty", [=](FArc& N) { N.Name(FnName); });
                 TagEnd(V);
             }, "MemberReference");
@@ -664,7 +855,13 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Ar.Idx(ImpObjectClass);                     // ClassWithin
         Ar.Name("Engine");                          // ClassConfigName
         Ar.Idx(Exp(ExBlueprint));                   // ClassGeneratedBy
-        Ar.I32(0);                                  // Interfaces
+        Ar.I32(int32(Interfaces.size()));
+        for (FIndex Interface : Interfaces)
+        {
+            Ar.Idx(Interface);
+            Ar.I32(0);
+            Ar.Bool(true);                          // bImplementedByK2
+        }
         Ar.Bool(false);                             // bDeprecatedForceScriptOrder
         Ar.Name("None");
         Ar.Bool(false);                             // bCooked
@@ -680,16 +877,19 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     Cdo.Serialize = [](FArc& Ar) { TagEnd(Ar); };   // a CDO omits the lazy-object guid
     P.AddExport(std::move(Cdo));
 
+    if (ExTree) WriteWidgetTree(ExBlueprint, ExTree);
+
     /* Without registry rows the content browser sees a package with nothing in it. */
     FRegistryObject Row;
     Row.ObjectPath = Class.AssetName;
-    Row.ClassName = "Blueprint";
+    Row.ClassName = bWidget ? "WidgetBlueprint" : "Blueprint";
     const std::string ParentPath = "Class'" + Class.ParentPackage + "." + Class.ParentClass + "'";
     Row.Tags = {
         { "BlueprintType", Class.bInterface ? "BPTYPE_Interface" : bFunctionLibrary ? "BPTYPE_FunctionLibrary" : "BPTYPE_Normal" },
         { "ParentClass", ParentPath },
         { "NativeParentClass", ParentPath },
-        { "GeneratedClass", "BlueprintGeneratedClass'" + P.Name() + "." + ClassName + "'" },
+        { "GeneratedClass", std::string(bWidget ? "WidgetBlueprintGeneratedClass'" : "BlueprintGeneratedClass'")
+                            + P.Name() + "." + ClassName + "'" },
         { "NumReplicatedProperties", "0" },
         { "IsDataOnly", "False" },
     };
@@ -697,6 +897,126 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     P.SetRegistryObjects({ Row });
 
     return P.Save(OutDir + "/" + Class.AssetName, Err);
+}
+
+/* The designer tree as the 4.27 editor saves a Widget Blueprint's (measured on an editor-saved one): no templates,
+   every widget under the tree and every slot under its panel, the hierarchy in the slots' Parent and Content, the
+   panel's Slots and the child's Slot, and the tree's editor-only AllWidgets. The cooked class's widget defaults ride
+   along, so the designer draws the layout and what the constructor sets; what PreConstruct sets at run time is not
+   there. Each widget is a variable (bIsVariable), as its C++ member is; one the game starts hidden is hidden in the
+   designer too. */
+void FApiWriter::WriteWidgetTree(int32 ExBlueprint, int32 ExTree)
+{
+    const int32 ExFirstWidget = ExTree + 1;
+    const int32 ExFirstSlot = ExFirstWidget + int32(Class.Widgets.size());
+    auto WidgetRow = [&](const std::string& Name) {
+        for (size_t I = 0; I < Class.Widgets.size(); ++I)
+            if (Class.Widgets[I].Name == Name) return ExFirstWidget + int32(I);
+        return ExFirstWidget;
+    };
+    auto Defaults = [&](const std::vector<FPropertyDef>& In) {
+        std::vector<FPropertyDef> Out;
+        for (FPropertyDef D : In)
+            if (RemapDefault(D)) Out.push_back(std::move(D));
+        return Out;
+    };
+    auto ClassOf = [&](FIndex Src) {
+        FIndex Out;
+        return Remap(Src, Out) ? Out : Object("/Script/UMG", "Class", "Widget");
+    };
+
+    const int32 Count = int32(Class.Widgets.size());
+    FExport Tree;
+    Tree.ClassIndex = Object("/Script/UMG", "Class", "WidgetTree");
+    Tree.OuterIndex = Exp(ExBlueprint);
+    Tree.ObjectName = "WidgetTree";
+    Tree.ObjectFlags = RF_Public | RF_Transactional | RF_DefaultSubObject;
+    Tree.Serialize = [=](FArc& Ar) {
+        Tag(Ar, "RootWidget", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(ExFirstWidget)); });
+        Tag(Ar, "AllWidgets", "ArrayProperty", [=](FArc& V) {
+            V.I32(Count);
+            for (int32 I = 0; I < Count; ++I) V.Idx(Exp(ExFirstWidget + I));
+        }, "ObjectProperty");
+        TagEnd(Ar);
+        Ar.Bool(false);
+    };
+    P.AddExport(std::move(Tree));
+
+    for (const FApiClass::FWidget& W : Class.Widgets)
+    {
+        std::vector<FIndex> Slots;
+        FIndex Own;
+        for (size_t I = 0; I < Class.WidgetSlots.size(); ++I)
+        {
+            if (Class.WidgetSlots[I].Panel == W.Name) Slots.push_back(Exp(ExFirstSlot + int32(I)));
+            if (Class.WidgetSlots[I].Child == W.Name) Own = Exp(ExFirstSlot + int32(I));
+        }
+        FExport E;
+        E.ClassIndex = ClassOf(W.Class);
+        E.OuterIndex = Exp(ExTree);
+        E.ObjectName = W.Name;
+        E.ObjectFlags = RF_Transactional;
+        /* A nested user widget's named slots this tree fills, {slot name, content}: UUserWidget's NamedSlotBindings. */
+        std::vector<std::pair<std::string, FIndex>> Fills;
+        for (const FApiClass::FWidgetSlotFill& F : Class.WidgetSlotFills)
+            if (F.Host == W.Name) Fills.push_back({ F.Slot, Exp(WidgetRow(F.Content)) });
+        E.Serialize = [=, Kept = Defaults(W.Defaults)](FArc& Ar) {
+            /* The designer draws every widget whatever its Visibility, so one the game starts without (a button's
+               glyph, collapsed until set) is hidden there instead: bHiddenInDesigner. */
+            bool bVariable = false, bHidden = false;
+            for (const FPropertyDef& D : Kept)
+            {
+                WriteDefaultTag(Ar, D);
+                bVariable |= D.Name == "bIsVariable";
+                bHidden |= D.Name == "Visibility"
+                    && (D.Default.S == "ESlateVisibility::Collapsed" || D.Default.S == "ESlateVisibility::Hidden");
+            }
+            if (bHidden) TagBool(Ar, "bHiddenInDesigner", true);
+            if (!Fills.empty())
+                Tag(Ar, "NamedSlotBindings", "ArrayProperty", [&](FArc& V) {
+                    FArc Elements(V.Owner());
+                    for (const auto& F : Fills)
+                    {
+                        Tag(Elements, "Name", "NameProperty", [&](FArc& N) { N.Name(F.first); });
+                        Tag(Elements, "Content", "ObjectProperty", [&](FArc& N) { N.Idx(F.second); });
+                        TagEnd(Elements);
+                    }
+                    StructArray(V, "NamedSlotBindings", "NamedSlotBinding", int32(Fills.size()), Elements);
+                }, "StructProperty");
+            if (!Slots.empty())
+                Tag(Ar, "Slots", "ArrayProperty", [=](FArc& V) {
+                    V.I32(int32(Slots.size()));
+                    for (const FIndex& S : Slots) V.Idx(S);
+                }, "ObjectProperty");
+            if (Own.V != 0) Tag(Ar, "Slot", "ObjectProperty", [=](FArc& V) { V.Idx(Own); });
+            if (!bVariable) TagBool(Ar, "bIsVariable", true);
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(E));
+    }
+
+    /* A slot is named <SlotClass>_<n>, counted per panel and class, as the cooked tree names it. */
+    std::map<std::string, int32> Counts;
+    for (const FApiClass::FWidgetSlot& S : Class.WidgetSlots)
+    {
+        const FImport* Of = Source.ImportAt(S.Class);
+        const std::string SlotClass = Of ? Of->ObjectName : "PanelSlot";
+        const FIndex Panel = Exp(WidgetRow(S.Panel)), Content = Exp(WidgetRow(S.Child));
+        FExport E;
+        E.ClassIndex = ClassOf(S.Class);
+        E.OuterIndex = Panel;
+        E.ObjectName = SlotClass + "_" + std::to_string(Counts[S.Panel + "." + SlotClass]++);
+        E.ObjectFlags = RF_Transactional;
+        E.Serialize = [=, Kept = Defaults(S.Defaults)](FArc& Ar) {
+            for (const FPropertyDef& D : Kept) WriteDefaultTag(Ar, D);
+            Tag(Ar, "Parent", "ObjectProperty", [=](FArc& V) { V.Idx(Panel); });
+            Tag(Ar, "Content", "ObjectProperty", [=](FArc& V) { V.Idx(Content); });
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(E));
+    }
 }
 
 /* One StructVariableDescription the editor recompiles a member from. */
@@ -881,15 +1201,7 @@ bool FApiStructWriter::Write(const std::string& OutDir, std::string* Err)
         Tag(Ar, "VariablesDescriptions", "ArrayProperty", [=](FArc& V) {
             FArc Elements(V.Owner());
             for (const FVarDesc& VD : VarDescs) WriteVarDesc(Elements, VD);
-            V.I32(int32(VarDescs.size()));
-            V.Name("VariablesDescriptions");
-            V.Name("StructProperty");
-            V.I32(int32(Elements.B.size()));
-            V.I32(0);                           // ArrayIndex
-            V.Name("StructVariableDescription");
-            for (int32 I = 0; I < 4; ++I) V.U32(0);     // StructGuid
-            V.U8(0);                            // HasPropertyGuid
-            V.Append(Elements);
+            StructArray(V, "VariablesDescriptions", "StructVariableDescription", int32(VarDescs.size()), Elements);
         }, "StructProperty");
         TagEnd(Ar);
         Ar.Bool(false);

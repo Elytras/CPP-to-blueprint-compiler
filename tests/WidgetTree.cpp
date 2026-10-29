@@ -42,11 +42,13 @@ public:
     Title->SetText(FText("Score"));
     Label->Text = FText("Play");
     Note->Text = FText("Inside");
+    Note->Visibility = ESlateVisibility::Hidden;   // the API stub hides it in the designer too
     Play->OnClicked.Add(this, &UWtCard::OnPlay);
     UE_BIND(Title, Text, &UWtCard::GetScoreText);
   }
 
   int32 Clicks = 0;
+  UE_DISPATCHER(OnPlayed, UWtCard *Card, int32 Count);   // the API stub's dispatcher, its card typed as the stub's class
   void OnPlay() { Clicks += 1; }
   FText GetScoreText() const { return UKismetTextLibrary::Conv_IntToText(Clicks, false, true, 1, 324); }
 };

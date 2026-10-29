@@ -241,6 +241,16 @@ def dep_stage(dep, by_name, bp):
     return content_dir(fsd, package), package, fsd
 
 
+def net_contract_holds(stage_content, baseline, name):
+    """A mod with a `net_contract` keeps the replicated surface its released version shipped (netsurface.py): a pak
+    that changes or drops any of it would disconnect that version's clients, so it is not packed."""
+    import netsurface
+    problems = netsurface.check(json.load(io.open(baseline, encoding="utf-8")), netsurface.surface(stage_content))
+    for line in problems:
+        print("%-16s %s" % (name, line))
+    return not problems
+
+
 def embed_deps(dep_stages, stage_fsd, assetgen):
     """Copy each dep's staged assets into this mod's FSD tree so the pak is self-contained, and its
     registry rows into the pak's one FSD/AssetRegistry.bin. Clears each dest first so a
@@ -529,8 +539,16 @@ def write_vs_filters(bp):
         if os.path.exists(manifest) else []
     tests = {os.path.normcase(os.path.normpath(p)) for m in mods if str(m.get("name", "")).endswith("Test")
              for s in m.get("sources") or [] for p in glob.glob(os.path.join(bp, s))}
+    # What git ignores is left out (a sibling's generated `RC/UeApi`, `UeApi`'s dumped headers): the list is
+    # committed, so it may only name what every checkout has. Outside a git checkout nothing is left out.
+    proc = subprocess.run(["git", "ls-files", "-oi", "--exclude-standard", "--directory"], cwd=bp,
+                          capture_output=True, encoding="utf-8")
+    ignored = set(proc.stdout.splitlines()) if proc.returncode == 0 else set()
+    def kept(path):
+        rel = os.path.relpath(path, bp).replace(os.sep, "/")
+        return rel not in ignored and rel + "/" not in ignored   # a wholly ignored folder is listed as `dir/`
     rows = []
-    for f in sorted(os.listdir(bp), key=str.lower):
+    for f in sorted((f for f in os.listdir(bp) if kept(os.path.join(bp, f))), key=str.lower):
         if f.endswith(".cpp"):
             test = f.endswith("Test.cpp") or os.path.normcase(os.path.normpath(os.path.join(bp, f))) in tests
             rows.append(("ClCompile", f, "Tests" if test else "Mods"))
@@ -551,7 +569,8 @@ def write_vs_filters(bp):
                 known.add(level)
                 filters.append((level, str(uuid.uuid5(uuid.NAMESPACE_URL, "bpmods:" + level.lower()))))
     for root, dirs, files in os.walk(bp):
-        dirs[:] = sorted((d for d in dirs if d not in ("build", "out", "__pycache__") + GENERATED), key=str.lower)
+        dirs[:] = sorted((d for d in dirs if d not in ("build", "out", "__pycache__") + GENERATED
+                          and kept(os.path.join(root, d))), key=str.lower)
         if root != bp:
             rel = os.path.relpath(root, bp)
             test = rel.split(os.sep)[0] == "Tests"
@@ -559,7 +578,7 @@ def write_vs_filters(bp):
             if folder != "Tests":
                 add_filter(folder)
             for f in sorted(files, key=str.lower):
-                if f.endswith((".cpp", ".h")) or (test and f.endswith(".py")):
+                if (f.endswith((".cpp", ".h")) or (test and f.endswith(".py"))) and kept(os.path.join(root, f)):
                     kind = "ClCompile" if f.endswith(".cpp") else "ClInclude" if f.endswith(".h") else "None"
                     where = folder
                     sub = None if test else vs_namespace_filter(os.path.join(root, f), os.path.basename(root))
@@ -580,7 +599,7 @@ def write_vs_filters(bp):
                     rows.append(("ClCompile" if f.endswith(".cpp") else "ClInclude", "..\\" + rel, folder))
     api = os.path.join(bp, "UeApi")
     for f in sorted(os.listdir(api), key=str.lower) if os.path.isdir(api) else []:
-        if f.endswith(".h"):
+        if f.endswith(".h") and kept(os.path.join(api, f)):
             rows.append(("ClInclude", "UeApi\\" + f, "UeApi"))
     text = ('<?xml version="1.0" encoding="utf-8"?>\n'
             '<!-- Written by AssetGen/tools/bpbuild.py on every build. Do not edit. -->\n'
@@ -590,14 +609,18 @@ def write_vs_filters(bp):
             + "".join('    <%s Include="%s"><Filter>%s</Filter></%s>\n' % (kind, name, folder, kind) for kind, name, folder in rows)
             + '    <None Include="mods.yaml" />\n  </ItemGroup>\n</Project>\n')
     dest = os.path.join(bp, "BpMods.vcxproj.filters")
-    if not os.path.exists(dest) or io.open(dest, encoding="utf-8").read() != text:
-        io.open(dest, "w", encoding="utf-8", newline="\n").write(text)
+    old = io.open(dest, encoding="utf-8", newline="").read() if os.path.exists(dest) else ""
+    if old.replace("\r\n", "\n") != text:
+        io.open(dest, "w", encoding="utf-8", newline="\r\n" if "\r\n" in old else "\n").write(text)
 
     # The same list, between the two marker comments of the project file.
     begin, end = "<!-- items: begin (bpbuild.py) -->", "<!-- items: end -->"
     old = io.open(project, encoding="utf-8", newline="").read()
     if begin in old and end in old:
-        items = "".join('\n    <%s Include="%s" />' % (kind, name) for kind, name, _ in rows) + '\n    <None Include="mods.yaml" />\n    '
+        # In the file's own line ending: a checkout may hold it as CRLF, and mixed endings show as a change in git.
+        nl = "\r\n" if "\r\n" in old else "\n"
+        items = "".join(nl + '    <%s Include="%s" />' % (kind, name) for kind, name, _ in rows) \
+            + nl + '    <None Include="mods.yaml" />' + nl + '    '
         new = old[:old.index(begin) + len(begin)] + items + old[old.index(end):]
         if new != old:
             io.open(project, "w", encoding="utf-8", newline="").write(new)
@@ -801,6 +824,9 @@ def main():
         if no_pak:
             continue
         if embed and not embed_deps(dep_stages, stage_fsd, assetgen):
+            failed.append(name)
+            continue
+        if mod.get("net_contract") and not net_contract_holds(stage_content, os.path.join(bp, mod["net_contract"]), name):
             failed.append(name)
             continue
         stage_bundle(bundle, stage_fsd)

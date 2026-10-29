@@ -40,6 +40,8 @@ public:
 
   /* `==` and `!=` compare exactly, as UE C++'s FVector operators do; `V == 0` fills a vector with the int. */
   int32 VecCompare(FVector A, FVector B) { return (A == B ? 1 : 0) + (A != B ? 10 : 0) + (A == 0 ? 100 : 0); }
+  /* FKey has Kismet's EqualEqual_KeyKey and no NotEqual: `!=` is clang's rewrite of it, `!(A == B)`. */
+  int32 KeyCompare(FKey A, FKey B) { return (A == B ? 1 : 0) + (A != B ? 10 : 0); }
   FVector Twos() {
     FVector V = 2;
     return V;

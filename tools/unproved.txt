@@ -148,7 +148,6 @@ what-the-optimizer.return-x-a-b
 what-the-optimizer.if-isready-item
 methods-as-blueprint.int32-getcharges-const
 methods-as-blueprint.ue-pure-static-int32-clamp01
-methods-as-blueprint.generate-api-true
 calling-your-own.other-twice-3
 parameters-and-return.auto-half-int32-v-return
 parameters-and-return.int32-byval-tarray-int32-a
@@ -173,7 +172,6 @@ messages-on-screen.ugamefunctionlibrary-2
 overriding-engine-and.void-onjumped-acharacter
 overriding-engine-and.bool-canjumpinternal-const
 overriding-engine-and.namespace-game
-overriding-engine-and.void-receivetick-float-2
 calling-the-parent.aactor-receivebeginplay
 inline-functions.other-twice-3
 inline-functions.an-inline-function-that-calls

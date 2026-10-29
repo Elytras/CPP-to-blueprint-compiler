@@ -32,20 +32,6 @@ std::string TimelineGuid(const std::string& ClassName, const std::string& Timeli
     return Hex;
 }
 
-/* An array of structs as the cook writes one: the count, one inner FPropertyTag whose Size is all the elements' bytes,
-   then the elements, each written whole (no defaults to leave a field out against). */
-static void StructArray(FArc& V, const std::string& Name, const std::string& StructName, int32 Count, const FArc& Elements)
-{
-    V.I32(Count);
-    V.Name(Name);
-    V.Name("StructProperty");
-    V.I32(int32(Elements.B.size()));
-    V.I32(0);                       // ArrayIndex
-    V.Name(StructName);
-    for (int32 I = 0; I < 4; ++I) V.U32(0);      // StructGuid
-    V.U8(0);                        // HasPropertyGuid
-    V.Append(Elements);
-}
 
 /* FRichCurve::AutoSetTangents (RichCurve.cpp 623-711) at the editor's tension 0, over one channel of keys sorted by
    time, which the curve editor runs after every edit: a cubic key's Auto tangents. Engine evaluation reads the stored
@@ -1585,16 +1571,27 @@ bool FBlueprintClass::WriteApi(const std::string& OutDir, std::string* Err) cons
     Api.PackageName = P.Name().substr(0, P.Name().rfind('/'));
     Api.ParentPackage = ParentPackage;
     Api.ParentClass = ParentClass;
+    /* Parent overrides are inherited from the parent's stub. An implementation of this class's own
+       interface has a graph too, owned by ImplementedInterfaces rather than FunctionGraphs. */
     for (const FPending& Fn : Functions)
-        Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags });
+        if (auto Interface = ApiInterfaceMethods.find(Fn.Def.Name); Interface != ApiInterfaceMethods.end())
+            Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags, Interface->second });
+        else if (Fn.Def.Super.V == 0) Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags });
+        else Api.bOverrides = true;
     Api.Categories = ApiCategory;
     Api.Docs = ApiDocs;
     Api.Description = ApiDescription;
     Api.bInterface = (ClassFlags & CLASS_Interface) != 0;
+    Api.Interfaces = Interfaces;
     /* Only what the outside can see. The rest - the UberGraphFrame pointer above all - is
        compiler plumbing that would show up as a broken variable in the editor. */
     for (const FPropertyDef& Var : Vars)
         if ((Var.PropertyFlags & CPF_BlueprintVisible) && !Var.bApiHidden) Api.Variables.push_back(Var);
+    // ponytail: a widget class below a mod widget with no tree anywhere in its chain still stubs as a plain Blueprint
+    Api.bWidget = bWidgetClass || ParentClass == "UserWidget";
+    for (const FWidget& W : Widgets) Api.Widgets.push_back({ W.Name, W.Class, W.Defaults });
+    for (const FWidgetSlot& S : WidgetSlots) Api.WidgetSlots.push_back({ S.Panel, S.Child, S.Class, S.Defaults });
+    for (const FWidgetSlotFill& F : WidgetSlotFills) Api.WidgetSlotFills.push_back({ F.Host, F.Slot, F.Content });
     return WriteApiAsset(Api, P, OutDir, Err);
 }
 

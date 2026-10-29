@@ -1148,6 +1148,7 @@ struct FRecord
     std::vector<std::pair<std::string, std::string>> TemplateSubobjects;   // UeTemplateSubobjects: (path under the class, class path)
     std::set<std::string> IchRecords;   // UeIchRecords: the inherited components a game Blueprint has a template of, lower case
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
+    std::map<std::string, std::set<size_t>> OutputParams;   // UE_OUT: method -> declaration parameter ordinals
     std::set<std::string> FinalMethods;             // `virtual T F() final`: no subclass has an F of its own
     std::set<std::string> Forwarders;               // Methods AssetGen declared, not the source: see SynthesizeForwarders
     std::vector<FInputMark> InputMarks;             // UE_INPUT_KEY / UE_INPUT_ACTION, in the order written
@@ -1170,6 +1171,7 @@ struct FRecord
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
     bool bIsPatch = false;      // UE_PATCH: not a class of its own; its UE_DEFAULTS edit its parent's, in the parent's package
     bool bCooked = false;       // UE_COOKED: shipped as the cooked package it was built from; imported here, never cooked
+    bool bUeApi = false;        // declared in a UeApi header: the game's (or another mod's) class, imported, never cooked here
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
     /* A game Blueprint from UeApi's Game/, or another mod's class from the header it shares: every function of one is a
@@ -2582,9 +2584,12 @@ private:
     bool NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const;
     /* `Other->Base::Method()`: the qualifier a call on another object is written with, else empty. */
     std::string QualifiedOnOther(const Json& Callee, const Json& Obj, const FRecord& R, const std::string& Method) const;
-    const std::vector<std::string>& ModSources() const;
+    const std::map<std::string, std::string>& ModSources() const;
+    /* The text of the mod source a location of the dump is in, else null. */
+    const std::string* SourceOf(const Json& Loc) const;
     /* The comment written right above Decl in a mod source, as tooltip text; empty when none. */
     std::string DocAbove(const Json& Decl) const;
+    bool InUeApi(const Json& Decl) const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
     /* The nearest declaration of some method along R's chain is `= 0`: the class Generate cooks CLASS_Abstract. */
     bool IsAbstract(const FRecord& R) const;
@@ -2592,7 +2597,8 @@ private:
     std::pair<const FRecord*, std::string> PureMethod(const FRecord& R) const;
     std::vector<uint8> NativeTail(const FRecord* Component) const;
     std::vector<const Json*> StructArgs(const Json& Value, const FRecord* R, const std::vector<std::string>& Fields) const;
-    mutable std::vector<std::string> SourceTexts;                       // the mod directory's .h/.cpp, read on demand
+    mutable std::map<std::string, std::string> SourceTexts;             // the mod's .h/.cpp by canonical path, read on demand
+    mutable std::vector<const std::string*> FileTexts;                  // per root `files` entry: its SourceTexts, or null
 
     /* The native UFunction Method overrides, or null; InheritedFlags gets the flags it passes on, also
        for a method implementing an interface's function, which has no Super. */
@@ -2605,6 +2611,7 @@ private:
     std::pair<const FRecord*, const Json*> ReplacedDecl(const FRecord& Self, const std::string& Method) const;
     /* The mod interface R lists (or one it extends) that declares Method, or null: R's stub of Method is Generate's. */
     const FRecord* ModInterfaceWith(const FRecord& R, const std::string& Method) const;
+    bool ImplementsPure(const FRecord& R, const std::string& Method) const;
     std::string Unreplicable(const Json& Typed, int32 Depth = 0) const;
 
     /* Records are keyed by qualified name; Bare holds only leaf names exactly one class claims,
@@ -2658,11 +2665,15 @@ private:
         return A == Aliases.end() || A->second == CppName ? nullptr : Find(A->second);
     }
     /* A record's package and UClass / UScriptStruct name. A mod's own is cooked where its namespace says (PathIn),
-       named after its leaf, a class with _C; the engine's and the game's carry theirs in UE_CLASS. */
-    std::string PackageOf(const FRecord& R) const { return R.UePackage.empty() ? PathIn(ModPackage, R.CppName) : R.UePackage; }
+       named after its leaf, a class with _C, a struct by its `__UeName` marker where it has one; the engine's and the
+       game's carry theirs in UE_CLASS. */
+    std::string PackageOf(const FRecord& R) const
+    {
+        return R.UePackage.empty() ? PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName) : R.UePackage;
+    }
     std::string ClassOf(const FRecord& R) const
     {
-        return !R.UePackage.empty() ? R.UeName : LeafOf(R.CppName) + (R.bIsStruct ? "" : "_C");
+        return !R.UePackage.empty() ? R.UeName : R.bIsStruct ? LeafOf(CookedQual(R.CppName)) : LeafOf(R.CppName) + "_C";
     }
     /* OutDir holds UE_MOD_PACKAGE, and is <Content>/<that path without /Game>, as bpbuild stages a mod. A package under
        the mod's is saved under OutDir, any other /Game one under Content. The log names the first relative to OutDir. */
@@ -2681,6 +2692,15 @@ private:
     {
         const std::string In = Shown(Package);
         return In != Package ? std::filesystem::path(OutDir) / In : ContentDir(OutDir) / Package.substr(6);
+    }
+    /* Where Package's editor stub goes: `--api` stands for the mod's folder, so a stub of a package in a subfolder lands
+       in the same subfolder, and the editor finds it at the /Game path the pak gives the cooked one. */
+    std::string ApiDirOf(const std::string& Package) const
+    {
+        const std::filesystem::path Dir = FileOf(*ApiDir, Package).parent_path();
+        std::error_code Ec;
+        if (std::filesystem::is_directory(*ApiDir, Ec)) std::filesystem::create_directories(Dir, Ec);
+        return Dir.string();
     }
     bool SavePackage(FPackage& P, const std::string& OutDir, const std::string& Package, std::string* Err) const
     {
@@ -2709,6 +2729,15 @@ private:
     std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;   // C++ name -> its enumerators, in order
     std::map<std::string, std::map<std::string, std::string>> EnumUeNames;        // `<Enum>__UeEnumNames`: C++ -> cooked
     std::map<std::string, std::map<std::string, std::string>> EnumUeDisplay;      // and C++ -> display
+    /* `<Type>__UeName` beside a mod struct or enum: C++ name -> the name it is cooked under (CookedQual). */
+    std::map<std::string, std::string> TypeUeNames;
+    /* `A::FBoolArray` is `A::BoolArray` when a marker renames it: the C++ name a mod type's package path and object name
+       are made from. Any other name is itself. */
+    std::string CookedQual(const std::string& Qual) const
+    {
+        const auto It = TypeUeNames.find(Qual);
+        return It == TypeUeNames.end() ? Qual : Qual.substr(0, Qual.size() - LeafOf(Qual).size()) + It->second;
+    }
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     /* UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags of each native BlueprintEvent. A UeApi from before
        genueapi 6 lists the game Blueprints' functions too, and GameFunctionFlags takes those rows where they are. */
@@ -2778,9 +2807,23 @@ private:
        int32 depending on where it comes from: one name for both. */
     std::string TypeTag(const std::string& Type) const
     {
+        /* First a game Blueprint class is spelled by its cooked name, Game::JSON::JSONValue_C for UeApi's
+           Game::JSON::UJSONValue: the tag names a cooked struct, which a rename in UeApi must not move. */
+        std::string Spelled, Ident;
+        auto Cooked = [&]() {
+            const FRecord* R = Ident.empty() ? nullptr : Find(Ident);
+            if (R && R->bUeApi && !R->bIsStruct && R->IsGameBlueprint() && LeafOf(Ident) == LeafOf(R->CppName))
+                Ident = Ident.substr(0, Ident.size() - LeafOf(Ident).size()) + R->UeName;
+            Spelled += Ident;
+            Ident.clear();
+        };
+        for (char C : StripTypeKeywords(Type))
+            if (std::isalnum(uint8(C)) || C == '_' || C == ':') Ident += C;
+            else { Cooked(); Spelled += C; }
+        Cooked();
         std::string Name, Word;
         auto Flush = [&]() { Name += Word == "int32" ? "int" : Word == "long" ? "int64" : Word; Word.clear(); };
-        for (char C : StripTypeKeywords(Type) + " ")
+        for (char C : Spelled + " ")
             if (std::isalnum(uint8(C)) || C == '_') Word += C;
             else
             {
@@ -3450,6 +3493,14 @@ bool FCompiler::Collect(std::string* Err)
             }
             return;
         }
+        /* `static constexpr const char *FBoolArray__UeName = "BoolArray";` beside a mod struct or enum: the name it is
+           cooked under, which its package path and object name take and every import of it holds - one rebuilt from
+           an editor's, or renamed in C++ after it shipped. */
+        if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 8 && Name(N).compare(Name(N).size() - 8, 8, "__UeName") == 0)
+        {
+            FindLiteral(N, TypeUeNames[Ns + Name(N).substr(0, Name(N).size() - 8)]);
+            return;
+        }
         if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 8 && Name(N).compare(Name(N).size() - 8, 8, "__UeEnum") == 0)
         {
             std::string Owner;
@@ -3537,6 +3588,7 @@ bool FCompiler::Collect(std::string* Err)
         FRecord R;
         R.CppName = Ns + Name(N);
         R.Doc = DocAbove(N);
+        R.bUeApi = InUeApi(N);
         if (auto SI = Structs.find(Name(N)); Ns.empty() && SI != Structs.end())
         {
             R.UePackage = SI->second.Package;
@@ -3558,6 +3610,7 @@ bool FCompiler::Collect(std::string* Err)
         std::vector<FInputMark> PendingInput;   // UE_INPUT_KEY / UE_INPUT_ACTION mark the member that follows them
         std::vector<FTimelineMark> PendingTimeline;     // and so do UE_TIMELINE_UPDATE / _FINISHED / _EVENT
         std::vector<std::pair<bool, std::string>> PendingDocs;  // and UE_TOOLTIP (true) / UE_KEYWORDS (false)
+        std::vector<std::string> PendingOutputParams;
         std::function<void(const Json&)> Member = [&](const Json& C) {
             /* genueapi puts a class's markers in a private `struct UeMarkers` at its bottom, out of IntelliSense's
                member list: they are the class's own. */
@@ -3589,6 +3642,28 @@ bool FCompiler::Collect(std::string* Err)
                 PendingDocs.emplace_back(Name(C)[2] == 'T', std::string());
                 FindLiteral(C, PendingDocs.back().second);
                 return;
+            }
+            if (Kind(C) == "VarDecl" && Name(C).compare(0, 12, "UeOutParam__") == 0)
+            {
+                std::string Param;
+                FindLiteral(C, Param);
+                PendingOutputParams.push_back(Param);
+                return;
+            }
+            if (!PendingOutputParams.empty() && !C.value("isImplicit", false))
+            {
+                const std::vector<std::string> Parms = ParmNames(C);
+                for (const std::string& Param : PendingOutputParams)
+                {
+                    const auto Found = std::find(Parms.begin(), Parms.end(), Param);
+                    if (Kind(C) != "CXXMethodDecl" || Found == Parms.end())
+                    {
+                        if (bMetaOk) *Err = R.CppName + ": UE_OUT(" + Param + ") must name a parameter of the next method";
+                        bMetaOk = false;
+                    }
+                    else R.OutputParams[Name(C)].insert(size_t(Found - Parms.begin()));
+                }
+                PendingOutputParams.clear();
             }
             if (!PendingDocs.empty() && !C.value("isImplicit", false))
             {
@@ -3831,6 +3906,11 @@ bool FCompiler::Collect(std::string* Err)
                 });
         };
         ForEach(N, Member);
+        if (!PendingOutputParams.empty())
+        {
+            if (bMetaOk) *Err = R.CppName + ": UE_OUT(" + PendingOutputParams.front() + ") must precede a method";
+            bMetaOk = false;
+        }
         if (!PendingInput.empty() && R.InputMisplaced.empty()) R.InputMisplaced = InputMarkText(PendingInput.front());
         if (!PendingTimeline.empty() && R.TimelineMisplaced.empty()) R.TimelineMisplaced = TimelineMarkText(PendingTimeline.front());
         if (!PendingDocs.empty() && R.DocMisplaced.empty())
@@ -3962,6 +4042,21 @@ bool FCompiler::Collect(std::string* Err)
         if (T.find('<') != std::string::npos || Records.count(StripTypeKeywords(T)) || EnumDecls.count(StripTypeKeywords(T))) Expand[A] = T;
     ExpandAliases(const_cast<Json&>(Doc), Expand);   // with none to expand it still drops a global `::`
     InferFromSources(EnumMarks, EnumUnderlying);
+    /* A `__UeName` marker names a struct or enum the source declares, or it would rename nothing. Another mod's struct
+       (UE_STRUCT_IN, or a folder's) was given the path its C++ name makes; the marker's name replaces that leaf. */
+    for (const auto& [Type, Ue] : TypeUeNames)
+        if (Ue.empty() || (!Records.count(Type) && !EnumDecls.count(Type)))
+        { *Err = Type + "__UeName: " + (Ue.empty() ? "give the name it is cooked under" : "names no struct or enum declared here"); return false; }
+    for (auto& [Key, R] : Records)
+    {
+        const std::string Natural = PathIn("", R.CppName);
+        if (R.bIsStruct && R.UeName == LeafOf(R.CppName) && R.UePackage.size() > Natural.size()
+            && R.UePackage.compare(R.UePackage.size() - Natural.size(), Natural.size(), Natural) == 0)
+        {
+            R.UePackage = PathIn(R.UePackage.substr(0, R.UePackage.size() - Natural.size()), CookedQual(R.CppName));
+            R.UeName = LeafOf(CookedQual(R.CppName));
+        }
+    }
     /* UE_FINAL_AS: the leaf's base is final in all but name. Its own code runs only on the leaf, which brings nothing
        of its own, so the base is compiled as `final` (FinalOwner, FUNC_Final) and cooked Abstract; a second subclass,
        here or in a mod that includes the header, would break that, so it is refused. */
@@ -3983,9 +4078,9 @@ bool FCompiler::Collect(std::string* Err)
                                   && Base->UePackage.compare(Base->UePackage.size() - Natural.size(), Natural.size(), Natural) == 0;
         if (!bCookedHere && !bOwnerPinned)
         {
-            const std::string B = LeafOf(Base->CppName);
+            const std::string B = Base->bUeApi ? Base->UeName : LeafOf(Base->CppName);
             *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): " + B
-                 + (Base->UeName == B ? " is the game's Blueprint (" + Base->UePackage + "), which no mod cooks"
+                 + (Base->bUeApi ? " is the game's Blueprint ("+ Base->UePackage + "), which no mod cooks"
                                       : " is cooked at " + Base->UePackage + ", not by this mod")
                  + ": it stays as it is cooked there, its functions not final and its other subclasses kept, so calls "
                    "bound to them as final would skip their overrides; derive " + LeafOf(Leaf.CppName) + " from it as a "
@@ -4073,16 +4168,16 @@ bool FCompiler::Collect(std::string* Err)
         for (const auto& En : D->second)
             if (En.second < Bottom || En.second > Top)
             { *Err = "UE_ENUM(" + Enum + "): " + En.first + " is out of range (the largest value is _MAX's)"; return false; }
-        const std::string Leaf = LeafOf(Enum);
+        const std::string Leaf = LeafOf(Enum), UeLeaf = LeafOf(CookedQual(Enum));
         /* An enumerator's FName is <Enum>::<Name>, kept in one global map where the first enum loaded wins
            (UEnum::AddNamesToMasterList, Enum.cpp 83-94): the game's enum of that name would answer every lookup. */
-        if (auto N = Enums.find(Leaf); (Owner.empty() || Owner == ModPackage) && N != Enums.end()
+        if (auto N = Enums.find(UeLeaf); (Owner.empty() || Owner == ModPackage) && N != Enums.end()
             && N->second.Package.compare(0, ModPackage.size(), ModPackage) != 0)
-        { *Err = "UE_ENUM(" + Enum + "): " + N->second.Package + " already has an enum " + Leaf + ", whose enumerator names ("
-                 + Leaf + "::...) the engine keeps in one global table; rename it"; return false; }
+        { *Err = "UE_ENUM(" + Enum + "): " + N->second.Package + " already has an enum " + UeLeaf + ", whose enumerator names ("
+                 + UeLeaf + "::...) the engine keeps in one global table; rename it"; return false; }
         std::string First = D->second.front().first;
         for (const auto& En : D->second) if (En.second == 0) { First = En.first; break; }
-        Enums[Enum] = { PathIn(Owner.empty() ? ModPackage : Owner, Enum), Leaf, U, First };
+        Enums[Enum] = { PathIn(Owner.empty() ? ModPackage : Owner, CookedQual(Enum)), UeLeaf, U, First };
         if (const auto R = EnumUeNames.find(Enum); R != EnumUeNames.end())
         {
             for (const auto& [Cpp, Ue] : R->second)
@@ -4166,7 +4261,9 @@ bool FCompiler::Collect(std::string* Err)
             return false;
         }
         if (R.UePackage.empty() || R.bCooked) continue;          // a UE_COOKED class is imported, as another mod's is
-        if (R.UePackage != PathIn(ModPackage, R.CppName)) continue;
+        /* UeApi's Game::_ModHub::IHubMod is at the path its namespace and name give, as a mod's class there would be. */
+        if (R.bUeApi) continue;
+        if (R.UePackage != PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName)) continue;
         if (!R.bIsStruct && R.UeName != LeafOf(R.CppName) + "_C")
         {
             *Err = "UE_CLASS on " + R.CppName + " says \"" + R.UeName
@@ -4560,10 +4657,20 @@ uint32 FCompiler::ModMethodFlags(const FRecord& Owner, const std::string& Method
     uint32 Flags = Inherited ? Inherited & kOverrideInherits : kPlainMethodFlags;
     if (auto A = Owner.MethodAccess.find(Method); !Inherited && A != Owner.MethodAccess.end())
         Flags = (Flags & ~uint32(FUNC_Public | FUNC_Protected | FUNC_Private)) | A->second;
-    if (IsPureDecl(Def) || (!Inherited && IsModPureDecl(Decl))) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
+    if (IsPureDecl(Def) || (!Inherited && (IsModPureDecl(Decl) || ImplementsPure(Owner, Method))))
+        Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
     const std::string DeclType = TypeOf(Decl);
     if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;
     return Flags | NetFlagsOf(Decl) | NetFlagsOf(Def) | AccessFlagsOf(Decl) | AccessFlagsOf(Def);
+}
+
+/* An implementation of a pure function of a mod interface the class lists is pure too, as the Kismet compiler copies
+   FUNC_BlueprintPure from the interface function it implements (KismetCompiler.cpp:1857): the C++ method need not say
+   `const` again. */
+bool FCompiler::ImplementsPure(const FRecord& R, const std::string& Method) const
+{
+    const FRecord* IR = ModInterfaceWith(R, Method);
+    return IR && IsModPureDecl(*IR->Methods.at(Method));
 }
 
 /* The flags of a game Blueprint's function (or of another mod's class, from the header it shares), with no table
@@ -5305,7 +5412,8 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
     std::string Tmp;
     if (!MakeTemp(Type, BP, &Tmp, Err)) return false;
 
-    const bool bPlainName = R->IsNative() || IsInternalViewStruct(R->CppName);
+    /* Another mod's struct (UE_STRUCT_IN) is a UserDefinedStruct too: its members are the minted names its owner cooked. */
+    const bool bPlainName = (R->IsNative() && !R->IsModStruct()) || IsInternalViewStruct(R->CppName);
     const FIndex Struct = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
     auto Body = std::make_shared<std::vector<FStmtIR>>();
     size_t I = 0;
@@ -5475,7 +5583,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
     {
         if (!ObjRaw) { *Err = "struct member access with no object: " + Name(MemberNode); return false; }
         Out.K = FArgIR::Member;
-        Out.S = (R->IsNative() || IsInternalViewStruct(R->CppName))
+        Out.S = ((R->IsNative() && !R->IsModStruct()) || IsInternalViewStruct(R->CppName))
                     ? UeNameOf(R, Name(MemberNode))
                     : ModFieldNameOf(*R, PackageOf(*R), Name(MemberNode));
         Out.Owner = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
@@ -8092,9 +8200,8 @@ std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
     return Tail;
 }
 
-/* The mod directory's .h / .cpp sources, read on the first call, in the order of their names' UTF-8 bytes.
-   NamedQualifier takes the first source that fits, so the order cannot be directory_iterator's: that is the
-   filesystem's, sorted on NTFS but hashed on ext4. */
+/* One spelling per file: how the mod's sources are keyed, and clang's names for files (relative ones to this process's
+   folder, which clang runs in) are looked up. */
 static std::string CanonicalPath(const std::filesystem::path& P)
 {
     std::error_code Ec;
@@ -8129,22 +8236,47 @@ static std::map<std::string, std::pair<std::filesystem::path, std::string>> Reac
 
 /* The mod's own sources: those beside the compiled one, and those it reaches by quoted includes. bpbuild compiles a
    unity file that includes each .cpp of a mod by its absolute path, so a mod in subfolders is only found that way. */
-const std::vector<std::string>& FCompiler::ModSources() const
+const std::map<std::string, std::string>& FCompiler::ModSources() const
 {
     if (SourceTexts.empty())
     {
         std::error_code Ec;
-        std::map<std::string, std::filesystem::path> Files;     // by canonical path: a file in both lists is read once
+        for (const auto& [Key, Entry] : ReachedByIncludes(SourceFile)) SourceTexts.emplace(Key, Entry.second);
         for (const auto& E : std::filesystem::directory_iterator(SourceDir, Ec))
         {
             const std::string Ext = E.path().extension().string();
             if (!E.is_regular_file() || (Ext != ".h" && Ext != ".hpp" && Ext != ".cpp")) continue;
-            Files.emplace(CanonicalPath(E.path()), E.path());
+            if (std::string Key = CanonicalPath(E.path()); !SourceTexts.count(Key)) SourceTexts.emplace(Key, ReadText(E.path().string()));
         }
-        for (const auto& [Key, Entry] : ReachedByIncludes(SourceFile)) Files.emplace(Key, Entry.first);
-        for (const auto& File : Files) SourceTexts.push_back(ReadText(File.second.string()));
     }
     return SourceTexts;
+}
+
+/* A location's offset is into its own file, and every source of a mod has that offset: the text read there is the
+   file FAstSax stamped the location with (`fileId`, an index into the root's `files`), never the first source that
+   fits. A location in a file that is no mod source (UeApi, clang's builtins) has none. */
+const std::string* FCompiler::SourceOf(const Json& Loc) const
+{
+    if (FileTexts.empty() && Doc.contains("files"))
+        for (const Json& Name : Doc["files"])
+        {
+            auto It = ModSources().find(CanonicalPath(Name.get<std::string>()));
+            FileTexts.push_back(It == ModSources().end() ? nullptr : &It->second);
+        }
+    const int32 Id = Loc.value("fileId", -1);
+    return Id >= 0 && size_t(Id) < FileTexts.size() ? FileTexts[Id] : nullptr;
+}
+
+/* Decl is written in a file of a UeApi folder (the path ReachedByIncludes does not follow either): read off its range's
+   begin, which FAstSax keeps for a record. */
+bool FCompiler::InUeApi(const Json& Decl) const
+{
+    const auto Range = Decl.find("range");
+    if (Range == Decl.end() || !Range->contains("begin") || !Doc.contains("files")) return false;
+    const int32 Id = (*Range)["begin"].value("fileId", -1);
+    if (Id < 0 || size_t(Id) >= Doc["files"].size()) return false;
+    const std::filesystem::path File = Doc["files"][Id].get<std::string>();
+    return std::any_of(File.begin(), File.end(), [](const std::filesystem::path& Part) { return Part == "UeApi"; });
 }
 
 /* The comment on the lines right above the line At is on, written as a doc comment is: one `/* ... *\/` block that begins
@@ -8201,9 +8333,8 @@ static std::string CommentAbove(const std::string& T, size_t At)
     return Out;
 }
 
-/* The dump names no file for a declaration in the one before it, so Decl's text is the mod source where its range
-   begins, a token long, and where its head (up to the first `{` or `;`) has its name as a word. A declaration that
-   begins in a macro, or outside the mod's sources (UeApi), has none. */
+/* Decl's text is in its own mod source (SourceOf) where its range begins, and its head (up to the first `{` or `;`)
+   has its name as a word. A declaration that begins in a macro, or outside the mod's sources (UeApi), has none. */
 std::string FCompiler::DocAbove(const Json& Decl) const
 {
     const Json Begin = Decl.value("range", Json::object()).value("begin", Json::object());
@@ -8211,14 +8342,12 @@ std::string FCompiler::DocAbove(const Json& Decl) const
     if (Name.empty() || Begin.contains("spellingLoc") || !Begin.contains("offset") || !Begin.contains("tokLen")) return std::string();
     const size_t From = Begin["offset"].get<size_t>();
     auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
-    for (const std::string& T : ModSources())
-    {
-        if (From >= T.size()) continue;
-        const size_t HeadEnd = T.find_first_of("{;", From);
-        if (HeadEnd == std::string::npos) continue;
-        for (size_t At = T.find(Name, From); At != std::string::npos && At < HeadEnd; At = T.find(Name, At + 1))
-            if ((At == 0 || !Ident(T[At - 1])) && !Ident(T[At + Name.size()])) return CommentAbove(T, From);
-    }
+    const std::string* T = SourceOf(Begin);
+    if (!T || From >= T->size()) return std::string();
+    const size_t HeadEnd = T->find_first_of("{;", From);
+    if (HeadEnd == std::string::npos) return std::string();
+    for (size_t At = T->find(Name, From); At != std::string::npos && At < HeadEnd; At = T->find(Name, At + 1))
+        if ((At == 0 || !Ident((*T)[At - 1])) && !Ident((*T)[At + Name.size()])) return CommentAbove(*T, From);
     return std::string();
 }
 
@@ -8371,6 +8500,19 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
                 R.UeName = LeafOf(R.CppName) + "_C";
                 R.bClassIn = true;
             }
+
+    /* So is a UE_STRUCT or UE_ENUM there, as UE_STRUCT_IN / UE_ENUM_IN would say: its owner cooks it, and a copy cooked
+       here would be another type, which the owner's saves and results do not hold. */
+    for (auto& [Key, R] : Records)
+        if (R.bIsStruct && R.UePackage.empty() && !R.bIsPatch && !R.bCooked)
+            if (const std::string O = OwnerOf(LeafOf(R.CppName)); !O.empty() && O != Mine)
+            {
+                R.UePackage = PathIn(O, R.CppName);
+                R.UeName = LeafOf(R.CppName);
+            }
+    for (auto& [Enum, Owner] : EnumMarks)
+        if (const std::string O = OwnerOf(LeafOf(Enum)); Owner.empty() && !O.empty() && O != Mine)
+            Owner = O;
 
     /* The candidates: a plain struct, its members values a struct holds (no text pointer, array or reference), and a
        uint8 enum, of a mod's folder. */
@@ -8545,10 +8687,9 @@ static std::string QualifierBefore(const std::string& T, size_t Off, size_t Len,
     }
 }
 
-/* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
-   not its file (that is only written when it changes, and Json's sorted keys lose the order). So each of the mod's own
-   sources is tried at that offset, and a hit counts only when `<Record>::StaticClass` is what is written there, the
-   record's name in as many parts as it is written with (`Weapons::Rifle::StaticClass()`).
+/* The qualifier token is where a qualified DeclRefExpr's range begins, read in its own source (SourceOf); it counts
+   only when `<Record>::StaticClass` is what is written there, the record's name in as many parts as it is written with
+   (`Weapons::Rifle::StaticClass()`).
    In a macro (`#define CLS(X) X::StaticClass()`) the range has spelling locations instead: the qualifier where the
    argument is written, StaticClass in the macro's body, which has to be `::StaticClass` then.
    ponytail: a macro defined outside the mod's own sources (a UeApi header) falls back to the declaring class. */
@@ -8564,27 +8705,23 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
     }
     if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
     const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
-    ModSources();
+    const std::string* T = SourceOf(Begin);
+    if (!T) return nullptr;
     if (End.is_null())
     {
-        for (const std::string& T : SourceTexts)
-            if (const std::string Q = QualifierBefore(T, Off, Len, "StaticClass"); !Q.empty())
-                if (const FRecord* R = Find(Q)) return R;
-        return nullptr;
+        const std::string Q = QualifierBefore(*T, Off, Len, "StaticClass");
+        return Q.empty() ? nullptr : Find(Q);
     }
     /* In a macro: its body has `::StaticClass` at End, and the qualifier is the whole identifier at Off. */
-    const size_t At = End["offset"].get<size_t>();
-    const bool bBody = std::any_of(SourceTexts.begin(), SourceTexts.end(), [&](const std::string& T) {
-        size_t P = At;
-        if (P + 11 > T.size() || T.compare(P, 11, "StaticClass") != 0) return false;
-        while (P > 0 && (T[P - 1] == ' ' || T[P - 1] == '\t')) --P;
-        return P >= 2 && T.compare(P - 2, 2, "::") == 0;
-    });
+    const std::string* Body = SourceOf(End);
+    size_t P = End["offset"].get<size_t>();
+    if (!Body || P + 11 > Body->size() || Body->compare(P, 11, "StaticClass") != 0) return nullptr;
+    while (P > 0 && ((*Body)[P - 1] == ' ' || (*Body)[P - 1] == '\t')) --P;
+    if (P < 2 || Body->compare(P - 2, 2, "::") != 0) return nullptr;
     auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
-    for (const std::string& T : SourceTexts)
-        if (bBody && Off + Len <= T.size() && (Off == 0 || !Ident(T[Off - 1])) && (Off + Len == T.size() || !Ident(T[Off + Len])))
-            if (const FRecord* R = Find(T.substr(Off, Len))) return R;
-    return nullptr;
+    if (Off + Len > T->size() || (Off > 0 && Ident((*T)[Off - 1])) || (Off + Len < T->size() && Ident((*T)[Off + Len])))
+        return nullptr;
+    return Find(T->substr(Off, Len));
 }
 
 /* `StaticClassOf<X>()`, `StaticStructOf<X>()` (UeMeta.h): the dump keeps no template argument, but X is the
@@ -8644,59 +8781,55 @@ const FRecord* FCompiler::HeldClassOf(const Json& ClassExpr) const
 
 /* A MemberExpr on an implicit this begins at its qualifier when it has one and at the member's own name when not
    (clang's MemberExpr::getBeginLoc), so `QcParent::Plain()` is told from `Plain()` by what is written where its range
-   begins: `<Record>::<member>`, tried in each of the mod's sources as NamedQualifier does.
+   begins: `<Record>::<member>`, in its own source (SourceOf).
    The record's name may come in parts, `Weapons::Rifle::Pull`. `this->QcParent::Plain()` begins at `this`, and a
    qualifier written in a macro has spelling locations: there it is read back from the member's name
    (WrittenQualifier). */
 const FRecord* FCompiler::MemberQualifier(const Json& Member) const
 {
     const Json Begin = Member.value("range", Json::object()).value("begin", Json::object());
-    if (Begin.contains("offset") && Begin.contains("tokLen"))
+    if (const std::string* T = SourceOf(Begin); T && Begin.contains("offset") && Begin.contains("tokLen"))
     {
         const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
-        const std::string Method = Member.value("name", std::string());
-        for (const std::string& T : ModSources())
-            if (const std::string Q = QualifierBefore(T, Off, Len, Method); !Q.empty())
-                if (const FRecord* R = Find(Q)) return R;
+        if (const std::string Q = QualifierBefore(*T, Off, Len, Member.value("name", std::string())); !Q.empty())
+            if (const FRecord* R = Find(Q)) return R;
     }
     const std::string Q = WrittenQualifier(Member);
     return Q.empty() ? nullptr : Find(Q);
 }
 
 /* A MemberExpr's range ends at its member's name (MemberExpr::getEndLoc), and a qualifier is written right before it,
-   `GetOther()->SuperBase::Bump`, so it is read back from there whatever comes before it: a name, a call or a cast. Each
-   of the mod's sources is tried at that offset, as NamedQualifier does; a hit needs the member's name there and a
-   record that the qualifier names, in as many parts as it is written with. In a macro the name is where it is spelled.
+   `GetOther()->SuperBase::Bump`, so it is read back from there whatever comes before it: a name, a call or a cast. It
+   is read in the member's own source (SourceOf); a hit needs the member's name there and a record that the qualifier
+   names, in as many parts as it is written with. In a macro the name is where it is spelled.
    ponytail: a member written with template arguments ends at its `>`, and a qualifier can be a macro's parameter or
    come from a macro outside the mod's sources: these read as unqualified here. */
 std::string FCompiler::WrittenQualifier(const Json& Member) const
 {
     Json End = Member.value("range", Json::object()).value("end", Json::object());
     if (End.contains("spellingLoc")) End = End["spellingLoc"];
-    if (!End.contains("offset") || !End.contains("tokLen")) return std::string();
+    const std::string* Src = SourceOf(End);
+    if (!Src || !End.contains("offset") || !End.contains("tokLen")) return std::string();
+    const std::string& T = *Src;
     const size_t Off = End["offset"].get<size_t>(), Len = End["tokLen"].get<size_t>();
     const std::string Method = Member.value("name", std::string());
     auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
     auto Blank = [](char C) { return C == ' ' || C == '\t'; };
-    for (const std::string& T : ModSources())
+    if (Len != Method.size() || Off + Len > T.size() || T.compare(Off, Len, Method) != 0) return std::string();
+    std::string Q;
+    for (size_t P = Off;;)
     {
-        if (Len != Method.size() || Off + Len > T.size() || T.compare(Off, Len, Method) != 0) continue;
-        std::string Q;
-        for (size_t P = Off;;)
-        {
-            while (P > 0 && Blank(T[P - 1])) --P;
-            if (P < 2 || T.compare(P - 2, 2, "::") != 0) break;
-            P -= 2;
-            while (P > 0 && Blank(T[P - 1])) --P;
-            size_t B = P;
-            while (B > 0 && Ident(T[B - 1])) --B;
-            if (B == P) break;
-            Q = T.substr(B, P - B) + (Q.empty() ? "" : "::" + Q);
-            P = B;
-        }
-        if (!Q.empty() && Find(Q)) return Q;
+        while (P > 0 && Blank(T[P - 1])) --P;
+        if (P < 2 || T.compare(P - 2, 2, "::") != 0) break;
+        P -= 2;
+        while (P > 0 && Blank(T[P - 1])) --P;
+        size_t B = P;
+        while (B > 0 && Ident(T[B - 1])) --B;
+        if (B == P) break;
+        Q = T.substr(B, P - B) + (Q.empty() ? "" : "::" + Q);
+        P = B;
     }
-    return std::string();
+    return !Q.empty() && Find(Q) ? Q : std::string();
 }
 
 /* clang's JSON keeps no qualifier, so it shows two ways. The method called is declared above the nearest declaration of
@@ -9072,6 +9205,23 @@ std::vector<const Json*> FCompiler::StructArgs(const Json& Value, const FRecord*
     return Out;
 }
 
+/* A struct passed where its parent struct is wanted (`FPointerEvent` to `const FInputEvent&`, by value too), among the
+   casts Strip peels off N: the cast, else null. The VM evaluates an argument into the callee's parameter-sized slot with
+   the argument's own struct ops (execLocalVariable's CopyCompleteValueToScriptVM, ScriptCore.cpp), so the child's tail is
+   written past the slot's end; the editor refuses the same link ("Derived structures are disallowed",
+   EdGraphSchema_K2.cpp 2049), unless the child adds nothing (FVector_NetQuantize to FVector: IsChildOf and
+   TheSameLayout, 4248), which LowerCall lets pass. An object pointer's upcast is a pointer, not a struct, and is fine. */
+static const Json* StructUpcastBelow(const Json& N)
+{
+    const Json* Leaf = Strip(&N);
+    for (const Json* W = &N; W && W != Leaf; W = First(*W))
+    {
+        const std::string Cast = Kind(*W) == "ImplicitCastExpr" ? W->value("castKind", std::string()) : std::string();
+        if ((Cast == "DerivedToBase" || Cast == "UncheckedDerivedToBase") && IsStructValueType(TypeOf(*W))) return W;
+    }
+    return nullptr;
+}
+
 bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
 {
     const std::string K = Kind(CallExprNode);
@@ -9104,6 +9254,50 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     }
     /* A static member template's instantiation is its class's function under the name its arguments give it. */
     if (const auto Inst = InstanceNames.find(DeclId); Inst != InstanceNames.end()) MethodName = Inst->second;
+    /* A child struct for its parent, as an argument or as the object of the parent's method (StructUpcastBelow). The
+       slice C++ makes is the child's own conversion, where UeApi declares one: `E.GetInputEventFromPointerEvent()`, the
+       editor's To Input Event node, a native that copies out the parent. The call is lowered with it in the child's
+       place; with none, it is refused. */
+    for (size_t I = 0; const Json* A = Nth(CallExprNode, I); ++I)
+    {
+        const Json* Of = I > 0 ? A : K == "CXXMemberCallExpr" ? First(*Callee) : nullptr;
+        const Json* Up = Of ? StructUpcastBelow(*Of) : nullptr;
+        if (!Up) continue;
+        const std::string Parent = StripTypeKeywords(TypeOf(*Up)), Child = StripTypeKeywords(TypeOf(*First(*Up)));
+        /* The editor's TheSameLayout, by Types.json: the parent's size, and no reflected member of the child's own. */
+        const auto PS = Structs.find(Parent), CS = Structs.find(Child);
+        if (PS != Structs.end() && CS != Structs.end() && PS->second.Size > 0 && PS->second.Size == CS->second.Size
+            && PS->second.Fields.size() == CS->second.Fields.size())
+            continue;
+        const std::string Conv = "Get" + Parent.substr(1) + "From" + Child.substr(1);
+        const FRecord* CR = Find(Child);
+        // ponytail: one step only; FAnalogInputEvent to FInputEvent (via GetKeyEventFromAnalogInputEvent) is refused.
+        const Json* ConvDecl = nullptr;
+        if (CR)
+            if (const auto M = CR->Methods.find(Conv); M != CR->Methods.end()) ConvDecl = M->second;
+        if (ConvDecl)
+        {
+            const Json Sliced = { {"kind", "CXXMemberCallExpr"}, {"type", {{"qualType", Parent}}}, {"valueCategory", "prvalue"},
+                                  {"inner", Json::array({ { {"kind", "MemberExpr"}, {"name", Conv}, {"isArrow", false},
+                                      {"type", {{"qualType", "<bound member function type>"}}},
+                                      {"referencedMemberDecl", ConvDecl->value("id", std::string())},
+                                      {"inner", Json::array({ *First(*Up) })} } })} };
+            Json Call = CallExprNode;
+            if (I > 0) Call["inner"][I] = Sliced;
+            else
+            {
+                Json Member = *Callee;
+                Member["inner"][0] = Sliced;
+                Call["inner"][0] = std::move(Member);
+            }
+            return LowerCall(Call, BP, Out, Err);
+        }
+        *Err = MethodName + (I == 0 ? "'s object" : " argument " + std::to_string(I)) + " is an " + Child
+             + " where an " + Parent + " is wanted: Blueprint passes only the exact struct (the editor disallows a derived "
+             "one), the VM would copy the whole " + Child + " into an " + Parent + "-sized slot, past its end, and UeApi "
+             "declares no " + Child + "::" + Conv + " to make the slice; convert it to an " + Parent + " first";
+        return false;
+    }
     /* SpawnActor returns None while a construction script runs (bIsRunningConstructionScript, LevelActor.cpp), and the
        editor keeps spawning out of the construction script graph. */
     const bool bSpawn = MethodName == "BeginDeferredActorSpawnFromClass" || MethodName == "BeginSpawningActorFromClass"
@@ -13455,10 +13649,17 @@ void FCompiler::IndexLambdas(const Json& N)
 /* `L(x)` is a CXXOperatorCallExpr [operator(), L, x]. Rewritten here, once, into the CallExpr [operator(), x] of an
    ordinary inline call, the object L kept in "lambdaObj" (ExpandInline reads what it is): so HoistComma, the
    impurity and eager-safety predicates, ResumesLater and the argument-order code see an inline call, which is what
-   it is, and none of them has a lambda case. Run after IndexLambdas has seen every closure. */
+   it is, and none of them has a lambda case. Run after IndexLambdas has seen every closure.
+   `A != B` over a type with only an operator== (FKey: Kismet has EqualEqual_KeyKey and no NotEqual) is C++20's
+   CXXRewrittenBinaryOperator, whose one child is the call it stands for, `!(A == B)`: it is replaced by that here too. */
 void FCompiler::RewriteLambdaCalls(Json& N)
 {
     if (!N.is_object()) return;
+    while (Kind(N) == "CXXRewrittenBinaryOperator" && N.contains("inner") && N["inner"].size() == 1)
+    {
+        Json Semantic = std::move(N["inner"][0]);
+        N = std::move(Semantic);
+    }
     if (auto In = N.find("inner"); In != N.end() && In->is_array())
         for (Json& C : *In) RewriteLambdaCalls(C);
     if (Kind(N) != "CXXOperatorCallExpr" || !N.contains("inner") || N["inner"].size() < 2) return;
@@ -13489,8 +13690,10 @@ bool FCompiler::CaptureNames(const Json& L, const std::vector<const Json*>& Init
     }
     const size_t Off = Begin["offset"].get<size_t>();
     auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
-    for (const std::string& T : ModSources())
+    for (const std::string* Src : { SourceOf(Begin) })      // its own source, once: a `continue` is a list not read
     {
+        if (!Src) continue;
+        const std::string& T = *Src;
         if (Off >= T.size() || T[Off] != '[') continue;
         std::vector<std::string> Entries;
         std::string Cur;
@@ -17521,12 +17724,13 @@ bool FCompiler::NestedWrapperOut(const std::string& ContainerType, size_t OutArg
 }
 
 /* A class the headers only forward-declare has no record, so nothing says what package to import it from. A
-   Blueprint class's header is named after it. */
+   Blueprint class's header is named after it: UBP_Foo in its Game:: namespace, or the older spelling BP_Foo_C. */
 static std::string UnknownClass(const std::string& Where, const std::string& QualType, std::string Class)
 {
     Class = StripTypeKeywords(Class);
     const size_t Leaf = Class.rfind("::");
-    if (Class.size() > 2 && Class.compare(Class.size() - 2, 2, "_C") == 0)
+    if ((Class.size() > 2 && Class.compare(Class.size() - 2, 2, "_C") == 0) || Class.rfind("Game::", 0) == 0
+        || Class.rfind("::Game::", 0) == 0)
         return Where + ": " + Class + " is only forward-declared here - #include \"UeApi/Game/"
              + Class.substr(Leaf == std::string::npos ? 0 : Leaf + 2) + ".h\"";
     return "TODO: unimplemented " + Where + ": " + QualType;
@@ -17750,7 +17954,7 @@ bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Ho
     if (TagsOnlyIn == &BP) { *Sig = Null(); return true; }
     /* DelegateSigs is the last class's still when an asset or a struct asks: its indices are that package's. */
     if (DelegateSigsIn != &BP)
-    { *Err = Holder + ": " + Type + " needs a signature function, which only a class holds, not a struct or an interface"; return false; }
+    { *Err = Holder + ": " + Type + " needs a signature function, which a class or an interface holds, not a struct"; return false; }
     const std::string Key = DelegateKey(Type);
     if (auto It = DelegateSigs.find(Key); It != DelegateSigs.end()) { *Sig = It->second.second; return true; }
     const size_t Open = Type.find('('), Close = Type.rfind(')');
@@ -17912,12 +18116,28 @@ bool FCompiler::SignatureNameTaken(const FRecord& For, const std::string& N) con
     if (&For == Cur && (std::any_of(CurSignatures.begin(), CurSignatures.end(), [&](const auto& D) { return D.first + "__DelegateSignature" == N; })
                         || std::any_of(DelegateSigs.begin(), DelegateSigs.end(), [&](const auto& D) { return D.second.first == N; })))
         return true;
-    if (Has(For)) return true;
+    /* The interfaces a class lists count as its chain too: FindFunctionByName looks in them (Class.cpp:5281-5323), and
+       invariants.py func_override_params takes a same-named function for an implementation of theirs. */
+    auto Lists = [&](const FRecord& A, const FRecord& Interface) {
+        for (const std::string& I : A.Interfaces)
+            for (const FRecord* IR : InterfaceChain(Find(I)))
+                if (IR == &Interface) return true;
+        return false;
+    };
+    auto HasOrItsInterfaces = [&](const FRecord& A) {
+        if (Has(A)) return true;
+        for (const std::string& I : A.Interfaces)
+            for (const FRecord* IR : InterfaceChain(Find(I)))
+                if (IR && Has(*IR)) return true;
+        return false;
+    };
+    if (HasOrItsInterfaces(For)) return true;
     for (const FRecord* A = For.Base.empty() ? nullptr : Find(For.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
-        if (Has(*A)) return true;
+        if (HasOrItsInterfaces(*A)) return true;
     for (const auto& [CppName, D] : Records)
     {
         if (&D == &For || !D.IsGenerated() || D.bIsStruct || D.bIsInterface) continue;
+        if (For.bIsInterface && Lists(D, For) && Has(D)) return true;
         for (const FRecord* A = D.Base.empty() ? nullptr : Find(D.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
             if (A == &For) { if (Has(D)) return true; break; }
     }
@@ -17948,13 +18168,23 @@ std::string FCompiler::SignatureName(const FRecord& In, const std::string& Type,
    held to its parameters the same (invariants.py func_override_params). Up mod classes only: a native's or another
    mod's parameter names a signature UeApi does not, and the class keeps its own there. The type is the declaring
    class's own parameter's, from the declaration its Generate lowers (Fn.Def: the out-of-line definition, else the one in
-   the class), never the asker's spelling of it (ForeignSignature). */
+   the class), never the asker's spelling of it (ForeignSignature). A mod interface's function is copied the same way:
+   an implementation's entry pins are the interface function's (FKismetCompilerContext::CreateFunctionList finds it as
+   the function to implement), so a class that no mod parent gives Method takes the signature of the interface it
+   implements, and a caller through the interface binds its value with it. */
 const FRecord* FCompiler::SignatureDeclarer(const FRecord& Owner, const std::string& Method) const
 {
+    auto Declares = [&](const FRecord* I) { return I && I->bIsInterface && I->IsGenerated() && I != Cur && I->Methods.count(Method); };
+    if (Owner.bIsInterface) return Declares(&Owner) ? &Owner : nullptr;
     const FRecord* D = &Owner;
     for (const FRecord* A = Owner.Base.empty() ? nullptr : Find(Owner.Base); A && !A->IsNative() && !A->bIsInterface;
          A = A->Base.empty() ? nullptr : Find(A->Base))
         if (!IsInlineMethod(*A, Method) && CompilesMethod(*A, Method)) D = A;
+    if (D == &Owner)
+        for (const FRecord* A = &Owner; A && !A->IsNative(); A = A->Base.empty() ? nullptr : Find(A->Base))
+            for (const std::string& I : A->Interfaces)
+                for (const FRecord* Link : InterfaceChain(Find(I)))
+                    if (Declares(Link)) return Link;
     if (D == Cur || D->IsNative() || !D->IsGenerated() || D->bIsStruct || D->bIsInterface || IsInlineMethod(*D, Method)
         || !CompilesMethod(*D, Method))
         return nullptr;
@@ -18225,7 +18455,26 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
            IsSignatureCompatibleWith reads it, and ignores it (Class.h 1914-1921). A pointer to const is no Blueprint type. */
         const bool bConstRef = bOutParm && ((Type.compare(0, 6, "const ") == 0 && Type.back() != '*')
                                             || (Type.size() >= 5 && Type.compare(Type.size() - 5, 5, "const") == 0));
-        const uint64 Flags = bOutParm ? uint64(CPF_OutParm | CPF_ReferenceParm | (bConstRef ? CPF_ConstParm : 0)) : 0;
+        bool bOutputOnly = false;
+        auto MarkedOutput = [&](const FRecord* Owner) {
+            if (!Owner) return false;
+            const auto Out = Owner->OutputParams.find(Fn);
+            return Out != Owner->OutputParams.end() && Out->second.count(Index - 1) != 0;
+        };
+        for (const FRecord* A = Cur; A && !bOutputOnly; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            bOutputOnly = MarkedOutput(A);
+            for (const std::string& Interface : A->Interfaces)
+                for (const FRecord* Decl : InterfaceChain(Find(Interface))) bOutputOnly = bOutputOnly || MarkedOutput(Decl);
+        }
+        if (bOutputOnly && (!bOutParm || bConstRef))
+        {
+            *Err = Fn + ": UE_OUT(" + PName + ") requires a non-const reference parameter";
+            bOk = false;
+            return;
+        }
+        const uint64 Flags = bOutParm ? uint64(CPF_OutParm | (bOutputOnly ? 0 : CPF_ReferenceParm)
+                                               | (bConstRef ? CPF_ConstParm : 0)) : 0;
         /* An override's delegate parameter is its parent's: that one's signature function (ImportedParamSignature). */
         if (FIndex Sig; Cur && StripTypeKeywords(Type).compare(0, 10, "TDelegate<") == 0
                         && ImportedParamSignature(*Cur, Fn, Index - 1, BP, &Sig))
@@ -18253,6 +18502,7 @@ no state, so there are no variables to carry.
 bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, std::string* Err)
 {
     Cur = &R;
+    BuiltClasses.insert(R.CppName);     // the signature functions it exports are known by name now (ForeignSignature)
     const std::string PackageName = PackageOf(R);
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
@@ -18272,6 +18522,11 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     BP.GameClassKinds = &GameClassKinds;
     BP.SetIsActor(false);
     BP.SetClassFlags(CLASS_Parsed | CLASS_Interface | CLASS_CompiledFromBlueprint);
+    /* An interface is a class too, so a TDelegate parameter of one of its functions gets a signature function in it,
+       as in a class (DelegateSignature), which its implementations and callers import (SignatureDeclarer). */
+    struct FSigScope { const FBlueprintClass*& In; ~FSigScope() { In = nullptr; } } SigScope{ DelegateSigsIn };
+    DelegateSigs.clear();
+    DelegateSigsIn = &BP;
 
     /* A variable on an interface is this compiler's own idea, not the engine's: it becomes a property of every
        class that implements the interface (Generate), so none is written here. What cannot move that way is
@@ -18311,12 +18566,16 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
            are the ones a caller dispatches through. */
         const bool bOut = std::any_of(Params.begin(), Params.end(),
                                       [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
-        /* Named as its implementations and callers name it: by its `__UeName` marker where it has one. */
+        /* Named as its implementations and callers name it: by its `__UeName` marker where it has one. A `const` or
+           UE_PURE one is pure, which UHT refuses on an interface ("BlueprintPure specifier is not allowed for interface
+           functions") and the editor hides from an interface's details, yet the Kismet compiler keeps it from the entry
+           node (KismetCompiler.cpp:1833) and copies it to each implementation (1857): a call on an interface pin
+           draws without exec pins. */
         const std::string UeFn = UeNameOf(&R, Entry.first);
         BP.AddFunction(UeFn, Null(), Params,
                        [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
                        FUNC_Public | FUNC_BlueprintCallable | FUNC_BlueprintEvent
-                           | (bOut ? FUNC_HasOutParms : 0));
+                           | (bOut ? FUNC_HasOutParms : 0) | (IsModPureDecl(*Entry.second) ? FUNC_BlueprintPure : 0));
         if (auto Cat = R.Categories.find(Entry.first); Cat != R.Categories.end()) BP.ApiCategory[UeFn] = Cat->second;
         if (auto Doc = R.Docs.find(Entry.first); Doc != R.Docs.end()) BP.ApiDocs[UeFn] = Doc->second;
     }
@@ -18327,7 +18586,7 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
        per function, as the editor saves one. Its variables, AssetGen's own idea, are not there: the editor's interfaces
        hold none. */
     BP.ApiDescription = R.Doc;
-    if (ApiDir && !BP.WriteApi(*ApiDir, Err))
+    if (ApiDir && !BP.WriteApi(ApiDirOf(PackageName), Err))
     {
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
         Err->clear();
@@ -18373,7 +18632,7 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     const uint32 Guid[4] = { ~H, H * 2654435761u, H ^ 0x9E3779B9u, H };
     /* The editor stub reads the members before FinishStruct consumes them; both share the same Guid,
        so the cooked and uncooked assets carry identical member names and struct identity. */
-    if (ApiDir && !IsInternalViewStruct(R.CppName) && !BP.WriteApiStruct(*ApiDir, Guid, Err))
+    if (ApiDir && !IsInternalViewStruct(R.CppName) && !BP.WriteApiStruct(ApiDirOf(PackageName), Guid, Err))
         return false;
     BP.FinishStruct(Guid);
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
@@ -18387,11 +18646,11 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
    cook identical packages at the same path. A wrapper's own member may need a deeper one. */
 bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir, std::string* Err)
 {
-    const std::string PackageName = PathIn(ModPackage, Enum), Name = LeafOf(Enum);
+    const std::string PackageName = Enums[Enum].Package, Name = Enums[Enum].UeName;
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, Name, "", "", false);
-    if (ApiDir && !BP.WriteApiEnum(*ApiDir, ModEnums[Enum], Err)) return false;
+    if (ApiDir && !BP.WriteApiEnum(ApiDirOf(PackageName), ModEnums[Enum], Err)) return false;
     std::vector<std::pair<std::string, int64>> Cooked;
     std::vector<std::pair<std::string, std::string>> Display;     // cooked name -> display name, for a renamed or labelled one
     for (const auto& [Cpp, Value] : ModEnums[Enum])
@@ -20433,6 +20692,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         if (Mine == Theirs)
                         { *Err = R.CppName + " implements " + Other + " and " + I + ", which both extend " + Mine->CppName; return false; }
         BP.AddInterface(ClassImportOf(*IR, BP));
+        for (const FRecord* Decl : InterfaceChain(IR))
+            for (const auto& Method : Decl->Methods)
+                BP.ApiInterfaceMethods[UeNameOf(Decl, Method.first)] = ClassImportOf(*IR, BP);
         if (R.bIsPatch) PatchInterfaces.push_back(ClassImportOf(*IR, BP));
     }
     if (!AddInputBindings(R, bIsActor, BP, Err)) return false;
@@ -22423,7 +22685,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            nothing, and clang has already refused what C++ forbids. */
         if (auto A = R.MethodAccess.find(Fn.Name); !Inherited && A != R.MethodAccess.end())
             Flags = (Flags & ~uint32(FUNC_Public | FUNC_Protected | FUNC_Private)) | A->second;
-        if (IsPureDecl(M) || (!Inherited && IsModPureDecl(Decl))) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
+        if (IsPureDecl(M) || (!Inherited && (IsModPureDecl(Decl) || ImplementsPure(R, Fn.Name))))
+            Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
         const std::string DeclType = TypeOf(Decl);
         if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;
         /* ProcessEvent only lists a script function's out-parms for EX_LocalOutVariable when this is set
@@ -22656,7 +22919,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (R.bIsPatch) return TransplantFunctions(R, *B, P, BP.ClassIndex(), Err);
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     BP.ApiDescription = R.Doc;
-    if (ApiDir && !BP.WriteApi(*ApiDir, Err))
+    if (ApiDir && !BP.WriteApi(ApiDirOf(PackageName), Err))
     {
         /* A class with nothing callable is not a build failure; the mod simply has no API surface. */
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
@@ -22674,11 +22937,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
    this same function, so the two cannot disagree.
    The contract: a key goes here only if FAstSax drops it in every context. A key it drops only in some (range, end,
    isImplicit, isUsed, isReferenced) stays in key()'s own rules, which see the tree built so far; the filter passes
-   those through. A key that anything reads later is in neither.
+   those through. A key that anything reads later is in neither: `file`, which FAstSax follows but never keeps.
    astcheck checks an edit here: its reference tree drops FrozenDroppedAstKey's keys instead. */
 bool DroppedAstKey(const std::string& K)
 {
-    return K == "loc" || K == "file" || K == "line" || K == "col" || K == "includedFrom" || K == "expansionLoc"
+    return K == "loc" || K == "line" || K == "col" || K == "includedFrom" || K == "expansionLoc"
         || K == "isMacroArgExpansion" || K == "mangledName" || K == "definitionData" || K == "typeAliasDeclId";
 }
 
@@ -22689,7 +22952,7 @@ bool DroppedAstKey(const std::string& K)
    the edit is known to be right (for a key added: nothing reads it, in any context). */
 bool FrozenDroppedAstKey(const std::string& K)
 {
-    return K == "loc" || K == "file" || K == "line" || K == "col" || K == "includedFrom" || K == "expansionLoc"
+    return K == "loc" || K == "line" || K == "col" || K == "includedFrom" || K == "expansionLoc"
         || K == "isMacroArgExpansion" || K == "mangledName" || K == "definitionData" || K == "typeAliasDeclId";
 }
 
@@ -22703,14 +22966,19 @@ bool FrozenDroppedAstKey(const std::string& K)
    it skips are not checked, and neither is the JSON around what it keeps: it drops whitespace between any two tokens,
    so `[1 2]` would come out as `[12]`, and holds an object's commas back for the next kept key, so `{"a":1,}` would
    come out valid. All of that is safe only because clang's JSON writer never writes a malformed dump; astcheck reports
-   one as `the filter's output parses, but the dump does not`. */
+   one as `the filter's output parses, but the dump does not`.
+   One thing is written that the dump does not have there: clang names a location's file only when it differs from
+   the last location's, so FAstSax follows every `file` to know the file of a location it keeps. One inside a dropped
+   loc or expansionLoc would be lost with it, so the last one there (not an includedFrom's, which names the includer)
+   is written right after it, as a `file` member of the object that held it. */
 class FDumpFilter
 {
 public:
     /* The most one Feed of N bytes can write: the room its Dst needs. Every byte written stands for one read in the
        same call, but for the comma held back before a kept key and the key itself, which an earlier call may have
-       read: a cut between a key and its colon writes the comma, both quotes and the key on reading the colon. */
-    size_t MaxOut(size_t N) const { return N + Key.size() + 4; }
+       read: a cut between a key and its colon writes the comma, both quotes and the key on reading the colon. And for
+       a dropped loc's file, written whole where the loc ends, which may have been read before: `,"file":"..."`. */
+    size_t MaxOut(size_t N) const { return N + Key.size() + 4 + LocFile.size() + Str.size() + 10; }
 
     /* Writes the filtered form of [P, P + N) at Dst, which has room for MaxOut(N) bytes, and returns its new end. */
     char* Feed(const char* P, const size_t N, char* Dst)
@@ -22751,7 +23019,15 @@ public:
                 ++P;
                 if (IsSpace(C)) break;
                 Key.pop_back();             // its closing quote
-                if (C == ':' && DroppedAstKey(Key)) { State = EState::SkipValue; break; }
+                if (C == ':' && DroppedAstKey(Key))
+                {
+                    State = EState::SkipValue;
+                    bLoc = Key == "loc" || Key == "expansionLoc";
+                    LocFile.clear();
+                    Prev.clear();
+                    PrevPrev.clear();
+                    break;
+                }
                 if (Open.back().bAny) *Dst++ = ',';
                 Open.back().bAny = true;
                 *Dst++ = '"';
@@ -22773,12 +23049,38 @@ public:
                     const char D = *P++;
                     if (D == '"') { bEscaped = false; State = EState::SkipString; break; }
                     if (D == '{' || D == '[') ++Depth;
-                    else if ((D == '}' || D == ']') && --Depth == 0) { State = EState::Token; break; }
+                    else if ((D == '}' || D == ']') && --Depth == 0)
+                    {
+                        State = EState::Token;
+                        if (bLoc && !LocFile.empty())
+                        {
+                            if (Open.back().bAny) *Dst++ = ',';
+                            Open.back().bAny = true;
+                            std::memcpy(Dst, "\"file\":\"", 8);
+                            std::memcpy(Dst + 8, LocFile.data(), LocFile.size());
+                            Dst += 8 + LocFile.size();
+                            *Dst++ = '"';
+                        }
+                        break;
+                    }
                 }
                 break;
             case EState::SkipString:
+            {
+                const char* const S = P;
                 while (P < E && !EndsString(*P++, Depth ? EState::SkipNested : EState::Token)) {}
+                if (!bLoc) break;
+                /* In a loc, a string is a key or a file's name: the one after a `file` key is the location's file,
+                   unless that key is an includedFrom's. Kept as written, escapes and all, to be written back so. */
+                Str.append(S, size_t(P - S));
+                if (State == EState::SkipString) break;
+                Str.pop_back();             // its closing quote
+                if (Prev == "file" && PrevPrev != "includedFrom") LocFile = Str;
+                PrevPrev.swap(Prev);
+                Prev.swap(Str);
+                Str.clear();
                 break;
+            }
             case EState::SkipScalar:        // a number, true, false or null ends where what follows it starts
                 if (C == ',' || C == '}' || C == ']' || IsSpace(C)) State = EState::Token;
                 else ++P;
@@ -22797,6 +23099,9 @@ private:
     int32 Depth = 0;                        // inside a dropped object or array
     bool bKeyNext = false;                  // the next string is a key of the innermost object
     bool bEscaped = false;                  // the last byte of the string being read was an unescaped backslash
+    bool bLoc = false;                      // the member being dropped is a loc or an expansionLoc
+    std::string Str, Prev, PrevPrev;        // in it: the string being read, and the last two read
+    std::string LocFile;                    // in it: the last location's file, as written
 
     static bool IsSpace(char C) { return C == ' ' || C == '\n' || C == '\r' || C == '\t'; }
     bool EndsString(char C, EState Then)
@@ -22812,7 +23117,11 @@ private:
    DeclRefExpr's or LambdaExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier and
    CaptureNames, a MemberExpr's whole range, see MemberQualifier and WrittenQualifier, and a braced value's, see
    IsUnsetInit), and a method's or record's range begin, see DocAbove, mangled names, a record's definitionData and a few flags are most of the dump, and building them was
-   most of a compile. A key read later must be in neither DroppedAstKey nor key()'s own rules. */
+   most of a compile. A key read later must be in neither DroppedAstKey nor key()'s own rules.
+   Each location kept gets a `fileId`, its file's index in the root's `files` (SourceOf): clang writes a location's
+   `file` only when it differs from the last location's, in a loc dropped or not, so every `file` is followed, but for
+   an includedFrom's, which names the file that included it. An id is given when a location first needs it, so a file
+   that only dropped locations name, which the filter may leave out (FDumpFilter), gets none in either parse. */
 class FAstSax : public nlohmann::json_sax<Json>
 {
 public:
@@ -22825,7 +23134,8 @@ public:
     bool number_float(number_float_t V, const string_t&) override { return Value(V); }
     bool string(string_t& V) override
     {
-        if (bKindNext && !Skipped)          // "kind" comes before "range"; a TypeTraitExpr's begin is its trait (FoldConst)
+        if (bFileNext && V != CurFile) { CurFile = V; CurId = -1; }
+        if (bKindNext && !Skipped)         // "kind" comes before "range"; a TypeTraitExpr's begin is its trait (FoldConst)
             Ranged.back() = V == "DeclRefExpr" || V == "TypeTraitExpr" || V == "LambdaExpr" || V == "CXXMethodDecl" || V == "CXXRecordDecl"
                           ? ERange::Begin
                           : V == "MemberExpr" || V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
@@ -22839,6 +23149,8 @@ public:
     bool end_array() override { return Close(); }
     bool key(string_t& K) override
     {
+        bFileNext = K == "file" && IncludedAt < 0;
+        bIncludedNext = K == "includedFrom";
         if (Skipped) return true;
         /* A spellingLoc only gets here inside a range kept (every other loc and range is skipped whole). A DeclRefExpr's
            end is kept only for a qualifier written in a macro (NamedQualifier); a MemberExpr's, which is its member's
@@ -22855,9 +23167,10 @@ public:
                  || (K == "isImplicit" && Stack.back()->value("kind", std::string()) != "CXXMethodDecl"
                      && Stack.back()->value("kind", std::string()) != "CXXConstructorDecl")
                  || ((K == "isUsed" || K == "isReferenced") && Stack.back()->value("kind", std::string()) != "VarDecl")
-                 || (K == "range" && Ranged.back() == ERange::None);
+                 || (K == "range" && Ranged.back() == ERange::None) || K == "file";
         bKindNext = K == "kind";
         bTypeNext = K == "qualType" || K == "desugaredQualType";
+        if (!bSkipNext && K == "offset") OffsetIn = Stack.back();
         if (!bSkipNext) Slot = &(*Stack.back())[std::move(K)];
         return true;
     }
@@ -22876,6 +23189,15 @@ private:
     bool bSkipNext = false;         // the next value is a dropped key's
     bool bKindNext = false;         // ... or "kind"'s
     bool bTypeNext = false;         // ... or a type's text
+    bool bFileNext = false;         // ... or a location's file
+    bool bIncludedNext = false;     // the next object or array is an includedFrom
+    int32 Nesting = 0;              // objects and arrays open, dropped ones too
+    int32 IncludedAt = -1;          // Nesting inside the includedFrom being read, or -1
+    std::string CurFile;            // the last location's file
+    int32 CurId = -1;               // its index in Files, or -1 before a location kept has needed it
+    std::vector<std::string> Files; // the root's `files`
+    std::map<std::string, int32> FileIds;   // asked only when the file changes
+    Json* OffsetIn = nullptr;       // the open object an offset was kept in last: a location
 
     /* A type written from the global namespace, `::Game::X` (genueapi roots every Blueprint's, inside which a bare
        `Game::` would find a Blueprint's own Game namespace): clang's text keeps the `::` as written, and every lookup
@@ -22901,20 +23223,32 @@ private:
     bool Value(Json&& V)
     {
         if (!Skipped && !bSkipNext) Place(std::move(V));
-        bSkipNext = bKindNext = bTypeNext = false;
+        bSkipNext = bKindNext = bTypeNext = bFileNext = bIncludedNext = false;
         return true;
     }
     bool Open(Json::value_t T)
     {
+        ++Nesting;
+        if (bIncludedNext) IncludedAt = Nesting;
         if (Skipped || bSkipNext) ++Skipped;
         else { Stack.push_back(Place(Json(T))); Ranged.push_back(ERange::None); }
-        bSkipNext = bKindNext = bTypeNext = false;
+        bSkipNext = bKindNext = bTypeNext = bFileNext = bIncludedNext = false;
         return true;
     }
     bool Close()
     {
-        if (Skipped) --Skipped;
-        else { Stack.pop_back(); Ranged.pop_back(); }
+        if (Nesting-- == IncludedAt) IncludedAt = -1;
+        if (Skipped) { --Skipped; return true; }
+        if (Stack.back() == OffsetIn && !CurFile.empty())
+        {
+            if (CurId < 0) CurId = FileIds.try_emplace(CurFile, int32(Files.size())).first->second;
+            if (size_t(CurId) == Files.size()) Files.push_back(CurFile);
+            (*OffsetIn)["fileId"] = CurId;
+            OffsetIn = nullptr;
+        }
+        if (Stack.size() == 1) (*Stack.back())["files"] = Files;
+        Stack.pop_back();
+        Ranged.pop_back();
         return true;
     }
 };
