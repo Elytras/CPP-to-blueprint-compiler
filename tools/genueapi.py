@@ -1,5 +1,5 @@
 ﻿#!/usr/bin/env python3
-"""usage: genueapi.py <SDK dir> <output dir> [--game <Content dir>] [--gaps <file>]
+"""usage: genueapi.py <SDK dir> <output dir> [--game <Content dir>]... [--gaps <file>]
        e.g. C:/Dumper-7/<version>-FSD/SDK/SDK  BpMods/UeApi  --game D:/DRGExtract/FSD-WindowsNoEditor/FSD/Content
 
 --gaps writes what the dump has and the output leaves out (members, functions, structs AssetGen cannot take), one JSON
@@ -10,7 +10,10 @@ row each with the type in the way, and prints a summary of it (write_gaps).
 implements (UeNativeInterfaces, see native_interfaces), which subobject a component member points at where the types
 cannot tell (map_subobjects), and the form of an enum only a local or a container element shows (scan_game).
 Blueprint classes' implemented interfaces become C++ bases, and imported Blueprint interface declarations carry
-their interface marker, from the cooked class metadata too.
+their interface marker, from the cooked class metadata too. A game Blueprint's enum and struct take their cooked
+names and defaults from it (game_enum_types, game_structs). --game may repeat: the game's Content first, then the
+Content folders of the installed mod paks, extracted, for the mods' own types the dump holds; a later one's package
+wins where two have it.
 
 The output's Version.json, written last, says which genueapi wrote it (GENUEAPI_VERSION), whether it had --game, and
 the engine and project the dump is of (dump_identity);
@@ -149,6 +152,7 @@ TEXT_TYPES = {
 STRUCTS = {}     # cpp name -> Struct, filled by parse_structs before any class header is mapped
 ENUMS = {}       # cpp name -> Enum
 GAME_STRUCT_NAMES = {}   # Dumper-7's name of a game struct -> its own, where they differ (game_structs)
+DECLARED = set()         # /Game paths of the enums and structs our mods' C++ declares (main)
 # Dumper-7 qualifies an enum or struct whose name another one takes (`BoolArray_0::FBoolArray`, `Engine::EModuleType`).
 # Ours, by the user's rule: a native one keeps the plain name, `EModuleType`; a game Blueprint's goes in its /Game
 # path's namespace, as a game Blueprint class sharing a name does (`Game::_ElytrasMods::_Shared::FBoolArray`).
@@ -320,7 +324,10 @@ def parse_structs(path, pkg):
                 cpp = m.group(1).rsplit("::", 1)[-1]
                 # ponytail: a native qualified because a Blueprint enum shares its name keeps the plain one; two natives
                 # of one name (none in the FSD dump) would want their package's namespace, and the second is left out.
-                if cpp not in ENUMS:
+                # So is one whose Blueprint twin our mods declare (EEE's EModuleType): AssetGen refuses a mod enum
+                # named like an engine one. ponytail: true only of an enum class's names; Engine's EModuleType is a
+                # plain enum (EPMT_General), so the refusal could ask the native's C++ form instead.
+                if cpp not in ENUMS and not (cpp != m.group(1) and any(p.endswith("/" + cpp) for p in DECLARED)):
                     if cpp != m.group(1):
                         QUALIFIED[m.group(1)] = cpp
                     cur_enum = ENUMS[cpp] = Enum(cpp, pkg, m.group(2))
@@ -377,14 +384,14 @@ def game_structs(own, content):
     dropped = []
     for st in [s for s in STRUCTS.values() if s.is_game]:
         names = [n for _, ns in sorted(REAL_FIELDS.get(st.path + "." + st.ue_name, {}).items()) for n in ns]
-        why = "ours" if st.path.startswith(own) else "no --game" if not content else None
+        why = "ours" if st.path.startswith(own) or st.path in DECLARED else "no --game" if not content else None
         if not why and not (st.complete and len(names) == len(st.raw_fields) == len(st.fields)
                             and all(is_spelling_of(n, r) for (_, n), r in zip(st.fields, names))):
             why = "members"
         if not why:
             st.real = dict((n, r) for (_, n), r in zip(st.fields, names))
-            base = os.path.join(content, st.path[len("/Game/"):].split(".")[0])
-            p = invariants.Package(base) if os.path.exists(base + ".uasset") else None
+            base = game_package(content, st.path.split(".")[0])
+            p = invariants.Package(base) if base else None
             ex = [i for i in range(len(p.exports)) if p.class_of(i + 1) == "UserDefinedStruct"] if p else []
             if not ex:
                 why = "no package"
@@ -445,12 +452,22 @@ def game_structs(own, content):
         "%s %d" % (w, c) for w, c in collections.Counter(w for _, w in dropped).most_common())))
 
 
+def game_package(content, path):
+    """The file base of the /Game package at path under the content roots (each --game), else None. A later root wins,
+    as a mod pak mounted after the game's own replaces its asset."""
+    for root in reversed(content or []):
+        base = os.path.join(root, path[len("/Game/"):])
+        if os.path.exists(base + ".uasset"):
+            return base
+    return None
+
+
 def cooked_enum_names(content, path):
     """{value: cooked enumerator name, `NewEnumerator0`} of the UserDefinedEnum in the game's package at path, under
-    content (--game), the closing _MAX among them; None when there is no such package."""
+    the content roots (--game), the closing _MAX among them; None when there is no such package."""
     import invariants
-    base = os.path.join(content, path[len("/Game/"):])
-    p = invariants.Package(base) if os.path.exists(base + ".uasset") else None
+    base = game_package(content, path)
+    p = invariants.Package(base) if base else None
     ex = [i for i in range(len(p.exports)) if p.class_of(i + 1) == "UserDefinedEnum"] if p else []
     if not ex:
         return None
@@ -485,7 +502,7 @@ def game_enum_types(own, content):
         # UE_ENUM_IN names the owner, the folder: the package must be named as the enum is.
         why = "no /Game path" if not paths else "shared name" if not path \
             else "package name" if path.rsplit("/", 1)[-1] != en.ue_name \
-            else "ours" if (path + "/").startswith(own) else "path" if dumped != leaf and not ns \
+            else "ours" if (path + "/").startswith(own) or path in DECLARED else "path" if dumped != leaf and not ns \
             else "no --game" if not content \
             else "name taken" if cpp in ENUMS or cpp in STRUCTS \
             else "%s underlying" % en.underlying if en.underlying != "uint8" else None
@@ -1755,7 +1772,7 @@ def scan_game(content, container_members):
         x = p.exports[k - 1]
         return x["name"] if x["outer"] == cdo else name_path(p, x["outer"], cdo) + ":" + x["name"]
 
-    for base in invariants.packages([content]):
+    for base in invariants.packages(content):
         p = invariants.Package(base)
         for i, e in enumerate(p.exports):
             kind = p.class_of(i + 1)
@@ -2008,21 +2025,39 @@ def main():
         at = args.index("--gaps")
         gaps_file = args[at + 1] if at + 1 < len(args) else sys.exit("--gaps needs a file")
         del args[at:at + 2]
-    if "--game" in args:
+    # --game may repeat: the game's Content, then extracted mod paks' (a mod's own types are in a dump taken with it).
+    while "--game" in args:
         at = args.index("--game")
-        game_dir = args[at + 1] if at + 1 < len(args) else None
+        if at + 1 >= len(args):
+            sys.exit(__doc__.strip().splitlines()[-1])
+        game_dir = (game_dir or []) + [args[at + 1]]
         del args[at:at + 2]
-    if len(args) < 2 or ("--game" in sys.argv and not game_dir):
+    if len(args) < 2:
         sys.exit(__doc__.strip().splitlines()[-1])
+    import invariants
+    invariants.GAME_CONTENT[:] = game_dir or []      # where Package.resolve finds a mod pak's /Game import
     sdk_dir, out_dir = args[0], args[1]
     global UE5
     UE5 = dump_identity(sdk_dir)[0] != "4.27"
+
+    # The enums and structs a mod's own C++ declares in its package's namespace (EEE's Game::_ElytrasMods::EEE_lib::
+    # EModuleType): an extracted mod pak (--game) holds their packages too, and a second definition would clash.
+    # Before the dump is read, where a native enum Dumper-7 qualified for one of these stays out (parse_structs).
+    mod_dir, cooked_here = os.path.dirname(os.path.abspath(out_dir)), ()
+    for d, subs, files in os.walk(mod_dir):
+        subs[:] = [s for s in subs if s not in ("UeApi", "UeAssets", "build")]
+        for f in [f for f in files if f.endswith((".cpp", ".h"))]:
+            text = io.open(os.path.join(d, f), encoding="utf-8-sig").read()
+            cooked_here += tuple(m + "/" for m in re.findall(r'UE_MOD_PACKAGE\("([^"]+)"', text))
+            for ns in re.findall(r"namespace (Game(?:::\w+)+)\s*\{", text):
+                for name in re.findall(r"\b(?:enum class|struct) ([EF]\w+)", text):
+                    for n in (name, name[1:]):
+                        DECLARED.add("/" + ns.replace("::", "/") + "/" + n)
 
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_structs.hpp")):
         parse_structs(os.path.join(sdk_dir, name), name[: -len("_structs.hpp")])
     read_real_fields(sdk_dir)
     # The packages the mods next to UeApi cook (UE_MOD_PACKAGE), not the rest of /Game/_ElytrasMods.
-    mod_dir = os.path.dirname(os.path.abspath(out_dir))
     own = ("/Game/_ElytrasMods/_NestedContainerStructs/",) + tuple(sorted(set(
         m + "/" for f in os.listdir(mod_dir) if f.endswith((".cpp", ".h"))
         for m in re.findall(r'UE_MOD_PACKAGE\("([^"]+)"', io.open(os.path.join(mod_dir, f), encoding="utf-8-sig").read()))))
@@ -2095,7 +2130,10 @@ def main():
         k.ich_records = GAME_ICH_RECORDS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
     tails = class_tails(classes, by_name, game)
     ifaces = native_interfaces(classes, by_name, game, overrides)
-    bp_ifaces = blueprint_interfaces(classes, by_name, GAME_INTERFACES)
+    # Not one a mod of ours cooks (ModHubApi's IHubMod, which an extracted mod pak shows CD2 implementing): its C++ is
+    # that mod's header, and a base from UeApi's copy would clash with it in any mod including both.
+    bp_ifaces = blueprint_interfaces(classes, by_name, dict(
+        (k, [i for i in v if not (i + "/").startswith(cooked_here)]) for k, v in GAME_INTERFACES.items()))
     ordered, seen = [], set()
 
     def place(k):
@@ -2449,6 +2487,18 @@ def main():
         if fwd:
             out += [""]
         out += body
+        # A Blueprint interface an interface's function takes (`const TScriptInterface<IHubContext>&`): a mod overriding
+        # the function needs its definition, which says its package, and a forward declaration does not. Only an
+        # interface's: a class's would drag the interface into every mod that includes the class, next to a mod's own
+        # copy of it (ModHubApi). Included at the bottom, after this header's own classes, since the two often take each
+        # other (IHubMod and IHubContext): under #pragma once each file then ends with both defined, whichever is first.
+        tail = sorted(set(by_name[c].header for k in members if k.path + "." + k.ue_name in GAME_INTERFACE_TYPES
+                          for t in [t for _, r, _, ps in k.funcs for t in [r] + [p for p, _ in ps]]
+                          for c in re.findall(r"TScriptInterface<class ((?:\w+::)?\w+)>", t)
+                          if c in by_name and by_name[c].is_bp and by_name[c].header != pkg) - deps[pkg])
+        if tail:
+            out += ["/* The Blueprint interfaces its members take, defined: see genueapi.py. */"]
+            out += ["#include \"%s.h\"" % beside(pkg, d) for d in tail]
         dest = os.path.join(out_dir, pkg + ".h")
         if not os.path.isdir(os.path.dirname(dest)):
             os.makedirs(os.path.dirname(dest))

@@ -125,6 +125,20 @@ class BlueprintEnumTests(unittest.TestCase):
             self.assertIn(('game enum', 'no --game'), [(g[0], g[4]) for g in genueapi.GAPS])
 
 
+class ContentRootTests(unittest.TestCase):
+    def test_later_root_wins(self):
+        """--game repeats: a package only a mod pak has is found there, and a mod pak's copy of a game asset wins."""
+        with tempfile.TemporaryDirectory() as temp:
+            game, mods = Path(temp) / 'Game' / 'Content', Path(temp) / 'Mods' / 'Content'
+            for f in (game / 'Art' / 'E.uasset', mods / 'Art' / 'E.uasset', mods / 'Mine' / 'M.uasset'):
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_bytes(b'')
+            roots = [str(game), str(mods)]
+            self.assertEqual(Path(genueapi.game_package(roots, '/Game/Art/E')), mods / 'Art' / 'E')
+            self.assertEqual(Path(genueapi.game_package(roots, '/Game/Mine/M')), mods / 'Mine' / 'M')
+            self.assertIsNone(genueapi.game_package(roots[:1], '/Game/Mine/M'))
+
+
 class SharedNameTests(unittest.TestCase):
     """Types whose name another one takes, which Dumper-7 qualifies, named by the user's rule: a native keeps the plain
     name, a game Blueprint's goes in its /Game path's namespace, as a game Blueprint class sharing a name does."""
