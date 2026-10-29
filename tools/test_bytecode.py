@@ -6824,7 +6824,10 @@ def game_blueprint_names():
                 import_paths(os.path.join(out, 'GameBpNames')), import_paths(os.path.join(out, 'GameBpNames'))
         shutil.rmtree(tmp, ignore_errors=True)
     assert cooked[0] == cooked[1], 'the two spellings cook differently'
-    assert 'class IHubMod\n' in open(os.path.join(UEAPI, 'Game', 'IHubMod.h'), encoding='utf-8-sig').read()
+    # IHubMod is ModHub's, so only a dump with mods loaded has it; the public SDK's vanilla one does not.
+    hub_mod = os.path.join(UEAPI, 'Game', 'IHubMod.h')
+    if os.path.exists(hub_mod):
+        assert 'class IHubMod\n' in open(hub_mod, encoding='utf-8-sig').read()
     import genueapi     # no game struct this dump keeps has its F already: the rule itself
     assert [genueapi.prefixed('F', n) for n in ('FloatArray', 'FModListEntry', 'Fire')] == \
         ['FFloatArray', 'FModListEntry', 'FFire']
