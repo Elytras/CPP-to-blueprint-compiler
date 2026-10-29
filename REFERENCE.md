@@ -1202,6 +1202,7 @@ Notes:
 | <a id="struct-conversions.flinearcolor-l-fcolor-255-0"></a>`FLinearColor L = FColor(255, 0, 0);` | FColor and FLinearColor convert both ways through sRGB. | Yes |
 | <a id="struct-conversions.fvector-v-flat"></a>`FVector V = Flat;` (FVector2D) | Z is 0. | Yes |
 | <a id="struct-conversions.fvector-v-facing"></a>`FVector V = Facing;` (FRotator) | Refused by clang: left out on purpose, because a rotator is not a direction. Call `UKismetMathLibrary::GetForwardVector(Facing)`. | Refused |
+| <a id="struct-conversions.ukismetinputlibrary-inputevent-iscontroldown-mouseevent"></a>`UKismetInputLibrary::InputEvent_IsControlDown(MouseEvent)`, `MouseEvent.InputEvent_IsControlDown()`, with `MouseEvent` an FPointerEvent | Refused: "where an FInputEvent is wanted". C++ passes a struct where its parent struct is wanted, by reference or by value, and so does the object of a method the parent declares; Blueprint passes only the exact struct, and the VM would copy the whole child into a parent-sized slot, past its end. Convert it first: `MouseEvent.GetInputEventFromPointerEvent()`, which the message names where UeApi declares one. A child that adds no member and keeps the parent's size passes as is, as the editor lets it (`Hit.Location`, an FVector_NetQuantize, to an FVector: see [Number conversions](#number-conversions)). An object pointer to its parent class is fine. | Refused |
 
 Notes:
 - A struct converts implicitly wherever Kismet has a conversion node, and the conversion means what that node means.

@@ -14649,6 +14649,34 @@ def input_refusals():
         refused(mod, body, why, base=base)
 
 
+def struct_upcast_refusals():
+    """A struct passed where its parent struct is wanted is refused, naming both: the VM would copy the whole child into
+    the parent-sized slot (a native's const reference, a function's by-value parameter, the object of a method the
+    parent declares). The control is the child's own conversion, which the message names: it compiles."""
+    import tempfile
+    proves('struct-conversions.ukismetinputlibrary-inputevent-iscontroldown-mouseevent')
+    top = '#include "UeApi/SlateCore.h"\n'
+    wanted = 'is an FPointerEvent where an FInputEvent is wanted'
+    for mod, body, why in (
+            ('UpcastNative', '  bool F(const FPointerEvent &E) { return UKismetInputLibrary::InputEvent_IsControlDown(E); }\n',
+             'InputEvent_IsControlDown argument 1 ' + wanted),
+            ('UpcastSugar', '  bool F(const FPointerEvent &E) { return E.InputEvent_IsControlDown(); }\n',
+             "InputEvent_IsControlDown's object " + wanted),
+            ('UpcastHint', '  bool F(const FPointerEvent &E) { return E.InputEvent_IsControlDown(); }\n',
+             "past its end; pass FPointerEvent's GetInputEventFromPointerEvent()"),
+            ('UpcastByValue', '  void Take(FInputEvent E) {}\n  void F(const FKeyEvent &K) { Take(K); }\n',
+             'Take argument 1 is an FKeyEvent where an FInputEvent is wanted')):
+        refused(mod, body, why, top=top)
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'UpcastConverted.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\n' + top
+                    + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/UpcastConverted");\nclass UpcastConverted : public AActor {\n'
+                    'public:\n  bool F(const FPointerEvent &E) { return E.GetInputEventFromPointerEvent().InputEvent_IsControlDown(); }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+    assert proc.returncode == 0, proc.stdout
+
+
 def input_key_names():
     """A key is named as the engine names it, case aside (FName's match): EKeys', or an input plugin's DRG ships, its
     FSDRawInput's GenericUSBController keys among them; or by its character, as a non-US layout names a key it has no
@@ -14689,6 +14717,9 @@ input_refusals()
 print('ok  InputRefusals: a key or action marker on no actor, a static or inline method, one returning a value or taking '
       'more than the key, an unknown option or an action\'s modifier, a key the engine does not have, or marking no '
       'method is refused')
+struct_upcast_refusals()
+print('ok  StructUpcast: a child struct passed for its parent - to a native\'s const reference, a by-value parameter, '
+      'or as the object of the parent\'s method - is refused, and the child\'s own conversion compiles')
 with_ini = input_key_names()
 print('ok  InputKeyNames: a key the engine has compiles whatever its case, a character key too, and its FKey literal '
       'says nothing; a literal of no key warns, naming the closest; ' + (

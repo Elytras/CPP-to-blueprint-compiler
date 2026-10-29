@@ -9205,6 +9205,23 @@ std::vector<const Json*> FCompiler::StructArgs(const Json& Value, const FRecord*
     return Out;
 }
 
+/* A struct passed where its parent struct is wanted (`FPointerEvent` to `const FInputEvent&`, by value too), among the
+   casts Strip peels off N: the cast, else null. The VM evaluates an argument into the callee's parameter-sized slot with
+   the argument's own struct ops (execLocalVariable's CopyCompleteValueToScriptVM, ScriptCore.cpp), so the child's tail is
+   written past the slot's end; the editor refuses the same link ("Derived structures are disallowed",
+   EdGraphSchema_K2.cpp 2049), unless the child adds nothing (FVector_NetQuantize to FVector: IsChildOf and
+   TheSameLayout, 4248), which LowerCall lets pass. An object pointer's upcast is a pointer, not a struct, and is fine. */
+static const Json* StructUpcastBelow(const Json& N)
+{
+    const Json* Leaf = Strip(&N);
+    for (const Json* W = &N; W && W != Leaf; W = First(*W))
+    {
+        const std::string Cast = Kind(*W) == "ImplicitCastExpr" ? W->value("castKind", std::string()) : std::string();
+        if ((Cast == "DerivedToBase" || Cast == "UncheckedDerivedToBase") && IsStructValueType(TypeOf(*W))) return W;
+    }
+    return nullptr;
+}
+
 bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
 {
     const std::string K = Kind(CallExprNode);
@@ -9237,6 +9254,27 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     }
     /* A static member template's instantiation is its class's function under the name its arguments give it. */
     if (const auto Inst = InstanceNames.find(DeclId); Inst != InstanceNames.end()) MethodName = Inst->second;
+    /* A child struct for its parent, as an argument or as the object of the parent's method (StructUpcastBelow). The
+       way out is the child's own conversion, where UeApi declares one (FPointerEvent::GetInputEventFromPointerEvent). */
+    for (size_t I = 0; const Json* A = Nth(CallExprNode, I); ++I)
+    {
+        const Json* Of = I > 0 ? A : K == "CXXMemberCallExpr" ? First(*Callee) : nullptr;
+        const Json* Up = Of ? StructUpcastBelow(*Of) : nullptr;
+        if (!Up) continue;
+        const std::string Parent = StripTypeKeywords(TypeOf(*Up)), Child = StripTypeKeywords(TypeOf(*First(*Up)));
+        /* The editor's TheSameLayout, by Types.json: the parent's size, and no reflected member of the child's own. */
+        const auto PS = Structs.find(Parent), CS = Structs.find(Child);
+        if (PS != Structs.end() && CS != Structs.end() && PS->second.Size > 0 && PS->second.Size == CS->second.Size
+            && PS->second.Fields.size() == CS->second.Fields.size())
+            continue;
+        const std::string Conv = "Get" + Parent.substr(1) + "From" + Child.substr(1);
+        const FRecord* CR = Find(Child);
+        *Err = MethodName + (I == 0 ? "'s object" : " argument " + std::to_string(I)) + " is an " + Child
+             + " where an " + Parent + " is wanted: Blueprint passes only the exact struct (the editor disallows a derived "
+             "one), and the VM would copy the whole " + Child + " into an " + Parent + "-sized slot, past its end; "
+             + (CR && CR->Methods.count(Conv) ? "pass " + Child + "'s " + Conv + "()" : "convert it to an " + Parent + " first");
+        return false;
+    }
     /* SpawnActor returns None while a construction script runs (bIsRunningConstructionScript, LevelActor.cpp), and the
        editor keeps spawning out of the construction script graph. */
     const bool bSpawn = MethodName == "BeginDeferredActorSpawnFromClass" || MethodName == "BeginSpawningActorFromClass"
