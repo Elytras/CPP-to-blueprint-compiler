@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import uuid
@@ -305,6 +306,23 @@ def mint_blob(url, cache):
     return hit["path"], hit["what"], hit["note"] and hit["note"] + ": recheck the patch against it"
 
 
+def pak_mount(pak):
+    """The mount point of a legacy .pak with an unencrypted index ("../../../" for most): the FString the index starts
+    with. The footer is found by its magic, as its size differs between pak versions."""
+    with open(pak, "rb") as f:
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 300))
+        tail = f.read()
+        at = tail.rfind(struct.pack("<I", 0x5A6F12E1))
+        if at < 0:
+            sys.exit("%s is not a .pak this build reads (no footer magic)" % pak)
+        index_offset = struct.unpack_from("<Q", tail, at + 8)[0]
+        f.seek(index_offset)
+        n = struct.unpack("<i", f.read(4))[0]
+        raw = f.read(-2 * n if n < 0 else n)
+    return (raw.decode("utf-16-le") if n < 0 else raw.decode("utf-8", "replace")).rstrip("\0").replace("\\", "/")
+
+
 def content_of(src, bp, root):
     """The Content folder of `src`, a path in mods.yaml: the folder itself, or, for a .pak or a .zip holding one (a
     mod.io download, as MINT caches it), its extraction under `root`, made once and again only when the file changes.
@@ -330,7 +348,11 @@ def content_of(src, bp, root):
                     if len(paks) != 1:
                         sys.exit("%s holds %d .pak files, not one" % (src, len(paks)))
                     pak = z.extract(paks[0], os.path.join(root, ".zip"))
-            extract = [REPAK, "unpack", pak, "-o", root, "-f", "-q"] if REPAK else UNREALPAK_RUN + [pak, "-Extract", root]
+            # Both tools write paths relative to the pak's mount point, so a pak mounted on its own folder
+            # (Colorful Sugar's ../../../FSD/Content/Colorful_Sugar/) is extracted into that folder:
+            dest = os.path.join(root, *[p for p in pak_mount(pak).split("/") if p not in ("", "..")])
+            os.makedirs(dest, exist_ok=True)
+            extract = [REPAK, "unpack", pak, "-o", dest, "-f", "-q"] if REPAK else UNREALPAK_RUN + [pak, "-Extract", dest]
             proc = subprocess.run(extract, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, errors="replace")
             if proc.returncode != 0:
