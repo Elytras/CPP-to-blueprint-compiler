@@ -1878,13 +1878,14 @@ and warns, with one message for every form:
 warning: RangeTest::WarnRemove: unsafe to mutate iterated container (Scores.Remove)
 ```
 
-| The body does | Warned as |
-|---|---|
-| a count-changing method on the walked container: Add, AddItems, AddUnique, Append, Clear, Emplace, Empty, FindAndRemoveChecked, FindOrAdd, Insert, Remove, RemoveAndCopyValue, RemoveItem, RemoveItems, Reset, Resize, Set, Shrink, Compact, a sort | `(Scores.Remove)` |
-| a whole assignment to it | `(Scores =)` |
-| a TMap store with any key but the current one, `Scores[Other] = 1`, which adds the key when the map lacks it | `(Scores[] =)` |
-| the container passed to a non-const reference parameter | `(Prune(Scores))` |
-| a call to one of the class's own methods whose body may change a container of that type, followed through the calls it makes | `(Prune())` |
+| You write | What it does | Status |
+|---|---|---|
+| <a id="changing-the-container.scores-remove-key"></a>`Scores.Remove(Key)` in the body, or another count-changing method on the walked container | Warned `(Scores.Remove)`. The methods: Add, AddItems, AddUnique, Append, Clear, Emplace, Empty, FindAndRemoveChecked, FindOrAdd, Insert, Remove, RemoveAndCopyValue, RemoveItem, RemoveItems, Reset, Resize, Set, Shrink, Compact, a sort. | Warns |
+| <a id="changing-the-container.items-other"></a>`Items = Other` in the body | A whole assignment to the walked container, warned `(Items =)`. | Warns |
+| <a id="changing-the-container.scores-other-1"></a>`Scores[Other] = 1` in the body | A TMap store with any key but the current one, which adds the key when the map lacks it, warned `(Scores[] =)`. | Warns |
+| <a id="changing-the-container.prune-scores"></a>`Prune(Scores)` in the body, Prune taking a non-const reference | Warned `(Prune(Scores))`, and `(Prune())` as well when Prune's body changes what it was passed. | Warns |
+| <a id="changing-the-container.dropall"></a>`DropAll()` in the body, one of the class's own methods | Followed through the calls it makes: a change to a member of the walked container's type, or to a container behind a reference parameter, is warned `(DropAll())`. Only names and types are compared, so a change to another member of that type is warned too. | Warns |
+| <a id="changing-the-container.countmore-x"></a>`CountMore(X)` in the body, whose own changes are to its locals; any own method called while walking a local or a by-value parameter | Not warned. A callee's locals and by-value parameters are its own, and the walking function's own local reaches a callee only when passed by reference, warned as `(Prune(Scores))` is. | Yes |
 
 What happens if you do it anyway: every walk reads its length, and a TSet or TMap walk its free slots, once, before the
 first pass. An added element is not visited. In a TSet or TMap walk, a removed element leaves a free slot that a later

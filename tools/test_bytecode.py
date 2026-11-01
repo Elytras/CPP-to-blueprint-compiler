@@ -2353,13 +2353,23 @@ for m in maps:
     want = {k: v for k, v in m.items() if v > 0}
     got = run(asset('RangeTest'), 'CopyPositive', self_vars=mine)[0]
     assert (got, mine['Positive'], mine['Scores']) == (len(want), want, m), (m, got, mine)
-proves('range-for-over.seen-remove-x', 'range-for-over.scores-remove-key')
+proves('range-for-over.seen-remove-x', 'range-for-over.scores-remove-key', 'changing-the-container.scores-remove-key',
+       'changing-the-container.items-other', 'changing-the-container.scores-other-1', 'changing-the-container.prune-scores',
+       'changing-the-container.dropall')
 warned = sorted(l.strip() for l in LOGS['RangeTest'].splitlines() if 'unsafe to mutate' in l)
 assert warned == sorted('warning: RangeTest::%s: unsafe to mutate iterated container (%s)' % w for w in (
     ('WarnRemove', 'Scores.Remove'), ('WarnByValue', 'Scores.Remove'), ('WarnStore', 'Scores[] ='), ('WarnSetAdd', 'Seen.Add'), ('WarnArrayAdd', 'Items.Add'),
-    ('WarnPassed', 'Prune()'), ('WarnPassed', 'Prune(Scores)'), ('WarnCalls', 'DropAll()'))), warned
+    ('WarnPassed', 'Prune()'), ('WarnPassed', 'Prune(Scores)'), ('WarnCalls', 'DropAll()'), ('WarnAssign', 'Items ='))), warned
+# An own method that changes only its own locals, or any own method under a walk of the caller's own local: no
+# warning (the list above is exact), and each runs as written.
+proves('changing-the-container.countmore-x')
+for a in arrays:
+    mine = range_self(Items=a)
+    assert run(asset('RangeTest'), 'CallsLocalOnly', self_vars=mine)[0] == len(a) * (len(a) + 1) and mine == range_self(Items=a), (a, mine)
+    mine = range_self(Items=a)
+    assert run(asset('RangeTest'), 'LocalWalk', self_vars=mine)[0] == sum(a) and mine == range_self(Items=a + a), (a, mine)
 print('ok  RangeTest: a change to the container a range-for walks is warned, and only that; another map of its type is'
-      ' changed directly  (%d cases)' % len(maps))
+      ' changed directly, and a callee\'s or the caller\'s own locals are not the walked container  (%d cases)' % (len(maps) + len(arrays)))
 
 
 def range_members():

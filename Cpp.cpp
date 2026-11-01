@@ -15037,14 +15037,34 @@ bool FCompiler::SameContainer(const Json& A, const Json& B) const
     return Same(&UA, &UB);
 }
 
+/* Whether N is a local or by-value parameter of the function that names it, or part of one (`L.Items`, `Lists[K]`):
+   no other function reaches it unless handed it by reference. A member, a reference, or what a pointer points at is
+   not. */
+static bool IsOwnLocal(const Json* N)
+{
+    N = Strip(N);
+    if (!N) return false;
+    if (IsTArrayElement(*N) || IsTMapElement(*N)) return IsOwnLocal(Nth(*N, 1));
+    const std::string K = Kind(*N);
+    if (K == "MemberExpr") return !N->value("isArrow", false) && IsOwnLocal(First(*N));
+    if (K != "DeclRefExpr") return false;
+    const Json& D = (*N)["referencedDecl"];
+    const std::string DK = D.value("kind", std::string());
+    return (DK == "VarDecl" || DK == "ParmVarDecl") && D.contains("type")
+        && D["type"].value("qualType", std::string()).find('&') == std::string::npos;
+}
+
 /* Each place in N that may change a container Hit picks, as Out names it (`Scores.Remove`, `Scores[] =`,
    `Prune(Scores)`, `Shrink()`): a count-changing method called on it, a whole assignment to it, a TMap store `M[k] = v`
    (Map_Add, which inserts a key the map lacks) unless k is one of KeyNames, it passed to a non-const reference parameter,
-   or a call to one of the class's own methods whose body may change a container of Type. bWrite: N is written. */
+   or a call to one of the class's own methods whose body may change a container of Type that it can reach: a member,
+   or one behind a reference, never the callee's own locals. An empty Type checks no callee: the walked container is
+   the caller's own local, which a callee reaches only when passed it, warned as that. bWrite: N is written. */
 bool FCompiler::MutatesType(const Json& Body, const std::string& Type, std::set<std::string>* Seen) const
 {
     std::vector<std::string> Hits;
-    CollectMutations(Body, false, [&](const Json& E) { return TypeTag(TypeOf(E)) == TypeTag(Type); }, Type, {}, *Seen, Hits);
+    CollectMutations(Body, false, [&](const Json& E) { return TypeTag(TypeOf(E)) == TypeTag(Type) && !IsOwnLocal(&E); },
+                     Type, {}, *Seen, Hits);
     return !Hits.empty();
 }
 
@@ -15080,7 +15100,7 @@ void FCompiler::CollectMutations(const Json& N, bool bWrite, const std::function
         const std::string M = Callee.value("name", std::string());
         const bool bCounts = Obj && CountMethod(KindOf(*Obj), M);
         if (bCounts && Hit(*Obj)) Out.push_back(ContainerName(Obj) + "." + M);
-        if (Cur && Obj && Kind(*Strip(Obj)) == "CXXThisExpr" && Seen.insert(M).second)
+        if (Cur && !Type.empty() && Obj && Kind(*Strip(Obj)) == "CXXThisExpr" && Seen.insert(M).second)
         {
             const auto D = Cur->MethodDefs.find(M);
             const auto Decl = Cur->Methods.find(M);
@@ -15130,7 +15150,8 @@ void FCompiler::WarnIteratedMutation(const Json& Body, const Json& Walked, const
 {
     std::vector<std::string> Hits;
     std::set<std::string> Seen;
-    CollectMutations(Body, false, [&](const Json& E) { return SameContainer(E, Walked); }, Type, KeyNames, Seen, Hits);
+    CollectMutations(Body, false, [&](const Json& E) { return SameContainer(E, Walked); },
+                     IsOwnLocal(&Walked) ? std::string() : Type, KeyNames, Seen, Hits);
     for (const std::string& What : Hits)
         if (WarnedMutation.insert(CurFnName + "|" + What).second)
             printf("  warning: %s::%s: unsafe to mutate iterated container (%s)\n", Cur ? Cur->CppName.c_str() : "",
