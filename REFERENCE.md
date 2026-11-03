@@ -4760,7 +4760,7 @@ The node's input pins are functions of the component, called on the timeline's v
 | <a id="playing-a-timeline.fade-stop"></a>`Fade->Stop()` | Stop: halts it where it is. Play goes on from there. | Yes |
 | <a id="playing-a-timeline.fade-setnewtime-1-0f"></a>`Fade->SetNewTime(1.0f)` | Set New Time: moves it to 1 s without passing the event tracks' times, and calls the update method. | Yes |
 | <a id="playing-a-timeline.fade-setplayrate-2-0f"></a>`Fade->SetPlayRate(2.0f)`, `Fade->SetLooping(true)`, `Fade->SetTimelineLength(3.0f)` | The component's settings, changed as it runs. | Yes |
-| <a id="playing-a-timeline.fade-getplaybackposition"></a>`Fade->GetPlaybackPosition()`, `Fade->IsPlaying()`, `Fade->IsReversing()` | Where it is and how it plays. IsReversing is the node's Direction output: true while it plays backward. | Yes |
+| <a id="playing-a-timeline.fade-getplaybackposition"></a>`Fade->GetPlaybackPosition()`, `Fade->IsPlaying()`, `Fade->IsReversing()` | Where it is and how it plays. IsReversing is true only while it plays backward: in the finished method a reverse run has ended, so it is false there (the engine's `bPlaying && bReversePlayback`). To know which run finished, keep a flag of your own. | Yes |
 
 Notes:
 
