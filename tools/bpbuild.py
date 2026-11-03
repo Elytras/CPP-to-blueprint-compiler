@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""usage: bpbuild.py <mods dir (holds mods.yaml) or a parent with BpMods/> <UeApi dir> <assetgen executable> [--force] [--no-pak]"""
+"""usage: bpbuild.py <mods dir (holds mods.yaml) or a parent with BpMods/> <UeApi dir> <assetgen executable> [--force] [--no-pak] [--only <mod>[,<mod>...]]"""
 import glob
 import io
 import json
@@ -657,6 +657,8 @@ def main():
     PROJECT = ueapi_project(ue_api)
     force = "--force" in sys.argv[4:]
     no_pak = "--no-pak" in sys.argv[4:]
+    flags = sys.argv[4:]
+    only = flags[flags.index("--only") + 1].split(",") if "--only" in flags[:-1] else None
 
     bp = repo if os.path.exists(os.path.join(repo, "mods.yaml")) else os.path.join(repo, "BpMods")
     write_vs_filters(bp)
@@ -692,6 +694,13 @@ def main():
     toolchain_time = max(newest(tree_files(ue_api)), newest(tree_files(ue_assets)), newest([assetgen]))
 
     by_name = dict((m["name"], m) for m in mods)
+    # --only builds the named mods and what they `need`, which an embed bakes in; the rest stay as they are:
+    if only:
+        unknown = [n for n in only if n not in by_name]
+        if unknown:
+            sys.exit("--only: mods.yaml has no mod %s" % ", ".join(unknown))
+        keep = set(only).union(*(transitive_needs(n, by_name) for n in only))
+        mods = [m for m in mods if m["name"] in keep]
 
     built, packed, skipped, failed = [], [], [], []
     staged = []

@@ -7634,8 +7634,10 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 - `mods.yaml lists no mods.`: the `mods:` list is empty or missing. Exit code 0. Fix: add an entry with `name` and
   `sources`. See [Building mods](GUIDE.md#building-mods).
 - `usage: bpbuild.py ...`: fewer than three arguments. Fix:
-  `python tools/bpbuild.py <mods dir> <UeApi dir> <assetgen> [--force] [--no-pak]`. See
+  `python tools/bpbuild.py <mods dir> <UeApi dir> <assetgen> [--force] [--no-pak] [--only <mod>[,<mod>...]]`. See
   [Building mods](GUIDE.md#building-mods).
+- `--only: mods.yaml has no mod <Name>`: a name after `--only` that no entry of `mods.yaml` has. Fix: spell it as the
+  entry's `name`. See [Building mods](GUIDE.md#building-mods).
 
 #### genueapi.py and genueassets.py
 

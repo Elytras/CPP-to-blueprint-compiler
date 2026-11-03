@@ -1321,16 +1321,17 @@ compiler change touched.
 ### bpbuild
 
 ```
-python tools/bpbuild.py <mods dir> <UeApi dir> <assetgen> [--force] [--no-pak]
+python tools/bpbuild.py <mods dir> <UeApi dir> <assetgen> [--force] [--no-pak] [--only <mod>[,<mod>...]]
 ```
 
-| Argument      | Meaning                                                                                                                                                                     |
-| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<mods dir>`  | The folder that holds `mods.yaml`. Every relative path in `mods.yaml` is relative to it. Without a manifest, bpbuild stops with `no manifest at <path>`.                    |
-| `<UeApi dir>` | The include dir that every compile gets.                                                                                                                                    |
-| `<assetgen>`  | The compiler. bpbuild makes the path absolute first, so a relative one works.                                                                                               |
-| `--force`     | Recompile every mod, changed or not.                                                                                                                                        |
-| `--no-pak`    | Compile only, and leave the staged files for you to pack. `embed` and `bundle` are not applied either: dependencies and bundle files are copied in only when a pak is made. |
+| Argument      | Meaning                                                                                                                                                                                                              |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<mods dir>`  | The folder that holds `mods.yaml`. Every relative path in `mods.yaml` is relative to it. Without a manifest, bpbuild stops with `no manifest at <path>`.                                                             |
+| `<UeApi dir>` | The include dir that every compile gets.                                                                                                                                                                             |
+| `<assetgen>`  | The compiler. bpbuild makes the path absolute first, so a relative one works.                                                                                                                                        |
+| `--force`     | Recompile every mod, changed or not.                                                                                                                                                                                 |
+| `--no-pak`    | Compile only, and leave the staged files for you to pack. `embed` and `bundle` are not applied either: dependencies and bundle files are copied in only when a pak is made.                                          |
+| `--only`      | Build only the mods named, comma-separated, and the mods their `needs` list. The others are left as their last build left them. A name `mods.yaml` lacks stops the build with `--only: mods.yaml has no mod <name>`. |
 
 With fewer than three arguments, bpbuild prints its usage line and stops.
 
