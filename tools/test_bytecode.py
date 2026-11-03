@@ -5828,6 +5828,56 @@ interface_bodies()
 interface_calls()
 interface_to_object()
 inherited_defaults()
+
+
+def inherited_defaults_other_mod():
+    """A default on a component that a parent in another mod's folder declares: the override record is keyed on the
+    node guid the owner cooked, ScsNodeGuid(class, component), as for a parent of the same mod."""
+    import dumptags
+    head = '#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n'
+    files = {
+        'Owner/Lamp.h': '#pragma once\n' + head + 'class AOwnLamp : public AActor {\npublic:\n'
+                        '  UE_COMPONENT(USceneComponent, Root);\n  UE_COMPONENT(UPointLightComponent, Lamp);\n'
+                        '  AOwnLamp() { Lamp->Intensity = 1000.0f; }\n};\n',
+        'Owner/Owner.cpp': '#include "Lamp.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Owner");\n',
+        'User/User.cpp': '#include "../Owner/Lamp.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/User");\n'
+                         'class ADimLamp : public AOwnLamp {\npublic:\n  ADimLamp() { Lamp->Intensity = 250.0f; }\n};\n'}
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, text in files.items():
+            os.makedirs(os.path.join(tmp, os.path.dirname(name)), exist_ok=True)
+            with open(os.path.join(tmp, name), 'w', encoding='utf-8') as f:
+                f.write(text)
+        out = lambda mod: os.path.join(tmp, 'out', mod)
+        for mod in ('Owner', 'User'):
+            os.makedirs(out(mod))
+            proc = assetgen_compile([os.path.join(tmp, mod, mod + '.cpp'), UEAPI, out(mod)])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        cooked = lambda mod: sorted(glob.glob(os.path.join(out(mod), '**', '*.uasset'), recursive=True))
+        assert [os.path.basename(f) for f in cooked('User')] == ['ADimLamp.uasset'], cooked('User')
+        own, dim = (next(f[:-7] for f in cooked(m) if f.endswith(c + '.uasset')) for m, c in (('Owner', 'AOwnLamp'), ('User', 'ADimLamp')))
+        node = next(dump('dumptags.py', own, i) for i, e in enumerate(dumpexp.load(own)[5])
+                    if ref(own, e['cls']) == '/Script/Engine.SCS_Node'
+                    and 'InternalVariableName [0] NameProperty size=8: Lamp' in dump('dumptags.py', own, i))
+        lamp_guid = re.search(r'VariableGuid \[0\] StructProperty size=16 struct=Guid: (\w+)', node).group(1)
+        ua, ue, total, names, imports, exports = dumpexp.load(dim)
+        i, h = next((i, e) for i, e in enumerate(exports) if e['name'].startswith('InheritableComponentHandler'))
+        blob = ue[h['off'] - total: h['off'] - total + h['size']]
+        records = re.search(r'Records \[0\] ArrayProperty size=\d+ inner=StructProperty: (\w+)',
+                            dump('dumptags.py', dim, i)).group(1)
+        assert records.startswith('01000000'), records
+        rec = []
+        dumptags.tags(blob, blob.find(bytes.fromhex(records)) + 4, len(blob), names, 1, rec)
+        rec = '\n'.join(rec)
+        idx = lambda f: int(re.search(r'%s \[0\] ObjectProperty size=4: index (-?\d+)' % f, rec).group(1))
+        proves('components-a-parent.ue-class')
+        assert ref(dim, idx('OwnerClass')) == '/Game/_ElytrasMods/Owner/AOwnLamp.AOwnLamp_C', rec
+        assert 'SCSVariableName [0] NameProperty size=8: Lamp' in rec and 'struct=Guid: ' + lamp_guid in rec, (lamp_guid, rec)
+        t = next(j for j, e in enumerate(exports) if e['name'] == ref(dim, idx('ComponentTemplate')))
+        assert 'Intensity [0] FloatProperty size=4: 250.0' in dump('dumptags.py', dim, t), dump('dumptags.py', dim, t)
+    print('ok  a default on a component another mod\'s class declares: keyed on the node its owner cooked')
+
+
+inherited_defaults_other_mod()
 parent_call()
 pure_virtual()
 func_stub_super()

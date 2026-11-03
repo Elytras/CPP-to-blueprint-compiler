@@ -1174,6 +1174,10 @@ struct FRecord
     bool bUeApi = false;        // declared in a UeApi header: the game's (or another mod's) class, imported, never cooked here
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
+    /* Whether an override of component C of this class can name C's construction-script node: a game Blueprint's
+       through its dumped `<C>__UeScsNode`, another mod's class (bClassIn) through its own UE_COMPONENT, whose node
+       guid its owner cooked as ScsNodeGuid(class, C) and so is the same here. */
+    bool KnowsScsNode(const std::string& C) const { return ScsNodes.count(C) || (bClassIn && Components.count(C)); }
     /* A game Blueprint from UeApi's Game/, or another mod's class from the header it shares: every function of one is a
        Blueprint function (GameFunctionFlags). */
     bool IsGameBlueprint() const { return IsNative() && UePackage.compare(0, 6, "/Game/") == 0; }
@@ -21207,7 +21211,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (S.Outer == FInstSpec::NativeSubobject && !SubobjectDefaults.count(S.Component))
                 SubobjectDefaults[S.Component].Owner = S.Declarer;
             if (S.Outer != FInstSpec::InheritedComponent || ComponentOverrides.count(S.Component)) continue;
-            if (S.Declarer->IsNative() && !S.Declarer->ScsNodes.count(S.Component))
+            if (S.Declarer->IsNative() && !S.Declarer->KnowsScsNode(S.Component))
             { *Err = S.Where + ": " + S.Component + " is a component of the Blueprint " + S.Declarer->UeName + ", and its header "
                      "does not say which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi";
               return false; }
@@ -21433,7 +21437,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                    subobject path below would cook an export the engine never looks at - so that is refused. */
                 const bool bBlueprintParent = DR->IsNative() && DR->UeName.size() > 2
                                               && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0;
-                if (bBlueprintParent && !DR->ScsNodes.count(CompName))
+                if (bBlueprintParent && !DR->KnowsScsNode(CompName))
                 {
                     *Err = Where + ": " + CompName + " is a component of the Blueprint " + DR->UeName + ", and its header does "
                            "not say which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi";

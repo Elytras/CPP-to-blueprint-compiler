@@ -204,7 +204,6 @@ the-root-s.body-relativescale3d-fvector-2
 components-a-parent.staticmesh-relativescale3d
 components-a-parent.controller-battachtopawn-true
 components-a-parent.uescsnode
-components-a-parent.ue-class
 instanced-objects.ue-instanced-2
 instanced-objects.ue-instanced-3
 instanced-objects.ue-instanced-getowner

@@ -3318,7 +3318,7 @@ Notes:
 | <a id="components-a-parent.staticmesh-relativescale3d"></a>`StaticMesh->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f);` in a child of a game Blueprint | A game Blueprint's component is a construction-script node, as a mod parent's is. The override is keyed on that node's GUID, which the SDK records as `<Component>__UeScsNode`. The node's real name is used, even when it contains spaces. | Yes |
 | <a id="components-a-parent.controller-battachtopawn-true"></a>`Controller->bAttachToPawn = true;` in an `APawn` child | Refused: "UeApi does not say which default subobject Controller is". Either the member is not a default subobject, and you set the value at run time, or the SDK predates the markers, and you regenerate it with genueapi. | Refused |
 | <a id="components-a-parent.uescsnode"></a>a component of a game Blueprint whose header has no `__UeScsNode` marker | Refused: "its header does not say which SCS node it is". Regenerate the SDK from a dump made with the Dumper-7 fork, which writes the markers. | Refused |
-| <a id="components-a-parent.ue-class"></a>a component of a mod parent that another mod owns (pinned with `UE_CLASS`) | Not yet: refused with the same SCS node message, and its advice to re-dump the game does not apply. Set the value at run time, for example in `ReceiveBeginPlay`. | Not yet |
+| <a id="components-a-parent.ue-class"></a>`Lamp->Intensity = 250.0f;`, where a parent in another mod's folder (or pinned with `UE_CLASS_IN`) declares `Lamp` | As for a parent of this mod: the record is keyed on the node its owner cooked, whose GUID AssetGen derives from the class and component names, so it needs no marker. A parent pinned with a hand-written `UE_CLASS` is still refused with the SCS node message. | Yes |
 
 ```cpp
 #include "UeApi/Game/BP_ExplosiveBarrel_C.h"
@@ -6978,9 +6978,9 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 - `<Class>::UE_DEFAULTS: <Component> is a component of the Blueprint <BlueprintClass>, and its header does not say
   which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi`: a default on a
   component of a game Blueprint parent whose header has no `<Component>__UeScsNode` marker. The same message appears
-  for a component of a mod parent that another mod cooks (a class pinned with UE_CLASS); the advice to re-dump does
-  not apply there. Fix: for a game Blueprint, regenerate UeApi from a dump made with the Dumper-7 fork; for another
-  mod's class, set the component's value at run time, for example in ReceiveBeginPlay. See
+  for a component of a mod parent pinned with a hand-written UE_CLASS; the advice to re-dump does not apply there.
+  Fix: for a game Blueprint, regenerate UeApi from a dump made with the Dumper-7 fork; for another mod's class, pin it
+  with UE_CLASS_IN or include it from its own folder, or set the value at run time. See
   [Class defaults](#class-defaults).
 - `<Class>::UE_DEFAULTS: <Parent> is a variable of the Blueprint <BlueprintClass>, and its header does not say it is a
   node of its construction script - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi`:
