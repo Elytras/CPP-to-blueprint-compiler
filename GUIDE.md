@@ -1879,8 +1879,8 @@ function that passes offline can still misbehave in game, most of all when it de
 
 Most of these take a package's **base path**, the path without `.uasset` or `.uexp`. Export indexes count from 0,
 and `uasset.py deps` lists every export with its index. `uasset.py` and `pak.py` print their usage when run without
-arguments; the older one-tool names (`dumpexp.py`, `dumpedl.py`, `dumpstruct.py`, `dumptags.py`, `walkscript.py`,
-`walk5.py`, `dumpar.py`, `pakx.py`) still run the same subcommands.
+arguments. `dumpexp.py`, `dumptags.py` and `dumpar.py` stay as modules for the scripts that import them (and still
+run `uasset.py exports`, `tags` and `registry`).
 
 | Tool                   | Usage                                                                            | Prints                                                                                                                                                                                                                             |
 | ---------------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
