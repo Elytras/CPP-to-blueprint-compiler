@@ -535,7 +535,7 @@ void FBlueprintClass::Finish()
     Class.ObjectFlags = RF_Public | RF_Transactional;
     Class.bIsAsset = true;
 
-    // Preload edges as a shipped DRG BPGC states them (dumpedl.py). Missing the parent
+    // Preload edges as a shipped DRG BPGC states them (uasset.py deps). Missing the parent
     // serialize-before-serialize edge aborts the async loading thread.
     Class.SerBeforeSer = { ParentIdx.V, ParentCdo.V };
     if (bIsActor) Class.SerBeforeSer.push_back(ScsIdx.V);

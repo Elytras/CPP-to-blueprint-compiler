@@ -1514,8 +1514,9 @@ Make the mod show that it ran. Print String shows nothing in the shipped game, s
 state's `PostGameMessage` in `ReceiveBeginPlay`, as HelloWorld does. Then check:
 
 - **The pak's contents.** The pak holds what bpbuild staged in `build/<name>/FSD`. Look there for the `InitSpacerig` and
-  `InitCave` packages in the mod's folder, and run `python tools/dumpar.py build/<name>/FSD/AssetRegistry.bin` to list
-  the registry's rows (see [Testing and inspecting](#testing-and-inspecting)).
+  `InitCave` packages in the mod's folder, and run
+  `python tools/uasset.py registry build/<name>/FSD/AssetRegistry.bin` to list the registry's rows (see
+  [Testing and inspecting](#testing-and-inspecting)).
 - **The game's log.** It is `FSD/Saved/Logs/FSD.log`; an earlier run's log is kept beside it as
   `FSD-backup-<time>.log`. Search it for your mod's folder. The spawn itself logs nothing.
 
@@ -1876,25 +1877,29 @@ function that passes offline can still misbehave in game, most of all when it de
 
 ### Looking inside a package
 
-Most of these tools take a package's **base path**, the path without `.uasset` or `.uexp`. Export indexes count from 0,
-and `dumpedl.py` lists every export with its index.
+Most of these take a package's **base path**, the path without `.uasset` or `.uexp`. Export indexes count from 0,
+and `uasset.py deps` lists every export with its index. `uasset.py` and `pak.py` print their usage when run without
+arguments; the older one-tool names (`dumpexp.py`, `dumpedl.py`, `dumpstruct.py`, `dumptags.py`, `walkscript.py`,
+`walk5.py`, `dumpar.py`, `pakx.py`) still run the same subcommands.
 
-| Tool            | Usage                                                         | Prints                                                                                                                                                                                                                             |
-| --------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `dumpedl.py`    | `dumpedl.py <file.uasset>`                                    | Every export with its index and its preload dependencies. Takes the `.uasset` file itself, not a base path.                                                                                                                        |
-| `walkscript.py` | `walkscript.py <base> <export-index>`                         | A function's bytecode, expression by expression, with disk and memory sizes, and whether the totals match the header. `loader would STOP here` means the engine would stop reading early.                                          |
-| `dumpstruct.py` | `dumpstruct.py <base> <export-index>`                         | A function or class export's body: its super, children, every property with flags and type, the bytecode sizes, then the function flags or the class trailer.                                                                      |
-| `dumptags.py`   | `dumptags.py <base> <export-index> [byte-offset]`             | The export's tagged properties, decoded, such as a default object's defaults. A struct's default instance starts after the struct's body, so pass that offset.                                                                     |
-| `dumpexp.py`    | `dumpexp.py <base> <export-index> [count]`                    | The export's class, super and outer, then its payload as 4-byte words, each annotated with the name or import it may stand for. Reads cooked packages and single-file uncooked ones, such as editor stubs.                         |
-| `walk5.py`      | `walk5.py <base> [function-name...]`                          | Every script function of a UE 5.6 package, or those whose names contain one of the words, with the memory offset of each expression: `walkscript.py` with the 5.6 operands.                                                        |
-| `pakx.py`       | `pakx.py <file.pak> <out-dir> <path-part>... [--oodle <dll>]` | Extracts the files whose pak paths contain one of the parts from a v11 `.pak` written by UE 5, which UE 4.27's UnrealPak refuses to extract. Oodle-compressed files need `oo2core_9_win64.dll`: pass `--oodle`, or put it on PATH. |
-| `dumpar.py`     | `dumpar.py <AssetRegistry.bin>`                               | Every row of a registry, AssetGen's or the game's, with its tags, then `OK - consumed the whole file`. It exits with an error unless the whole file parses.                                                                        |
-| `genenums.py`   | `genenums.py <UE_4.27/Engine/Source/Runtime>`                 | Regenerates the compiler's `UeEnums.h` (bytecode tokens and flag values) from the engine source. For compiler development only.                                                                                                    |
+| Tool                   | Usage                                                                            | Prints                                                                                                                                                                                                                             |
+| ---------------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `uasset.py summary`    | `uasset.py summary <file.uasset>... [--names] [--imports] [--exports] [--ue5=N]` | The package header: version stamps, custom versions, package flags and table offsets, then the tables asked for. An unversioned UE 5 package is read at `--ue5` (default 1017, UE 5.6).                                            |
+| `uasset.py deps`       | `uasset.py deps <file.uasset>`                                                   | Every export with its index and its preload dependencies. Takes the `.uasset` file itself, not a base path.                                                                                                                        |
+| `uasset.py walk`       | `uasset.py walk <base> <export-index>`                                           | A function's bytecode, expression by expression, with disk and memory sizes, and whether the totals match the header. `loader would STOP here` means the engine would stop reading early.                                          |
+| `uasset.py struct`     | `uasset.py struct <base> <export-index>`                                         | A function or class export's body: its super, children, every property with flags and type, the bytecode sizes, then the function flags or the class trailer.                                                                      |
+| `uasset.py tags`       | `uasset.py tags <base> <export-index> [byte-offset]`                             | The export's tagged properties, decoded, such as a default object's defaults. A struct's default instance starts after the struct's body, so pass that offset.                                                                     |
+| `uasset.py exports`    | `uasset.py exports <base> <export-index> [count]`                                | The export's class, super and outer, then its payload as 4-byte words, each annotated with the name or import it may stand for. Reads cooked packages and single-file uncooked ones, such as editor stubs.                         |
+| `uasset.py walk --ue5` | `uasset.py walk --ue5 <base> [function-name...]`                                 | Every script function of a UE 5.6 package, or those whose names contain one of the words, with the memory offset of each expression: `uasset.py walk` with the 5.6 operands.                                                       |
+| `uasset.py registry`   | `uasset.py registry <AssetRegistry.bin>`                                         | Every row of a registry, AssetGen's or the game's, with its tags, then `OK - consumed the whole file`. It exits with an error unless the whole file parses.                                                                        |
+| `pak.py ls`            | `pak.py ls <file.pak>`                                                           | Every file in a `.pak`, its mount point included. `pak.py find <path-part> <pak or folder>...` names the paks that hold a path.                                                                                                    |
+| `pak.py extract`       | `pak.py extract <file.pak> <out-dir> <path-part>... [--oodle <dll>]`             | Extracts the files whose pak paths contain one of the parts from a v11 `.pak` written by UE 5, which UE 4.27's UnrealPak refuses to extract. Oodle-compressed files need `oo2core_9_win64.dll`: pass `--oodle`, or put it on PATH. |
+| `genenums.py`          | `genenums.py <UE_4.27/Engine/Source/Runtime>`                                    | Regenerates the compiler's `UeEnums.h` (bytecode tokens and flag values) from the engine source. For compiler development only.                                                                                                    |
 
-To read one function, find its index with `dumpedl.py`, then walk it. For `Half` above, export 3:
+To read one function, find its index with `uasset.py deps`, then walk it. For `Half` above, export 3:
 
 ```
-> python tools\walkscript.py mods\build\RunDemo\FSD\Content\_MyMods\RunDemo\RunDemo 3
+> python tools\uasset.py walk mods\build\RunDemo\FSD\Content\_MyMods\RunDemo\RunDemo 3
 Half: header ScriptBytecodeSize=26 ScriptStorageSize=30, script at +126
   + 126 mem    0  disk  29 mem  25  Return
   + 127 mem    1  disk  28 mem  24    CallMath             imp[3]:Function'Multiply_FloatFloat'
@@ -1908,7 +1913,7 @@ walked: disk 30 (header 30)  mem 26 (header 26)
 and the mod's registry:
 
 ```
-> python tools\dumpar.py mods\build\RunDemo\FSD\AssetRegistry.bin
+> python tools\uasset.py registry mods\build\RunDemo\FSD\AssetRegistry.bin
 version 8
 1 asset(s), 12 name(s)
   /Game/_MyMods/RunDemo/RunDemo.RunDemo_C              BlueprintGeneratedClass
@@ -2064,8 +2069,8 @@ and try again. The form asks for:
 - what you expected and what happened;
 - for a problem in the game, the relevant part of the game's log or the crash report's call stack;
 - for anything that compiled, the generated `.uasset` and `.uexp`, zipped, and the `_P.pak` if you have it. The
-  output of `python tools/walkscript.py <package without extension> <export index>` for the function that misbehaves
-  helps too. `python tools/dumpedl.py <file.uasset>` lists every export with its index; see
+  output of `python tools/uasset.py walk <package without extension> <export index>` for the function that
+  misbehaves helps too. `python tools/uasset.py deps <file.uasset>` lists every export with its index; see
   [Testing and inspecting](#testing-and-inspecting).
 
 To cut the source down, start from the function that the message's `<Class>::<Function>: ` prefix names, and delete

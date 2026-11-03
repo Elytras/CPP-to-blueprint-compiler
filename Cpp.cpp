@@ -19857,7 +19857,7 @@ bool FCompiler::MergeElement(const FCookedPackage& P, int32 Export, FEditDef& Ed
 
 /* Each FFieldPath operand of a cooked script, B[Begin, End) being its serialized bytes: Visit gets the offset of the
    operand's owner, an FPackageIndex after its name segments. The grammar is the loader's (ScriptSerialization.h, UE
-   4.27), as tools/walkscript.py reads it. False when the bytes do not read as that grammar. */
+   4.27), as tools/uasset.py walk reads it. False when the bytes do not read as that grammar. */
 static bool ForEachFieldPath(const std::vector<uint8>& B, size_t Begin, size_t End, const std::function<void(size_t)>& Visit)
 {
     size_t O = Begin;

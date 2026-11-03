@@ -22,6 +22,7 @@ from collections import defaultdict, OrderedDict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import invariants
+from uasset_io import fstring as read_fstring
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UEAPI = os.path.normpath(os.path.join(HERE, '..', '..', 'BpMods', 'UeApi'))
@@ -278,13 +279,6 @@ class Model:
                 text, o = read_ftext(v, o)
                 out[k] = text
         return out
-
-
-def read_fstring(b, o):
-    n = struct.unpack_from('<i', b, o)[0]; o += 4
-    if n == 0: return '', o
-    if n > 0: return b[o:o + n - 1].decode('latin-1'), o + n
-    return b[o:o - 2 * n - 2].decode('utf-16-le'), o - 2 * n
 
 
 def read_ftext(b, o):

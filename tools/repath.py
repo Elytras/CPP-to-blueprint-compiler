@@ -14,7 +14,7 @@ import struct
 import sys
 
 sys.path.insert(0, __file__.rsplit("\\", 1)[0].rsplit("/", 1)[0])
-from dumpexp import R  # noqa: E402
+from uasset_io import R  # noqa: E402
 
 DEPRECATED, REFLECTED = [], []
 for i in range(256):

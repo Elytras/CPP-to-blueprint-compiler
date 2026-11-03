@@ -6061,7 +6061,7 @@ Notes:
   only for tokens whose on-disk and in-memory forms are the same size. A wrong size shifts every later jump target.
 - The bytes are not checked. Invalid bytes still cook, and the VM runs them.
 - A malformed string, such as an odd digit count or the `x` of `0x0B`, compiles with no error or warning, and the
-  statement emits nothing. Write bare hex digits, two per byte, and check the result with `tools/walkscript.py`.
+  statement emits nothing. Write bare hex digits, two per byte, and check the result with `tools/uasset.py walk`.
 
 ### __EmbedFile__
 
@@ -7675,12 +7675,13 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 
 #### Other tools
 
-- `usage: dumpar.py <AssetRegistry.bin>`: `dumpar.py` was run without a file. Fix: pass the registry to read, such as
-  a mod's `build/<mod>/FSD/AssetRegistry.bin`. See [Testing and inspecting](GUIDE.md#testing-and-inspecting).
+- `usage: uasset.py registry <AssetRegistry.bin>`: `uasset.py registry` (or `dumpar.py`) was run without a file. Fix:
+  pass the registry to read, such as a mod's `build/<mod>/FSD/AssetRegistry.bin`. See
+  [Testing and inspecting](GUIDE.md#testing-and-inspecting).
 - `truncated at 0x<Offset>: wanted <N> bytes`, `name batch: <N> string bytes unread`, `tag store: bad begin magic`,
   `tag store: bad end magic`, `not an asset registry: guid <Guid>` and `<N> trailing byte(s) after the body`:
-  `dumpar.py` could not parse the whole file as an AssetRegistry.bin. Fix: check that the file is a registry. If
-  assetgen wrote it, report it. See [Testing and inspecting](GUIDE.md#testing-and-inspecting).
+  `uasset.py registry` could not parse the whole file as an AssetRegistry.bin. Fix: check that the file is a
+  registry. If assetgen wrote it, report it. See [Testing and inspecting](GUIDE.md#testing-and-inspecting).
 - `<Function>: no such export`: `runscript.py` was asked to run a function the package does not export. Fix: check
   the function name and the package's base path, which is the path without `.uasset`. The interpreter's other
   messages are listed under Internal errors below. See [Testing and inspecting](GUIDE.md#testing-and-inspecting).
@@ -7741,7 +7742,7 @@ Until it is fixed, write the statement it points at in another form.
   `<Intrinsic> takes exactly one argument`, and the `__Asm__` checks listed above. Their messages are dropped and the
   compile still succeeds. A function that misbehaves in game after a clean build can be one of these; report
   it with the source.
-- **walkscript.py.** `unknown op <Op> at <Offset>`: an opcode that its UE 4.27 grammar does not know. Report it with
+- **uasset.py walk.** `unknown op <Op> at <Offset>`: an opcode that its UE 4.27 grammar does not know. Report it with
   the package.
 - **runscript.py and runvm.py**, the offline interpreters the test suite uses. runvm reports some of the same checks
   with a `vm: ` prefix and slightly different wording. Their messages are of three kinds:
