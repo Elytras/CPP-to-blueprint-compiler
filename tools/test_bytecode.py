@@ -4898,6 +4898,7 @@ def asset_defaults():
     """AssetDefaults: UE_ASSET_DEFAULTS cooks an asset as a braced one is, and each UE_INSTANCED of its block as an export
     under its outer (the asset, or another such object), RF_Transactional as the cook writes a particle system's
     modules; a default pointing at one points at its export."""
+    import invariants
     folder = os.path.dirname(asset('AssetDefaults'))
     mod = '/Game/_ElytrasMods/AssetDefaults/'
     p = invariants.Package(os.path.join(folder, 'AD_Held'))
@@ -4969,6 +4970,7 @@ def particle_bake():
     MinValue / MaxValue (and the vector's MinValueVec / MaxValueVec) filled, Distribution null, the object left out of
     the package; one object two raw distributions share is baked into both. A raw distribution left unset gets its
     module's starting value (InitializeDefaults), baked."""
+    import invariants
     p = invariants.Package(os.path.join(os.path.dirname(asset('ParticleBake')), 'P_Bake'))
     proves('particle-systems.life-lifetime-distribution-span')
     assert not [e['name'] for i, e in enumerate(p.exports) if p.class_of(i + 1).startswith('Distribution')], p.exports
@@ -4999,6 +5001,7 @@ def particle_lod_validity():
     """ParticleLod: each module's LODValidity is the bits of the LOD levels naming it, across emitters; a LOD level's
     Level is its place in LODLevels (0, the default, is no tag); a module AssetGen has no starting values for, left
     unset, warns."""
+    import invariants
     p = invariants.Package(os.path.join(os.path.dirname(asset('ParticleLod')), 'P_Lod'))
     tags = {e['name']: tag_values(p, i, p.tags(i)) for i, e in enumerate(p.exports)}
     proves('particle-systems.a-lodlevels-a0-a1')
@@ -6031,11 +6034,6 @@ api_stub_widget()
 api_stub_library()
 output_param_refusals()
 static_assets()
-asset_defaults()
-asset_defaults_refusals()
-particle_bake()
-particle_lod_validity()
-particle_refusals()
 ue_assets()
 asset_elsewhere()
 globals_()
@@ -12896,6 +12894,11 @@ def defaults_own_nest():
 defaults_own_nest()
 print('ok  DefaultsOwnNest: braces in a value that starts as a struct\'s default instance leave out what its initializer '
       'leaves out, and are refused at what it gives')
+asset_defaults()
+asset_defaults_refusals()
+particle_bake()
+particle_lod_validity()
+particle_refusals()
 
 
 def asset_over_cdo():
