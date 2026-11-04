@@ -1125,7 +1125,7 @@ struct FRecord
     std::vector<const Json*> Fields;
     std::vector<const Json*> Ctors;                 // CXXConstructorDecls: their parameter names place a value's arguments
     const Json* Dtor = nullptr;                     // the destructor the source declares, if any (LowerCtor refuses it)
-    std::vector<std::string> Interfaces;            // every base after the first; a native class's from UeNativeInterfaces
+    std::vector<std::string> Interfaces;            // every base after the first; a native class's those genueapi found
     std::string Tail;                               // genueapi's UeClassTail: "<ScriptInherit flags> <ClassWithin> <ConfigName>"
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
@@ -3747,18 +3747,6 @@ bool FCompiler::Collect(std::string* Err)
             else if (Kind(C) == "VarDecl" && Name(C) == "UeClassTail")
             {
                 FindLiteral(C, R.Tail);
-            }
-            else if (Kind(C) == "VarDecl" && Name(C) == "UeNativeInterfaces")
-            {
-                /* The native interfaces a native class implements, which the dump does not list: genueapi takes them
-                   from the game's Blueprints that override one's function. */
-                std::string List;
-                if (FindLiteral(C, List))
-                    for (size_t At = 0, End; At < List.size(); At = End + 1)
-                    {
-                        End = std::min(List.find(' ', At), List.size());
-                        if (End > At) R.Interfaces.push_back(List.substr(At, End - At));
-                    }
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeIchRecords")
             {
@@ -7304,6 +7292,17 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         if (Kind(*Obj) == "CXXThisExpr" || Out.Sub->bReceiverIsArg) return true;
         Out.Sub->Target = std::make_shared<FArgIR>();
         if (!LowerArg(*Obj, BP, *Out.Sub->Target, Err)) return false;
+        /* `Spider->QueueMontage(M)`, a native interface's function on an object of a class implementing it: the
+           editor's EX_InterfaceContext of the object, as for `TScriptInterface<INetMontageAble>(Spider)->...`. */
+        if (Out.Sub->Target->K != FArgIR::InterfaceCtx && !Out.Sub->VirtualName.empty())
+            if (auto Owner = MethodOwner.find(Callee->value("referencedMemberDecl", std::string())); Owner != MethodOwner.end())
+                if (const FRecord* IR = Find(Owner->second); IR && IR->IsNative() && IR->CppName[0] == 'I')
+                {
+                    FArgIR Ctx;
+                    Ctx.K = FArgIR::InterfaceCtx;
+                    Ctx.Base = std::make_shared<FArgIR>(std::move(*Out.Sub->Target));
+                    *Out.Sub->Target = std::move(Ctx);
+                }
         /* Through an interface the implementation is found by name, as the Blueprint compiler calls it. */
         if (Out.Sub->Target->K == FArgIR::InterfaceCtx)
         {
@@ -9610,7 +9609,11 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            so a subclass's override would never run. The editor calls it by name (backend 1222, 1253-1282); a qualified
            or parent call stays final. */
         const bool bNativeEvent = !bStatic && !bParentCall && !bNamesQualified && !Out.bReceiverIsArg && IsNativeEvent(*R, MethodName);
-        if ((!R->IsNative() || bImportedScript || bNativeEvent) && !bStatic && !bParentCall && !Bound)
+        /* A native interface's function called as a member of a class implementing it (`GetTargetCenterMass()` in a
+           spider) is found by name, as the editor calls it: on self a plain EX_VirtualFunction (ENE_SpiderBase_Large's
+           QueueMontage), on another object through EX_InterfaceContext (LowerArg's member call). */
+        const bool bInterfaceFn = R->IsNative() && R->CppName[0] == 'I' && !bStatic && !Out.bReceiverIsArg;
+        if ((!R->IsNative() || bImportedScript || bNativeEvent || bInterfaceFn) && !bStatic && !bParentCall && !Bound)
             Out.VirtualName = UeNameOf(R, MethodName);      // an override of `Set is Extruded` is found by that name
         Out.bLocal = (!Out.VirtualName.empty() || Bound) && bLocal;
         /* A call whose one body is known here - bound on `this`, a parent's, or a static of this mod - is that body,
@@ -20699,7 +20702,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!IR->IsNative() && !IR->bIsInterface)
         { *Err = R.CppName + " implements " + I + ", which is not an interface"; return false; }
         /* clang already rejects one listed twice; an ancestor's copy it only warns about. A native
-           ancestor's interfaces are not in the dump: only those UeNativeInterfaces names are checked. */
+           ancestor's interfaces are not in the dump: only those genueapi found and made its bases are checked. */
         /* Through an interface that extends it as well: this class's empty stubs would otherwise override the
            functions the ancestor implemented. */
         for (const FRecord* A = Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))

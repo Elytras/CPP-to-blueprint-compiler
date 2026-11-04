@@ -9553,6 +9553,30 @@ object_through_interface()
 print('ok  ObjThroughIface: TScriptInterface<I>(Obj)->Fn() is InterfaceContext(Obj); Cast<T> of a weak member casts its read')
 
 
+def native_interface_members():
+    """A native interface a game class implements is a base of its UeApi class, so its functions are members: on self
+    a call by name with no context, as ENE_SpiderBase_Large calls QueueMontage; on another object InterfaceContext of it,
+    as TScriptInterface<I>(Obj)->Fn() is."""
+    tmp, out, _ = compile_to(EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/NativeIfaceMembers");\n'
+                             'class NativeIfaceMembers : public ASpiderEnemy {\npublic:\n  FVector At;\n  float Len = 0.0f;\n'
+                             '  void Mine(UAnimMontage *M) { At = GetTargetCenterMass(); Len = QueueMontage(M); }\n'
+                             '  void Theirs(ASpiderEnemy *Other, UAnimMontage *M) { Len = Other->QueueMontage(M); }\n};\n',
+                             'NativeIfaceMembers')
+    base = os.path.join(out, 'NativeIfaceMembers')
+    keeps_invariants(base)
+    mine = dump('walkscript.py', base, export_index(base, 'Mine'))
+    theirs = dump('walkscript.py', base, export_index(base, 'Theirs'))
+    shutil.rmtree(tmp, ignore_errors=True)
+    proves('interface-values.native-interface-member')
+    assert 'Context' not in mine, mine
+    assert re.search(r"VirtualFunction\s+GetTargetCenterMass", mine) and re.search(r"VirtualFunction\s+QueueMontage", mine), mine
+    assert re.search(r"InterfaceContext\s*\n.*LocalVariable\s+Other@(.*\n)*.*VirtualFunction\s+QueueMontage", theirs), theirs
+
+
+native_interface_members()
+print('ok  NativeIfaceMembers: a native interface\'s function is a member of a class UeApi lists it on')
+
+
 def derived_struct_conv():
     """A struct passes where its base's conversion is wanted: FHitResult's FVector_NetQuantize Location to a const
     FTransform& is Conv_VectorToTransform, as FVector's is; to an FVector it passes as is."""

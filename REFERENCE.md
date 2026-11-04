@@ -4806,7 +4806,8 @@ declares and implements one.
 | <a id="interface-values.tscriptinterface-iaimable-target"></a>`TScriptInterface<IAimable> Target = Mark;` | Converts one interface value to another. The result is empty if the object behind it does not implement the target interface. Converting to the same interface is a plain copy. | Yes |
 | <a id="interface-values.health-getobject"></a>`Health.GetObject()` | The object behind the interface. GetObject() is the only method a TScriptInterface has. | Yes |
 | <a id="interface-values.current-getpriority"></a>`Current->GetPriority()` | Calls the interface function on the object behind it, with the interface value as Target. The implementation is whatever that object has under that name. | Yes |
-| <a id="interface-values.tscriptinterface-itargetable"></a>`TScriptInterface<ITargetable>(Player)->GetTargetHealthComponent()` | Calls the interface function on an object directly, as the editor does when the object's class implements the interface: InterfaceContext of the object, with no Cast To in between. The way to call a game interface's function on a game object, since UeApi does not record which interfaces a game class implements. | Yes |
+| <a id="interface-values.tscriptinterface-itargetable"></a>`TScriptInterface<ITargetable>(Player)->GetTargetHealthComponent()` | Calls the interface function on an object directly, as the editor does when the object's class implements the interface: InterfaceContext of the object, with no Cast To in between. For an object whose class UeApi lists the interface on, the member call below says the same. | Yes |
+| <a id="interface-values.native-interface-member"></a>`GetTargetCenterMass()` in a child of `ASpiderEnemy`, `Spider->QueueMontage(M)` | A native interface's function called as a member of a game class that implements it, as the editor calls it: on self by name, with no context; on another object through InterfaceContext of it. UeApi makes such an interface a base of the class, from the game's Blueprints (with `--game`) that override one of its functions or call one on self: an interface no game Blueprint shows is not listed, and its functions take the `TScriptInterface` call above. | Yes |
 | <a id="interface-values.if-seen"></a>`if (Seen)`, `!Seen`, `Seen == nullptr`, `Seen != nullptr`, `Seen ? A : B` | Whether an object is behind the interface. | Yes |
 | <a id="interface-values.health-nullptr"></a>`Health = nullptr;`, `TakeIface(nullptr)` | The null interface. It clears both halves of the value. | Yes |
 | <a id="interface-values.cast-iaimable-other"></a>`Cast<IAimable>(Other)` | Refused for a mod interface: "Cast<> to an unknown class". Write `TScriptInterface<IAimable> I = Other;` instead. | Refused |
@@ -4930,8 +4931,8 @@ Notes:
   interface that extends another. Without it, a call through the interface would reach the interface's own function.
 - The native-only message names the first such function in alphabetical order.
 - The already-implemented check sees mod ancestors, and native ones only for the interfaces UeApi lists on them
-  (`UeNativeInterfaces`): the dump lists no class's interfaces, so genueapi takes, with `--game`, those a game
-  Blueprint shows by overriding one's function. A method named like a function of such an interface is an override of
+  as bases: the dump lists no class's interfaces, so genueapi takes, with `--game`, those a game Blueprint shows by
+  overriding one's function or calling one on self. A method named like a function of such an interface is an override of
   it, as `OnMessageAI` (ITriggerAI) is in an `AWoodLouse` child: its parameters must match.
 - For some of these base lists clang also prints a harmless warning, "direct base 'IAimable' is inaccessible due to
   ambiguity".
