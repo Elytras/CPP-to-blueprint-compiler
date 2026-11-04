@@ -4941,6 +4941,101 @@ def asset_defaults_refusals():
     print('ok  AssetDefaults refusals')
 
 
+def particle_tables(p, name):
+    """Each raw distribution of the export named name, as {member: its tags (tag_values)}, its Table's float values
+    rounded to 4 places."""
+    i = next(k for k, e in enumerate(p.exports) if e['name'] == name)
+    out = {}
+    for k, v in tag_values(p, i, p.tags(i)).items():
+        if isinstance(v, dict) and 'Table' in v:
+            v['Table']['Values'] = [round(f, 4) for f in v['Table']['Values']]
+            out[k] = v
+    return out
+
+
+def baked(op, values):
+    """The table FRawDistribution::Initialize leaves for a Constant or Uniform distribution (Distributions.cpp 109-160,
+    613-679), written independently of Cascade.cpp. Their input range is [0, 0], so the 128 samples BuildLookupTable
+    takes are equal and OptimizeLookupTable keeps one: EntryCount 1, TimeScale and TimeBias 0. op 1 (RDO_None) keeps
+    the entry's first ValuesPerEntry values (the stride); op 2 (RDO_Random) keeps min and max, the stride twice that,
+    SubEntryStride the count of one. Only what differs from zero is a tag, as the cook writes it."""
+    t = dict(Values=[round(f, 4) for f in values], Op=op, EntryCount=1, EntryStride=len(values))
+    if op != 1: t['SubEntryStride'] = len(values) // 2
+    return t
+
+
+def particle_bake():
+    """ParticleBake: each raw distribution pointing at a Constant or Uniform object is baked as the cook bakes it,
+    MinValue / MaxValue (and the vector's MinValueVec / MaxValueVec) filled, Distribution null, the object left out of
+    the package; one object two raw distributions share is baked into both. A raw distribution left unset gets its
+    module's starting value (InitializeDefaults), baked."""
+    p = invariants.Package(os.path.join(os.path.dirname(asset('ParticleBake')), 'P_Bake'))
+    proves('particle-systems.life-lifetime-distribution-span')
+    assert not [e['name'] for i, e in enumerate(p.exports) if p.class_of(i + 1).startswith('Distribution')], p.exports
+    color = particle_tables(p, 'Color')
+    # Control: P_CAretakerAoE_ElectricutionAttack's ParticleModuleColor_0 as DRG cooked it, Values [0, 41.67, 500].
+    assert color['StartColor'] == dict(MaxValue=500.0, MinValueVec=(0.0, 41.66999816894531, 500.0),
+                                       MaxValueVec=(0.0, 41.66999816894531, 500.0), Distribution=None,
+                                       Table=baked(1, [0.0, 41.67, 500.0])), color
+    assert color['StartAlpha'] == dict(MinValue=1.0, MaxValue=1.0, Distribution=None, Table=baked(1, [1.0])), color
+    # Control: P_electric_arc's ParticleModuleLifetime_1, Uniform 0.5 to 1.15: Values [0.5, 1.15], Op 2, stride 2, sub 1.
+    life = particle_tables(p, 'Life')['LifeTime']
+    assert life == dict(MinValue=0.5, MaxValue=1.149999976158142, Distribution=None, Table=baked(2, [0.5, 1.15])), life
+    # Control: P_electric_arc's ParticleModuleSize_0, Uniform (1,1,1) to (3,3,3): Op 2, stride 6, sub 3.
+    size = particle_tables(p, 'Size')['StartSize']
+    assert size == dict(MinValue=1.0, MaxValue=3.0, MinValueVec=(1.0, 1.0, 1.0), MaxValueVec=(3.0, 3.0, 3.0),
+                        Distribution=None, Table=baked(2, [1, 1, 1, 3, 3, 3])), size
+    spawn = particle_tables(p, 'Spawn')
+    proves('particle-systems.spawn-rate-distribution-three')
+    assert spawn['Rate']['Table'] == spawn['RateScale']['Table'] == baked(1, [3.0]), spawn
+    proves('particle-systems.spawn-burstscale')
+    assert spawn['BurstScale'] == dict(MinValue=1.0, MaxValue=1.0, Distribution=None, Table=baked(1, [1.0])), spawn
+    assert particle_tables(p, 'Required')['SpawnRate']['Table'] == baked(1, [0.0])
+    keeps_invariants(p.base)
+    print('ok  ParticleBake: distributions baked as the cook bakes them')
+
+
+def particle_lod_validity():
+    """ParticleLod: each module's LODValidity is the bits of the LOD levels naming it, across emitters; a LOD level's
+    Level is its place in LODLevels (0, the default, is no tag); a module AssetGen has no starting values for, left
+    unset, warns."""
+    p = invariants.Package(os.path.join(os.path.dirname(asset('ParticleLod')), 'P_Lod'))
+    tags = {e['name']: tag_values(p, i, p.tags(i)) for i, e in enumerate(p.exports)}
+    proves('particle-systems.a-lodlevels-a0-a1')
+    got = {m: tags[m].get('LODValidity') for m in ('ReqA', 'SpawnA', 'Near', 'ReqB', 'SpawnB0', 'SpawnB1', 'Fall')}
+    assert got == dict(ReqA=3, SpawnA=3, Near=3, ReqB=3, SpawnB0=1, SpawnB1=2, Fall=1), got
+    assert [tags[l].get('Level') for l in ('A0', 'A1', 'B0', 'B1')] == [None, 1, None, 1], tags
+    proves('particle-systems.uparticlemoduleacceleration')
+    assert 'ParticleModuleAcceleration Fall: Acceleration is left unset and reads as 0 in game' in LOGS['ParticleLod'], \
+        LOGS['ParticleLod']
+    keeps_invariants(p.base)
+    print('ok  ParticleLod: LODValidity and Level as the editor keeps them')
+
+
+def particle_refusals():
+    """A particle system the engine would assert on or patch at load is refused, saying what; so is a distribution
+    class AssetGen does not bake."""
+    def system(mod, body, dists='{0.0f}'):
+        return ('UE_ASSET_DEFAULTS(UParticleSystem, P_%s) {\n'
+                '  UParticleSpriteEmitter *E = UE_INSTANCED(UParticleSpriteEmitter, this, "E");\n'
+                '  UParticleLODLevel *L = UE_INSTANCED(UParticleLODLevel, E, "L");\n'
+                '  UParticleModuleRequired *Req = UE_INSTANCED(UParticleModuleRequired, this, "Req");\n'
+                '  UParticleModuleSpawn *Sp = UE_INSTANCED(UParticleModuleSpawn, this, "Sp");\n'
+                '  L->RequiredModule = Req;\n  L->SpawnModule = Sp;\n  E->LODLevels = {L};\n  Emitters = {E};\n'
+                '  LODDistances = %s;\n%s}\n' % (mod, dists, body))
+    proves('particle-systems.loddistances')
+    refused('PrNoSpawn', '', 'E LOD 0: has no SpawnModule', after=system('NoSpawn', '  L->SpawnModule = nullptr;\n'))
+    refused('PrLods', '', "has 1 LOD levels and the system's LODDistances 2", after=system('Lods', '', '{0.0f, 1000.0f}'))
+    refused('PrLevel', '', 'its Level is 1', after=system('Level', '  L->Level = 1;\n'))
+    refused('PrSettings', '', 'LODSettings has 2 entries and LODDistances 1',
+            after=system('Settings', '  LODSettings = {FParticleSystemLOD(), FParticleSystemLOD()};\n'))
+    proves('particle-systems.spawn-rate-distribution-c')
+    refused('PrCurve', '', 'is a DistributionFloatConstantCurve, which AssetGen does not bake yet',
+            after=system('Curve', '  UDistributionFloatConstantCurve *C = UE_INSTANCED(UDistributionFloatConstantCurve, Sp, "C");\n'
+                                  '  Sp->Rate.Distribution = C;\n'))
+    print('ok  Particle system refusals')
+
+
 def ue_assets():
     """genueassets names each asset a registry lists by its content path, one header per class; a mod reaching one
     through that header imports exactly that object. The registry here is AssetTest's, the game's in real use."""
@@ -5938,6 +6033,9 @@ output_param_refusals()
 static_assets()
 asset_defaults()
 asset_defaults_refusals()
+particle_bake()
+particle_lod_validity()
+particle_refusals()
 ue_assets()
 asset_elsewhere()
 globals_()
@@ -12749,6 +12847,8 @@ def tag_values(pkg, i, tags):
         elif ty == 'StructProperty' and t['struct'] in ('Guid', 'Vector2D', 'LinearColor'): x = v   # native: raw bytes
         elif ty == 'StructProperty': x = tag_values(pkg, i, pkg.tags(i, t['at']))
         elif ty == 'ArrayProperty' and t['inner'] == 'IntProperty': x = list(struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4))
+        elif ty == 'ArrayProperty' and t['inner'] == 'FloatProperty': x = list(struct.unpack_from('<%df' % struct.unpack_from('<i', v)[0], v, 4))
+        elif ty == 'ByteProperty' and t['size'] == 1: x = v[0]                 # a byte, no enum
         else: x = ('?', ty)
         out[re.sub(r'_\d+_[0-9A-F]{32}$', '', t['name'])] = x
     return out

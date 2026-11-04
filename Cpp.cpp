@@ -29,6 +29,7 @@
 #include <nlohmann/json.hpp>
 
 #include "Blueprint.h"
+#include "Cascade.h"
 #include "Command.h"
 #include "Cooked.h"
 #include "Package.h"
@@ -8204,6 +8205,8 @@ std::pair<const FRecord*, std::string> FCompiler::PureMethod(const FRecord& R) c
    - UHierarchicalInstancedStaticMeshComponent: its ClusterTree, BulkSerialize again (64 per FClusterNode).
    - USkyAtmosphereComponent: bStaticLightingBuiltGUID, an FGuid.
    - UAtmosphericFogComponent: three empty bulk-data headers (flags, count, size on disk, offset), then CounterVal.
+   - UParticleModuleRequired: bCooked, which a cooked load requires true (else Fatal), then DerivedData's
+     BoundingGeometry, empty without a cutout texture (ParticleModules.cpp, SubUVAnimation.cpp 33-36).
    Too little or too much is fatal alike: the loader checks each export's size ("Serial size mismatch"). */
 std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
 {
@@ -8220,6 +8223,7 @@ std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
         else if (A->UeName == "HierarchicalInstancedStaticMeshComponent") I32({ 64, 0 });
         else if (A->UeName == "SkyAtmosphereComponent") Tail.resize(Tail.size() + 16);
         else if (A->UeName == "AtmosphericFogComponent") Tail.resize(Tail.size() + 3 * 20 + 4);
+        else if (A->UeName == "ParticleModuleRequired") I32({ 1, 0 });
     }
     return Tail;
 }
@@ -22104,6 +22108,48 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        exports the objects its own UE_DEFAULTS make there; one that makes none of that name inherits it, so the class
        above is asked next. A game Blueprint's package exports every one it has, which UeApi lists. Found, it is an
        import; this class's own copy loads from it what its tags leave unset. */
+    /* A particle system: the cooker's work on its tags (Cascade.cpp), before its objects are exported. A baked
+       distribution object is left out, and the rest renumbered. */
+    if (!R.AssetOf.empty() && Derives(B, "ParticleSystem"))
+    {
+        std::vector<FCascadeObject> Objs;
+        for (size_t I = 0; I < Insts.size(); ++I)
+        {
+            FCascadeObject O;
+            O.Class = ClassOf(*Insts[I].Class);
+            O.Name = Insts[I].Name;
+            O.Outer = Insts[I].Parent;
+            O.Tags = InstDefaults[I];
+            for (const FRecord* C = Insts[I].Class; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+                for (const Json* F : C->Fields)
+                    if (const std::string T = TypeOf(*F); T.find("FRawDistributionFloat") != std::string::npos
+                                                          || T.find("FRawDistributionVector") != std::string::npos)
+                        O.RawDists.emplace_back(UeNameOf(C, Name(*F)), T.find("FRawDistributionVector") != std::string::npos);
+            Objs.push_back(std::move(O));
+        }
+        std::vector<int32> Kept;
+        std::vector<std::string> Warnings;
+        if (!CookCascade(InheritedDefaults, Objs, Kept, Warnings, Err)) { *Err = R.AssetOf + ": " + *Err; return false; }
+        for (const std::string& W : Warnings) printf("  warning: %s: %s\n", R.AssetOf.c_str(), W.c_str());
+        std::vector<int32> NewOf(Insts.size(), -1);
+        for (size_t K = 0; K < Kept.size(); ++K)
+        {
+            if (size_t(Kept[K]) >= Insts.size())
+            { *Err = R.AssetOf + ": a starting distribution was left in the package unbaked (AssetGen bug)"; return false; }
+            NewOf[size_t(Kept[K])] = int32(K);
+        }
+        std::vector<FInstSpec> KeptInsts;
+        std::vector<std::vector<FPropertyDef>> KeptDefaults;
+        for (size_t K = 0; K < Kept.size(); ++K)
+        {
+            FInstSpec S = Insts[size_t(Kept[K])];
+            if (S.Parent >= 0) S.Parent = NewOf[size_t(S.Parent)];
+            KeptInsts.push_back(S);
+            KeptDefaults.push_back(std::move(Objs[K].Tags));
+        }
+        Insts = std::move(KeptInsts);
+        InstDefaults = std::move(KeptDefaults);
+    }
     for (size_t I = 0; I < Insts.size(); ++I)
     {
         const FInstSpec& S = Insts[I];

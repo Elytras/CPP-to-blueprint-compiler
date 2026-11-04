@@ -4040,6 +4040,49 @@ Notes:
 - An object nothing points at is refused, as in a class's `UE_DEFAULTS`: the editor keeps none such.
 - Each object starts from its class's defaults. The asset's members the block leaves unset keep the class defaults.
 
+### Particle systems
+
+A Cascade particle system (`UParticleSystem`) is an asset with objects inside: its emitters, each emitter's LOD levels,
+the modules each LOD level names, and the distributions the modules read. AssetGen does to them what DRG's cooker does,
+so the asset loads as a cooked one. Niagara systems are not compiled yet: their scripts are compiled Vector VM code.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="particle-systems.life-lifetime-distribution-span"></a>`Life->LifeTime.Distribution = Span;` with `Span` a `UDistributionFloatUniform` (`Min`, `Max`), or a `UDistributionFloatConstant`, `UDistributionVectorConstant` or `UDistributionVectorUniform` | The raw distribution is baked as the cook bakes it: its lookup table filled, `MinValue` / `MaxValue` set, `Distribution` null, and the distribution object left out of the package. | Yes |
+| <a id="particle-systems.spawn-rate-distribution-three"></a>`Spawn->Rate.Distribution = Three;` and `Spawn->RateScale.Distribution = Three;` | One distribution object several raw distributions point at is baked into each of them. | Yes |
+| <a id="particle-systems.spawn-burstscale"></a>A module's distribution left unset, as `Spawn->BurstScale` | Gets the value Cascade's editor starts a new module with, baked. The editor sets it in `InitializeDefaults`, which never runs for a loaded object, so left unset it reads as 0 in game (an unset `BurstScale` turns every burst off). Covered: Required, Spawn, Lifetime, Size, Color, Light, Velocity, and the beam modules. | Yes |
+| <a id="particle-systems.uparticlemoduleacceleration"></a>An unset distribution of a module outside that list, as `UParticleModuleAcceleration`'s `Acceleration` | Warns: "Acceleration is left unset and reads as 0 in game (Cascade's editor starts it at a value of its own); set it". | Warns |
+| <a id="particle-systems.a-lodlevels-a0-a1"></a>`A->LODLevels = {A0, A1};` and `LODDistances = {0.0f, 1500.0f};` | Each module's `LODValidity` is set to the LOD levels that name it, as bits, and each LOD level's `Level` to its place in `LODLevels`, as the editor keeps them. | Yes |
+| <a id="particle-systems.loddistances"></a>An emitter with fewer or more LOD levels than `LODDistances` has entries, a `LODSettings` of another count, a LOD level whose `Level` is not its place, or one without a `RequiredModule` or `SpawnModule` | Refused, saying which: "has 1 LOD levels and the system's LODDistances 2", "its Level is 1", "has no SpawnModule". The engine asserts on these or patches them at load. | Refused |
+| <a id="particle-systems.spawn-rate-distribution-c"></a>`Spawn->Rate.Distribution = C;` with `C` a `UDistributionFloatConstantCurve`, or another distribution class | Refused: "which AssetGen does not bake yet; use a DistributionFloatConstant / DistributionFloatUniform (Vector for a vector one)". | Not yet |
+
+```cpp
+UE_ASSET_DEFAULTS(UParticleSystem, P_Sparks) {
+  UParticleSpriteEmitter *Sparks = UE_INSTANCED(UParticleSpriteEmitter, this, "Sparks");
+  UParticleLODLevel *Lod = UE_INSTANCED(UParticleLODLevel, Sparks, "LOD0");
+  UParticleModuleRequired *Required = UE_INSTANCED(UParticleModuleRequired, this, "Required");
+  UParticleModuleSpawn *Spawn = UE_INSTANCED(UParticleModuleSpawn, this, "Spawn");
+  Spawn->BurstList = {FParticleBurst(4, -1, 0.0f)};
+  UParticleModuleLifetime *Life = UE_INSTANCED(UParticleModuleLifetime, this, "Life");
+  UDistributionFloatUniform *Span = UE_INSTANCED(UDistributionFloatUniform, Life, "Span");
+  Span->Min = 0.5f;
+  Span->Max = 1.15f;
+  Life->LifeTime.Distribution = Span;
+  Lod->RequiredModule = Required;
+  Lod->SpawnModule = Spawn;
+  Lod->Modules = {Life};
+  Sparks->LODLevels = {Lod};
+  Emitters = {Sparks};
+  LODDistances = {0.0f};
+}
+```
+
+Notes:
+
+- The modules are made under the system, as the editor makes them, and a LOD level names them; one module may serve
+  several LOD levels.
+- Curve distributions, and the per-particle event modules, are the next slice ([TODO.md](../TODO.md)).
+
 ## Game assets
 
 An asset that another package holds, the game's or another mod's, is named with `UE_ASSET_AT`, and `&Name` then points
