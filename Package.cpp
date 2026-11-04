@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 
 namespace Uasset
 {
@@ -99,6 +101,18 @@ void WriteFString(std::vector<uint8>& B, const std::string& S)
     B.push_back(0);
 }
 }   // namespace
+
+std::string CannotWrite(const std::string& Path)
+{
+    const int Errno = errno;
+    std::error_code Ec;
+    const std::string Full = std::filesystem::absolute(std::filesystem::u8path(Path), Ec).u8string();
+    const std::string& Shown = Ec ? Path : Full;
+    if (Shown.size() >= 260)        // MAX_PATH counts the terminator, so 259 characters is the longest that opens
+        return "cannot write " + Shown + ": the path is " + std::to_string(Shown.size()) + " characters, past Windows' "
+               "260-character limit (MAX_PATH, its terminator included); build in a shorter folder";
+    return "cannot write " + Shown + ": " + std::strerror(Errno);
+}
 
 std::string Lower(const std::string& S)
 {
@@ -875,20 +889,18 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
 
     auto Dump = [&](const std::string& Path, const std::vector<uint8>& Bytes) {
         FILE* F = fopen(Path.c_str(), "wb");
-        if (!F) return false;
-        const bool bOk = fwrite(Bytes.data(), 1, Bytes.size(), F) == Bytes.size();
-        fclose(F);
+        const bool bOk = F && fwrite(Bytes.data(), 1, Bytes.size(), F) == Bytes.size();
+        if (F) fclose(F);
+        if (!bOk && Err) *Err = CannotWrite(Path);
         return bOk;
     };
     if (bUncooked)
     {
         Header.insert(Header.end(), Exp.begin(), Exp.end());
         remove((OutBaseNoExt + ".uexp").c_str());   // a stale cooked pair next to it would shadow this
-        return Dump(OutBaseNoExt + ".uasset", Header) ? true : Fail("cannot write .uasset");
+        return Dump(OutBaseNoExt + ".uasset", Header);
     }
-    if (!Dump(OutBaseNoExt + ".uasset", Header)) return Fail("cannot write .uasset");
-    if (!Dump(OutBaseNoExt + ".uexp", Exp)) return Fail("cannot write .uexp");
-    return true;
+    return Dump(OutBaseNoExt + ".uasset", Header) && Dump(OutBaseNoExt + ".uexp", Exp);
 }
 
 }   // namespace Uasset

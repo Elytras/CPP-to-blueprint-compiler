@@ -188,6 +188,10 @@ private:
     FIndex Written(FIndex V) const;
 };
 
+/* The error for a file that would not open for writing: its full path, and Windows' 260-character limit when the
+   path passes it (a build folder deep under another, such as a session scratchpad), else the C runtime's reason. */
+std::string CannotWrite(const std::string& Path);
+
 /* ASCII lowercase: FName and package-name comparisons are case-insensitive. */
 std::string Lower(const std::string& S);
 
