@@ -24265,6 +24265,12 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (const std::string Cpp = R.AssetOf.empty() ? Key : R.AssetOf; R.IsGenerated())     // an asset by its own name
             if (const auto [At, bNew] = Cooked.emplace(Lower(PackageOf(R)), Cpp); !bNew)
             { *Err = Cpp + " and " + At->second + " would both be cooked as " + PackageOf(R); return false; }
+    /* A UE_ASSET_DEFAULTS name a curve macro or a UE_ASSET_AT also declares is one variable to C++: a curve would be
+       cooked over the asset at one path, and a UE_ASSET_AT would point every reference elsewhere. */
+    for (const std::string& Qual : ModAssetBlocks)
+        if (const char* Other = ModCurves.count(Qual) ? "UE_FLOAT_CURVE (or UE_VECTOR_CURVE / UE_COLOR_CURVE)"
+                              : AssetPaths.count(Qual) ? "UE_ASSET_AT" : nullptr)
+        { *Err = Qual + ": declared by UE_ASSET_DEFAULTS and by " + Other + "; keep one: both name one asset"; return false; }
 
     /* A UE_ASSET_AT whose class this mod cooks: the asset is an instance of the copy its own mod cooked, so the
        import's class check fails in game and the reference loads as null. Pinning the class to its owner with

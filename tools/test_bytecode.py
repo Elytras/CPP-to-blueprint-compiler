@@ -4939,6 +4939,11 @@ def asset_defaults_refusals():
     proves('objects-inside-an.ue-instanced-udamageimpulse')
     refused('AdOuter', '', "UE_INSTANCED's outer is `this`",
             after=hold + 'UE_ASSET_DEFAULTS(UHold, AD_Y) { Inner = UE_INSTANCED(UDamageImpulse, nullptr, "I"); }\n')
+    proves('objects-inside-an.ue-asset-defaults-uhold-ad')
+    refused('AdCurve', '', 'C_X: declared by UE_ASSET_DEFAULTS and by UE_FLOAT_CURVE',
+            after='UE_FLOAT_CURVE(C_X, (0, 0), (1, 2));\nUE_ASSET_DEFAULTS(UCurveFloat, C_X) {}\n')
+    refused('AdAt', '', 'C_Y: declared by UE_ASSET_DEFAULTS and by UE_ASSET_AT',
+            after='UE_ASSET_AT(::UCurveFloat, C_Y, "/Game/Elsewhere/C_Y.C_Y");\nUE_ASSET_DEFAULTS(UCurveFloat, C_Y) {}\n')
     print('ok  AssetDefaults refusals')
 
 
@@ -5037,6 +5042,27 @@ def particle_refusals():
             after=system('Curve', '  UDistributionFloatConstantCurve *C = UE_INSTANCED(UDistributionFloatConstantCurve, Sp, "C");\n'
                                   '  Sp->Rate.Distribution = C;\n'))
     print('ok  Particle system refusals')
+
+
+def particle_starts():
+    """ParticleStarts: a module's unset distributions get the values Cascade's editor gives a new module,
+    InitializeDefaults then SetToSensibleDefaults (ParticleModules.cpp 3242-3282, 3863-3871), baked. P_Starts9 grows the
+    object list past its capacity while filling its Spawn module's three; each is still filled."""
+    import invariants
+    folder = os.path.dirname(asset('ParticleStarts'))
+    proves('particle-systems.spawn-burstscale')
+    spawn = particle_tables(invariants.Package(os.path.join(folder, 'P_Starts9')), 'Sp')
+    assert sorted(spawn) == ['BurstScale', 'Rate', 'RateScale'], spawn
+    assert [spawn[m]['Table'] for m in ('Rate', 'RateScale', 'BurstScale')] == [baked(1, [20.0]), baked(1, [1.0]), baked(1, [1.0])], spawn
+    p = invariants.Package(os.path.join(folder, 'P_Sensible'))
+    light = particle_tables(p, 'Light')
+    assert {m: v['Table'] for m, v in light.items()} == dict(
+        ColorScaleOverLife=baked(1, [1.0, 1.0, 1.0]), BrightnessOverLife=baked(1, [32.0]), RadiusScale=baked(1, [15.0]),
+        LightExponent=baked(1, [16.0])), light
+    # Uniform 1 to 1: Min == Max bakes as a constant (UDistributionFloatUniform::GetOperation, Distributions.cpp 2035-2043).
+    assert particle_tables(p, 'Life')['LifeTime']['Table'] == baked(1, [1.0]), particle_tables(p, 'Life')
+    keeps_invariants(p.base)
+    print('ok  ParticleStarts: unset distributions start where the editor starts them')
 
 
 def ue_assets():
@@ -12898,6 +12924,7 @@ asset_defaults()
 asset_defaults_refusals()
 particle_bake()
 particle_lod_validity()
+particle_starts()
 particle_refusals()
 
 

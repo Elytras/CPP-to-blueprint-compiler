@@ -246,22 +246,24 @@ std::vector<FPropertyDef> RawTags(const FBaked& B)
 // ---- the modules' starting distributions (each class's InitializeDefaults)
 
 struct FStart { const char* Class; const char* Member; const char* Dist; float A[3]; float B[3]; };
-/* Ported from InitializeDefaults in Engine/Private/Particles: ParticleModules.cpp (Required, Lifetime, Light),
-   ParticleModules_Spawn.cpp, _Size.cpp, _Color.cpp, _Velocity.cpp, ParticleBeamModules.cpp. A is a Constant's value
-   or a Uniform's Min, B a Uniform's Max. Dist "Curve" is a default AssetGen cannot bake yet. */
+/* What Cascade's editor gives a new module (Cascade.cpp 984): InitializeDefaults, from Engine/Private/Particles:
+   ParticleModules.cpp (Required, Lifetime, Light), ParticleModules_Spawn.cpp, _Size.cpp, _Color.cpp, _Velocity.cpp,
+   ParticleBeamModules.cpp; then SetToSensibleDefaults, which only Lifetime (1 to 1, ParticleModules.cpp 3863-3871) and
+   Light (ParticleModules.cpp 3242-3282) change here. A is a Constant's value or a Uniform's Min, B a Uniform's Max.
+   Dist "Curve" is a default AssetGen cannot bake yet. */
 const FStart kStarts[] = {
     { "ParticleModuleRequired", "SpawnRate", "DistributionFloatConstant", { 0 }, { 0 } },
     { "ParticleModuleSpawn", "Rate", "DistributionFloatConstant", { 20 }, { 0 } },
     { "ParticleModuleSpawn", "RateScale", "DistributionFloatConstant", { 1 }, { 0 } },
     { "ParticleModuleSpawn", "BurstScale", "DistributionFloatConstant", { 1 }, { 0 } },
-    { "ParticleModuleLifetime", "Lifetime", "DistributionFloatUniform", { 0 }, { 0 } },
+    { "ParticleModuleLifetime", "Lifetime", "DistributionFloatUniform", { 1 }, { 1 } },
     { "ParticleModuleSize", "StartSize", "DistributionVectorUniform", { 1, 1, 1 }, { 1, 1, 1 } },
     { "ParticleModuleColor", "StartColor", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
     { "ParticleModuleColor", "StartAlpha", "DistributionFloatConstant", { 1 }, { 0 } },
-    { "ParticleModuleLight", "ColorScaleOverLife", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
-    { "ParticleModuleLight", "BrightnessOverLife", "DistributionFloatConstant", { 0 }, { 0 } },
-    { "ParticleModuleLight", "RadiusScale", "DistributionFloatConstant", { 0 }, { 0 } },
-    { "ParticleModuleLight", "LightExponent", "DistributionFloatConstant", { 0 }, { 0 } },
+    { "ParticleModuleLight", "ColorScaleOverLife", "DistributionVectorConstant", { 1, 1, 1 }, { 0 } },
+    { "ParticleModuleLight", "BrightnessOverLife", "DistributionFloatConstant", { 32 }, { 0 } },
+    { "ParticleModuleLight", "RadiusScale", "DistributionFloatConstant", { 15 }, { 0 } },
+    { "ParticleModuleLight", "LightExponent", "DistributionFloatConstant", { 16 }, { 0 } },
     { "ParticleModuleVelocity", "StartVelocity", "DistributionVectorUniform", { 0, 0, 0 }, { 0, 0, 0 } },
     { "ParticleModuleVelocity", "StartVelocityRadial", "DistributionFloatUniform", { 0 }, { 0 } },
     { "ParticleModuleTypeDataBeam2", "Distance", "DistributionFloatConstant", { 25 }, { 0 } },
@@ -406,18 +408,21 @@ bool CookCascade(std::vector<FPropertyDef>& SystemTags, std::vector<FCascadeObje
        the module's, appended to the list as the editor's NewObject in InitializeDefaults makes one. */
     for (size_t I = 0; I < N; ++I)
     {
-        FCascadeObject& O = Objects[I];
+        /* By index, never a reference: Objects grows below, which moves every element. */
         bool bKnown = false;
         for (const FStart& S : kStarts)
         {
-            if (O.Class != S.Class) continue;
+            if (Objects[I].Class != S.Class) continue;
             bKnown = true;
-            if (Find(O.Tags, S.Member)) continue;
-            const auto Raw = std::find_if(O.RawDists.begin(), O.RawDists.end(), [&](const auto& R) { return Lower(R.first) == Lower(S.Member); });
-            if (Raw == O.RawDists.end()) continue;
+            if (Find(Objects[I].Tags, S.Member)) continue;
+            const std::vector<std::pair<std::string, bool>>& Dists = Objects[I].RawDists;
+            const auto Raw = std::find_if(Dists.begin(), Dists.end(), [&](const auto& R) { return Lower(R.first) == Lower(S.Member); });
+            if (Raw == Dists.end()) continue;
+            const std::string Member = Raw->first;
+            const bool bVector = Raw->second;
             if (std::string(S.Dist) == "Curve")
             {
-                Warnings.push_back(Where(int32(I)) + ": " + Raw->first + " is left unset and reads as 0 in game; Cascade's editor "
+                Warnings.push_back(Where(int32(I)) + ": " + Member + " is left unset and reads as 0 in game; Cascade's editor "
                                    "starts it as a curve, which AssetGen does not bake yet; set it");
                 continue;
             }
@@ -432,11 +437,11 @@ bool CookCascade(std::vector<FPropertyDef>& SystemTags, std::vector<FCascadeObje
             Ref.Name = "Distribution";
             Ref.Default.K = FDefaultValue::Obj;
             Ref.Default.Instanced = int32(Objects.size());
-            Objects[I].Tags.push_back(StructTag(Raw->first, Raw->second ? "RawDistributionVector" : "RawDistributionFloat", { Ref }));
+            Objects[I].Tags.push_back(StructTag(Member, bVector ? "RawDistributionVector" : "RawDistributionFloat", { Ref }));
         }
-        if (!bKnown && O.Class.compare(0, 14, "ParticleModule") == 0)
-            for (const auto& [Member, bVector] : O.RawDists)
-                if (!Find(O.Tags, Member))
+        if (!bKnown && Objects[I].Class.compare(0, 14, "ParticleModule") == 0)
+            for (const auto& [Member, bVector] : Objects[I].RawDists)
+                if (!Find(Objects[I].Tags, Member))
                     Warnings.push_back(Where(int32(I)) + ": " + Member + " is left unset and reads as 0 in game (Cascade's editor "
                                        "starts it at a value of its own); set it");
     }
