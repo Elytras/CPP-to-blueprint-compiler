@@ -1668,11 +1668,19 @@ void FBlueprintClass::FinishAsset(FIndex Class, FIndex ClassCdo)
     A.ObjectFlags = RF_Public | RF_Standalone | RF_Transactional;
     A.bIsAsset = true;
     A.SerBeforeCreate = { Class.V, ClassCdo.V };
+    /* UE_ASSET_DEFAULTS' objects (AddInstanced) follow the asset, an outer before what it holds, each default that
+       points at one pointed at its export first. */
+    const int32 RowAsset = 0, RowFirstInstanced = 1;
+    for (FPropertyDef& V : Vars) PointAtInstanced(V, RowFirstInstanced);
+    for (FInstanced& I : Instanced) for (FPropertyDef& V : I.Defaults) PointAtInstanced(V, RowFirstInstanced);
+    auto OuterRow = [&](const FInstanced& I) { return I.Outer == FInstanced::Instanced ? RowFirstInstanced + I.OuterId - 1 : RowAsset; };
     for (const FPropertyDef& V : Vars)
     {
         if (V.Extra.V != 0) A.CreateBeforeSer.push_back(V.Extra.V);      // a user-defined enum / struct the tag names
         DefaultRefs(V.Default, A.CreateBeforeSer);
     }
+    for (size_t K = 0; K < Instanced.size(); ++K)
+        if (OuterRow(Instanced[K]) == RowAsset) A.CreateBeforeSer.push_back(Exp(RowFirstInstanced + int32(K)).V);
 
     const std::vector<FPropertyDef> Set = Vars;
     A.Serialize = [=](FArc& Ar) {
@@ -1681,6 +1689,30 @@ void FBlueprintClass::FinishAsset(FIndex Class, FIndex ClassCdo)
         Ar.Bool(false);
     };
     P.AddExport(std::move(A));
+
+    /* Measured on DRG's particle systems (P_CAretakerAoE_ElectricutionAttack): an object under an asset is
+       RF_Transactional alone, archetyped on its class's CDO. */
+    for (size_t K = 0; K < Instanced.size(); ++K)
+    {
+        const FInstanced& I = Instanced[K];
+        FExport Object;
+        Object.ClassIndex = I.Class;
+        Object.TemplateIndex = I.Archetype;
+        Object.OuterIndex = Exp(OuterRow(I));
+        Object.ObjectName = I.Name;
+        Object.ObjectFlags = RF_Transactional;
+        Object.SerBeforeSer = { Object.OuterIndex.V };
+        for (const FPropertyDef& V : I.Defaults) TagRefs(V, Object.CreateBeforeSer);
+        for (size_t C = 0; C < Instanced.size(); ++C)
+            if (OuterRow(Instanced[C]) == RowFirstInstanced + int32(K)) Object.CreateBeforeSer.push_back(Exp(RowFirstInstanced + int32(C)).V);
+        Object.SerBeforeCreate = { I.Class.V, I.Archetype.V };
+        Object.CreateBeforeCreate = { Object.OuterIndex.V };
+        Object.Serialize = [Defaults = I.Defaults, Tail = I.NativeTail](FArc& Ar) {
+            for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
+            EndComponent(Ar, Tail);
+        };
+        P.AddExport(std::move(Object));
+    }
 }
 
 /* Measured on DRG's Hologram_FadeIn: one export of the curve class, flags Public | Standalone | Transactional, its

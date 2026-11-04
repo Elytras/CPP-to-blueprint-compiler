@@ -4001,6 +4001,45 @@ Notes:
   the rest of the session, and nothing is saved.
 - [examples/EnemyInfo.cpp](examples/EnemyInfo.cpp) declares a data-asset class, its instances and soft references.
 
+### Objects inside an asset
+
+Some assets hold objects of their own: a particle system holds its emitters, their LOD levels and modules, and a
+behaviour tree its nodes. Braces cannot make an object, so such an asset is declared with `UE_ASSET_DEFAULTS(Type, Name)`
+and a block of statements, read as a class's `UE_DEFAULTS` is, with `this` the asset. `UE_INSTANCED` makes an object
+under the asset or under another of its objects, and a default points at it.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="objects-inside-an.ue-asset-defaults-uholder-ad"></a>`UE_ASSET_DEFAULTS(UHolder, AD_Held) { Scale = 2.5f; Items = {UE_INSTANCED(UStatChangeStatusEffectItem, this, "B")}; }` at namespace scope | An asset of the class, cooked at `<mod package>/AD_Held` with the members the block sets, as a braced one is. Each `UE_INSTANCED` is an export of its own under the asset, `RF_Transactional`, as the cook writes a particle system's modules, and the default points at it. | Yes |
+| <a id="objects-inside-an.udotstatuseffectitem-a-ue"></a>`UDotStatusEffectItem *A = UE_INSTANCED(UDotStatusEffectItem, this, "A");` then `A->OverrideDamageImpulse = true;` and `A->DamageImpulseOverride = UE_INSTANCED(UDamageImpulse, A, "Impulse");` | A local holds an object so its own members can be set, and objects nest under it, as in [Instanced objects](#instanced-objects). | Yes |
+| <a id="objects-inside-an.namespace-folder-ue-asset"></a>`namespace Folder { UE_ASSET_DEFAULTS(UHolder, AD_Deep) { ... } }` | A namespace is a folder: `<mod package>/Folder/AD_Deep`. | Yes |
+| <a id="objects-inside-an.uholder-picked-ad-held"></a>`UHolder *Picked = &AD_Held;` | `&Name` points at the asset, as at a braced one. | Yes |
+| <a id="objects-inside-an.ue-asset-defaults-uhold-ad"></a>`UE_ASSET_DEFAULTS(UHold, AD_X) {...}` and `UHold AD_X = {};`, or a class of the same name | Refused: "declared by UE_ASSET_DEFAULTS and with braces; keep one", or "AdClash and AdClash would both be cooked as ...". C++ takes both as one name, and both would be cooked at one path. | Refused |
+| <a id="objects-inside-an.ue-instanced-udamageimpulse"></a>`UE_INSTANCED(UDamageImpulse, nullptr, "I")` in the block | Refused: "UE_INSTANCED's outer is `this`, one of the class's components, or a local holding another UE_INSTANCED". | Refused |
+
+```cpp
+class UHolder : public UPrimaryDataAsset {
+public:
+  UObject *Inner = nullptr;
+  TArray<UObject *> Items;
+  float Scale = 1;
+};
+
+UE_ASSET_DEFAULTS(UHolder, AD_Held) {
+  UDotStatusEffectItem *A = UE_INSTANCED(UDotStatusEffectItem, this, "A");
+  A->OverrideDamageImpulse = true;
+  A->DamageImpulseOverride = UE_INSTANCED(UDamageImpulse, A, "Impulse");
+  Items = {A, UE_INSTANCED(UStatChangeStatusEffectItem, this, "B")};
+  Inner = A;
+  Scale = 2.5f;
+}
+```
+
+Notes:
+
+- An object nothing points at is refused, as in a class's `UE_DEFAULTS`: the editor keeps none such.
+- Each object starts from its class's defaults. The asset's members the block leaves unset keep the class defaults.
+
 ## Game assets
 
 An asset that another package holds, the game's or another mod's, is named with `UE_ASSET_AT`, and `&Name` then points

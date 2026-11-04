@@ -4894,6 +4894,53 @@ def static_assets():
     print('ok  AssetTest: the asset registry lists every asset with its class')
 
 
+def asset_defaults():
+    """AssetDefaults: UE_ASSET_DEFAULTS cooks an asset as a braced one is, and each UE_INSTANCED of its block as an export
+    under its outer (the asset, or another such object), RF_Transactional as the cook writes a particle system's
+    modules; a default pointing at one points at its export."""
+    folder = os.path.dirname(asset('AssetDefaults'))
+    mod = '/Game/_ElytrasMods/AssetDefaults/'
+    p = invariants.Package(os.path.join(folder, 'AD_Held'))
+    proves('objects-inside-an.ue-asset-defaults-uholder-ad')
+    rows = [(e['name'], p.class_of(i + 1), e['flags'] & 0xF) for i, e in enumerate(p.exports)]
+    assert rows[0] == ('AD_Held', 'UHolder_C', 0xB), rows                 # Public | Standalone | Transactional
+    outer = {e['name']: p.exports[e['outer'] - 1]['name'] if e['outer'] > 0 else None for e in p.exports}
+    assert outer == {'AD_Held': None, 'A': 'AD_Held', 'B': 'AD_Held', 'Impulse': 'A'}, outer
+    assert sorted(r[1:] for r in rows[1:]) == [('DamageImpulse', 0x8), ('DotStatusEffectItem', 0x8),
+                                               ('StatChangeStatusEffectItem', 0x8)], rows
+    held = tag_values(p, 0, p.tags(0))
+    assert held == {'Items': [mod + 'AD_Held.AD_Held:A', mod + 'AD_Held.AD_Held:B'], 'Inner': mod + 'AD_Held.AD_Held:A',
+                    'Scale': 2.5}, held
+    proves('objects-inside-an.udotstatuseffectitem-a-ue')
+    a = next(i for i, e in enumerate(p.exports) if e['name'] == 'A')
+    assert tag_values(p, a, p.tags(a)) == {'OverrideDamageImpulse': True,
+                                            'DamageImpulseOverride': mod + 'AD_Held.AD_Held:A:Impulse'}, p.tags(a)
+    assert ('/Game/_ElytrasMods/AssetDefaults/AD_Held.AD_Held', 'UHolder_C') in registry_rows(registry_of('AssetDefaults'))
+    keeps_invariants(p.base)
+    proves('objects-inside-an.namespace-folder-ue-asset')
+    deep = invariants.Package(os.path.join(folder, 'Folder', 'AD_Deep'))
+    assert [e['name'] for e in deep.exports] == ['AD_Deep'] and tag_values(deep, 0, deep.tags(0)) == {'Scale': 4.0}
+    proves('objects-inside-an.uholder-picked-ad-held')
+    user = invariants.Package(os.path.join(folder, 'AssetDefaults'))
+    cdo = next(i for i, e in enumerate(user.exports) if e['name'] == 'Default__AssetDefaults_C')
+    assert tag_values(user, cdo, user.tags(cdo)) == {'Picked': mod + 'AD_Held.AD_Held', 'Deep': mod + 'Folder/AD_Deep.AD_Deep'}
+    print('ok  AssetDefaults: an asset of statements holds objects of its own')
+
+
+def asset_defaults_refusals():
+    """UE_ASSET_DEFAULTS refuses an asset two declarations cook at one path, and an object made under anything but the
+    asset or another of its objects."""
+    hold = 'class UHold : public UPrimaryDataAsset {\npublic:\n  UObject *Inner = nullptr;\n};\n'
+    proves('objects-inside-an.ue-asset-defaults-uhold-ad')
+    refused('AdTwice', '', 'declared by UE_ASSET_DEFAULTS and with braces',
+            after=hold + 'UE_ASSET_DEFAULTS(UHold, AD_X) { Inner = nullptr; }\nUHold AD_X = {};\n')
+    refused('AdClash', '', 'AdClash and AdClash would both be cooked as', after=hold + 'UE_ASSET_DEFAULTS(UHold, AdClash) { Inner = nullptr; }\n')
+    proves('objects-inside-an.ue-instanced-udamageimpulse')
+    refused('AdOuter', '', "UE_INSTANCED's outer is `this`",
+            after=hold + 'UE_ASSET_DEFAULTS(UHold, AD_Y) { Inner = UE_INSTANCED(UDamageImpulse, nullptr, "I"); }\n')
+    print('ok  AssetDefaults refusals')
+
+
 def ue_assets():
     """genueassets names each asset a registry lists by its content path, one header per class; a mod reaching one
     through that header imports exactly that object. The registry here is AssetTest's, the game's in real use."""
@@ -5889,6 +5936,8 @@ api_stub_widget()
 api_stub_library()
 output_param_refusals()
 static_assets()
+asset_defaults()
+asset_defaults_refusals()
 ue_assets()
 asset_elsewhere()
 globals_()
