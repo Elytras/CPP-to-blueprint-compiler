@@ -4416,6 +4416,60 @@ def parent_call():
     print('ok  SuperTest: Base::Method() is the parent\'s body, expanded or a final call; overrides bind to it')
 
 
+def engine_parent_call():
+    """EngineParentCall: a qualified call to an ancestor above the direct parent runs that ancestor's own function, past
+    every override between, and never the caller's own by name (that would re-enter, forever). A function outside the
+    mod (the engine's, a cooked game Blueprint's) runs as a recorder of which one was called; the mod's own run.
+    - EngineParentCall: `AActor::ReceiveBeginPlay()` past EpcBase's: the engine's, once, and Count 5 -> 15.
+    - EpcSkip, past EpcMid (which adds 100 per step): EpcBase's ReceiveBeginPlay, Bump (its body copied in) and its
+      noinline Slow (a final call), each as C++ runs them.
+    - EpcGame, a child of the cooked BP_Spider_RadiationCloud: BP_Damage_Cloud_Base's ReceiveBeginPlay, and not
+      RadiationCloud's own."""
+    import runscript
+    folder = os.path.dirname(asset('EngineParentCall'))
+    at = lambda name: os.path.join(folder, name)
+
+    def outside(cls, fn, chain):
+        """Runs cls's fn on Count 5 with each final call it makes out of the mod recorded; (fields, result, calls)."""
+        paths, calls = import_paths(cls), []
+        w = dump('walkscript.py', cls, exports_of(cls).index(fn))
+        imps = {int(i) for i in re.findall(r'FinalFunction\s+imp\[(\d+)\]', w)
+                if not paths[int(i)].startswith('/Game/_ElytrasMods/')}
+        for i in imps: runscript.MATH[cls, i] = (lambda p: lambda *a: calls.append(p))(paths[i])
+        try:
+            fields = {'Count': 5}
+            got = run_as(chain, fn, fields) if chain else runscript.run(cls, fn, fields)[0]
+        finally:
+            for i in imps: del runscript.MATH[cls, i]
+        return fields, got, calls
+
+    fields, _, calls = outside(at('EngineParentCall'), 'ReceiveBeginPlay', [at('EngineParentCall'), at('EpcBase')])
+    assert calls == ['/Script/Engine.Actor:ReceiveBeginPlay'] and fields['Count'] == 15, (calls, fields)
+
+    class Base:                                   # EngineParentCall.cpp's EpcBase and EpcSkip, as Python
+        def __init__(s, Count): s.Count = Count
+        def ReceiveBeginPlay(s): s.Count = 1
+        def Bump(s, By): s.Count += By; return s.Count
+        Slow = Bump
+
+    class Skip(Base):                             # EpcMid's versions are never reached
+        def ReceiveBeginPlay(s): Base.ReceiveBeginPlay(s); s.Count += 10
+        def Bump(s, By): return Base.Bump(s, By) + 1000
+        def Slow(s, By): return Base.Slow(s, By) + 1000
+
+    chain = [at('EpcSkip'), at('EpcMid'), at('EpcBase')]
+    for fn, args in (('ReceiveBeginPlay', {}), ('Bump', {'By': 3}), ('Slow', {'By': 2})):
+        fields, obj = {'Count': 5}, Skip(5)
+        got, want = run_as(chain, fn, fields, **args), getattr(obj, fn)(**args)
+        assert (got in (None, 0) if want is None else got == want) and fields['Count'] == obj.Count, (fn, got, want, fields)
+
+    fields, _, calls = outside(at('EpcGame'), 'ReceiveBeginPlay', None)
+    want = '/Game/Enemies/BaseItems/BP_Damage_Cloud_Base.BP_Damage_Cloud_Base_C:ReceiveBeginPlay'
+    assert calls == [want] and fields['Count'] == 15, (calls, fields)
+    print("ok  EngineParentCall: Ancestor::Fn() runs that ancestor's function past the overrides between: the engine's, "
+          "a mod class's, a cooked game Blueprint's")
+
+
 def pure_virtual():
     """SuperTest's PureBase: `= 0` cooks an empty function returning the default, which a subclass's version names as
     its super and a call by name on an object without one finds; a class clang calls abstract is cooked Abstract."""
@@ -5879,6 +5933,8 @@ def inherited_defaults_other_mod():
 
 inherited_defaults_other_mod()
 parent_call()
+proves('calling-the-parent.aactor-receivebeginplay', 'calling-the-parent.ancestor-skip')
+engine_parent_call()
 pure_virtual()
 func_stub_super()
 engine_names()
