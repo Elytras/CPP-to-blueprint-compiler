@@ -645,30 +645,102 @@ std::vector<FPropertyDef> RawTags(const FBaked& B)
 
 // ---- the modules' starting distributions (each class's InitializeDefaults)
 
-struct FStart { const char* Class; const char* Member; const char* Dist; float A[3]; float B[3]; };
-/* What Cascade's editor gives a new module (Cascade.cpp 984): InitializeDefaults, from Engine/Private/Particles:
-   ParticleModules.cpp (Required, Lifetime, Light), ParticleModules_Spawn.cpp, _Size.cpp, _Color.cpp, _Velocity.cpp,
-   ParticleBeamModules.cpp; then SetToSensibleDefaults, which only Lifetime (1 to 1, ParticleModules.cpp 3863-3871) and
-   Light (ParticleModules.cpp 3242-3282) change here. A is a Constant's value or a Uniform's Min, B a Uniform's Max; a
-   ConstantCurve starts with no keys. */
+struct FStart { const char* Class; const char* Member; const char* Dist; float A[3]; float B[3]; uint8 Keys = 0; };
+/* What Cascade's editor gives a new module (Cascade.cpp 984): NewObject, whose PostInitProperties runs the
+   InitializeDefaults of the class and of each base that has one (they are not virtual: PrimitiveBase's VelocityScale is
+   a Sphere's too, as 682 vanilla spheres show), then SetToSensibleDefaults (virtual: the class's own or its nearest
+   base's), which replaces several. From Engine/Private/Particles: ParticleModules.cpp, ParticleModules_*.cpp,
+   ParticleBeamModules.cpp, ParticleTrailModules.cpp. A is a Constant's value or a Uniform's Min, B a Uniform's Max. A
+   ConstantCurve has no keys, or with Keys 2 the two linear keys SetToSensibleDefaults makes (CreateNewKey, AddPoint):
+   A at 0, B at 1. */
 const FStart kStarts[] = {
     { "ParticleModuleRequired", "SpawnRate", "DistributionFloatConstant", { 0 }, { 0 } },
     { "ParticleModuleSpawn", "Rate", "DistributionFloatConstant", { 20 }, { 0 } },
     { "ParticleModuleSpawn", "RateScale", "DistributionFloatConstant", { 1 }, { 0 } },
     { "ParticleModuleSpawn", "BurstScale", "DistributionFloatConstant", { 1 }, { 0 } },
+    { "ParticleModuleSpawnPerUnit", "SpawnPerUnit", "DistributionFloatConstant", { 0 }, { 0 } },
     { "ParticleModuleLifetime", "Lifetime", "DistributionFloatUniform", { 1 }, { 1 } },
     { "ParticleModuleSize", "StartSize", "DistributionVectorUniform", { 1, 1, 1 }, { 1, 1, 1 } },
-    { "ParticleModuleColor", "StartColor", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
+    { "ParticleModuleSizeMultiplyLife", "LifeMultiplier", "DistributionVectorConstantCurve", { 1, 1, 1 }, { 1, 1, 1 }, 2 },
+    { "ParticleModuleSizeScale", "SizeScale", "DistributionVectorConstant", { 1, 1, 1 }, { 0 } },
+    { "ParticleModuleColor", "StartColor", "DistributionVectorConstant", { 1, 1, 1 }, { 0 } },
     { "ParticleModuleColor", "StartAlpha", "DistributionFloatConstant", { 1 }, { 0 } },
+    { "ParticleModuleColorOverLife", "ColorOverLife", "DistributionVectorConstantCurve", { 1, 1, 1 }, { 0, 0, 0 }, 2 },
+    { "ParticleModuleColorOverLife", "AlphaOverLife", "DistributionFloatConstantCurve", { 1 }, { 0 }, 2 },
+    { "ParticleModuleColorScaleOverLife", "ColorScaleOverLife", "DistributionVectorConstantCurve", { 1, 1, 1 }, { 1, 1, 1 }, 2 },
+    { "ParticleModuleColorScaleOverLife", "AlphaScaleOverLife", "DistributionFloatConstant", { 1 }, { 0 } },
     { "ParticleModuleLight", "ColorScaleOverLife", "DistributionVectorConstant", { 1, 1, 1 }, { 0 } },
     { "ParticleModuleLight", "BrightnessOverLife", "DistributionFloatConstant", { 32 }, { 0 } },
     { "ParticleModuleLight", "RadiusScale", "DistributionFloatConstant", { 15 }, { 0 } },
     { "ParticleModuleLight", "LightExponent", "DistributionFloatConstant", { 16 }, { 0 } },
     { "ParticleModuleVelocity", "StartVelocity", "DistributionVectorUniform", { 0, 0, 0 }, { 0, 0, 0 } },
     { "ParticleModuleVelocity", "StartVelocityRadial", "DistributionFloatUniform", { 0 }, { 0 } },
+    { "ParticleModuleVelocityInheritParent", "Scale", "DistributionVectorConstant", { 1, 1, 1 }, { 0 } },
+    { "ParticleModuleVelocityOverLifetime", "VelOverLife", "DistributionVectorConstantCurve", { 0 }, { 0 } },
+    { "ParticleModuleVelocityCone", "Angle", "DistributionFloatUniform", { 0 }, { 0 } },
+    { "ParticleModuleVelocityCone", "Velocity", "DistributionFloatUniform", { 0 }, { 0 } },
+    { "ParticleModuleAcceleration", "Acceleration", "DistributionVectorUniform", { 0, 0, 0 }, { 0, 0, 0 } },
+    { "ParticleModuleAccelerationOverLifetime", "AccelOverLife", "DistributionVectorConstantCurve", { 0 }, { 0 } },
+    { "ParticleModuleAccelerationDrag", "DragCoefficientRaw", "DistributionFloatConstant", { 1 }, { 0 } },
+    { "ParticleModuleAccelerationDragScaleOverLife", "DragScaleRaw", "DistributionFloatConstant", { 1 }, { 0 } },
+    { "ParticleModuleAttractorLine", "Strength", "DistributionFloatConstant", { 0 }, { 0 } },
+    { "ParticleModuleAttractorLine", "Range", "DistributionFloatConstant", { 0 }, { 0 } },
+    { "ParticleModuleAttractorParticle", "Range", "DistributionFloatConstant", { 0 }, { 0 } },
+    { "ParticleModuleAttractorParticle", "Strength", "DistributionFloatConstant", { 0 }, { 0 } },
+    { "ParticleModuleAttractorPoint", "Position", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
+    { "ParticleModuleAttractorPoint", "Range", "DistributionFloatConstant", { 0 }, { 0 } },
+    { "ParticleModuleAttractorPoint", "Strength", "DistributionFloatConstant", { 0 }, { 0 } },
+    { "ParticleModuleAttractorPointGravity", "StrengthRaw", "DistributionFloatConstant", { 1 }, { 0 } },
+    { "ParticleModuleCameraOffset", "CameraOffset", "DistributionFloatConstant", { 1 }, { 0 } },
+    { "ParticleModuleCollision", "DampingFactor", "DistributionVectorUniform", { 0, 0, 0 }, { 0, 0, 0 } },
+    { "ParticleModuleCollision", "DampingFactorRotation", "DistributionVectorConstant", { 1, 1, 1 }, { 0 } },
+    { "ParticleModuleCollision", "MaxCollisions", "DistributionFloatUniform", { 1 }, { 1 } },
+    { "ParticleModuleCollision", "ParticleMass", "DistributionFloatConstant", { 0.1f }, { 0 } },
+    { "ParticleModuleCollision", "DelayAmount", "DistributionFloatConstant", { 0 }, { 0 } },
+    { "ParticleModuleCollisionGPU", "Resilience", "DistributionFloatConstant", { 0.75f }, { 0 } },
+    { "ParticleModuleCollisionGPU", "ResilienceScaleOverLife", "DistributionFloatConstant", { 1 }, { 0 } },
+    { "ParticleModuleEventReceiverSpawn", "SpawnCount", "DistributionFloatConstant", { 0 }, { 0 } },
+    { "ParticleModuleEventReceiverSpawn", "InheritVelocityScale", "DistributionVectorConstant", { 1, 1, 1 }, { 0 } },
+    { "ParticleModuleKillBox", "LowerLeftCorner", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
+    { "ParticleModuleKillBox", "UpperRightCorner", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
+    { "ParticleModuleKillHeight", "Height", "DistributionFloatConstant", { 0 }, { 0 } },
+    { "ParticleModuleLocation", "StartLocation", "DistributionVectorUniform", { 0, 0, 0 }, { 0, 0, 0 } },
+    { "ParticleModuleLocationDirect", "Location", "DistributionVectorUniform", { 0, 0, 0 }, { 0, 0, 0 } },
+    { "ParticleModuleLocationDirect", "LocationOffset", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
+    { "ParticleModuleLocationDirect", "ScaleFactor", "DistributionVectorConstant", { 1, 1, 1 }, { 0 } },
+    { "ParticleModuleLocationDirect", "Direction", "DistributionVectorUniform", { 0, 0, 0 }, { 0, 0, 0 } },
+    { "ParticleModuleLocationPrimitiveBase", "VelocityScale", "DistributionFloatConstant", { 1 }, { 0 } },
+    { "ParticleModuleLocationPrimitiveBase", "StartLocation", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
+    { "ParticleModuleLocationPrimitiveTriangle", "StartOffset", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
+    { "ParticleModuleLocationPrimitiveTriangle", "Height", "DistributionFloatConstant", { 50 }, { 0 } },
+    { "ParticleModuleLocationPrimitiveTriangle", "Angle", "DistributionFloatConstant", { 90 }, { 0 } },
+    { "ParticleModuleLocationPrimitiveTriangle", "Thickness", "DistributionFloatConstant", { 0 }, { 0 } },
+    { "ParticleModuleLocationPrimitiveCylinder", "StartRadius", "DistributionFloatConstant", { 50 }, { 0 } },
+    { "ParticleModuleLocationPrimitiveCylinder", "StartHeight", "DistributionFloatConstant", { 50 }, { 0 } },
+    { "ParticleModuleLocationPrimitiveSphere", "StartRadius", "DistributionFloatConstant", { 50 }, { 0 } },
+    { "ParticleModuleSourceMovement", "SourceMovementScale", "DistributionVectorConstant", { 1, 1, 1 }, { 0 } },
+    { "ParticleModuleMeshRotation", "StartRotation", "DistributionVectorUniform", { 0, 0, 0 }, { 1, 1, 1 } },
+    { "ParticleModuleMeshRotationRate", "StartRotationRate", "DistributionVectorUniform", { 0, 0, 0 }, { 1, 1, 1 } },
+    { "ParticleModuleMeshRotationRateMultiplyLife", "LifeMultiplier", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
+    { "ParticleModuleMeshRotationRateOverLife", "RotRate", "DistributionVectorConstantCurve", { 0, 0, 0 }, { 1, 1, 1 }, 2 },
+    { "ParticleModuleOrbit", "OffsetAmount", "DistributionVectorUniform", { 0, 0, 0 }, { 0, 50, 0 } },
+    { "ParticleModuleOrbit", "RotationAmount", "DistributionVectorUniform", { 0, 0, 0 }, { 1, 1, 1 } },
+    { "ParticleModuleOrbit", "RotationRateAmount", "DistributionVectorUniform", { 0, 0, 0 }, { 1, 1, 1 } },
+    { "ParticleModuleRotation", "StartRotation", "DistributionFloatUniform", { 0 }, { 1 } },
+    { "ParticleModuleRotationRate", "StartRotationRate", "DistributionFloatUniform", { 0 }, { 1 } },
+    { "ParticleModuleRotationOverLifetime", "RotationOverLife", "DistributionFloatConstantCurve", { 0 }, { 0 } },
+    { "ParticleModuleRotationRateMultiplyLife", "LifeMultiplier", "DistributionFloatConstantCurve", { 1 }, { 1 }, 2 },
+    { "ParticleModuleSubUV", "SubImageIndex", "DistributionFloatConstantCurve", { 0 }, { 0 }, 2 },
+    { "ParticleModuleSubUVMovie", "FrameRate", "DistributionFloatConstant", { 30 }, { 0 } },
+    { "ParticleModuleTrailSource", "SourceStrength", "DistributionFloatConstant", { 100 }, { 0 } },
+    { "ParticleModuleVectorFieldScale", "VectorFieldScaleRaw", "DistributionFloatConstant", { 1 }, { 0 } },
+    { "ParticleModuleVectorFieldScaleOverLife", "VectorFieldScaleOverLifeRaw", "DistributionFloatConstant", { 1 }, { 0 } },
     { "ParticleModuleTypeDataBeam2", "Distance", "DistributionFloatConstant", { 25 }, { 0 } },
     { "ParticleModuleTypeDataBeam2", "TaperFactor", "DistributionFloatConstant", { 1 }, { 0 } },
     { "ParticleModuleTypeDataBeam2", "TaperScale", "DistributionFloatConstant", { 1 }, { 0 } },
+    { "ParticleModuleBeamModifier", "Position", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
+    { "ParticleModuleBeamModifier", "Tangent", "DistributionVectorConstant", { 0, 0, 0 }, { 0 } },
+    { "ParticleModuleBeamModifier", "Strength", "DistributionFloatConstant", { 0 }, { 0 } },
     { "ParticleModuleBeamSource", "Source", "DistributionVectorConstant", { 50, 50, 50 }, { 0 } },
     { "ParticleModuleBeamSource", "SourceTangent", "DistributionVectorConstant", { 1, 0, 0 }, { 0 } },
     { "ParticleModuleBeamSource", "SourceStrength", "DistributionFloatConstant", { 25 }, { 0 } },
@@ -682,6 +754,26 @@ const FStart kStarts[] = {
     { "ParticleModuleBeamNoise", "NoiseScale", "DistributionFloatConstantCurve", { 0 }, { 0 } },
 };
 
+/* The bools SetToSensibleDefaults sets against the class default, as the vanilla modules show [V]: 3481 of DRG's 3483
+   Required modules have bUseLegacyEmitterTime false (the class default is true; ParticleModules.cpp 1253-1257), and
+   3646 of 3647 acceleration modules bAlwaysInWorldSpace true (ParticleModules.cpp 2463-2467). */
+struct FBoolStart { const char* Class; const char* Member; bool bValue; };
+const FBoolStart kBoolStarts[] = {
+    { "ParticleModuleRequired", "bUseLegacyEmitterTime", false },
+    { "ParticleModuleAccelerationBase", "bAlwaysInWorldSpace", true },
+};
+
+FPropertyDef BoolTag(const std::string& Name, bool b)
+{
+    FPropertyDef P;
+    P.Type = "BoolProperty";
+    P.Name = Name;
+    P.ElementSize = 1;
+    P.Default.K = FDefaultValue::Bool;
+    P.Default.I = b ? 1 : 0;
+    return P;
+}
+
 /* A starting value as the tags of its distribution object, to bake as the mod's own. */
 std::vector<FPropertyDef> StartTags(const FStart& S)
 {
@@ -690,7 +782,24 @@ std::vector<FPropertyDef> StartTags(const FStart& S)
     if (D == "DistributionFloatConstant") return { FloatTag("Constant", S.A[0]) };
     if (D == "DistributionFloatUniform") return { FloatTag("Min", S.A[0]), FloatTag("Max", S.B[0]) };
     if (D == "DistributionVectorConstant") return { VecTag("Constant", A) };
-    if (D == "DistributionFloatConstantCurve") return {};
+    if (D == "DistributionFloatConstantCurve" || D == "DistributionVectorConstantCurve")
+    {
+        if (!S.Keys) return {};
+        const bool bVec = D == "DistributionVectorConstantCurve";
+        FPropertyDef Points;
+        Points.Type = "ArrayProperty";
+        Points.Name = "Points";
+        Points.Default.K = FDefaultValue::Array;
+        for (uint8 K = 0; K < S.Keys; ++K)
+        {
+            FDefaultValue Item;
+            Item.K = FDefaultValue::Struct;
+            Item.Members = std::make_shared<std::vector<FPropertyDef>>(std::vector<FPropertyDef>{
+                FloatTag("InVal", float(K)), bVec ? VecTag("OutVal", K ? B : A) : FloatTag("OutVal", K ? S.B[0] : S.A[0]) });
+            Points.Default.Items.push_back(std::move(Item));
+        }
+        return { StructTag("ConstantCurve", bVec ? "InterpCurveVector" : "InterpCurveFloat", { Points }) };
+    }
     return { VecTag("Min", A), VecTag("Max", B) };
 }
 
@@ -794,6 +903,28 @@ bool CookCascade(std::vector<FPropertyDef>& SystemTags, std::vector<FCascadeObje
                                                                                                       : "UParticleModuleRequired");
                     return false;
                 }
+            /* The event generator: the engine finds it in Modules (UParticleLODLevel::UpdateModuleLists resets the slot
+               and sets it from there), and the editor keeps both, the generator first in Modules. */
+            const std::vector<int32> Mods = RefsOf(Find(Lod.Tags, "Modules"));
+            const std::vector<int32> Gen = RefsOf(Find(Lod.Tags, "EventGenerator"));
+            if (!Gen.empty() && std::find(Mods.begin(), Mods.end(), Gen[0]) == Mods.end())
+            {
+                *Err = At + ": its EventGenerator " + Objects[size_t(Gen[0])].Name + " is not in its Modules, where the engine "
+                       "looks for it; put it first in Modules";
+                return false;
+            }
+            if (Gen.empty())
+                for (int32 M : Mods)
+                    if (Objects[size_t(M)].Class == "ParticleModuleEventGenerator")
+                    {
+                        FPropertyDef Ref;
+                        Ref.Type = "ObjectProperty";
+                        Ref.Name = "EventGenerator";
+                        Ref.Default.K = FDefaultValue::Obj;
+                        Ref.Default.Instanced = M + 1;
+                        Lod.Tags.push_back(Ref);
+                        break;
+                    }
             for (const char* Slot : { "RequiredModule", "SpawnModule", "TypeDataModule", "EventGenerator", "Modules" })
                 for (int32 M : RefsOf(Find(Lod.Tags, Slot))) Validity[M] |= uint8(1u << L);
         }
@@ -820,17 +951,30 @@ bool CookCascade(std::vector<FPropertyDef>& SystemTags, std::vector<FCascadeObje
     for (size_t I = 0; I < N; ++I)
     {
         /* By index, never a reference: Objects grows below, which moves every element. */
-        bool bKnown = false;
-        for (const FStart& S : kStarts)
+        if (Objects[I].Class.compare(0, 14, "ParticleModule") != 0) continue;
+        const std::vector<std::string> Chain = Objects[I].Chain.empty() ? std::vector<std::string>{ Objects[I].Class } : Objects[I].Chain;
+        for (const FBoolStart& S : kBoolStarts)
+            if (std::find(Chain.begin(), Chain.end(), S.Class) != Chain.end() && !Find(Objects[I].Tags, S.Member))
+                Objects[I].Tags.push_back(BoolTag(S.Member, S.bValue));
+        /* Each raw distribution left unset starts as the nearest class of the chain that starts it says. A copy: the
+           object list grows below, which moves every element. */
+        const std::vector<std::pair<std::string, bool>> Dists = Objects[I].RawDists;
+        for (const auto& [Member, bVector] : Dists)
         {
-            if (Objects[I].Class != S.Class) continue;
-            bKnown = true;
-            if (Find(Objects[I].Tags, S.Member)) continue;
-            const std::vector<std::pair<std::string, bool>>& Dists = Objects[I].RawDists;
-            const auto Raw = std::find_if(Dists.begin(), Dists.end(), [&](const auto& R) { return Lower(R.first) == Lower(S.Member); });
-            if (Raw == Dists.end()) continue;
-            const std::string Member = Raw->first;
-            const bool bVector = Raw->second;
+            if (Find(Objects[I].Tags, Member)) continue;
+            const FStart* Hit = nullptr;
+            for (const std::string& C : Chain)
+            {
+                for (const FStart& S : kStarts)
+                    if (C == S.Class && Lower(S.Member) == Lower(Member)) { Hit = &S; break; }
+                if (Hit) break;
+            }
+            if (!Hit)
+            {
+                Warnings.push_back(Where(int32(I)) + ": " + Member + " is left unset and reads as 0 in game; set it");
+                continue;
+            }
+            const FStart& S = *Hit;
             FCascadeObject D;
             D.Class = S.Dist;
             D.Name = std::string("Distribution") + S.Member;
@@ -844,11 +988,6 @@ bool CookCascade(std::vector<FPropertyDef>& SystemTags, std::vector<FCascadeObje
             Ref.Default.Instanced = int32(Objects.size());
             Objects[I].Tags.push_back(StructTag(Member, bVector ? "RawDistributionVector" : "RawDistributionFloat", { Ref }));
         }
-        if (!bKnown && Objects[I].Class.compare(0, 14, "ParticleModule") == 0)
-            for (const auto& [Member, bVector] : Objects[I].RawDists)
-                if (!Find(Objects[I].Tags, Member))
-                    Warnings.push_back(Where(int32(I)) + ": " + Member + " is left unset and reads as 0 in game (Cascade's editor "
-                                       "starts it at a value of its own); set it");
     }
 
     /* Bake every raw distribution that points at a distribution object; the object is then left out unless something

@@ -5289,9 +5289,7 @@ def particle_lod_validity():
     got = {m: tags[m].get('LODValidity') for m in ('ReqA', 'SpawnA', 'Near', 'ReqB', 'SpawnB0', 'SpawnB1', 'Fall')}
     assert got == dict(ReqA=3, SpawnA=3, Near=3, ReqB=3, SpawnB0=1, SpawnB1=2, Fall=1), got
     assert [tags[l].get('Level') for l in ('A0', 'A1', 'B0', 'B1')] == [None, 1, None, 1], tags
-    proves('particle-systems.uparticlemoduleacceleration')
-    assert 'ParticleModuleAcceleration Fall: Acceleration is left unset and reads as 0 in game' in LOGS['ParticleLod'], \
-        LOGS['ParticleLod']
+    assert 'left unset' not in LOGS['ParticleLod'], LOGS['ParticleLod']      # Fall starts as the editor starts it
     keeps_invariants(p.base)
     print('ok  ParticleLod: LODValidity and Level as the editor keeps them')
 
@@ -5322,7 +5320,37 @@ def particle_refusals():
     proves('particle-systems.l-typedatamodule-gpu')
     refused('PrGpu', '', 'a GPU sprite emitter needs the EmitterInfo and ResourceData the editor builds',
             after=system('Gpu', '  L->TypeDataModule = UE_INSTANCED(UParticleModuleTypeDataGpu, this, "Gpu");\n'))
+    proves('particle-systems.l-eventgenerator-g')
+    refused('PrGen', '', 'its EventGenerator G is not in its Modules, where the engine looks for it; put it first in Modules',
+            after=system('Gen', '  L->EventGenerator = UE_INSTANCED(UParticleModuleEventGenerator, this, "G");\n'))
     print('ok  Particle system refusals')
+
+
+def particle_events():
+    """ParticleEvents: a generator listed in Modules alone gets the LOD level's EventGenerator slot the editor keeps
+    (the engine re-finds it in Modules at load); a receiver's events, name and spawn count are its tags, its unset
+    InheritVelocityScale starts at (1, 1, 1)."""
+    import invariants
+    p = invariants.Package(os.path.join(os.path.dirname(asset('ParticleEvents')), 'P_Events'))
+    proves('particle-systems.sl-modules-gen-hit')
+    sl = tag_values(p, p.find('SL'), p.tags(p.find('SL')))
+    assert sl['EventGenerator'] == p.path(p.find('Gen') + 1), sl
+    assert sl['Modules'] == [p.path(p.find('Gen') + 1), p.path(p.find('Hit') + 1)], sl
+    assert 'EventGenerator' not in tag_values(p, p.find('BL'), p.tags(p.find('BL')))
+    gen = particle_roundtrip_values(p, 'Gen')
+    assert [(e['type'], e['customname']) for e in gen['events']] == [('EPET_Collision', 'SparkHit')], gen
+    recv = particle_roundtrip_values(p, 'Recv')
+    assert (recv['eventgeneratortype'], recv['eventname']) == ('EPET_Collision', 'SparkHit'), recv
+    tables = {m: v['Table'] for m, v in particle_tables(p, 'Recv').items()}
+    assert tables == dict(SpawnCount=baked(1, [5.0]), InheritVelocityScale=baked(1, [1.0, 1.0, 1.0])), tables
+    keeps_invariants(p.base)
+    print('ok  ParticleEvents: the generator in Modules and the slot, the receiver by name')
+
+
+def particle_roundtrip_values(p, name):
+    """An export's tags as particle_roundtrip reads them: names lowercased, structs and arrays of them decoded."""
+    import particle_roundtrip as rt
+    return rt.values(p, p.find(name))
 
 
 def particle_decompile():
@@ -5338,7 +5366,7 @@ def particle_decompile():
     work = tempfile.mkdtemp()
     try:
         rt.layout(work, os.path.abspath(UEAPI))
-        for mod in ('ParticleBake', 'ParticleCurves'):
+        for mod in ('ParticleBake', 'ParticleCurves', 'ParticleEvents'):
             folder = os.path.dirname(asset(mod))
             content = folder.replace(os.sep, '/').split('/FSD/Content/')[0] + '/FSD/Content'
             root = '/Game/_ElytrasMods/' + mod
@@ -5375,6 +5403,27 @@ def particle_starts():
         LightExponent=baked(1, [16.0])), light
     # Uniform 1 to 1: Min == Max bakes as a constant (UDistributionFloatUniform::GetOperation, Distributions.cpp 2035-2043).
     assert particle_tables(p, 'Life')['LifeTime']['Table'] == baked(1, [1.0]), particle_tables(p, 'Life')
+    keeps_invariants(p.base)
+    # P_Every: every module's starts, a base class's among them, and the bools SetToSensibleDefaults sets.
+    proves('particle-systems.every-module-unset')
+    p = invariants.Package(os.path.join(folder, 'P_Every'))
+    tables = lambda name: {m: v['Table'] for m, v in particle_tables(p, name).items()}
+    assert tables('Sphere') == dict(VelocityScale=baked(1, [1.0]), StartLocation=baked(1, [0.0, 0.0, 0.0]),
+                                    StartRadius=baked(1, [50.0])), tables('Sphere')
+    assert tables('Col') == dict(StartColor=baked(1, [1.0, 1.0, 1.0]), StartAlpha=baked(1, [1.0])), tables('Col')
+    fade = particle_tables(p, 'Fade')
+    assert close(fade['ColorOverLife'], curve_baked('vector', [(0, [1, 1, 1], LINEAR), (1, [0, 0, 0], LINEAR)])), fade
+    assert close(fade['AlphaOverLife'], curve_baked('float', [(0, [1], LINEAR), (1, [0], LINEAR)])), fade
+    movie = particle_tables(p, 'Movie')
+    assert close(movie['SubImageIndex'], curve_baked('float', [(0, [0], LINEAR), (1, [0], LINEAR)])), movie
+    assert movie['FrameRate']['Table'] == baked(1, [30.0]), movie
+    assert tables('Recv') == dict(SpawnCount=baked(1, [0.0]), InheritVelocityScale=baked(1, [1.0, 1.0, 1.0])), tables('Recv')
+    assert tables('Acc') == dict(DragCoefficientRaw=baked(1, [1.0])), tables('Acc')
+    flags = lambda name: {k: v for k, v in tag_values(p, p.find(name), p.tags(p.find(name))).items() if k.startswith('b')}
+    assert flags('Req') == dict(bUseLegacyEmitterTime=False), flags('Req')
+    assert flags('Acc') == dict(bAlwaysInWorldSpace=True), flags('Acc')
+    assert flags('Acc2') == dict(bAlwaysInWorldSpace=False), flags('Acc2')
+    assert 'left unset' not in LOGS['ParticleStarts'], LOGS['ParticleStarts']
     keeps_invariants(p.base)
     print('ok  ParticleStarts: unset distributions start where the editor starts them')
 
@@ -13345,6 +13394,7 @@ particle_curves()
 behaviour_trees()
 behaviour_tree_refusals()
 particle_refusals()
+particle_events()
 particle_decompile()
 
 

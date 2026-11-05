@@ -27,6 +27,9 @@ struct FCascadeObject
     std::vector<Uasset::FPropertyDef> Tags;     // an FDefaultValue::Instanced id is an index into the list + 1
     /* The class's FRawDistribution members by their tag names, each with whether it is a vector one. */
     std::vector<std::pair<std::string, bool>> RawDists;
+    /* The class, then its bases ("ParticleModuleLocationPrimitiveSphere", "ParticleModuleLocationPrimitiveBase", ...):
+       each class's PostInitProperties runs its own InitializeDefaults, so a module starts with all of theirs. */
+    std::vector<std::string> Chain;
 };
 
 /* Rewrites SystemTags and Objects in place. The objects left out (baked distributions) are removed from Objects and

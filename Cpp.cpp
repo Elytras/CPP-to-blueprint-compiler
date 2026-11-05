@@ -22152,6 +22152,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             O.Outer = Insts[I].Parent;
             O.Tags = InstDefaults[I];
             for (const FRecord* C = Insts[I].Class; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+                O.Chain.push_back(ClassOf(*C));
+            for (const FRecord* C = Insts[I].Class; C; C = C->Base.empty() ? nullptr : Find(C->Base))
                 for (const Json* F : C->Fields)
                     if (const std::string T = TypeOf(*F); T.find("FRawDistributionFloat") != std::string::npos
                                                           || T.find("FRawDistributionVector") != std::string::npos)
