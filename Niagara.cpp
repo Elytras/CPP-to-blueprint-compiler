@@ -141,6 +141,7 @@ bool LayoutOf(const FType& T, FLayout& L)
         { "NiagaraInt32", { {}, { 0 }, {} } },
         { "NiagaraBool", { {}, { 0 }, {} } },
         { "NiagaraID", { {}, { 0, 4 }, {} } },
+        { "NiagaraRandInfo", { {}, { 0, 4, 8 }, {} } },        // Seed1, Seed2, Seed3
         { "NiagaraSpawnInfo", { { 4, 8 }, { 0, 12 }, {} } },   // Count, InterpStartDt, IntervalDt, SpawnGroup
         { "Vector2D", { { 0, 4 }, {}, {} } },
         { "Vector", { { 0, 4, 8 }, {}, {} } },
@@ -368,5 +369,13 @@ bool CookNiagara(std::vector<FPropertyDef>& SystemTags, std::vector<FNiagaraObje
                "AssetGen does not build yet; use a CPU emitter";
         return false;
     }
+    /* An enabled GPU emitter runs nothing without them, whatever its script holds. */
+    for (const FNiagaraObject& O : Objects)
+        if (O.Class == "NiagaraEmitter" && StrOf(Find(&O.Tags, "SimTarget")).find("GPUComputeSim") != std::string::npos)
+        {
+            *Err = StrOf(Find(&O.Tags, "UniqueEmitterName")) + ": a GPU emitter runs on the GPU shader maps the editor compiles "
+                   "from its scripts' HLSL, which AssetGen does not build yet; use a CPU emitter";
+            return false;
+        }
     return true;
 }

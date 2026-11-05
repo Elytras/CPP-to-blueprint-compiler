@@ -4,8 +4,9 @@ UNiagaraSystem::Serialize writes after the system's tags (AssetGen/Niagara.cpp).
 
 NS_Two: Sparks' particle scripts hold an attribute of each register kind (float, vector, colour, int pair, halves), its
 spawn script repeating the update script's Age; the system scripts hold three spawn infos named "Sparks." (one spelled
-"sparks.", one listed twice) and Glow's. Glow asks for persistent IDs itself, Sparks through its Particles.ID. Old is a
-disabled GPU emitter, which the cook leaves out: its compiled data keeps its name, sim target and persistent IDs.
+"sparks.", one listed twice) and Glow's. Glow asks for persistent IDs itself, Sparks through its Particles.ID; Glow's
+Rand is a seed triple (three ints). Old is a disabled GPU emitter, which the cook leaves out: its compiled data keeps its
+name, sim target and persistent IDs.
 
 NS_Off: a disabled GPU emitter's compiled GPU script (empty, as the editor leaves a disabled emitter's), left out with it,
 so its shader maps are not needed.
@@ -39,7 +40,8 @@ UE_ASSET_DEFAULTS(UNiagaraSystem, NS_Two) {
   Glow->bRequiresPersistentIDs = true;
   UNiagaraScript *GU = UE_INSTANCED(UNiagaraScript, Glow, "GU");
   GU->Usage = ENiagaraScriptUsage::ParticleUpdateScript;
-  GU->CachedScriptVM.Attributes = {FNiagaraVariable("Age", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), {})};
+  GU->CachedScriptVM.Attributes = {FNiagaraVariable("Age", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), {}),
+                                   FNiagaraVariable("Rand", FNiagaraTypeDefinition(StaticStructOf<FNiagaraRandInfo>(), 2), {})};
   GU->CachedScriptVM.LastCompileStatus = ENiagaraScriptCompileStatus::NCS_UpToDate;
   Glow->UpdateScriptProps.Script = GU;
 

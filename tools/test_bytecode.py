@@ -5376,7 +5376,9 @@ def niagara_compiled():
     assert (d['totalfloatcomponents'], d['totalint32components'], d['totalhalfcomponents']) == (8, 2, 2), d
     assert (d['brequirespersistentids'], d['simtarget'], d['id']) == (True, 'CPUSim', dict(name='IdSparks', type='ParticleData')), d
     g = glow['datasetcompileddata']
-    assert ([v['name'] for v in g['variables']], g['brequirespersistentids'], g['id']['name']) == (['Age'], True, 'IdGlow'), g
+    assert ([v['name'] for v in g['variables']], g['brequirespersistentids'], g['id']['name']) == (['Age', 'Rand'], True, 'IdGlow'), g
+    rand = g['variablelayouts'][1]
+    assert (rand['floatcomponentstart'], rand['int32componentstart'], rand['layoutinfo']['int32componentbyteoffsets']) == (1, 0, [0, 4, 8]), rand
     keeps_invariants(p.base)
     # a disabled emitter is left out, its compiled data kept: Old's here, Off's GPU script with it (no shader maps asked)
     proves('niagara-systems.disabled-emitter')
@@ -5412,6 +5414,9 @@ def niagara_refusals():
                                           '  G->Usage = ENiagaraScriptUsage::ParticleGPUComputeScript;\n'
                                           '  G->CachedScriptVM.LastCompileStatus = ENiagaraScriptCompileStatus::NCS_UpToDate;\n'
                                           '  E->GPUComputeScript = G;\n'))
+    proves('niagara-systems.gpu-emitter')
+    refused('NgGpuE', '', 'E: a GPU emitter runs on the GPU shader maps the editor compiles from its scripts\' HLSL',
+            after=system('GpuE', emitter + '  E->SimTarget = ENiagaraSimTarget::GPUComputeSim;\n'))
     proves('niagara-systems.attribute-type')
     refused('NgType', '', 'E: particle attribute Spin is a Rotator, whose register layout AssetGen does not know',
             after=system('Type', emitter + '  UNiagaraScript *U = UE_INSTANCED(UNiagaraScript, E, "U");\n'

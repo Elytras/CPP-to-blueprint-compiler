@@ -150,12 +150,27 @@ def item(pkg, ty, b, o, t=None, sname=None):
 
 INTS = {'UInt16Property': '<H', 'Int16Property': '<h', 'Int8Property': '<b', 'Int64Property': '<q', 'UInt64Property': '<Q',
         'DoubleProperty': '<d'}
-NATIVE = ('GameplayTagContainer', 'NiagaraVariableBase', 'NiagaraVariable', 'NiagaraVariableWithOffset')
+NATIVE = ('GameplayTagContainer', 'NiagaraVariableBase', 'NiagaraVariable', 'NiagaraVariableWithOffset',
+          'NiagaraDataInterfaceGPUParamInfo')
 
 
 def native(pkg, sname, b, o):
     """(value, offset after it) of a struct with a Serialize of its own (bpdecomp.native_form): a tag container's
-    names; a Niagara variable's Name, type definition as tags, then its VarData or Offset."""
+    names; a Niagara variable's Name, type definition as tags, then its VarData or Offset; a GPU script's data interface
+    parameters (its HLSL symbol, class name, then each generated function's name, instance name and specifier pairs)."""
+    fstr = lambda o: item(pkg, 'StrProperty', b, o, None)
+    if sname == 'NiagaraDataInterfaceGPUParamInfo':
+        symbol, o = fstr(o)
+        cls, o = fstr(o)
+        funcs = []
+        n = struct.unpack_from('<i', b, o)[0]; o += 4
+        for _ in range(n):
+            name = V.name_at(pkg, b, o)
+            inst, o = fstr(o + 8)
+            k = struct.unpack_from('<i', b, o)[0]; o += 4
+            funcs.append((name, inst, [(V.name_at(pkg, b, o + 16 * j), V.name_at(pkg, b, o + 16 * j + 8)) for j in range(k)]))
+            o += 16 * k
+        return {'symbol': symbol, 'class': cls, 'functions': funcs}, o
     if sname == 'GameplayTagContainer':
         n = struct.unpack_from('<i', b, o)[0]; o += 4
         return [V.name_at(pkg, b, o + 8 * k) for k in range(n)], o + 8 * n
