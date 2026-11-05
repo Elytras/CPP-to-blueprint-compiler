@@ -4067,7 +4067,8 @@ def type_ue_name():
     """TypeUeName: `FTunRow__UeName = "TunRow"` beside a struct, and the same beside an enum, is the name it cooks
     under: its package, its object and every reference to it - a variable, a container, a replicated variable, an RPC's
     and a function's parameters, an enum default, the registry row. TypeUeNameOther imports both (UE_STRUCT_IN /
-    UE_ENUM_IN) by those names. A type with no marker keeps its C++ name, prefix and all (every other test)."""
+    UE_ENUM_IN) by those names. A type with no marker keeps its C++ name, prefix and all (every other test). The marker
+    beside a UE_ASSET_DEFAULTS asset names it so: P_Tun_Burst cooks as P_Tun-Burst, and the class's default points there."""
     import dumpexp
     base, other = asset('TypeUeName'), asset('TypeUeNameOther')
     here = os.path.dirname(base)
@@ -4085,9 +4086,15 @@ def type_ue_name():
                 'TunMood::Angry'} <= set(names), b
         assert not [n for n in names if 'FTunRow' in n or 'ETunMood' in n], b
     assert run(base, 'Call')[0] == 5
-    refused('TypeUeNameNone', '  int32 X;\n', 'FNothing__UeName: names no struct or enum declared here',
+    proves('names.asset-ue-name')
+    assert os.path.exists(os.path.join(here, 'P_Tun-Burst.uasset')) and not os.path.exists(os.path.join(here, 'P_Tun_Burst.uasset'))
+    assert '/Game/_ElytrasMods/TypeUeName/P_Tun-Burst.P_Tun-Burst' in rows, rows
+    assert {'/Game/_ElytrasMods/TypeUeName/P_Tun-Burst', 'P_Tun-Burst'} <= set(dumpexp.load(base)[3])
+    assert not [n for n in dumpexp.load(base)[3] if 'P_Tun_Burst' in n]
+    keeps_invariants(os.path.join(here, 'P_Tun-Burst'))
+    refused('TypeUeNameNone', '  int32 X;\n', 'FNothing__UeName: names no struct, enum or asset declared here',
             'static constexpr const char *FNothing__UeName = "Nothing";\n')
-    print('ok  TypeUeName: a struct and an enum cook, and are named by this mod and another, under their __UeName names')
+    print('ok  TypeUeName: a struct, an enum and an asset cook, and are named by this mod and another, under their __UeName names')
 
 
 type_ue_name()

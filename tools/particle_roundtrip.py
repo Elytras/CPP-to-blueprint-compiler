@@ -298,17 +298,13 @@ def one(args, path):
         # a GPU emitter's shader maps: AssetGen does not build them yet (REFERENCE.md#niagara-systems.gpu-compute-script)
         if not errs and failed and all('GPU shader maps' in l for l in failed): return 'gap', failed[:1]
         return 'compile', sorted(set(errs))[:6] or failed[:2] or text[-6:]
-    # an asset name C++ cannot spell (P_Tri-Jaw_...) cooks under bpdecomp's respelling: assets have no __UeName marker
-    spelled = re.sub(r'\W', '_', name)
-    renamed = spelled != name and not os.path.exists(os.path.join(out, name + '.uasset'))
-    d = diffs(invariants.Package(src), invariants.Package(os.path.join(out, spelled if renamed else name)))
-    if renamed: notes.append('%s: cooks as %s, a name C++ can spell (no __UeName marker for an asset)' % (path, spelled))
-    hard = [x for x in d if not x.startswith('baked ') and not (renamed and x.endswith('(ParticleSystem)'))]
+    d = diffs(invariants.Package(src), invariants.Package(os.path.join(out, name)))
+    hard = [x for x in d if not x.startswith('baked ')]
     if not args.keep: shutil.rmtree(work, ignore_errors=True)
     # a member bpdecomp said it could not write (a C array) is a known gap, not a difference
     noted = {m.group(1).lower() for n in notes for m in [re.search(r': default (\w+) not rendered', n)] if m}
     unexplained = [x for x in hard if x.split(': ', 1)[0].rsplit('.', 1)[-1] not in noted]
-    verdict = 'differs' if unexplained else 'gap' if hard or renamed else 'ok'
+    verdict = 'differs' if unexplained else 'gap' if hard else 'ok'
     return verdict, hard + [n for n in notes if n.strip()] + [x for x in d if x.startswith('baked ')]
 
 

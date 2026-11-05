@@ -2684,12 +2684,12 @@ private:
        game's carry theirs in UE_CLASS. */
     std::string PackageOf(const FRecord& R) const
     {
-        if (!R.AssetOf.empty()) return PathIn(ModPackage, R.AssetOf);
+        if (!R.AssetOf.empty()) return PathIn(ModPackage, CookedQual(R.AssetOf));
         return R.UePackage.empty() ? PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName) : R.UePackage;
     }
     std::string ClassOf(const FRecord& R) const
     {
-        if (!R.AssetOf.empty()) return LeafOf(R.AssetOf);       // the asset's object, not a class
+        if (!R.AssetOf.empty()) return LeafOf(CookedQual(R.AssetOf));       // the asset's object, not a class
         return !R.UePackage.empty() ? R.UeName : R.bIsStruct ? LeafOf(CookedQual(R.CppName)) : LeafOf(R.CppName) + "_C";
     }
     /* OutDir holds UE_MOD_PACKAGE, and is <Content>/<that path without /Game>, as bpbuild stages a mod. A package under
@@ -3513,9 +3513,9 @@ bool FCompiler::Collect(std::string* Err)
             }
             return;
         }
-        /* `static constexpr const char *FBoolArray__UeName = "BoolArray";` beside a mod struct or enum: the name it is
-           cooked under, which its package path and object name take and every import of it holds - one rebuilt from
-           an editor's, or renamed in C++ after it shipped. */
+        /* `static constexpr const char *FBoolArray__UeName = "BoolArray";` beside a mod struct, enum or UE_ASSET_DEFAULTS
+           asset: the name it is cooked under, which its package path and object name take and every import of it holds -
+           one rebuilt from an editor's, or renamed in C++ after it shipped, or an asset name C++ cannot spell. */
         if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 8 && Name(N).compare(Name(N).size() - 8, 8, "__UeName") == 0)
         {
             FindLiteral(N, TypeUeNames[Ns + Name(N).substr(0, Name(N).size() - 8)]);
@@ -4061,11 +4061,12 @@ bool FCompiler::Collect(std::string* Err)
         if (T.find('<') != std::string::npos || Records.count(StripTypeKeywords(T)) || EnumDecls.count(StripTypeKeywords(T))) Expand[A] = T;
     ExpandAliases(const_cast<Json&>(Doc), Expand);   // with none to expand it still drops a global `::`
     InferFromSources(EnumMarks, EnumUnderlying);
-    /* A `__UeName` marker names a struct or enum the source declares, or it would rename nothing. Another mod's struct
-       (UE_STRUCT_IN, or a folder's) was given the path its C++ name makes; the marker's name replaces that leaf. */
+    /* A `__UeName` marker names a struct, enum or UE_ASSET_DEFAULTS asset the source declares, or it would rename
+       nothing. Another mod's struct (UE_STRUCT_IN, or a folder's) was given the path its C++ name makes; the marker's
+       name replaces that leaf. */
     for (const auto& [Type, Ue] : TypeUeNames)
-        if (Ue.empty() || (!Records.count(Type) && !EnumDecls.count(Type)))
-        { *Err = Type + "__UeName: " + (Ue.empty() ? "give the name it is cooked under" : "names no struct or enum declared here"); return false; }
+        if (Ue.empty() || (!Records.count(Type) && !EnumDecls.count(Type) && !ModAssetBlocks.count(Type)))
+        { *Err = Type + "__UeName: " + (Ue.empty() ? "give the name it is cooked under" : "names no struct, enum or asset declared here"); return false; }
     for (auto& [Key, R] : Records)
     {
         const std::string Natural = PathIn("", R.CppName);
@@ -17077,7 +17078,7 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
     if (auto At = AssetPaths.find(Qual); At != AssetPaths.end())
         Package = At->second;
     else if (ModCurves.count(Qual) || ModAssetBlocks.count(Qual) || std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
-        Package = PathIn(ModPackage, Qual);
+        Package = PathIn(ModPackage, CookedQual(Qual));
     else return false;
 
     const std::string Object = SplitAssetPath(Package);

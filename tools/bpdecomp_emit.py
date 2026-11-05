@@ -218,6 +218,8 @@ class AssetEmit:
         cls = s.run.types.cls(pkg, pkg.exports[a.export]['cls'], a)
         o.header = ''.join([HEADER_BANNER % a.path, '#pragma once\n', ns_open(a.ns),
                             'UE_ASSET_DEFAULTS(%s, %s) {\n' % (cls, a.cpp), ''.join('  %s\n' % l for l in s.lines), '}\n',
+                            # a name C++ cannot spell (P_Tri-Jaw_...) cooks under its own by the marker
+                            'static constexpr const char *%s__UeName = %s;\n' % (a.cpp, B.cstring(a.name)) if a.cpp != a.name else '',
                             ns_close(a.ns)])
         return o
 
