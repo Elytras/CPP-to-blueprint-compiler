@@ -5248,6 +5248,12 @@ def particle_curves():
     assert param == dict(ParameterName='Strength', MaxOutput=40.0), param
     unbaked = tag_values(live, live.find('Unbaked'), live.tags(live.find('Unbaked')))
     assert unbaked == dict(Constant=2.0, bCanBeBaked=False), unbaked
+    # a C array member's elements: a tag each, at its index (FPropertyTag::ArrayIndex), named as the member
+    proves('particle-systems.c-array-element')
+    import struct
+    modes = [(t['index'], live.names[struct.unpack_from('<i', bytes(t['value']))[0]])
+             for t in live.tags(live.find('VParam')) if t['name'] == 'ParamModes']
+    assert modes == [(0, 'DistributionParamMode::DPM_Abs'), (2, 'DistributionParamMode::DPM_Direct')], modes
     keeps_invariants(live.base)
     keeps_invariants(p.base)
     print('ok  ParticleCurves: curve distributions baked as the cook bakes them')

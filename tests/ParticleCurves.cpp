@@ -8,7 +8,8 @@ curve, and a uniform vector curve with extremes. A BeamNoise module leaves Noise
 a ConstantCurve without keys.
 
 P_Live: what the engine cannot bake stays a live object the raw distribution points at, no table: a particle
-parameter (CanBeBaked is false for the class) and a constant whose bCanBeBaked is false.
+parameter (CanBeBaked is false for the class) and a constant whose bCanBeBaked is false. Its vector parameter sets
+two elements of the C array ParamModes, each a tag at its index.
 
 P_Gpu: a GPU sprite emitter given the data the editor builds for it (as bpdecomp writes a vanilla one's), and an
 engine uint32 member set (DetailModeBitmask). The suite decompiles all three and compiles them again.
@@ -99,8 +100,15 @@ UE_ASSET_DEFAULTS(UParticleSystem, P_Live) {
   Unbaked->Constant = 2.0f;
   Unbaked->bCanBeBaked = false;
   Sp->RateScale.Distribution = Unbaked;
+  UParticleModuleVelocity *Vel = UE_INSTANCED(UParticleModuleVelocity, this, "Vel");
+  UDistributionVectorParticleParameter *VParam = UE_INSTANCED(UDistributionVectorParticleParameter, Vel, "VParam");
+  VParam->ParameterName = "Push";
+  VParam->ParamModes[0] = EDistributionParamMode::DPM_Abs;
+  VParam->ParamModes[2] = EDistributionParamMode::DPM_Direct;
+  Vel->StartVelocity.Distribution = VParam;
   L->RequiredModule = Req;
   L->SpawnModule = Sp;
+  L->Modules = {Vel};
   E->LODLevels = {L};
   Emitters = {E};
   LODDistances = {0.0f};
