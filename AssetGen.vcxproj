@@ -76,6 +76,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="BehaviorTree.h" />
     <ClInclude Include="Blueprint.h" />
     <ClInclude Include="Command.h" />
     <ClInclude Include="Cascade.h" />
@@ -89,6 +90,7 @@
     <ClInclude Include="Verify.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="BehaviorTree.cpp" />
     <ClCompile Include="Blueprint.cpp" />
     <ClCompile Include="Command.cpp" />
     <ClCompile Include="Cascade.cpp" />
