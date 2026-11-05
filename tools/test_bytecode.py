@@ -5024,6 +5024,214 @@ def baked(op, values):
     return t
 
 
+LINEAR, AUTO, CONSTANT, USER, BREAK, CLAMPED = range(6)      # EInterpCurveMode
+
+
+def curve_baked(kind, points, looped=False, offset=0.0, lock=0, extremes=False):
+    """What FRawDistribution*::Initialize leaves for a curve distribution, written from the engine source independently
+    of Cascade.cpp, as the raw distribution's tags (as tag_values reads them). kind is 'float' (ConstantCurve),
+    'float2' (FloatUniformCurve: min, max), 'vector' (VectorConstantCurve, lock its LockedAxes) or 'two'
+    (VectorUniformCurve, extremes its bUseExtremes); points are (InVal, OutVal components, mode). The editor's
+    AutoSetTangents (InterpCurve.h 618-683, tension 0, stationary ends) sets the tangents first, as it does on every
+    edit. Then BuildLookupTable samples the curve 128 times over its keys' span (Distributions.cpp 109-160), and
+    OptimizeLookupTable keeps the fewest samples, a power of two, within 0.05 of those (613-679). Worked in double, so
+    compare it with close(), not ==."""
+    n, last = len(points), len(points) - 1
+    pts = [dict(t=float(t), v=[float(x) for x in v], m=m, at=[0.0] * len(v), lt=[0.0] * len(v)) for t, v, m in points]
+    width = 1 if kind == 'float' else 2 if kind == 'float2' else 3 if kind == 'vector' else 6
+
+    def is_curve(pt): return pt['m'] in (AUTO, USER, BREAK, CLAMPED)
+
+    def clamp_tangent(pv, pt, cv, ct, nv, nt):     # ClampFloatTangent, UnrealMath.cpp 2552-2620
+        pn, pc, cn = max(1e-4, nt - pt), max(1e-4, ct - pt), max(1e-4, nt - ct)
+        dn, dc, dcn = nv - pv, cv - pv, nv - cv
+        if (dc >= 0 and dcn <= 0) or (dc <= 0 and dcn >= 0): return 0.0
+        tan = dn / pn
+        alpha = dc / dn
+        lower = lambda a: dn / pn + (dc / pc - dn / pn) * a
+        upper = lambda a: dn / pn + (dcn / cn - dn / pn) * a
+        pick = min if dn > 0 else max
+        if alpha < 0.333: tan = pick(tan, lower(1 - alpha / 0.333))
+        if alpha > 1 - 0.333: tan = pick(tan, upper((alpha - (1 - 0.333)) / 0.333))
+        return tan
+
+    for i, pt in enumerate(pts):
+        prev = pts[(last if looped else 0) if i == 0 else i - 1]
+        nxt = pts[(0 if looped else last) if i == last else i + 1]
+        if pt['m'] in (AUTO, CLAMPED):
+            if i == 0 or (i == last and not looped):
+                tan = [0.0] * width
+            elif is_curve(prev):
+                pt_ = pt['t'] - offset if looped and i == 0 else prev['t']
+                nt = pt['t'] + offset if looped and i == last else nxt['t']
+                if pt['m'] == CLAMPED:
+                    tan = [clamp_tangent(prev['v'][k], pt_, pt['v'][k], pt['t'], nxt['v'][k], nt) for k in range(width)]
+                else:
+                    tan = [((pt['v'][k] - prev['v'][k]) + (nxt['v'][k] - pt['v'][k])) / max(1e-4, nt - pt_) for k in range(width)]
+            else:
+                pt['at'], pt['lt'] = list(prev['at']), list(prev['lt'])
+                continue
+            pt['at'], pt['lt'] = list(tan), list(tan)
+        elif pt['m'] == LINEAR:
+            pt['at'] = pt['lt'] = [nxt['v'][k] - pt['v'][k] for k in range(width)]
+        elif pt['m'] == CONSTANT:
+            pt['at'] = pt['lt'] = [0.0] * width
+
+    def cubic(p0, t0, p1, t1, a):
+        a2, a3 = a * a, a * a * a
+        return (2 * a3 - 3 * a2 + 1) * p0 + (a3 - 2 * a2 + a) * t0 + (a3 - a2) * t1 + (-2 * a3 + 3 * a2) * p1
+
+    def evaluate(t):                                # FInterpCurve::Eval, InterpCurve.h 289-352
+        if not n: return [0.0] * width
+        if t < pts[0]['t']: return list(pts[0]['v'])
+        i = max(k for k in range(n) if pts[k]['t'] <= t)
+        if i == last:
+            if not looped: return list(pts[last]['v'])
+            if t >= pts[last]['t'] + offset: return list(pts[0]['v'])
+        a, b = pts[i], pts[0 if (looped and i == last) else i + 1]
+        diff = offset if (looped and i == last) else b['t'] - a['t']
+        if diff > 0 and a['m'] != CONSTANT:
+            al = (t - a['t']) / diff
+            if a['m'] == LINEAR: return [a['v'][k] + (b['v'][k] - a['v'][k]) * al for k in range(width)]
+            return [cubic(a['v'][k], a['lt'][k] * diff, b['v'][k], b['at'][k] * diff, al) for k in range(width)]
+        return list(a['v'])
+
+    def bounds():                                   # FInterpCurve::CalcBounds, InterpCurve.h 686-712; FindBounds
+        if not n: return [0.0] * width, [0.0] * width
+        lo, hi = list(pts[0]['v']), list(pts[0]['v'])
+        for i in range(n if looped and n > 1 else n - 1):
+            a, b = pts[i], pts[(i + 1) % n]
+            for k in range(width):
+                s0, e0 = a['v'][k], b['v'][k]
+                mn, mx = min(s0, e0), max(s0, e0)
+                if is_curve(a):
+                    d = b['t'] - a['t']
+                    st, et = a['lt'][k] * d, b['at'][k] * d
+                    qa = 6 * s0 + 3 * st + 3 * et - 6 * e0
+                    qb = -6 * s0 - 4 * st - 2 * et + 6 * e0
+                    disc = qb * qb - 4 * qa * st
+                    if disc > 0 and abs(qa) > 1e-8:
+                        for x in ((-qb + disc ** 0.5) / (2 * qa), (-qb - disc ** 0.5) / (2 * qa)):
+                            if a['t'] < a['t'] + x * d < b['t']:
+                                y = cubic(s0, st, e0, et, x)
+                                mn, mx = min(mn, y), max(mx, y)
+                lo[k], hi[k] = min(lo[k], mn), max(hi[k], mx)
+        return lo, hi
+
+    def locked(v):                                  # EDVLF_XY, XZ, YZ, XYZ
+        x, y, z = v
+        return [[x, y, z], [x, x, z], [x, y, x], [x, y, y], [x, x, x]][lock]
+
+    if kind == 'float2':
+        one = n == 1 and pts[0]['v'][0] == pts[0]['v'][1]
+        op, per = (1 if one else 2), 1
+    elif kind == 'two':
+        one = n == 1 and pts[0]['v'][:3] == pts[0]['v'][3:]
+        op, per = (1 if one else 3 if extremes else 2), 3
+    else:
+        op, per = 1, width
+
+    def entry(t):                                   # InitializeRawEntry: a vector constant curve's value is locked
+        v = evaluate(t)
+        return locked(v) if kind == 'vector' else v
+
+    stride = per * (1 if op == 1 else 2)
+    lo_in, hi_in = (min(q['t'] for q in pts), max(q['t'] for q in pts)) if n else (0.0, 0.0)
+    step = (hi_in - lo_in) / 127
+
+    def table(count, sample):                       # sample(t) -> the stride's values
+        sc = (hi_in - lo_in) / (count - 1) if count > 1 else 0.0
+        return dict(count=count, scale=(1 / sc if sc > 0 else 0.0), bias=lo_in,
+                    values=[x for i in range(count) for x in sample(lo_in + i * sc)])
+
+    def lookup(tb, t):                              # FDistributionLookupTable::GetEntry, lerped
+        x = max(0.0, (t - tb['bias']) * tb['scale'])
+        i, a = int(x), x - int(x)
+        e1, e2 = min(i, tb['count'] - 1) * stride, min(i + 1, tb['count'] - 1) * stride
+        return [tb['values'][e1 + k] + (tb['values'][e2 + k] - tb['values'][e1 + k]) * a for k in range(stride)]
+
+    full = dict(count=128, scale=(1 / step if step > 0 else 0.0), bias=lo_in,
+                values=[x for i in range(128) for x in entry(lo_in + i * step)[:stride]])
+    best = full
+    count = 1
+    while count < 128:
+        tb = table(count, lambda t: lookup(full, t))
+        err, t = 0.0, lo_in
+        for _ in range(128):
+            a, b = lookup(full, t), lookup(tb, t)
+            for sub in range(stride // per):
+                d = sum((a[sub * per + k] - b[sub * per + k]) ** 2 for k in range(per)) ** 0.5
+                err = max(err, d)
+            t += step
+        if err < 0.05:
+            best = tb
+            break
+        count <<= 1
+
+    tags = dict(TimeScale=best['scale'], TimeBias=best['bias'], Values=best['values'], Op=op,
+                EntryCount=best['count'], EntryStride=stride, SubEntryStride=0 if op == 1 else per)
+    out = {}
+    lo, hi = bounds()
+    if kind == 'float':
+        out.update(MinValue=lo[0], MaxValue=hi[0])
+    elif kind == 'float2':
+        out.update(MinValue=min(lo), MaxValue=max(hi))
+    elif kind == 'vector':
+        lo, hi = locked(lo), locked(hi)
+        out.update(MinValue=min(lo), MaxValue=max(hi), MinValueVec=tuple(lo), MaxValueVec=tuple(hi))
+    else:
+        out.update(MinValue=min(lo + hi), MaxValue=max(lo + hi),
+                   MinValueVec=tuple(min(lo[k], hi[k]) for k in range(3)), MaxValueVec=tuple(max(lo[3 + k], hi[3 + k]) for k in range(3)))
+    out = {k: v for k, v in out.items() if v != 0 and v != (0.0, 0.0, 0.0)}
+    out['Distribution'] = None
+    out['Table'] = {k: v for k, v in tags.items() if k == 'Values' or v != 0}
+    return out
+
+
+def close(a, b, tol=1e-3):
+    """a and b equal, their floats within tol, through dicts, lists and tuples: a cooked float32 against a double."""
+    if isinstance(a, dict): return isinstance(b, dict) and a.keys() == b.keys() and all(close(a[k], b[k], tol) for k in a)
+    if isinstance(a, (list, tuple)): return type(a) == type(b) and len(a) == len(b) and all(close(x, y, tol) for x, y in zip(a, b))
+    if isinstance(a, float) or isinstance(b, float): return isinstance(b, (int, float)) and abs(a - b) <= tol
+    return a == b
+
+
+def particle_curves():
+    """ParticleCurves: each curve distribution class baked into the table the cook leaves, against curve_baked: a ramp
+    (two entries), a lone point away from 0 (TimeBias), an empty curve (zero), a uniform curve, auto tangents the
+    source left 0, clamped ones, steps (all 128 samples kept), a looped curve, extremes."""
+    import invariants
+    p = invariants.Package(os.path.join(os.path.dirname(asset('ParticleCurves')), 'P_Curves'))
+    proves('particle-systems.spawn-rate-distribution-ramp')
+    assert not [e['name'] for i, e in enumerate(p.exports) if p.class_of(i + 1).startswith('Distribution')], p.exports
+    got = {m: v for name in ('Sp', 'Life', 'Sz', 'Vel', 'Col') for m, v in particle_tables(p, name).items()}
+    want = dict(
+        Rate=curve_baked('float', [(0, [0], LINEAR), (1, [10], LINEAR)]),
+        RateScale=curve_baked('float', [(0.5, [3], LINEAR)]),
+        BurstScale=curve_baked('float', []),
+        LifeTime=curve_baked('float2', [(0, [1, 2], LINEAR), (2, [3, 6], LINEAR)]),
+        StartSize=curve_baked('vector', [(0, [0, 0, 0], AUTO), (0.5, [10, 20, 10], AUTO), (1, [0, 40, 30], AUTO)], lock=1),
+        StartVelocity=curve_baked('two', [(0.5, [1, 2, 3, 4, 5, 6], LINEAR)], extremes=True),
+        StartVelocityRadial=curve_baked('float', [(0, [0], CLAMPED), (1, [1], CLAMPED), (2, [4], CLAMPED), (3, [6], CLAMPED)]),
+        StartColor=curve_baked('vector', [(0, [1, 0, 0], CONSTANT), (1, [0, 1, 0], CONSTANT), (2, [0, 0, 1], CONSTANT)]),
+        StartAlpha=curve_baked('float', [(0, [0], AUTO), (0.5, [1], AUTO), (1, [0.5], AUTO)], looped=True, offset=1.0))
+    # Hand checks on the oracle: the ramp is two entries a second apart; the lone point a TimeBias, no TimeScale; the
+    # steps keep every sample; the uniform curve's entries hold min then max.
+    assert close(want['Rate']['Table'], dict(TimeScale=1.0, Values=[0.0, 10.0], Op=1, EntryCount=2, EntryStride=1)), want['Rate']
+    assert close(want['RateScale']['Table'], dict(TimeBias=0.5, Values=[3.0], Op=1, EntryCount=1, EntryStride=1)), want['RateScale']
+    assert want['StartColor']['Table']['EntryCount'] == 128, want['StartColor']
+    assert close(want['LifeTime']['Table'], dict(TimeScale=0.5, Values=[1.0, 2.0, 3.0, 6.0], Op=2, EntryCount=2,
+                                                 EntryStride=2, SubEntryStride=1)), want['LifeTime']
+    for m in want:
+        assert close(got.get(m), want[m]), (m, got.get(m), want[m])
+    # A BeamNoise module's NoiseScale, left unset, starts as the editor starts it: a ConstantCurve without keys, zero.
+    proves('particle-systems.spawn-burstscale')
+    assert close(particle_tables(p, 'Noise')['NoiseScale'], curve_baked('float', [])), particle_tables(p, 'Noise')
+    assert 'NoiseScale' not in LOGS['ParticleCurves'], LOGS['ParticleCurves']
+    keeps_invariants(p.base)
+    print('ok  ParticleCurves: curve distributions baked as the cook bakes them')
+
+
 def particle_bake():
     """ParticleBake: each raw distribution pointing at a Constant or Uniform object is baked as the cook bakes it,
     MinValue / MaxValue (and the vector's MinValueVec / MaxValueVec) filled, Distribution null, the object left out of
@@ -5092,8 +5300,14 @@ def particle_refusals():
     refused('PrSettings', '', 'LODSettings has 2 entries and LODDistances 1',
             after=system('Settings', '  LODSettings = {FParticleSystemLOD(), FParticleSystemLOD()};\n'))
     proves('particle-systems.spawn-rate-distribution-c')
-    refused('PrCurve', '', 'is a DistributionFloatConstantCurve, which AssetGen does not bake yet',
-            after=system('Curve', '  UDistributionFloatConstantCurve *C = UE_INSTANCED(UDistributionFloatConstantCurve, Sp, "C");\n'
+    refused('PrParam', '', 'is a DistributionFloatParticleParameter, which AssetGen does not bake yet',
+            after=system('Param', '  UDistributionFloatParticleParameter *C = UE_INSTANCED(UDistributionFloatParticleParameter, Sp, "C");\n'
+                                  '  Sp->Rate.Distribution = C;\n'))
+    proves('particle-systems.c-constantcurve-points-1-0f')
+    refused('PrOrder', '', "Rate is C, and its ConstantCurve's point 1 has a smaller InVal than point 0",
+            after=system('Order', '  UDistributionFloatConstantCurve *C = UE_INSTANCED(UDistributionFloatConstantCurve, Sp, "C");\n'
+                                  '  C->ConstantCurve.Points = {{1.0f, 1.0f, 0.0f, 0.0f, EInterpCurveMode::CIM_Linear},\n'
+                                  '                             {0.0f, 0.0f, 0.0f, 0.0f, EInterpCurveMode::CIM_Linear}};\n'
                                   '  Sp->Rate.Distribution = C;\n'))
     print('ok  Particle system refusals')
 
@@ -13005,6 +13219,7 @@ asset_defaults_refusals()
 particle_bake()
 particle_lod_validity()
 particle_starts()
+particle_curves()
 particle_refusals()
 
 

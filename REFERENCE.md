@@ -4050,12 +4050,14 @@ so the asset loads as a cooked one. Niagara systems are not compiled yet: their 
 | You write | What it does | Status |
 |---|---|---|
 | <a id="particle-systems.life-lifetime-distribution-span"></a>`Life->LifeTime.Distribution = Span;` with `Span` a `UDistributionFloatUniform` (`Min`, `Max`), or a `UDistributionFloatConstant`, `UDistributionVectorConstant` or `UDistributionVectorUniform` | The raw distribution is baked as the cook bakes it: its lookup table filled, `MinValue` / `MaxValue` set, `Distribution` null, and the distribution object left out of the package. | Yes |
+| <a id="particle-systems.spawn-rate-distribution-ramp"></a>`Spawn->Rate.Distribution = Ramp;` with `Ramp` a `UDistributionFloatConstantCurve` (`Ramp->ConstantCurve.Points = {{0.0f, 0.0f, 0.0f, 0.0f, EInterpCurveMode::CIM_Linear}, {1.0f, 10.0f, 0.0f, 0.0f, EInterpCurveMode::CIM_Linear}};`), or a `UDistributionFloatUniformCurve`, `UDistributionVectorConstantCurve` or `UDistributionVectorUniformCurve` | Baked as the cook bakes it: the curve sampled 128 times over its points' `InVal` span, kept at the fewest samples (a power of two) within 0.05 of those, `MinValue` / `MaxValue` its bounds. Auto keys (`CIM_CurveAuto`, `CIM_CurveAutoClamped`) get the tangents the editor sets on every edit, whatever the source gives; `CIM_CurveUser` and `CIM_CurveBreak` keep theirs. A curve without points reads 0. | Yes |
 | <a id="particle-systems.spawn-rate-distribution-three"></a>`Spawn->Rate.Distribution = Three;` and `Spawn->RateScale.Distribution = Three;` | One distribution object several raw distributions point at is baked into each of them. | Yes |
 | <a id="particle-systems.spawn-burstscale"></a>A module's distribution left unset, as `Spawn->BurstScale` | Gets the value Cascade's editor starts a new module with, baked: `InitializeDefaults`, then `SetToSensibleDefaults` (a Light's colour scale (1, 1, 1), brightness 32, radius scale 15, exponent 16; a Lifetime of 1). The editor sets them when it adds the module; neither runs for a loaded object, so left unset it reads as 0 in game (an unset `BurstScale` turns every burst off). Covered: Required, Spawn, Lifetime, Size, Color, Light, Velocity, and the beam modules. | Yes |
 | <a id="particle-systems.uparticlemoduleacceleration"></a>An unset distribution of a module outside that list, as `UParticleModuleAcceleration`'s `Acceleration` | Warns: "Acceleration is left unset and reads as 0 in game (Cascade's editor starts it at a value of its own); set it". | Warns |
 | <a id="particle-systems.a-lodlevels-a0-a1"></a>`A->LODLevels = {A0, A1};` and `LODDistances = {0.0f, 1500.0f};` | Each module's `LODValidity` is set to the LOD levels that name it, as bits, and each LOD level's `Level` to its place in `LODLevels`, as the editor keeps them. | Yes |
 | <a id="particle-systems.loddistances"></a>An emitter with fewer or more LOD levels than `LODDistances` has entries, a `LODSettings` of another count, a LOD level whose `Level` is not its place, or one without a `RequiredModule` or `SpawnModule` | Refused, saying which: "has 1 LOD levels and the system's LODDistances 2", "its Level is 1", "has no SpawnModule". The engine asserts on these or patches them at load. | Refused |
-| <a id="particle-systems.spawn-rate-distribution-c"></a>`Spawn->Rate.Distribution = C;` with `C` a `UDistributionFloatConstantCurve`, or another distribution class | Refused: "which AssetGen does not bake yet; use a DistributionFloatConstant / DistributionFloatUniform (Vector for a vector one)". | Not yet |
+| <a id="particle-systems.c-constantcurve-points-1-0f"></a>`C->ConstantCurve.Points = {{1.0f, ...}, {0.0f, ...}};`, a curve's points out of `InVal` order | Refused: "its ConstantCurve's point 1 has a smaller InVal than point 0; give the points in InVal order". The engine's lookup assumes them sorted; the editor keeps them so. | Refused |
+| <a id="particle-systems.spawn-rate-distribution-c"></a>`Spawn->Rate.Distribution = C;` with `C` a `UDistributionFloatParticleParameter` or `UDistributionVectorParticleParameter` | Refused: "which AssetGen does not bake yet; use a Constant, Uniform, ConstantCurve or UniformCurve distribution". | Not yet |
 
 ```cpp
 UE_ASSET_DEFAULTS(UParticleSystem, P_Sparks) {
@@ -4082,7 +4084,7 @@ Notes:
 
 - The modules are made under the system, as the editor makes them, and a LOD level names them; one module may serve
   several LOD levels.
-- Curve distributions, and the per-particle event modules, are the next slice ([TODO.md](../TODO.md)).
+- Particle parameter distributions, and the per-particle event modules, are not built yet ([TODO.md](../TODO.md)).
 
 ## Game assets
 

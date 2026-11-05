@@ -3,6 +3,7 @@
 #include "Package.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -121,16 +122,260 @@ FPropertyDef NullObjectTag(const std::string& Name)
     return P;
 }
 
+// ---- curves: FInterpCurve (Core/Public/Math/InterpCurve.h, InterpCurvePoint.h, Private/Math/UnrealMath.cpp), with
+// up to six components a key (a FTwoVectors), each worked in float as the engine works it
+
+/* EInterpCurveMode (InterpCurvePoint.h 18-30). */
+enum : uint8 { CIM_Linear = 0, CIM_CurveAuto = 1, CIM_Constant = 2, CIM_CurveUser = 3, CIM_CurveBreak = 4, CIM_CurveAutoClamped = 5 };
+
+using FVals = std::array<float, 6>;
+struct FKey { float In = 0; FVals Out{}, Arrive{}, Leave{}; uint8 Mode = CIM_Linear; };
+struct FCurve
+{
+    int32 Width = 1;
+    std::vector<FKey> Keys;
+    bool bLooped = false;
+    float LoopOffset = 0;
+};
+
+bool IsCurveKey(const FKey& K) { return K.Mode == CIM_CurveAuto || K.Mode == CIM_CurveAutoClamped || K.Mode == CIM_CurveUser || K.Mode == CIM_CurveBreak; }
+
+uint8 ModeOf(const FPropertyDef* T)
+{
+    if (!T || T->Default.K == FDefaultValue::None) return CIM_Linear;
+    if (T->Default.K != FDefaultValue::Str) return uint8(T->Default.I);
+    const std::string S = T->Default.S.substr(T->Default.S.rfind(':') == std::string::npos ? 0 : T->Default.S.rfind(':') + 1);
+    static const char* const Names[] = { "CIM_Linear", "CIM_CurveAuto", "CIM_Constant", "CIM_CurveUser", "CIM_CurveBreak", "CIM_CurveAutoClamped" };
+    for (uint8 I = 0; I < 6; ++I) if (S == Names[I]) return I;
+    return CIM_Linear;
+}
+
+/* A key's value member as Width floats: a float, a Vector2D, a Vector, or a TwoVectors' v1 then v2. */
+FVals ValsOf(FPropertyDef* T, int32 Width)
+{
+    FVals V{};
+    if (Width == 1) { V[0] = FloatOf(T); return V; }
+    if (Width == 2)
+    {
+        if (std::vector<FPropertyDef>* M = T ? MembersOf(*T) : nullptr) { V[0] = FloatOf(Find(*M, "X")); V[1] = FloatOf(Find(*M, "Y")); }
+        return V;
+    }
+    if (Width == 3) { const FVec A = VecOf(T); return { A.X, A.Y, A.Z }; }
+    if (std::vector<FPropertyDef>* M = T ? MembersOf(*T) : nullptr)
+    {
+        const FVec A = VecOf(Find(*M, "v1")), B = VecOf(Find(*M, "v2"));
+        V = { A.X, A.Y, A.Z, B.X, B.Y, B.Z };
+    }
+    return V;
+}
+
+/* The ConstantCurve member of a curve distribution. False with Why when its keys are not in InVal order: the
+   engine's binary search (GetPointIndexForInputValue) assumes they are, and the editor keeps them so. */
+bool CurveOf(std::vector<FPropertyDef>& Tags, int32 Width, FCurve& C, std::string& Why)
+{
+    C.Width = Width;
+    FPropertyDef* Curve = Find(Tags, "ConstantCurve");
+    std::vector<FPropertyDef>* M = Curve ? MembersOf(*Curve) : nullptr;
+    if (!M) return true;
+    C.bLooped = BoolOf(Find(*M, "bIsLooped"));
+    C.LoopOffset = FloatOf(Find(*M, "LoopKeyOffset"));
+    if (FPropertyDef* Points = Find(*M, "Points"))
+        for (FDefaultValue& Item : Points->Default.Items)
+        {
+            if (!Item.Members) continue;
+            FKey K;
+            K.In = FloatOf(Find(*Item.Members, "InVal"));
+            K.Out = ValsOf(Find(*Item.Members, "OutVal"), Width);
+            K.Arrive = ValsOf(Find(*Item.Members, "ArriveTangent"), Width);
+            K.Leave = ValsOf(Find(*Item.Members, "LeaveTangent"), Width);
+            K.Mode = ModeOf(Find(*Item.Members, "InterpMode"));
+            if (!C.Keys.empty() && K.In < C.Keys.back().In)
+            {
+                Why = "its ConstantCurve's point " + std::to_string(C.Keys.size()) + " has a smaller InVal than point "
+                    + std::to_string(C.Keys.size() - 1) + "; give the points in InVal order";
+                return false;
+            }
+            C.Keys.push_back(K);
+        }
+    return true;
+}
+
+/* ClampFloatTangent (UnrealMath.cpp 2552-2620). */
+float ClampTangent(float PrevVal, float PrevTime, float CurVal, float CurTime, float NextVal, float NextTime)
+{
+    const float PrevToNextTime = std::max(1.e-4f, NextTime - PrevTime);
+    const float PrevToCurTime = std::max(1.e-4f, CurTime - PrevTime);
+    const float CurToNextTime = std::max(1.e-4f, NextTime - CurTime);
+    const float PrevToNext = NextVal - PrevVal, PrevToCur = CurVal - PrevVal, CurToNext = NextVal - CurVal;
+    if ((PrevToCur >= 0.0f && CurToNext <= 0.0f) || (PrevToCur <= 0.0f && CurToNext >= 0.0f)) return 0.0f;
+    const float Threshold = 0.333f;
+    const float CurToNextTan = CurToNext / CurToNextTime, PrevToCurTan = PrevToCur / PrevToCurTime, PrevToNextTan = PrevToNext / PrevToNextTime;
+    float Clamped = PrevToNextTan;
+    const float Alpha = PrevToCur / PrevToNext;
+    auto Lerp = [](float A, float B, float T) { return A + T * (B - A); };
+    if (Alpha < Threshold)
+    {
+        const float Lower = Lerp(PrevToNextTan, PrevToCurTan, 1.0f - Alpha / Threshold);
+        Clamped = PrevToNext > 0.0f ? std::min(Clamped, Lower) : std::max(Clamped, Lower);
+    }
+    if (Alpha > 1.0f - Threshold)
+    {
+        const float Upper = Lerp(PrevToNextTan, CurToNextTan, (Alpha - (1.0f - Threshold)) / Threshold);
+        Clamped = PrevToNext > 0.0f ? std::min(Clamped, Upper) : std::max(Clamped, Upper);
+    }
+    return Clamped;
+}
+
+/* FInterpCurve::AutoSetTangents (InterpCurve.h 618-683), tension 0, stationary end points: what the editor stores
+   after every edit of a curve, so a mod's auto keys get the tangents the editor would have given them. */
+void AutoSetTangents(FCurve& C)
+{
+    const int32 N = int32(C.Keys.size()), Last = N - 1;
+    for (int32 I = 0; I < N; ++I)
+    {
+        FKey& This = C.Keys[size_t(I)];
+        const FKey& Prev = C.Keys[size_t(I == 0 ? (C.bLooped ? Last : 0) : I - 1)];
+        const FKey& Next = C.Keys[size_t(I == Last ? (C.bLooped ? 0 : Last) : I + 1)];
+        if (This.Mode == CIM_CurveAuto || This.Mode == CIM_CurveAutoClamped)
+        {
+            if (I == 0 || (I == Last && !C.bLooped))
+                This.Arrive = This.Leave = FVals{};
+            else if (IsCurveKey(Prev))
+            {
+                const float PrevTime = (C.bLooped && I == 0) ? This.In - C.LoopOffset : Prev.In;
+                const float NextTime = (C.bLooped && I == Last) ? This.In + C.LoopOffset : Next.In;
+                FVals T{};
+                for (int32 K = 0; K < C.Width; ++K)
+                    T[size_t(K)] = This.Mode == CIM_CurveAutoClamped
+                        ? ClampTangent(Prev.Out[size_t(K)], PrevTime, This.Out[size_t(K)], This.In, Next.Out[size_t(K)], NextTime)
+                        : ((This.Out[size_t(K)] - Prev.Out[size_t(K)]) + (Next.Out[size_t(K)] - This.Out[size_t(K)]))
+                              / std::max(1.e-4f, NextTime - PrevTime);
+                This.Arrive = This.Leave = T;
+            }
+            else
+            {
+                This.Arrive = Prev.Arrive;
+                This.Leave = Prev.Leave;
+            }
+        }
+        else if (This.Mode == CIM_Linear)
+        {
+            for (int32 K = 0; K < C.Width; ++K) This.Arrive[size_t(K)] = Next.Out[size_t(K)] - This.Out[size_t(K)];
+            This.Leave = This.Arrive;
+        }
+        else if (This.Mode == CIM_Constant)
+            This.Arrive = This.Leave = FVals{};
+    }
+}
+
+float Cubic(float P0, float T0, float P1, float T1, float A)
+{
+    const float A2 = A * A, A3 = A2 * A;
+    return (((2 * A3) - (3 * A2) + 1) * P0) + ((A3 - (2 * A2) + A) * T0) + ((A3 - A2) * T1) + (((-2 * A3) + (3 * A2)) * P1);
+}
+
+/* FInterpCurve::Eval (InterpCurve.h 289-352); zero for a curve without keys. */
+FVals Eval(const FCurve& C, float In)
+{
+    const int32 N = int32(C.Keys.size()), Last = N - 1;
+    if (N == 0) return FVals{};
+    if (In < C.Keys[0].In) return C.Keys[0].Out;
+    int32 Index = Last;
+    if (In < C.Keys[size_t(Last)].In)
+    {
+        int32 Min = 0, Max = N;
+        while (Max - Min > 1)
+        {
+            const int32 Mid = (Min + Max) / 2;
+            if (C.Keys[size_t(Mid)].In <= In) Min = Mid; else Max = Mid;
+        }
+        Index = Min;
+    }
+    if (Index == Last)
+    {
+        if (!C.bLooped) return C.Keys[size_t(Last)].Out;
+        if (In >= C.Keys[size_t(Last)].In + C.LoopOffset) return C.Keys[0].Out;
+    }
+    const bool bLoopSegment = C.bLooped && Index == Last;
+    const FKey& Prev = C.Keys[size_t(Index)];
+    const FKey& Next = C.Keys[bLoopSegment ? 0 : size_t(Index + 1)];
+    const float Diff = bLoopSegment ? C.LoopOffset : Next.In - Prev.In;
+    if (!(Diff > 0.0f && Prev.Mode != CIM_Constant)) return Prev.Out;
+    const float Alpha = (In - Prev.In) / Diff;
+    FVals V{};
+    for (int32 K = 0; K < C.Width; ++K)
+    {
+        const size_t S = size_t(K);
+        V[S] = Prev.Mode == CIM_Linear ? Prev.Out[S] + Alpha * (Next.Out[S] - Prev.Out[S])
+                                       : Cubic(Prev.Out[S], Prev.Leave[S] * Diff, Next.Out[S], Next.Arrive[S] * Diff, Alpha);
+    }
+    return V;
+}
+
+/* FInterpCurve::CalcBounds (InterpCurve.h 686-712) through FindBounds (UnrealMath.cpp 1331-1375), per component. */
+void CalcBounds(const FCurve& C, FVals& Lo, FVals& Hi)
+{
+    const int32 N = int32(C.Keys.size());
+    Lo = Hi = N ? C.Keys[0].Out : FVals{};
+    if (N < 2) return;
+    for (int32 I = 0; I < (C.bLooped ? N : N - 1); ++I)
+    {
+        const FKey& A = C.Keys[size_t(I)];
+        const FKey& B = C.Keys[size_t(I == N - 1 ? 0 : I + 1)];
+        for (int32 K = 0; K < C.Width; ++K)
+        {
+            const size_t S = size_t(K);
+            const float Start = A.Out[S], End = B.Out[S];
+            float Min = std::min(Start, End), Max = std::max(Start, End);
+            if (IsCurveKey(A))
+            {
+                const float Diff = B.In - A.In;
+                const float StartTan = A.Leave[S] * Diff, EndTan = B.Arrive[S] * Diff;
+                const float Qa = 6.f * Start + 3.f * StartTan + 3.f * EndTan - 6.f * End;
+                const float Qb = -6.f * Start - 4.f * StartTan - 2.f * EndTan + 6.f * End;
+                const float Disc = (Qb * Qb) - (4.f * Qa * StartTan);
+                if (Disc > 0.f && std::fabs(Qa) > 1.e-8f)
+                {
+                    const float Root = std::sqrt(Disc);
+                    for (const float X : { (-Qb + Root) / (2.f * Qa), (-Qb - Root) / (2.f * Qa) })
+                    {
+                        const float T = A.In + X * (B.In - A.In);
+                        if (T > A.In && T < B.In)
+                        {
+                            const float Y = Cubic(Start, StartTan, End, EndTan, X);
+                            Min = std::min(Min, Y);
+                            Max = std::max(Max, Y);
+                        }
+                    }
+                }
+            }
+            Lo[S] = std::min(Lo[S], Min);
+            Hi[S] = std::max(Hi[S], Max);
+        }
+    }
+}
+
+void InRange(const FCurve& C, float& MinIn, float& MaxIn)
+{
+    MinIn = MaxIn = 0.0f;
+    if (C.Keys.empty()) return;
+    MinIn = 3.4e+38f;      // BIG_NUMBER
+    MaxIn = -3.4e+38f;
+    for (const FKey& K : C.Keys) { MinIn = std::min(MinIn, K.In); MaxIn = std::max(MaxIn, K.In); }
+}
+
 // ---- the distributions: what FRawDistribution::Initialize reads off each class (Distributions.cpp)
 
-/* What baking one distribution object gives: the table's one entry (InitializeRawEntry, cut to the stride), its
-   operation and lock flag, the out range (GetOutRange) and a vector's GetRange. */
+/* What one distribution object gives the bake: its operation, values per entry and lock flag, its input range, its
+   InitializeRawEntry, its GetOutRange and a vector's GetRange. */
 struct FBaked
 {
     bool bVector = false;
     uint8 Op = RDO_None;
     uint8 Lock = 0;
-    std::vector<float> Entry;
+    int32 PerEntry = 1;
+    float MinIn = 0, MaxIn = 0;
+    std::function<FVals(float)> Entry;
     float MinOut = 0, MaxOut = 0;
     FVec MinVec, MaxVec;
 };
@@ -150,15 +395,17 @@ FVec Locked(const FVec& V, uint8 Lock)
 
 float MinOf(const FVec& V) { return std::min(V.X, std::min(V.Y, V.Z)); }
 float MaxOf(const FVec& V) { return std::max(V.X, std::max(V.Y, V.Z)); }
+FVec VecAt(const FVals& V, size_t At) { return { V[At], V[At + 1], V[At + 2] }; }
 
-/* The four classes slice 1 bakes, from their members (unset ones their class defaults: zero, MirrorFlags Different,
-   which UeApi cannot set). False for a class not baked yet. */
-bool Bake(const std::string& Class, std::vector<FPropertyDef>& Tags, FBaked& Out)
+/* The classes AssetGen bakes, from their members (unset ones their class defaults: zero, no keys, MirrorFlags
+   Different and LockedAxes None, which UeApi cannot set). False for a class not baked yet; false with Why for one
+   the engine would misread. */
+bool Bake(const std::string& Class, std::vector<FPropertyDef>& Tags, FBaked& Out, std::string& Why)
 {
     if (Class == "DistributionFloatConstant")                   // 1731-1735, 1771-1781; GetOperation RDO_None
     {
         const float C = FloatOf(Find(Tags, "Constant"));
-        Out.Entry = { C };
+        Out.Entry = [C](float) { return FVals{ C }; };
         Out.MinOut = Out.MaxOut = C;
         return true;
     }
@@ -166,7 +413,7 @@ bool Bake(const std::string& Class, std::vector<FPropertyDef>& Tags, FBaked& Out
     {
         const float Min = FloatOf(Find(Tags, "Min")), Max = FloatOf(Find(Tags, "Max"));
         Out.Op = Min == Max ? RDO_None : RDO_Random;
-        Out.Entry = { Min, Max };
+        Out.Entry = [Min, Max](float) { return FVals{ Min, Max }; };
         Out.MinOut = Min;
         Out.MaxOut = Max;
         return true;
@@ -176,7 +423,8 @@ bool Bake(const std::string& Class, std::vector<FPropertyDef>& Tags, FBaked& Out
         const FVec C = VecOf(Find(Tags, "Constant"));
         const FVec L = Locked(C, LockOf(Find(Tags, "LockedAxes")));
         Out.bVector = true;
-        Out.Entry = { L.X, L.Y, L.Z };
+        Out.PerEntry = 3;
+        Out.Entry = [L](float) { return FVals{ L.X, L.Y, L.Z }; };
         Out.MinOut = MinOf(L);
         Out.MaxOut = MaxOf(L);
         Out.MinVec = Out.MaxVec = C;
@@ -188,49 +436,201 @@ bool Bake(const std::string& Class, std::vector<FPropertyDef>& Tags, FBaked& Out
         const uint8 Lock = LockOf(Find(Tags, "LockedAxes"));
         const FVec LMin = Locked(Min, Lock), LMax = Locked(Max, Lock);
         Out.bVector = true;
+        Out.PerEntry = 3;
         Out.Op = Min == Max ? RDO_None : BoolOf(Find(Tags, "bUseExtremes")) ? RDO_Extreme : RDO_Random;
         Out.Lock = Lock;
-        Out.Entry = { LMin.X, LMin.Y, LMin.Z, LMax.X, LMax.Y, LMax.Z };
+        Out.Entry = [LMin, LMax](float) { return FVals{ LMin.X, LMin.Y, LMin.Z, LMax.X, LMax.Y, LMax.Z }; };
         Out.MinOut = MinOf(LMin);
         Out.MaxOut = MaxOf(LMax);
         Out.MinVec = Min;
         Out.MaxVec = Max;
         return true;
     }
-    return false;
+
+    /* The curves: the keys' span is the input range, the curve's value at a time the entry, its bounds the out range. */
+    const int32 Width = Class == "DistributionFloatConstantCurve" ? 1 : Class == "DistributionFloatUniformCurve" ? 2
+                      : Class == "DistributionVectorConstantCurve" ? 3 : Class == "DistributionVectorUniformCurve" ? 6 : 0;
+    if (!Width) return false;
+    auto Curve = std::make_shared<FCurve>();
+    if (!CurveOf(Tags, Width, *Curve, Why)) return false;
+    AutoSetTangents(*Curve);
+    InRange(*Curve, Out.MinIn, Out.MaxIn);
+    FVals Lo, Hi;
+    CalcBounds(*Curve, Lo, Hi);
+    const bool bOneKey = Curve->Keys.size() == 1;
+    if (Width == 1)                                             // 1844-1848, 1884-1915
+    {
+        Out.Entry = [Curve](float T) { return Eval(*Curve, T); };
+        Out.MinOut = Lo[0];
+        Out.MaxOut = Hi[0];
+    }
+    else if (Width == 2)                                        // 2212-2232, 2342-2348
+    {
+        Out.Op = bOneKey && Curve->Keys[0].Out[0] == Curve->Keys[0].Out[1] ? RDO_None : RDO_Random;
+        Out.Entry = [Curve](float T) { return Eval(*Curve, T); };
+        Out.MinOut = std::min(Lo[0], Lo[1]);
+        Out.MaxOut = std::max(Hi[0], Hi[1]);
+    }
+    else if (Width == 3)                                        // 2732-2748, 2889-2920, 3048-3078; GetLockFlag 0
+    {
+        const uint8 Lock = LockOf(Find(Tags, "LockedAxes"));
+        Out.bVector = true;
+        Out.PerEntry = 3;
+        Out.Entry = [Curve, Lock](float T) { const FVec V = Locked(VecAt(Eval(*Curve, T), 0), Lock); return FVals{ V.X, V.Y, V.Z }; };
+        Out.MinVec = Locked(VecAt(Lo, 0), Lock);
+        Out.MaxVec = Locked(VecAt(Hi, 0), Lock);
+        Out.MinOut = MinOf(Out.MinVec);
+        Out.MaxOut = MaxOf(Out.MaxVec);
+    }
+    else                                                        // 3728-3760, 3961-3970, 4225-4245; LockAndMirror a no-op
+    {
+        const FKey* One = bOneKey ? &Curve->Keys[0] : nullptr;
+        Out.bVector = true;
+        Out.PerEntry = 3;
+        Out.Op = One && VecAt(One->Out, 0) == VecAt(One->Out, 3) ? RDO_None : BoolOf(Find(Tags, "bUseExtremes")) ? RDO_Extreme : RDO_Random;
+        Out.Entry = [Curve](float T) { return Eval(*Curve, T); };
+        Out.MinOut = std::min(*std::min_element(Lo.begin(), Lo.end()), *std::min_element(Hi.begin(), Hi.end()));
+        Out.MaxOut = std::max(*std::max_element(Lo.begin(), Lo.end()), *std::max_element(Hi.begin(), Hi.end()));
+        Out.MinVec = { std::min(Lo[0], Hi[0]), std::min(Lo[1], Hi[1]), std::min(Lo[2], Hi[2]) };
+        Out.MaxVec = { std::max(Lo[3], Hi[3]), std::max(Lo[4], Hi[4]), std::max(Lo[5], Hi[5]) };
+    }
+    return true;
 }
 
-/* The raw distribution's tags as the cook writes a baked one (P_CAretakerAoE_ElectricutionAttack, P_electric_arc):
-   MinValue, MaxValue and a vector's MinValueVec / MaxValueVec where not zero, Distribution null, then the Table.
+// ---- the lookup table: BuildLookupTable then OptimizeLookupTable (Distributions.cpp 109-160, 535-679)
 
-   The table is BuildLookupTable's (Distributions.cpp 109-160) after OptimizeLookupTable (613-679). Every class above
-   has the input range [0, 0], so the 128 samples are equal and the first resample, to one entry, has no error: one
-   entry, TimeScale and TimeBias 0, EntryStride ValuesPerEntry (twice that unless RDO_None), SubEntryStride
-   ValuesPerEntry unless RDO_None, LockFlag kept. Members at their zero are left out, as a delta over the struct's
-   default. */
+struct FTable
+{
+    float TimeScale = 0, TimeBias = 0;
+    std::vector<float> Values;
+    uint32 EntryCount = 0, EntryStride = 0, SubEntryStride = 0;
+};
+
+constexpr uint32 kMaxSamples = 128;     // LOOKUP_TABLE_MAX_SAMPLES
+
+/* FDistributionLookupTable::GetEntry (Distributions.h 106-122): the two entries around a time, and the lerp alpha. */
+void GetEntry(const FTable& T, float Time, const float*& E1, const float*& E2, float& Alpha)
+{
+    Time -= T.TimeBias;
+    Time *= T.TimeScale;
+    Time = Time >= 0.0f ? Time : 0.0f;
+    Alpha = Time - std::trunc(Time);
+    const uint32 Index = uint32(int32(Time));
+    E1 = &T.Values[std::min(Index, T.EntryCount - 1) * T.EntryStride];
+    E2 = &T.Values[std::min(Index + 1, T.EntryCount - 1) * T.EntryStride];
+}
+
+FTable BuildTable(const FBaked& B)
+{
+    FTable T;
+    const float Step = (B.MaxIn - B.MinIn) / float(kMaxSamples - 1);
+    T.EntryCount = kMaxSamples;
+    T.EntryStride = uint32((B.Op == RDO_None ? 1 : 2) * B.PerEntry);
+    T.SubEntryStride = B.Op == RDO_None ? 0 : uint32(B.PerEntry);
+    T.TimeScale = Step > 0.0f ? 1.0f / Step : 0.0f;
+    T.TimeBias = B.MinIn;
+    for (uint32 I = 0; I < kMaxSamples; ++I)
+    {
+        const FVals V = B.Entry(B.MinIn + float(I) * Step);
+        T.Values.insert(T.Values.end(), V.begin(), V.begin() + T.EntryStride);
+    }
+    return T;
+}
+
+FTable Resample(const FTable& In, float MinIn, float MaxIn, uint32 Count)
+{
+    FTable T;
+    const float Step = Count > 1 ? (MaxIn - MinIn) / float(Count - 1) : 0.0f;
+    T.EntryCount = Count;
+    T.EntryStride = In.EntryStride;
+    T.SubEntryStride = In.SubEntryStride;
+    T.TimeBias = MinIn;
+    T.TimeScale = Step > 0.0f ? 1.0f / Step : 0.0f;
+    T.Values.resize(size_t(Count) * In.EntryStride);
+    for (uint32 I = 0; I < Count; ++I)
+    {
+        const float* E1;
+        const float* E2;
+        float Alpha;
+        GetEntry(In, MinIn + Step * float(I), E1, E2, Alpha);
+        for (uint32 V = 0; V < In.EntryStride; ++V) T.Values[I * In.EntryStride + V] = E1[V] + Alpha * (E2[V] - E1[V]);
+    }
+    return T;
+}
+
+/* ComputeLookupTableError: the largest distance between the two tables' entries over Count samples. */
+float TableError(const FTable& A, const FTable& B, float MinIn, float MaxIn, uint32 Count)
+{
+    const FTable& T1 = B.EntryCount > A.EntryCount ? B : A;
+    const FTable& T2 = &T1 == &A ? B : A;
+    const uint32 Per = T1.EntryStride - T1.SubEntryStride;
+    const float Step = (MaxIn - MinIn) / float(Count - 1);
+    float Error = 0.0f, Time = MinIn;
+    for (uint32 I = 0; I < Count; ++I, Time += Step)
+    {
+        const float *A1, *A2, *B1, *B2;
+        float AlphaA, AlphaB;
+        GetEntry(T1, Time, A1, A2, AlphaA);
+        GetEntry(T2, Time, B1, B2, AlphaB);
+        for (uint32 Sub = 0; Sub < (T1.SubEntryStride > 0 ? 2u : 1u); ++Sub)
+        {
+            const uint32 At = Sub * T1.SubEntryStride;
+            float Dist = 0.0f;
+            for (uint32 V = 0; V < Per; ++V)
+            {
+                const float D = (A1[At + V] + AlphaA * (A2[At + V] - A1[At + V])) - (B1[At + V] + AlphaB * (B2[At + V] - B1[At + V]));
+                Dist += D * D;
+            }
+            Error = std::max(Error, std::sqrt(Dist));
+        }
+    }
+    return Error;
+}
+
+/* OptimizeLookupTable: the fewest samples, a power of two, within 0.05 of the 128 (LOOKUP_TABLE_ERROR_THRESHOLD). */
+void Optimize(FTable& T)
+{
+    const float OneOverScale = T.TimeScale == 0.0f ? 0.0f : 1.0f / T.TimeScale;
+    const float MinIn = T.TimeBias, MaxIn = T.TimeBias + float(T.EntryCount - 1) * OneOverScale;
+    for (uint32 Count = 1; Count < kMaxSamples; Count <<= 1)
+    {
+        FTable R = Resample(T, MinIn, MaxIn, Count);
+        if (TableError(R, T, MinIn, MaxIn, kMaxSamples) < 0.05f)
+        {
+            T = std::move(R);
+            return;
+        }
+    }
+}
+
+/* The raw distribution's tags as the cook writes a baked one (P_CAretakerAoE_ElectricutionAttack, P_electric_arc; the
+   order and the left-out zeros across DRG's P_*): MinValue, MaxValue and a vector's MinValueVec / MaxValueVec where not
+   zero, Distribution null, then the Table, its members at zero left out as a delta over the struct's default. */
 std::vector<FPropertyDef> RawTags(const FBaked& B)
 {
-    const size_t PerEntry = B.bVector ? 3 : 1;
-    const size_t Stride = (B.Op == RDO_None ? 1 : 2) * PerEntry;
+    FTable T = BuildTable(B);
+    Optimize(T);
     std::vector<FPropertyDef> Table;
+    if (T.TimeScale != 0.0f) Table.push_back(FloatTag("TimeScale", T.TimeScale));
+    if (T.TimeBias != 0.0f) Table.push_back(FloatTag("TimeBias", T.TimeBias));
     FPropertyDef Values;
     Values.Type = "ArrayProperty";
     Values.Name = "Values";
     Values.StructName = "FloatProperty";
     Values.Inner = std::make_shared<FPropertyDef>(FloatTag("Values", 0.0f));
     Values.Default.K = FDefaultValue::Array;
-    for (size_t I = 0; I < Stride; ++I)
+    for (const float F : T.Values)
     {
         FDefaultValue V;
         V.K = FDefaultValue::Float;
-        V.F = B.Entry[I];
+        V.F = F;
         Values.Default.Items.push_back(V);
     }
     Table.push_back(Values);
     Table.push_back(ByteTag("Op", B.Op));
-    Table.push_back(ByteTag("EntryCount", 1));
-    Table.push_back(ByteTag("EntryStride", uint8(Stride)));
-    if (B.Op != RDO_None) Table.push_back(ByteTag("SubEntryStride", uint8(PerEntry)));
+    Table.push_back(ByteTag("EntryCount", uint8(T.EntryCount)));
+    Table.push_back(ByteTag("EntryStride", uint8(T.EntryStride)));
+    if (T.SubEntryStride) Table.push_back(ByteTag("SubEntryStride", uint8(T.SubEntryStride)));
     if (B.Lock) Table.push_back(ByteTag("LockFlag", B.Lock));
 
     std::vector<FPropertyDef> Out;
@@ -249,8 +649,8 @@ struct FStart { const char* Class; const char* Member; const char* Dist; float A
 /* What Cascade's editor gives a new module (Cascade.cpp 984): InitializeDefaults, from Engine/Private/Particles:
    ParticleModules.cpp (Required, Lifetime, Light), ParticleModules_Spawn.cpp, _Size.cpp, _Color.cpp, _Velocity.cpp,
    ParticleBeamModules.cpp; then SetToSensibleDefaults, which only Lifetime (1 to 1, ParticleModules.cpp 3863-3871) and
-   Light (ParticleModules.cpp 3242-3282) change here. A is a Constant's value or a Uniform's Min, B a Uniform's Max.
-   Dist "Curve" is a default AssetGen cannot bake yet. */
+   Light (ParticleModules.cpp 3242-3282) change here. A is a Constant's value or a Uniform's Min, B a Uniform's Max; a
+   ConstantCurve starts with no keys. */
 const FStart kStarts[] = {
     { "ParticleModuleRequired", "SpawnRate", "DistributionFloatConstant", { 0 }, { 0 } },
     { "ParticleModuleSpawn", "Rate", "DistributionFloatConstant", { 20 }, { 0 } },
@@ -279,7 +679,7 @@ const FStart kStarts[] = {
     { "ParticleModuleBeamNoise", "NoiseRange", "DistributionVectorConstant", { 50, 50, 50 }, { 0 } },
     { "ParticleModuleBeamNoise", "NoiseRangeScale", "DistributionFloatConstant", { 1 }, { 0 } },
     { "ParticleModuleBeamNoise", "NoiseTangentStrength", "DistributionFloatConstant", { 250 }, { 0 } },
-    { "ParticleModuleBeamNoise", "NoiseScale", "Curve", { 0 }, { 0 } },
+    { "ParticleModuleBeamNoise", "NoiseScale", "DistributionFloatConstantCurve", { 0 }, { 0 } },
 };
 
 /* A starting value as the tags of its distribution object, to bake as the mod's own. */
@@ -290,6 +690,7 @@ std::vector<FPropertyDef> StartTags(const FStart& S)
     if (D == "DistributionFloatConstant") return { FloatTag("Constant", S.A[0]) };
     if (D == "DistributionFloatUniform") return { FloatTag("Min", S.A[0]), FloatTag("Max", S.B[0]) };
     if (D == "DistributionVectorConstant") return { VecTag("Constant", A) };
+    if (D == "DistributionFloatConstantCurve") return {};
     return { VecTag("Min", A), VecTag("Max", B) };
 }
 
@@ -420,12 +821,6 @@ bool CookCascade(std::vector<FPropertyDef>& SystemTags, std::vector<FCascadeObje
             if (Raw == Dists.end()) continue;
             const std::string Member = Raw->first;
             const bool bVector = Raw->second;
-            if (std::string(S.Dist) == "Curve")
-            {
-                Warnings.push_back(Where(int32(I)) + ": " + Member + " is left unset and reads as 0 in game; Cascade's editor "
-                                   "starts it as a curve, which AssetGen does not bake yet; set it");
-                continue;
-            }
             FCascadeObject D;
             D.Class = S.Dist;
             D.Name = std::string("Distribution") + S.Member;
@@ -458,10 +853,17 @@ bool CookCascade(std::vector<FPropertyDef>& SystemTags, std::vector<FCascadeObje
             if (!D || D->Default.Instanced <= 0) return;
             const int32 Obj = D->Default.Instanced - 1;
             FBaked B;
-            if (!Bake(Objects[size_t(Obj)].Class, Objects[size_t(Obj)].Tags, B))
+            std::string Why;
+            if (!Bake(Objects[size_t(Obj)].Class, Objects[size_t(Obj)].Tags, B, Why) && !Why.empty())
+            {
+                *Err = Where(Owner) + ": " + T.Name + " is " + Objects[size_t(Obj)].Name + ", and " + Why;
+                bOk = false;
+                return;
+            }
+            if (!B.Entry)
             {
                 *Err = Where(Owner) + ": " + T.Name + " is a " + Objects[size_t(Obj)].Class + ", which AssetGen does not bake "
-                       "yet; use a DistributionFloatConstant / DistributionFloatUniform (Vector for a vector one)";
+                       "yet; use a Constant, Uniform, ConstantCurve or UniformCurve distribution";
                 bOk = false;
                 return;
             }
