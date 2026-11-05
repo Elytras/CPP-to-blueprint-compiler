@@ -83,7 +83,7 @@ def class_refs(t):
 
 def split_args(text):
     return [a.strip() for a in split_params(text)]
-FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ()\"]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
+FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ()\"]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?(?:\[0x([0-9A-Fa-f]+)\])?;\s*//")
 WEAK = re.compile(r"^TWeakObjectPtr<class\s+(\w+)>$")     # a native struct's weak member, of a native class
 NO_STRUCT_LITERAL = ("TDelegate<", "TMulticast", "TScriptInterface<")    # EX_StructConst has no zero for these
 # The engine's C++ constructor where it takes the members in another order than the reflected one (FColor's are B, G,
@@ -370,7 +370,9 @@ def parse_structs(path, pkg):
             m = FIELD.match(line)
             # A member Dumper-7 adds by hand (UE5's FInstancedStruct: ScriptStruct, uint8* StructMemory) is no FProperty,
             # so neither a field EX_StructConst writes nor one a stub can declare (`uint8*` reads as an out-parm).
-            if m and not m.group(2).startswith(("Pad_", "BitPad_")) and "NOT AUTO-GENERATED PROPERTY" not in line:
+            # ponytail: a struct's C array member (FExpressionInput Inputs[0x3]) stays out, as before genueapi read them;
+            # a class's is declared (parse_field), and a struct's would need its constructor and literals to take one.
+            if m and not m.group(4) and not m.group(2).startswith(("Pad_", "BitPad_")) and "NOT AUTO-GENERATED PROPERTY" not in line:
                 # The flag comment, `(Edit, Transient, ...)`, or a bitfield's `(BitIndex: .., PropSize: .. (flags))`.
                 transient = bool(TRANSIENT.search(line[line.index("//"):]))
                 cur_struct.raw_fields.append(("bool" if m.group(3) else m.group(1), m.group(2), transient))
@@ -1379,6 +1381,8 @@ def parse_field(cur, m, skipped):
         GAPS.append(("member", cur, fname, raw, mapped if mapped in KINDS else "other"))
         return
     cur.fields.append((mapped, fname))
+    if m.group(4):
+        cur.dims[fname] = int(m.group(4), 16)
     # BlueprintReadOnly: the stub declares it UE_READONLY (`mutable`), so a child's UE_DEFAULTS may still set it.
     if re.search(r"\bBlueprintReadOnly\b", flags):
         cur.readonly.add(fname)
@@ -1413,6 +1417,7 @@ class Klass(object):
         self.raw_funcs = []      # (return, name, params) as Dumper-7 spelled them, before any mapping
         self.fields = []
         self.readonly = set()    # the fields Dumper-7 flags BlueprintReadOnly
+        self.dims = {}           # a C array member (`ParamModes[0x3]`) -> its length; a tag per element
         self.replicated = {}     # field -> its RepNotify function, "" when none (or the dump predates the name)
         self.offsets = {}        # field -> (offset, ordinal among the members at that offset): the join to REAL_FIELDS
         self.scs_nodes = {}      # component variable -> its SCS node's VariableGuid, 32 hex digits
@@ -2379,7 +2384,8 @@ def main():
             for ftype, fname in k.fields:
                 if fname in names:
                     continue
-                body.append("    %s%s %s;" % ("UE_READONLY " if fname in k.readonly else "", rewrite(named(ftype), short, k), fname))
+                body.append("    %s%s %s%s;" % ("UE_READONLY " if fname in k.readonly else "", rewrite(named(ftype), short, k), fname,
+                                             "[%d]" % k.dims[fname] if fname in k.dims else ""))
                 real = real_field(k, fname)
                 if real:
                     marks.append('static constexpr const char* %s__UeName = "%s";' % (fname, c_literal(real)))
