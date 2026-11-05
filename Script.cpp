@@ -300,6 +300,7 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         else if (P.Type == "DoubleProperty") V.Raw(&D.F, 8);
         else if (P.Type == "Int64Property") V.I64(D.I);
         else if (P.Type == "UInt16Property") V.U16(uint16(D.I));
+        else if (P.Type == "UInt32Property") V.U32(uint32(D.I));
         else if (P.Type == "EnumProperty") V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero);
         else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(uint8(D.I)); else V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero); }   // an enum byte is its enumerator's name
         else if (P.Type == "StrProperty") WriteFStringValue(V, D.S);

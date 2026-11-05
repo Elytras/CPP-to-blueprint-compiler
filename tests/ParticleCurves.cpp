@@ -6,6 +6,12 @@ an empty curve (zero), a uniform curve (min and max per entry), auto tangents th
 writes them 0), clamped auto tangents, steps (no smaller table is close enough: all 128 samples kept), a looped
 curve, and a uniform vector curve with extremes. A BeamNoise module leaves NoiseScale unset: the editor starts it as
 a ConstantCurve without keys.
+
+P_Live: what the engine cannot bake stays a live object the raw distribution points at, no table: a particle
+parameter (CanBeBaked is false for the class) and a constant whose bCanBeBaked is false.
+
+P_Gpu: a GPU sprite emitter given the data the editor builds for it (as bpdecomp writes a vanilla one's), and an
+engine uint32 member set (DetailModeBitmask). The suite decompiles all three and compiles them again.
 */
 #include "UeApi/Types.h"
 
@@ -76,6 +82,46 @@ UE_ASSET_DEFAULTS(UParticleSystem, P_Curves) {
 
   L->Modules = {Life, Sz, Vel, Col, Noise};
   E->LODLevels = {L};
+  Emitters = {E};
+  LODDistances = {0.0f};
+}
+
+UE_ASSET_DEFAULTS(UParticleSystem, P_Live) {
+  UParticleSpriteEmitter *E = UE_INSTANCED(UParticleSpriteEmitter, this, "E");
+  UParticleLODLevel *L = UE_INSTANCED(UParticleLODLevel, E, "L");
+  UParticleModuleRequired *Req = UE_INSTANCED(UParticleModuleRequired, this, "Req");
+  UParticleModuleSpawn *Sp = UE_INSTANCED(UParticleModuleSpawn, this, "Sp");
+  UDistributionFloatParticleParameter *Param = UE_INSTANCED(UDistributionFloatParticleParameter, Sp, "Param");
+  Param->ParameterName = "Strength";
+  Param->MaxOutput = 40.0f;
+  Sp->Rate.Distribution = Param;
+  UDistributionFloatConstant *Unbaked = UE_INSTANCED(UDistributionFloatConstant, Sp, "Unbaked");
+  Unbaked->Constant = 2.0f;
+  Unbaked->bCanBeBaked = false;
+  Sp->RateScale.Distribution = Unbaked;
+  L->RequiredModule = Req;
+  L->SpawnModule = Sp;
+  E->LODLevels = {L};
+  Emitters = {E};
+  LODDistances = {0.0f};
+}
+
+UE_ASSET_DEFAULTS(UParticleSystem, P_Gpu) {
+  UParticleSpriteEmitter *E = UE_INSTANCED(UParticleSpriteEmitter, this, "E");
+  UParticleLODLevel *L = UE_INSTANCED(UParticleLODLevel, E, "L");
+  UParticleModuleRequired *Req = UE_INSTANCED(UParticleModuleRequired, this, "Req");
+  UParticleModuleSpawn *Sp = UE_INSTANCED(UParticleModuleSpawn, this, "Sp");
+  UParticleModuleTypeDataGpu *Gpu = UE_INSTANCED(UParticleModuleTypeDataGpu, this, "Gpu");
+  Gpu->EmitterInfo.RequiredModule = Req;
+  Gpu->EmitterInfo.SpawnModule = Sp;
+  Gpu->EmitterInfo.MaxLifetime = 2.0f;
+  Gpu->ResourceData.QuantizedColorSamples = {FColor(255, 128, 0, 255), FColor(0, 0, 0, 0)};
+  Gpu->ResourceData.ColorScale = FVector4(1.0f, 1.0f, 1.0f, 1.0f);
+  L->RequiredModule = Req;
+  L->SpawnModule = Sp;
+  L->TypeDataModule = Gpu;
+  E->LODLevels = {L};
+  E->DetailModeBitmask = 5;
   Emitters = {E};
   LODDistances = {0.0f};
 }

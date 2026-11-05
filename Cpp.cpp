@@ -17098,7 +17098,7 @@ static void ZeroDefault(FPropertyDef& PD)
 {
     FDefaultValue& D = PD.Default;
     const std::string& T = PD.Type;
-    if (T == "IntProperty" || T == "Int64Property" || T == "UInt16Property" || (T == "ByteProperty" && PD.StructName.empty())) { D.K = FDefaultValue::Int; D.I = 0; }
+    if (T == "IntProperty" || T == "Int64Property" || T == "UInt16Property" || T == "UInt32Property" || (T == "ByteProperty" && PD.StructName.empty())) { D.K = FDefaultValue::Int; D.I = 0; }
     else if (T == "FloatProperty" || T == "DoubleProperty") { D.K = FDefaultValue::Float; D.F = 0.0; }
     else if (T == "BoolProperty") { D.K = FDefaultValue::Bool; D.I = 0; }
     else if (T == "ByteProperty" || T == "EnumProperty") { D.K = FDefaultValue::Str; D.S = PD.EnumZero; }
@@ -17658,7 +17658,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     const std::string& T = PD.Type;
     /* A number is whatever the initializer comes to: `40`, `-1.5f`, `kMax * 2 + 1`, `1 << 3 | 2`. An enum-typed
        byte keeps its named-constant path below. */
-    if (FConstVal V; (T == "IntProperty" || T == "Int64Property" || T == "UInt16Property" || (T == "ByteProperty" && PD.StructName.empty())
+    if (FConstVal V; (T == "IntProperty" || T == "Int64Property" || T == "UInt16Property" || T == "UInt32Property" || (T == "ByteProperty" && PD.StructName.empty())
                       || T == "FloatProperty" || T == "DoubleProperty" || T == "BoolProperty") && FoldConst(*Whole, V))
     {
         const double Num = V.Num();
@@ -17909,13 +17909,14 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
     if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
     if (Type == "uint8" || Type == "unsigned char") { *Out = ByteParam(PName, ExtraFlags); return true; }
-    /* A native struct's uint16 member, for its tag in a value AssetGen writes (FNiagaraTypeDefinition::UnderlyingType). No
-       Blueprint variable is one, so a mod's own is still refused. */
-    if ((Type == "uint16" || Type == "unsigned short") && Where.compare(0, 7, "member ") == 0)
+    /* A native uint16 or uint32 member, for its tag in a value AssetGen writes (FNiagaraTypeDefinition::UnderlyingType,
+       UParticleEmitter::DetailModeBitmask). No Blueprint variable is one, so a mod's own is still refused. */
+    if ((Type == "uint16" || Type == "unsigned short" || Type == "uint32" || Type == "unsigned int") && Where.compare(0, 7, "member ") == 0)
     {
+        const bool b16 = Type == "uint16" || Type == "unsigned short";
         *Out = IntParam(PName, ExtraFlags);
-        Out->Type = "UInt16Property";
-        Out->ElementSize = 2;
+        Out->Type = b16 ? "UInt16Property" : "UInt32Property";
+        Out->ElementSize = b16 ? 2 : 4;
         return true;
     }
     if (Type == "char *" || Type == "char*" || Type == "FString")
@@ -19030,11 +19031,21 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
 /* S38: one assignment of an edit, `Root<Steps> = Rhs`: the member Root names (Declarer's), each step's def down the
    path, and the value lowered against the last. Zero is a real value here: it replaces the game's own, which need not
    be zero. */
+/* Where, or TypeToProperty's "member <Name>" for an engine class's uint16 / uint32 member: its unsigned ints
+   (UParticleEmitter::DetailModeBitmask) are then tags AssetGen writes, which a mod's own variable may not be. */
+std::string NativeMemberWhere(const FRecord* Declarer, const std::string& Type, const std::string& Name, const std::string& Where)
+{
+    const std::string T = StripTypeKeywords(Type);
+    const bool bUnsigned = T == "uint16" || T == "uint32" || T == "unsigned short" || T == "unsigned int";
+    return Declarer && Declarer->IsNative() && bUnsigned ? "member " + Name : Where;
+}
+
 bool FCompiler::EditAssignment(const Json& Root, const FRecord& Declarer, const std::vector<const Json*>& Steps,
                                const Json* Rhs, const std::string& Where, FBlueprintClass& BP, FEditDef& Out, std::string* Err)
 {
     Out.Chain.emplace_back();
-    if (!TypeToProperty(TypeOf(Root), UeNameOf(&Declarer, Name(Root)), 0, Where, BP, &Out.Chain.back(), Err)) return false;
+    if (!TypeToProperty(TypeOf(Root), UeNameOf(&Declarer, Name(Root)), 0, NativeMemberWhere(&Declarer, TypeOf(Root), Name(Root), Where),
+                        BP, &Out.Chain.back(), Err)) return false;
     std::string Path = Name(Root);
     /* One element of a TMap or TSet: `Score["a"] = 1` (the last step a map's key), `Score.Add("a", 1)`, `Ids.Add(7)`,
        `X.Remove(Key)` (Rhs the call). */
@@ -21369,7 +21380,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* The tag is read back by the engine's name of the member, which its declarer's header knows. */
                 const std::string LhsDeclarer = OwnerOf(*Lhs);
                 const std::string TagName = UeNameOf(LhsDeclarer.empty() ? DR : Find(LhsDeclarer), Name(*Lhs));
-                if (!TypeToProperty(TypeOf(*Lhs), TagName, 0, Where, BP, &PD, Err)) { bOk = false; return; }
+                const FRecord* LhsRec = LhsDeclarer.empty() ? DR : Find(LhsDeclarer);
+                if (!TypeToProperty(TypeOf(*Lhs), TagName, 0, NativeMemberWhere(LhsRec, TypeOf(*Lhs), Name(*Lhs), Where), BP, &PD, Err))
+                { bOk = false; return; }
                 /* Zero is a real value here: an archetype deltas against the component CDO (where
                    bVisible is already true) and an inherited property against the parent's CDO,
                    not against the type's zero the way a fresh class variable does. */

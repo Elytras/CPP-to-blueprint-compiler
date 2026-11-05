@@ -805,6 +805,16 @@ bool CookCascade(std::vector<FPropertyDef>& SystemTags, std::vector<FCascadeObje
         Tags.push_back(ByteTag("LODValidity", Bits));
     }
 
+    /* A GPU sprite emitter simulates off what the editor's UParticleModuleTypeDataGpu::Build works out from the emitter's
+       modules (EmitterInfo, ResourceData); the game's Build is editor-only, so without it the emitter misrenders. */
+    for (size_t I = 0; I < N; ++I)
+        if (Objects[I].Class == "ParticleModuleTypeDataGpu" && !Find(Objects[I].Tags, "ResourceData"))
+        {
+            *Err = Where(int32(I)) + ": a GPU sprite emitter needs the EmitterInfo and ResourceData the editor builds from its "
+                   "modules, which AssetGen does not build yet; give them (bpdecomp writes a vanilla P_*'s) or use a CPU emitter";
+            return false;
+        }
+
     /* The starting values first, so they bake with the mod's own distributions below. Each is a distribution object of
        the module's, appended to the list as the editor's NewObject in InitializeDefaults makes one. */
     for (size_t I = 0; I < N; ++I)
@@ -852,6 +862,12 @@ bool CookCascade(std::vector<FPropertyDef>& SystemTags, std::vector<FCascadeObje
             FPropertyDef* D = M ? Find(*M, "Distribution") : nullptr;
             if (!D || D->Default.Instanced <= 0) return;
             const int32 Obj = D->Default.Instanced - 1;
+            /* What CanBeBaked refuses stays live, pointed at, without a table (FRawDistribution*::Initialize returns
+               first): a particle parameter (ParameterBase overrides it false) or an object whose bCanBeBaked is false. */
+            const std::string& Class = Objects[size_t(Obj)].Class;
+            const FPropertyDef* Can = Find(Objects[size_t(Obj)].Tags, "bCanBeBaked");
+            if (Class == "DistributionFloatParticleParameter" || Class == "DistributionVectorParticleParameter" || (Can && !BoolOf(Can)))
+                return;
             FBaked B;
             std::string Why;
             if (!Bake(Objects[size_t(Obj)].Class, Objects[size_t(Obj)].Tags, B, Why) && !Why.empty())

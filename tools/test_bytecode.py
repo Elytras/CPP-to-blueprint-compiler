@@ -5228,6 +5228,20 @@ def particle_curves():
     proves('particle-systems.spawn-burstscale')
     assert close(particle_tables(p, 'Noise')['NoiseScale'], curve_baked('float', [])), particle_tables(p, 'Noise')
     assert 'NoiseScale' not in LOGS['ParticleCurves'], LOGS['ParticleCurves']
+    # P_Live: what the engine cannot bake (CanBeBaked false) stays a live object, pointed at, with no table.
+    proves('particle-systems.spawn-rate-distribution-c')
+    live = invariants.Package(os.path.join(os.path.dirname(asset('ParticleCurves')), 'P_Live'))
+    spawn = particle_tables(live, 'Sp')
+    assert sorted(spawn) == ['BurstScale'], spawn             # Rate and RateScale keep no table
+    raw = tag_values(live, live.find('Sp'), live.tags(live.find('Sp')))
+    assert raw['Rate'] == {'Distribution': live.path(live.find('Param') + 1)}, raw
+    assert raw['RateScale'] == {'Distribution': live.path(live.find('Unbaked') + 1)}, raw
+    assert live.class_of(live.find('Param') + 1) == 'DistributionFloatParticleParameter'
+    param = tag_values(live, live.find('Param'), live.tags(live.find('Param')))
+    assert param == dict(ParameterName='Strength', MaxOutput=40.0), param
+    unbaked = tag_values(live, live.find('Unbaked'), live.tags(live.find('Unbaked')))
+    assert unbaked == dict(Constant=2.0, bCanBeBaked=False), unbaked
+    keeps_invariants(live.base)
     keeps_invariants(p.base)
     print('ok  ParticleCurves: curve distributions baked as the cook bakes them')
 
@@ -5299,17 +5313,49 @@ def particle_refusals():
     refused('PrLevel', '', 'its Level is 1', after=system('Level', '  L->Level = 1;\n'))
     refused('PrSettings', '', 'LODSettings has 2 entries and LODDistances 1',
             after=system('Settings', '  LODSettings = {FParticleSystemLOD(), FParticleSystemLOD()};\n'))
-    proves('particle-systems.spawn-rate-distribution-c')
-    refused('PrParam', '', 'is a DistributionFloatParticleParameter, which AssetGen does not bake yet',
-            after=system('Param', '  UDistributionFloatParticleParameter *C = UE_INSTANCED(UDistributionFloatParticleParameter, Sp, "C");\n'
-                                  '  Sp->Rate.Distribution = C;\n'))
     proves('particle-systems.c-constantcurve-points-1-0f')
     refused('PrOrder', '', "Rate is C, and its ConstantCurve's point 1 has a smaller InVal than point 0",
             after=system('Order', '  UDistributionFloatConstantCurve *C = UE_INSTANCED(UDistributionFloatConstantCurve, Sp, "C");\n'
                                   '  C->ConstantCurve.Points = {{1.0f, 1.0f, 0.0f, 0.0f, EInterpCurveMode::CIM_Linear},\n'
                                   '                             {0.0f, 0.0f, 0.0f, 0.0f, EInterpCurveMode::CIM_Linear}};\n'
                                   '  Sp->Rate.Distribution = C;\n'))
+    proves('particle-systems.l-typedatamodule-gpu')
+    refused('PrGpu', '', 'a GPU sprite emitter needs the EmitterInfo and ResourceData the editor builds',
+            after=system('Gpu', '  L->TypeDataModule = UE_INSTANCED(UParticleModuleTypeDataGpu, this, "Gpu");\n'))
     print('ok  Particle system refusals')
+
+
+def particle_decompile():
+    """The suite's own particle systems (ParticleBake, ParticleCurves) decompiled by bpdecomp and compiled again come
+    out the same by meaning (particle_roundtrip.diffs, the oracle the vanilla round trip uses): baked tables, live
+    distributions, a GPU emitter's given data, an engine uint32 member."""
+    import invariants, particle_roundtrip as rt
+    gpu = invariants.Package(os.path.join(os.path.dirname(asset('ParticleCurves')), 'P_Gpu'))
+    proves('particle-systems.e-detailmodebitmask-5')
+    e = rt.values(gpu, gpu.find('E'))
+    assert e['detailmodebitmask'] == 5, e
+    proves('particle-systems.bpdecomp-particles')
+    work = tempfile.mkdtemp()
+    try:
+        rt.layout(work, os.path.abspath(UEAPI))
+        for mod in ('ParticleBake', 'ParticleCurves'):
+            folder = os.path.dirname(asset(mod))
+            content = folder.replace(os.sep, '/').split('/FSD/Content/')[0] + '/FSD/Content'
+            root = '/Game/_ElytrasMods/' + mod
+            proc = rt.decompile(content, root, 'RT' + mod, work, UEAPI)
+            assert not proc.returncode, proc.stdout[-2000:] + proc.stderr[-2000:]
+            notes = open(os.path.join(work, 'BpMods', 'NOTES.md'), encoding='utf-8').read().splitlines()[3:]
+            assert not [n for n in notes if n.strip()], notes
+            proc, out = rt.compile_mod(work, 'RT' + mod, root, os.path.abspath(ASSETGEN))
+            assert not proc.returncode, proc.stdout[-2000:] + proc.stderr[-2000:]
+            names = sorted(f[:-7] for f in os.listdir(folder) if f.startswith('P_') and f.endswith('.uasset'))
+            assert names and names == sorted(f[:-7] for f in os.listdir(out) if f.endswith('.uasset')), (names, os.listdir(out))
+            for n in names:
+                d = rt.diffs(invariants.Package(os.path.join(folder, n)), invariants.Package(os.path.join(out, n)))
+                assert not d, (mod, n, d)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print('ok  Particle systems decompile and compile again to the same packages')
 
 
 def particle_starts():
@@ -13221,6 +13267,7 @@ particle_lod_validity()
 particle_starts()
 particle_curves()
 particle_refusals()
+particle_decompile()
 
 
 def asset_over_cdo():
