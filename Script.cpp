@@ -78,6 +78,23 @@ FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlag
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Class };
 }
 
+void ForEachValue(FDefaultValue& D, const std::function<void(FDefaultValue&)>& Fn)
+{
+    Fn(D);
+    for (FDefaultValue& I : D.Items) ForEachValue(I, Fn);
+    for (FDefaultValue& I : D.Removed) ForEachValue(I, Fn);
+    if (D.Members) for (FPropertyDef& M : *D.Members) ForEachValue(M.Default, Fn);
+}
+
+void ForEachRef(std::vector<FPropertyDef>& Tags, const std::function<void(FDefaultValue&)>& Fn)
+{
+    for (FPropertyDef& T : Tags)
+    {
+        ForEachValue(T.Default, Fn);
+        if (T.Members) ForEachRef(*T.Members, Fn);
+    }
+}
+
 /* Container elements carry no parm flags of their own; the element property is named like its container. */
 FPropertyDef Element(const FPropertyDef& In)
 {

@@ -80,6 +80,7 @@
     <ClInclude Include="Blueprint.h" />
     <ClInclude Include="Command.h" />
     <ClInclude Include="Cascade.h" />
+    <ClInclude Include="Niagara.h" />
     <ClInclude Include="Cooked.h" />
     <ClInclude Include="Cpp.h" />
     <ClInclude Include="Package.h" />
@@ -94,6 +95,7 @@
     <ClCompile Include="Blueprint.cpp" />
     <ClCompile Include="Command.cpp" />
     <ClCompile Include="Cascade.cpp" />
+    <ClCompile Include="Niagara.cpp" />
     <ClCompile Include="Cooked.cpp" />
     <ClCompile Include="Cpp.cpp" />
     <ClCompile Include="Main.cpp" />

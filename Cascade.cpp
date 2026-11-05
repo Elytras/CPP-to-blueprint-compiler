@@ -816,23 +816,6 @@ void ForEachTag(std::vector<FPropertyDef>& Tags, const std::function<void(FPrope
     }
 }
 
-void ForEachValue(FDefaultValue& D, const std::function<void(FDefaultValue&)>& Fn)
-{
-    Fn(D);
-    for (FDefaultValue& I : D.Items) ForEachValue(I, Fn);
-    for (FDefaultValue& I : D.Removed) ForEachValue(I, Fn);
-    if (D.Members) for (FPropertyDef& M : *D.Members) ForEachValue(M.Default, Fn);
-}
-
-void ForEachRef(std::vector<FPropertyDef>& Tags, const std::function<void(FDefaultValue&)>& Fn)
-{
-    for (FPropertyDef& T : Tags)
-    {
-        ForEachValue(T.Default, Fn);
-        if (T.Members) ForEachRef(*T.Members, Fn);
-    }
-}
-
 /* The objects a tag points at, as indices into the list. */
 std::vector<int32> RefsOf(FPropertyDef* T)
 {

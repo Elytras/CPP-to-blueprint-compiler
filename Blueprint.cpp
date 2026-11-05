@@ -1683,10 +1683,11 @@ void FBlueprintClass::FinishAsset(FIndex Class, FIndex ClassCdo)
         if (OuterRow(Instanced[K]) == RowAsset) A.CreateBeforeSer.push_back(Exp(RowFirstInstanced + int32(K)).V);
 
     const std::vector<FPropertyDef> Set = Vars;
-    A.Serialize = [=](FArc& Ar) {
+    A.Serialize = [=, Tail = AssetTail](FArc& Ar) {
         for (const FPropertyDef& V : Set) WriteDefaultTag(Ar, V);
         TagEnd(Ar);
         Ar.Bool(false);
+        if (Tail) Tail(Ar);
     };
     P.AddExport(std::move(A));
 

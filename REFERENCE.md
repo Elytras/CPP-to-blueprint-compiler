@@ -4045,7 +4045,7 @@ Notes:
 
 A Cascade particle system (`UParticleSystem`) is an asset with objects inside: its emitters, each emitter's LOD levels,
 the modules each LOD level names, and the distributions the modules read. AssetGen does to them what DRG's cooker does,
-so the asset loads as a cooked one. Niagara systems are not compiled yet: their scripts are compiled Vector VM code.
+so the asset loads as a cooked one. Niagara systems are the next section.
 
 | You write | What it does | Status |
 |---|---|---|
@@ -4089,7 +4089,28 @@ Notes:
 
 - The modules are made under the system, as the editor makes them, and a LOD level names them; one module may serve
   several LOD levels.
-- Particle parameter distributions, and the per-particle event modules, are not built yet ([TODO.md](../TODO.md)).
+
+### Niagara systems
+
+A Niagara system (`UNiagaraSystem`) is an asset with objects inside, like a Cascade one: its emitters, each emitter's
+scripts and renderers, the data interfaces the scripts read. A script's `CachedScriptVM` is its compiled Vector VM code,
+which AssetGen does not compile: a system is written from a vanilla one's (bpdecomp writes them), its scripts kept and
+what lives outside the bytecode changed. The one part of a cooked system that is no tag, its emitters' compiled data,
+AssetGen works out as the editor does.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="niagara-systems.emitterhandles"></a>`EmitterHandles = {FNiagaraEmitterHandle(FGuid(1, 2, 3, 4), "IdSparks", true, "Sparks", Sparks)};` with each emitter's scripts (`SU->CachedScriptVM.Attributes = {FNiagaraVariable("Age", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), {})};`, `LastCompileStatus`) and the system's `SystemSpawnScript` / `SystemUpdateScript` | After the system's tags, its `EmitterCompiledData`, as `UNiagaraSystem::InitEmitterCompiledData` builds it: per handle the system scripts' `FNiagaraSpawnInfo` attributes named `<emitter>.`, the emitter's alias variables (`Sparks.SpawnInterval`, `Engine.Sparks.InstanceSeed`, ...), its particle attributes (the update script's, then the spawn script's not there yet) each with its register layout, the handle's `IdName` as the data set's, and persistent IDs when the emitter asks or a `Particles.ID` is among them. None while a system script has not compiled. | Yes |
+| <a id="niagara-systems.bpdecomp-niagara"></a>A cooked `NS_*` given to bpdecomp (`bpdecomp_emit.py <Content> <out> --mod /Game/Path=Mod --kinds particles`) | Written as a `UE_ASSET_DEFAULTS(UNiagaraSystem, NS_X)` block: each object a `UE_INSTANCED` local, then its tags, the compiled scripts' bytecode and parameter stores included; `SystemCompiledData` as its tags (the editor builds it from bindings only the editor has). It compiles back to the same package by meaning, the emitters' compiled data included, for each of DRG's CPU systems. | Yes |
+| <a id="niagara-systems.disabled-emitter"></a>`FNiagaraEmitterHandle(FGuid(9, 10, 11, 12), "IdOld", false, "Old", Old)` (a disabled handle) | The emitter, and everything under it, is left out of the package and the handle's `Instance` is null, as the cook does (`UNiagaraEmitter::NeedsLoadForTargetPlatform`). Its compiled data is kept: its name, sim target and persistent IDs, and the variables its scripts hold (none for a script the editor did not compile). A compiled GPU script under it goes with it, so it is not refused. bpdecomp writes such a handle's lost emitter back as a stand-in `<Name>_Disabled` holding what the compiled data kept. | Yes |
+| <a id="niagara-systems.gpu-compute-script"></a>A `UNiagaraScript` with `Usage = ENiagaraScriptUsage::ParticleGPUComputeScript` and a `LastCompileStatus` (a GPU emitter's) | Refused: "a compiled GPU compute script carries the GPU shader maps the editor compiles from its HLSL, which AssetGen does not build yet; use a CPU emitter". The engine reads them after the script's tags. | Not yet |
+| <a id="niagara-systems.attribute-type"></a>A particle attribute of a type other than the Niagara and math ones (`FNiagaraTypeDefinition(StaticStructOf<FRotator>(), 2)`) | Refused, naming the attribute and type: its register layout is not known. | Not yet |
+| <a id="niagara-systems.handle-without-emitter"></a>`FNiagaraEmitterHandle(FGuid(), "Id", true, "E", nullptr)` (an enabled handle) | Refused: "EmitterHandles[0] names no emitter of the block, which the editor's compile needs". | Refused |
+
+Notes:
+
+- An empty `RapidIterationParameters` the cook writes as an empty struct tag loads the same as none, so bpdecomp
+  writes nothing for it.
 
 ### Behaviour trees and blackboards
 

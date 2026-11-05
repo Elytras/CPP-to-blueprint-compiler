@@ -5347,6 +5347,83 @@ def particle_events():
     print('ok  ParticleEvents: the generator in Modules and the slot, the receiver by name')
 
 
+def niagara_compiled():
+    """NiagaraCompiled: a Niagara system's EmitterCompiledData, worked out from its compiled scripts as the editor works
+    it out (UNiagaraSystem::InitEmitterCompiledData) and written after the system's tags: per emitter handle the system
+    scripts' spawn infos named for it (any case, each once), its alias variables, its particle attributes (the update
+    script's, then the spawn script's not there yet), each attribute's register layout (FNiagaraTypeLayoutInfo), the
+    handle's IdName and whether it needs persistent IDs. A disabled emitter is left out of the package, its handle's
+    Instance null, its compiled data kept (NS_Two's Old; NS_Off's GPU script goes with it, so needs no shader maps)."""
+    import invariants, particle_roundtrip as rt
+    p = invariants.Package(os.path.join(os.path.dirname(asset('NiagaraCompiled')), 'NS_Two'))
+    proves('niagara-systems.emitterhandles')
+    sparks, glow, old = rt.values(p, p.find('NS_Two'))['<native>']
+    assert sparks['spawnattributes'] == ['Sparks.Burst', 'Sparks.Rate', 'sparks.Late'], sparks['spawnattributes']
+    assert glow['spawnattributes'] == ['Glow.Spawn'], glow['spawnattributes']
+    names = {k: v['name'] for k, v in sparks.items() if k.endswith('var')}
+    assert names == dict(emitterspawnintervalvar='Sparks.SpawnInterval', emitterinterpspawnstartdtvar='Sparks.InterpSpawnStartDt',
+                         emitterspawngroupvar='Sparks.SpawnGroup', emitteragevar='Sparks.Age', emitterrandomseedvar='Sparks.RandomSeed',
+                         emitterinstanceseedvar='Engine.Sparks.InstanceSeed',
+                         emittertotalspawnedparticlesvar='Engine.Sparks.TotalSpawnedParticles'), names
+    assert sparks['emitterspawngroupvar']['type']['classstructorenum'].endswith('.NiagaraInt32'), sparks['emitterspawngroupvar']
+    d = sparks['datasetcompileddata']
+    assert [v['name'] for v in d['variables']] == ['Age', 'Color', 'Position', 'Particles.ID', 'Pad'], d['variables']
+    layouts = [(l['floatcomponentstart'], l['int32componentstart'], l['halfcomponentstart'],
+                l['layoutinfo']['floatcomponentbyteoffsets'], l['layoutinfo']['int32componentbyteoffsets'],
+                l['layoutinfo']['halfcomponentbyteoffsets'], l['layoutinfo']['halfcomponentregisteroffsets']) for l in d['variablelayouts']]
+    assert layouts == [(0, 0, 0, [0], [], [], []), (1, 0, 0, [0, 4, 8, 12], [], [], []), (5, 0, 0, [0, 4, 8], [], [], []),
+                       (8, 0, 0, [], [0, 4], [], []), (8, 2, 0, [], [], [0, 2], [0, 1])], layouts
+    assert (d['totalfloatcomponents'], d['totalint32components'], d['totalhalfcomponents']) == (8, 2, 2), d
+    assert (d['brequirespersistentids'], d['simtarget'], d['id']) == (True, 'CPUSim', dict(name='IdSparks', type='ParticleData')), d
+    g = glow['datasetcompileddata']
+    assert ([v['name'] for v in g['variables']], g['brequirespersistentids'], g['id']['name']) == (['Age'], True, 'IdGlow'), g
+    keeps_invariants(p.base)
+    # a disabled emitter is left out, its compiled data kept: Old's here, Off's GPU script with it (no shader maps asked)
+    proves('niagara-systems.disabled-emitter')
+    v = rt.values(p, p.find('NS_Two'))
+    assert [h['instance'] for h in v['emitterhandles']][2] is None and p.find('Old') is None, v['emitterhandles']
+    o = old['datasetcompileddata']
+    assert (o['variables'], o['simtarget'], o['brequirespersistentids'], o['id']['name']) == ([], 'GPUComputeSim', True, 'IdOld'), o
+    assert (old['emitteragevar']['name'], old['spawnattributes']) == ('Old.Age', []), old
+    off = invariants.Package(os.path.join(os.path.dirname(asset('NiagaraCompiled')), 'NS_Off'))
+    assert [e['name'] for e in off.exports] == ['NS_Off', 'Spawn', 'Update'], off.exports
+    o = rt.values(off, off.find('NS_Off'))['<native>'][0]['datasetcompileddata']
+    assert (o['variables'], o['simtarget'], o['id']['name']) == ([], 'GPUComputeSim', 'IdOff'), o
+    keeps_invariants(off.base)
+    print('ok  NiagaraCompiled: the emitters\' compiled data, worked out from their scripts')
+
+
+def niagara_refusals():
+    """A Niagara system the editor could not build either, or whose compiled data AssetGen cannot work out, is refused,
+    saying what."""
+    def system(mod, body):
+        return ('UE_ASSET_DEFAULTS(UNiagaraSystem, NS_%s) {\n'
+                '  UNiagaraScript *Sp = UE_INSTANCED(UNiagaraScript, this, "Sp");\n'
+                '  Sp->CachedScriptVM.LastCompileStatus = ENiagaraScriptCompileStatus::NCS_UpToDate;\n'
+                '  UNiagaraScript *Up = UE_INSTANCED(UNiagaraScript, this, "Up");\n'
+                '  Up->CachedScriptVM.LastCompileStatus = ENiagaraScriptCompileStatus::NCS_UpToDate;\n'
+                '  SystemSpawnScript = Sp;\n  SystemUpdateScript = Up;\n%s}\n' % (mod, body))
+    emitter = ('  UNiagaraEmitter *E = UE_INSTANCED(UNiagaraEmitter, this, "E");\n  E->UniqueEmitterName = "E";\n'
+               '  EmitterHandles = {FNiagaraEmitterHandle(FGuid(), "Id", true, "E", E)};\n')
+    proves('niagara-systems.gpu-compute-script')
+    refused('NgGpu', '', 'G: a compiled GPU compute script carries the GPU shader maps the editor compiles from its HLSL',
+            after=system('Gpu', emitter + '  E->SimTarget = ENiagaraSimTarget::GPUComputeSim;\n'
+                                          '  UNiagaraScript *G = UE_INSTANCED(UNiagaraScript, E, "G");\n'
+                                          '  G->Usage = ENiagaraScriptUsage::ParticleGPUComputeScript;\n'
+                                          '  G->CachedScriptVM.LastCompileStatus = ENiagaraScriptCompileStatus::NCS_UpToDate;\n'
+                                          '  E->GPUComputeScript = G;\n'))
+    proves('niagara-systems.attribute-type')
+    refused('NgType', '', 'E: particle attribute Spin is a Rotator, whose register layout AssetGen does not know',
+            after=system('Type', emitter + '  UNiagaraScript *U = UE_INSTANCED(UNiagaraScript, E, "U");\n'
+                                           '  U->CachedScriptVM.Attributes = {FNiagaraVariable("Spin", FNiagaraTypeDefinition('
+                                           'StaticStructOf<FRotator>(), 2), {})};\n'
+                                           '  E->UpdateScriptProps.Script = U;\n'))
+    proves('niagara-systems.handle-without-emitter')
+    refused('NgHandle', '', "EmitterHandles[0] names no emitter of the block, which the editor's compile needs",
+            after=system('Handle', '  EmitterHandles = {FNiagaraEmitterHandle(FGuid(), "Id", true, "E", nullptr)};\n'))
+    print('ok  Niagara system refusals')
+
+
 def particle_roundtrip_values(p, name):
     """An export's tags as particle_roundtrip reads them: names lowercased, structs and arrays of them decoded."""
     import particle_roundtrip as rt
@@ -5356,17 +5433,18 @@ def particle_roundtrip_values(p, name):
 def particle_decompile():
     """The suite's own particle systems (ParticleBake, ParticleCurves) decompiled by bpdecomp and compiled again come
     out the same by meaning (particle_roundtrip.diffs, the oracle the vanilla round trip uses): baked tables, live
-    distributions, a GPU emitter's given data, an engine uint32 member."""
+    distributions, a GPU emitter's given data, an engine uint32 member; a Niagara system with its computed
+    EmitterCompiledData."""
     import invariants, particle_roundtrip as rt
     gpu = invariants.Package(os.path.join(os.path.dirname(asset('ParticleCurves')), 'P_Gpu'))
     proves('particle-systems.e-detailmodebitmask-5')
     e = rt.values(gpu, gpu.find('E'))
     assert e['detailmodebitmask'] == 5, e
-    proves('particle-systems.bpdecomp-particles')
+    proves('particle-systems.bpdecomp-particles', 'niagara-systems.bpdecomp-niagara')
     work = tempfile.mkdtemp()
     try:
         rt.layout(work, os.path.abspath(UEAPI))
-        for mod in ('ParticleBake', 'ParticleCurves', 'ParticleEvents'):
+        for mod in ('ParticleBake', 'ParticleCurves', 'ParticleEvents', 'NiagaraCompiled'):
             folder = os.path.dirname(asset(mod))
             content = folder.replace(os.sep, '/').split('/FSD/Content/')[0] + '/FSD/Content'
             root = '/Game/_ElytrasMods/' + mod
@@ -5376,7 +5454,7 @@ def particle_decompile():
             assert not [n for n in notes if n.strip()], notes
             proc, out = rt.compile_mod(work, 'RT' + mod, root, os.path.abspath(ASSETGEN))
             assert not proc.returncode, proc.stdout[-2000:] + proc.stderr[-2000:]
-            names = sorted(f[:-7] for f in os.listdir(folder) if f.startswith('P_') and f.endswith('.uasset'))
+            names = sorted(f[:-7] for f in os.listdir(folder) if f.startswith(('P_', 'NS_')) and f.endswith('.uasset'))
             assert names and names == sorted(f[:-7] for f in os.listdir(out) if f.endswith('.uasset')), (names, os.listdir(out))
             for n in names:
                 d = rt.diffs(invariants.Package(os.path.join(folder, n)), invariants.Package(os.path.join(out, n)))
@@ -13395,6 +13473,8 @@ behaviour_trees()
 behaviour_tree_refusals()
 particle_refusals()
 particle_events()
+niagara_compiled()
+niagara_refusals()
 particle_decompile()
 
 

@@ -31,6 +31,7 @@
 #include "Blueprint.h"
 #include "BehaviorTree.h"
 #include "Cascade.h"
+#include "Niagara.h"
 #include "Command.h"
 #include "Cooked.h"
 #include "Package.h"
@@ -2582,6 +2583,8 @@ private:
     const FRecord* NamedQualifier(const Json& Ref) const;
     /* The class a StaticClass call names, Callee its DeclRefExpr and Slot the type it fills; null when unknown. */
     const FRecord* StaticClassOf(const Json& Callee, const std::string& Slot) const;
+    std::string NativeMemberWhere(const FRecord* Declarer, const std::string& Type, const std::string& Name,
+                                  const std::string& Where) const;
     const FRecord* HeldClassOf(const Json& ClassExpr) const;
     const FRecord* TemplateParamOf(const Json& Callee) const;
     FIndex StructObjectOf(const FRecord& R, FBlueprintClass& BP) const;
@@ -8209,6 +8212,8 @@ std::pair<const FRecord*, std::string> FCompiler::PureMethod(const FRecord& R) c
    - UAtmosphericFogComponent: three empty bulk-data headers (flags, count, size on disk, offset), then CounterVal.
    - UParticleModuleRequired: bCooked, which a cooked load requires true (else Fatal), then DerivedData's
      BoundingGeometry, empty without a cutout texture (ParticleModules.cpp, SubUVAnimation.cpp 33-36).
+   - UNiagaraSpriteRendererProperties: its cutout DerivedData's BoundingGeometry the same way, empty in all 1,332 of
+     DRG's (NiagaraSpriteRendererProperties.cpp Serialize).
    Too little or too much is fatal alike: the loader checks each export's size ("Serial size mismatch"). */
 std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
 {
@@ -8226,6 +8231,7 @@ std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
         else if (A->UeName == "SkyAtmosphereComponent") Tail.resize(Tail.size() + 16);
         else if (A->UeName == "AtmosphericFogComponent") Tail.resize(Tail.size() + 3 * 20 + 4);
         else if (A->UeName == "ParticleModuleRequired") I32({ 1, 0 });
+        else if (A->UeName == "NiagaraSpriteRendererProperties") I32({ 0 });
     }
     return Tail;
 }
@@ -17483,6 +17489,17 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         PD.Default.Object = ClassImportOf(*C, BP);
         return true;
     }
+    /* `X::StaticClass()` in a UObject* member: the class as an object, as the cook writes a Niagara data interface's
+       type definition's ClassStructOrEnum (FNiagaraTypeDefinition(UNiagaraDataInterfaceCurve::StaticClass(), 1)). */
+    if (const Json* Callee = PD.Type == "ObjectProperty" && K == "CallExpr" ? Strip(First(*Init)) : nullptr;
+        Callee && Kind(*Callee) == "DeclRefExpr" && (*Callee)["referencedDecl"].value("name", std::string()) == "StaticClass")
+    {
+        const FRecord* C = StaticClassOf(*Callee, TypeOf(F));
+        if (!C) { *Err = Name(F) + ": StaticClass() on an unknown class"; return false; }
+        PD.Default.K = FDefaultValue::Obj;
+        PD.Default.Object = ClassImportOf(*C, BP);
+        return true;
+    }
     /* `StaticStructOf<X>()`: the struct object, as the cook writes a Niagara type definition's ClassStructOrEnum. */
     if (const Json* Callee = PD.Type == "ObjectProperty" && K == "CallExpr" ? Strip(First(*Init)) : nullptr;
         Callee && Kind(*Callee) == "DeclRefExpr"
@@ -17928,21 +17945,25 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     if (Type == "FText") { *Out = TextParam(PName, ExtraFlags); return true; }
     if (auto E = Enums.find(Type); E != Enums.end())
     {
-        if (E->second.Underlying == "int32" || E->second.Underlying == "int64")
+        const std::string& U = E->second.Underlying;
+        if (U == "int32" || U == "int64" || ((U == "uint32" || U == "uint16") && Where.compare(0, 7, "member ") == 0))
         {
-            /* An EnumProperty over an Int/Int64Property, the way UHT reflects `enum class : int32`. No editor-made
-               Blueprint has one, but FEnumProperty takes any numeric underlying property and UEnum values are int64. */
-            const bool b64 = E->second.Underlying == "int64";
+            /* An EnumProperty over an Int/Int64Property, the way UHT reflects `enum class : int32`; an engine member's
+               over a UInt32/UInt16Property too (Niagara's ribbon UV modes are `: uint32`). No editor-made Blueprint has
+               one, but FEnumProperty takes any numeric underlying property and UEnum values are int64. */
+            const bool b64 = U == "int64";
             *Out = b64 ? Int64Param(PName, ExtraFlags) : IntParam(PName, ExtraFlags);
             Out->Type = "EnumProperty";
             Out->Extra = BP.Enum(E->second.Package, E->second.UeName);
             Out->StructName = E->second.UeName;
             Out->EnumZero = E->second.UeName + "::" + E->second.First;
             Out->Inner = std::make_shared<FPropertyDef>(b64 ? Int64Param("UnderlyingType") : IntParam("UnderlyingType"));
+            if (U == "uint32") Out->Inner->Type = "UInt32Property";
+            if (U == "uint16") { Out->Inner->Type = "UInt16Property"; Out->Inner->ElementSize = 2; }
             Out->Inner->PropertyFlags = 0;
             return true;
         }
-        if (E->second.Underlying != "uint8")
+        if (U != "uint8")
         { *Err = "TODO: unimplemented " + Where + ": " + QualType + " (a uint8, int32 or int64 enum only)"; return false; }
         *Out = ByteParam(PName, ExtraFlags);
         Out->Extra = BP.Enum(E->second.Package, E->second.UeName);
@@ -19034,12 +19055,16 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
 /* S38: one assignment of an edit, `Root<Steps> = Rhs`: the member Root names (Declarer's), each step's def down the
    path, and the value lowered against the last. Zero is a real value here: it replaces the game's own, which need not
    be zero. */
-/* Where, or TypeToProperty's "member <Name>" for an engine class's uint16 / uint32 member: its unsigned ints
-   (UParticleEmitter::DetailModeBitmask) are then tags AssetGen writes, which a mod's own variable may not be. */
-std::string NativeMemberWhere(const FRecord* Declarer, const std::string& Type, const std::string& Name, const std::string& Where)
+/* Where, or TypeToProperty's "member <Name>" for an engine class's uint16 / uint32 member, or one of an enum over them:
+   its unsigned ints (UParticleEmitter::DetailModeBitmask, UNiagaraRibbonRendererProperties::UV0Settings'
+   DistributionMode) are then tags AssetGen writes, which a mod's own variable may not be. */
+std::string FCompiler::NativeMemberWhere(const FRecord* Declarer, const std::string& Type, const std::string& Name,
+                                         const std::string& Where) const
 {
     const std::string T = StripTypeKeywords(Type);
-    const bool bUnsigned = T == "uint16" || T == "uint32" || T == "unsigned short" || T == "unsigned int";
+    const auto E = Enums.find(T);
+    const std::string U = E == Enums.end() ? T : E->second.Underlying;
+    const bool bUnsigned = U == "uint16" || U == "uint32" || U == "unsigned short" || U == "unsigned int";
     return Declarer && Declarer->IsNative() && bUnsigned ? "member " + Name : Where;
 }
 
@@ -19195,7 +19220,8 @@ bool FCompiler::EditStep(const Json& Step, const FPropertyDef& Parent, const std
         const FRecord* SR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
         if (!SR || Parent.Type != "StructProperty") { *Err = Where + ": cannot tell which struct declares " + Name(Step); return false; }
         Out.Member = UeNameOf(SR, Name(Step));
-        if (!TypeToProperty(TypeOf(Step), Out.Member, 0, Where, BP, &Reached, Err)) return false;
+        if (!TypeToProperty(TypeOf(Step), Out.Member, 0, NativeMemberWhere(SR, TypeOf(Step), Name(Step), Where), BP, &Reached, Err))
+            return false;
         const int32 Native = NativeStructSize(Parent.StructName);
         if (!Native) return true;
         /* A native struct's bytes are its members' in declaration order, each of a fixed size. */
@@ -19203,7 +19229,8 @@ bool FCompiler::EditStep(const Json& Step, const FPropertyDef& Parent, const std
         for (const Json* F : SR->Fields)
         {
             FPropertyDef M;
-            if (!TypeToProperty(TypeOf(*F), UeNameOf(SR, Name(*F)), 0, Where, BP, &M, Err)) return false;
+            if (!TypeToProperty(TypeOf(*F), UeNameOf(SR, Name(*F)), 0, NativeMemberWhere(SR, TypeOf(*F), Name(*F), Where), BP, &M, Err))
+                return false;
             const int32 Size = FixedValueSize(M);
             if (!Size) { *Err = Where + ": " + SR->CppName + "::" + Name(*F) + " is not a fixed size, so its bytes cannot be found"; return false; }
             if (Name(*F) == Name(Step)) { Out.Offset = At; Out.Size = Size; }
@@ -21416,7 +21443,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     {
                         FPropertyDef M;
                         const std::string MD = OwnerOf(*Part[I]);
-                        if (!TypeToProperty(TypeOf(*Part[I]), UeNameOf(MD.empty() ? nullptr : Find(MD), Name(*Part[I])), 0, Where, BP, &M, Err))
+                        const FRecord* MR = MD.empty() ? nullptr : Find(MD);
+                        if (!TypeToProperty(TypeOf(*Part[I]), UeNameOf(MR, Name(*Part[I])), 0,
+                                            NativeMemberWhere(MR, TypeOf(*Part[I]), Name(*Part[I]), Where), BP, &M, Err))
                         { bOk = false; return; }
                         Outer.push_back(M);
                     }
@@ -21425,8 +21454,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         { *Err = Where + ": " + (I ? Name(*Part[I - 1]) : Name(*Lhs)) + " is " + (Outer[I].Type == "StructProperty"
                                  ? "a " + Outer[I].StructName + ", which is written whole: assign all of it" : "no struct"); bOk = false; return; }
                     const std::string LD = OwnerOf(*Leaf);
+                    const FRecord* LR = LD.empty() ? nullptr : Find(LD);
                     PD = FPropertyDef();
-                    if (!TypeToProperty(TypeOf(*Leaf), UeNameOf(LD.empty() ? nullptr : Find(LD), Name(*Leaf)), 0, Where, BP, &PD, Err))
+                    if (!TypeToProperty(TypeOf(*Leaf), UeNameOf(LR, Name(*Leaf)), 0, NativeMemberWhere(LR, TypeOf(*Leaf), Name(*Leaf), Where),
+                                        BP, &PD, Err))
                     { bOk = false; return; }
                 }
                 if (!LowerDefault(*Leaf, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
@@ -22139,6 +22170,21 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        exports the objects its own UE_DEFAULTS make there; one that makes none of that name inherits it, so the class
        above is asked next. A game Blueprint's package exports every one it has, which UeApi lists. Found, it is an
        import; this class's own copy loads from it what its tags leave unset. */
+    /* The objects a cook below left in the package (Kept: their indices before, in order), with their tags after it,
+       each outer renumbered. */
+    auto KeepInstanced = [&](const std::vector<int32>& Kept, std::vector<std::vector<FPropertyDef>>&& Tags) {
+        std::vector<int32> NewOf(Insts.size(), -1);
+        for (size_t K = 0; K < Kept.size(); ++K) NewOf[size_t(Kept[K])] = int32(K);
+        std::vector<FInstSpec> KeptInsts;
+        for (int32 Old : Kept)
+        {
+            FInstSpec S = Insts[size_t(Old)];
+            if (S.Parent >= 0) S.Parent = NewOf[size_t(S.Parent)];
+            KeptInsts.push_back(S);
+        }
+        Insts = std::move(KeptInsts);
+        InstDefaults = std::move(Tags);
+    };
     /* A particle system: the cooker's work on its tags (Cascade.cpp), before its objects are exported. A baked
        distribution object is left out, and the rest renumbered. */
     if (!R.AssetOf.empty() && Derives(B, "ParticleSystem"))
@@ -22164,24 +22210,37 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         std::vector<std::string> Warnings;
         if (!CookCascade(InheritedDefaults, Objs, Kept, Warnings, Err)) { *Err = R.AssetOf + ": " + *Err; return false; }
         for (const std::string& W : Warnings) printf("  warning: %s: %s\n", R.AssetOf.c_str(), W.c_str());
-        std::vector<int32> NewOf(Insts.size(), -1);
-        for (size_t K = 0; K < Kept.size(); ++K)
-        {
-            if (size_t(Kept[K]) >= Insts.size())
+        for (int32 Old : Kept)
+            if (size_t(Old) >= Insts.size())
             { *Err = R.AssetOf + ": a starting distribution was left in the package unbaked (AssetGen bug)"; return false; }
-            NewOf[size_t(Kept[K])] = int32(K);
-        }
-        std::vector<FInstSpec> KeptInsts;
-        std::vector<std::vector<FPropertyDef>> KeptDefaults;
-        for (size_t K = 0; K < Kept.size(); ++K)
-        {
-            FInstSpec S = Insts[size_t(Kept[K])];
-            if (S.Parent >= 0) S.Parent = NewOf[size_t(S.Parent)];
-            KeptInsts.push_back(S);
-            KeptDefaults.push_back(std::move(Objs[K].Tags));
-        }
-        Insts = std::move(KeptInsts);
-        InstDefaults = std::move(KeptDefaults);
+        std::vector<std::vector<FPropertyDef>> Tags;
+        for (FCascadeObject& O : Objs) Tags.push_back(std::move(O.Tags));
+        KeepInstanced(Kept, std::move(Tags));
+    }
+    /* A Niagara system: the cooker's work on it (Niagara.cpp). A disabled emitter is left out, and the rest renumbered;
+       its EmitterCompiledData, which UNiagaraSystem::Serialize writes after the tags (a count, then each emitter's as
+       tags), is worked out first. */
+    if (!R.AssetOf.empty() && Derives(B, "NiagaraSystem"))
+    {
+        std::vector<FNiagaraObject> Objs;
+        for (size_t I = 0; I < Insts.size(); ++I) Objs.push_back({ ClassOf(*Insts[I].Class), Insts[I].Name, Insts[I].Parent, InstDefaults[I] });
+        std::vector<int32> Kept;
+        std::vector<std::vector<FPropertyDef>> Compiled;
+        if (!CookNiagara(InheritedDefaults, Objs, Kept,
+                         [&](FIndex V) { const FImport* Im = P.ImportAt(V); return Im ? Im->ObjectName : std::string(); },
+                         [&](const std::string& S) { return BP.ScriptStruct("/Script/Niagara", S); }, Compiled, Err))
+        { *Err = R.AssetOf + ": " + *Err; return false; }
+        std::vector<std::vector<FPropertyDef>> Tags;
+        for (FNiagaraObject& O : Objs) Tags.push_back(std::move(O.Tags));
+        KeepInstanced(Kept, std::move(Tags));
+        BP.AssetTail = [Compiled](FArc& Ar) {
+            Ar.I32(int32(Compiled.size()));
+            for (const std::vector<FPropertyDef>& Tags : Compiled)
+            {
+                for (const FPropertyDef& T : Tags) WriteDefaultTag(Ar, T);
+                TagEnd(Ar);
+            }
+        };
     }
     /* A behaviour tree: each node's TreeAsset and ParentNode, as the editor keeps them (BehaviorTree.cpp). */
     if (!R.AssetOf.empty() && Derives(B, "BehaviorTree"))
