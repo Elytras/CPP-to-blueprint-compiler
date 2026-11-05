@@ -156,16 +156,61 @@ class AssetEmit:
         outer = 'this' if o == s.a.export else s.instanced(o)
         cls = s.run.types.cls(s.pkg, e['cls'], s.a)
         local, n = ident(e['name']), 2
-        while local in s.locals.values() or local == 'this': local, n = '%s_%d' % (ident(e['name']), n), n + 1
+        while local in s.locals.values() or local == 'this' or local.lower() in s.own_members():
+            local, n = '%s_%d' % (ident(e['name']), n), n + 1
         s.locals[i] = local
         s.lines.append('%s *%s = UE_INSTANCED(%s, %s, %s);' % (cls, local, cls, outer, B.cstring(e['name'])))
         s.tags(i, local + '->')
         return local
 
+    HANDLE = re.compile(r'FNiagaraEmitterHandle\((FGuid\([^)]*\)), ("[^"]*"|FName\(\)), (true|false), "([^"]*)", (\w+)\)')
+
+    def disabled_emitters(s):
+        """A Niagara system's disabled emitter, which the cook left out (its handle's Instance null), as a UE_INSTANCED
+        stand-in AssetGen leaves out again: its name, and the sim target and persistent IDs its compiled data kept
+        (UNiagaraSystem's EmitterCompiledData, after the tags), which AssetGen works out from it."""
+        pkg, i = s.pkg, s.a.export
+        at = next((k for k, l in enumerate(s.lines) if l.startswith('EmitterHandles = ')), None)
+        if pkg.class_of(i + 1) != 'NiagaraSystem' or at is None: return
+        b, o = bytes(pkg.blob(i)), pkg.tags(i).end + 4
+        if len(b) < o + 4: return
+        vals, kept, count = Values(s.cx), [], struct.unpack_from('<i', b, o)[0]
+        o += 4
+        for _ in range(count):
+            tags, o = vals.read_tags(pkg, b, o)
+            d = next((t for t in tags if t['name'] == 'DataSetCompiledData'), None)
+            inner = vals.read_tags(pkg, bytes(d['value']), 0)[0] if d else []
+            sim = next((vals.name_at(pkg, bytes(t['value']), 0) for t in inner if t['name'] == 'SimTarget'), '')
+            kept.append((sim.split('::')[-1], any(t['name'] == 'bRequiresPersistentIDs' and t['bool'] for t in inner)))
+        add, k = [], [0]
+
+        def stand_in(m):
+            n, k[0] = k[0], k[0] + 1
+            if m.group(3) != 'false' or m.group(5) != 'nullptr' or n >= len(kept): return m.group(0)
+            local, j = ident(m.group(4)), 2
+            while local in s.locals.values() or local.lower() in s.own_members(): local, j = '%s_%d' % (ident(m.group(4)), j), j + 1
+            s.locals[('disabled', n)] = local
+            add.append('UNiagaraEmitter *%s = UE_INSTANCED(UNiagaraEmitter, this, %s);' % (local, B.cstring(m.group(4) + '_Disabled')))
+            add.append('%s->UniqueEmitterName = %s;' % (local, B.cstring(m.group(4))))
+            if kept[n][0] and kept[n][0] != 'CPUSim': add.append('%s->SimTarget = ENiagaraSimTarget::%s;' % (local, kept[n][0]))
+            if kept[n][1]: add.append('%s->bRequiresPersistentIDs = true;' % local)
+            return m.group(0)[:-len('nullptr)')] + local + ')'
+        s.lines[at] = s.HANDLE.sub(stand_in, s.lines[at])
+        s.lines[at:at] = add
+
+    def own_members(s):
+        """The asset class's members (its bases' too), lowercased: a local of one's name would hide it, and
+        `SystemSpawnScript = SystemSpawnScript;` assign the local to itself."""
+        if not hasattr(s, '_own'):
+            s._own, c = set(), s.run.types.cls(s.pkg, s.pkg.exports[s.a.export]['cls'], s.a)
+            while c: s._own |= set(s.run.api.members(c)); c = s.run.api.bases.get(c)
+        return s._own
+
     def emit(s):
         a, pkg = s.a, s.pkg
         o = Out(a)
         s.tags(a.export, '')
+        s.disabled_emitters()
         for i, e in enumerate(pkg.exports):
             if i == a.export or i in s.locals or not e['outer']: continue
             if pkg.class_of(i + 1).startswith('Distribution'): continue

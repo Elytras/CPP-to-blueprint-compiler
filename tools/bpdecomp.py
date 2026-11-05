@@ -30,9 +30,10 @@ from bpdecomp_model import *
 # Engine structs serialized in a form of their own (WithSerializer), not as tags: Values.native_form reads each.
 NATIVE_FORMS = ('GameplayTagContainer', 'NiagaraVariableBase', 'NiagaraVariable', 'NiagaraVariableWithOffset')
 
+# A Guid's parts are signed: UeApi's FGuid takes int, and clang warns on a literal past INT_MAX.
 IMMUTABLE = {'Vector': ('<fff', 'FVector'), 'Vector2D': ('<ff', 'FVector2D'), 'Rotator': ('<fff', 'FRotator'),
              'Vector4': ('<ffff', 'FVector4'), 'Quat': ('<ffff', 'FQuat'), 'IntPoint': ('<ii', 'FIntPoint'),
-             'IntVector': ('<iii', 'FIntVector'), 'LinearColor': ('<ffff', 'FLinearColor'), 'Guid': ('<IIII', 'FGuid'),
+             'IntVector': ('<iii', 'FIntVector'), 'LinearColor': ('<ffff', 'FLinearColor'), 'Guid': ('<iiii', 'FGuid'),
              'Box': ('<ffffffB', 'FBox')}
 
 
@@ -181,6 +182,8 @@ class Values:
             if ty == 'IntProperty': out.append(str(struct.unpack_from('<i', b, o)[0])); o += 4
             elif ty == 'FloatProperty': out.append(B.cfloat(struct.unpack_from('<f', b, o)[0])); o += 4
             elif ty == 'Int64Property': out.append(str(struct.unpack_from('<q', b, o)[0])); o += 8
+            elif ty == 'UInt32Property': out.append('%du' % struct.unpack_from('<I', b, o)[0]); o += 4
+            elif ty == 'UInt16Property': out.append(str(struct.unpack_from('<H', b, o)[0])); o += 2
             elif ty == 'BoolProperty': out.append('true' if b[o] else 'false'); o += 1
             elif ty in ('ByteProperty', 'EnumProperty'):
                 if prop is not None and (prop.type == 'EnumProperty' or prop.ref) and ty != 'ByteProperty' or \
@@ -297,21 +300,23 @@ class Values:
             return s.transform(pkg, tags, cur)
         parts = []
         uname = sname or (tp.path(ref).rsplit('.', 1)[-1] if ref else '')
-        fields = s.cx.api.fields.get(uname, {})
+        # a tag holds its FName's first spelling in the package, which may differ in case from UeApi's member
+        # (FNiagaraEmitterHandle's `ID` is tagged `Id` where FGuid's `Id` was named first)
+        fields = {k.lower(): v for k, v in s.cx.api.fields.get(uname, {}).items()}
         for t in tags:
             mp = members.get(t['name']) if members else None
-            if mp is None and t['name'] in fields: t = dict(t, cpp=fields[t['name']])     # a native struct's member
+            if mp is None and t['name'].lower() in fields: t = dict(t, cpp=fields[t['name'].lower()])     # a native struct's member
             v = s.value(pkg, t['type'], bytes(t['value']), mp, cur, t)
             parts.append((t['name'], v))
         tname = s.cx.types.struct(tp, ref, cur) if ref else 'F' + (sname or '')
         native = not ref or tp.path(ref).startswith('/Script/')
         order = s.cx.api.ctor_fields.get(uname) if getattr(s, 'in_element', 0) and native else None
-        if order and uname != 'Color' and all(n in order for n, _ in parts):
+        if order and uname != 'Color' and all(n.lower() in {o.lower() for o in order} for n, _ in parts):
             # its constructor, every member in order; one the cooked value leaves out is UE_KEEP, unwritten, so it
             # holds what the engine's constructor sets, as the cooked value does
-            given = dict(parts)
+            given = {n.lower(): v for n, v in parts}
             if not given: return '%s()' % tname
-            return '%s(%s)' % (tname, ', '.join(given.get(n, 'UE_KEEP') for n in order))
+            return '%s(%s)' % (tname, ', '.join(given.get(n.lower(), 'UE_KEEP') for n in order))
         return '%s{%s}' % (tname, ', '.join('.%s = %s' % (ident(authored(n)), v) for n, v in parts))
 
     def transform(s, pkg, tags, cur):

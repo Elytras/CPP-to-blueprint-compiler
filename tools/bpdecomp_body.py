@@ -32,7 +32,8 @@ class E:
 
 def cfloat(v):
     if v != v: return 'NAN'
-    if v in (float('inf'), float('-inf')): return ('-' if v < 0 else '') + 'INFINITY'
+    # a double past float's range: inf, with no header and no clang warning (1e39f would warn)
+    if v in (float('inf'), float('-inf')): return ('-' if v < 0 else '') + '(float)1e39'
     for digits in range(6, 10):
         t = '%.*g' % (digits, v)
         if struct.unpack('<f', struct.pack('<f', float(t)))[0] == v: break

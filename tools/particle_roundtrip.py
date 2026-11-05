@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """usage: particle_roundtrip.py <Content dir> <work dir> [--root /Game/Path]... [--only P_Name]... [--assetgen exe]
-                             [--ueapi dir] [--jobs N]
+                             [--ueapi dir] [--jobs N] [--niagara] [--list paths.txt]
 
 The oracle for Cascade particle systems in AssetGen: each cooked UParticleSystem under the roots (DRG's 972 P_*) is
 decompiled by bpdecomp to UE_ASSET_DEFAULTS source, compiled again by AssetGen, and the two packages are compared by
-meaning (diffs()). Prints one line per package that differs or fails, then a tally; writes <work>/report.txt.
+meaning (diffs()), what a class's native Serialize writes after the tags included. With --niagara the same for each
+UNiagaraSystem (NS_*, DRG's 494); --list gives the packages instead of a walk. Prints one line per package that differs
+or fails, then a tally; writes <work>/report.txt.
 
 The suite uses the same pieces on its own particle systems (particle_decompile in test_bytecode.py)."""
 import argparse, os, re, shutil, struct, subprocess, sys
@@ -60,7 +62,24 @@ def values(pkg, i):
     """Export i's tags as {name: value}: numbers, bools, names, object paths (None for null), arrays, structs as dicts.
     Names are lowercased: an FName compares without case, and the runtime name pool UeApi is dumped from can spell one
     otherwise than the editor that cooked the package (Lifetime, LifeTime)."""
-    return {t['name'].lower(): value(pkg, t) for t in pkg.tags(i)}
+    out = {t['name'].lower(): value(pkg, t) for t in pkg.tags(i)}
+    tail = native_tail(pkg, i)
+    if tail is not None: out['<native>'] = tail
+    return out
+
+
+def native_tail(pkg, i):
+    """What export i's class's native Serialize wrote after its tags and the object guid flag, or None: a Niagara
+    system's EmitterCompiledData decoded (a count, then each emitter's as tags), any other's bytes as hex."""
+    b = bytes(pkg.blob(i))
+    tail = b[pkg.tags(i).end + 4:]
+    if not tail: return None
+    if pkg.class_of(i + 1) != 'NiagaraSystem': return tail.hex()
+    out, o = [], 4
+    for _ in range(struct.unpack_from('<i', tail)[0]):
+        tags, o = V.read_tags(pkg, tail, o)
+        out.append({x['name'].lower(): value(pkg, x) for x in tags})
+    return out if o == len(tail) else ('undecoded', tail.hex())
 
 
 V = bpdecomp.Values(None)
@@ -76,15 +95,23 @@ def item(pkg, ty, b, o, t=None, sname=None):
     """(value, offset after it) of one ty at b[o:]: a tag's value (t given) or a container's element."""
     if ty == 'FloatProperty': return struct.unpack_from('<f', b, o)[0], o + 4
     if ty in ('IntProperty', 'UInt32Property'): return struct.unpack_from('<i' if ty == 'IntProperty' else '<I', b, o)[0], o + 4
+    if ty in INTS: return struct.unpack_from(INTS[ty], b, o)[0], o + struct.calcsize(INTS[ty])
+    if ty == 'StrProperty':
+        n = struct.unpack_from('<i', b, o)[0]; o += 4
+        if n < 0: return b[o:o - 2 * n].decode('utf-16-le').rstrip('\0'), o - 2 * n
+        return b[o:o + n].decode('latin-1').rstrip('\0'), o + n
     if ty == 'BoolProperty': return (bool(t['bool']), o) if t else (bool(b[o]), o + 1)
     if ty in ('ObjectProperty', 'ClassProperty'):
         r = struct.unpack_from('<i', b, o)[0]
         return (pkg.path(r) if r else None), o + 4
     if ty == 'NameProperty' or (ty in ('ByteProperty', 'EnumProperty') and (len(b) - o >= 8 if t is None else t['size'] == 8)):
         return V.name_at(pkg, b, o).split('::')[-1], o + 8
-    if ty == 'ByteProperty': return b[o], o + 1
+    if ty in ('ByteProperty', 'Byte1'): return b[o], o + 1
     if ty == 'StructProperty':
         sname = t['struct'] if t else sname
+        if sname is None:       # a map's or set's struct element: its tag names no struct
+            sname = 'NiagaraVariable' if V.name_at(pkg, b, o + 8) == 'ClassStructOrEnum' else None
+        if sname in NATIVE: return native(pkg, sname, b, o)
         if sname in FIXED:
             n = struct.calcsize(FIXED[sname])
             return struct.unpack_from(FIXED[sname], b, o), o + n
@@ -99,21 +126,56 @@ def item(pkg, ty, b, o, t=None, sname=None):
         if inner == 'StructProperty' and n:
             tl = V.read_tag(pkg, b, o)          # an array of structs leads with one tag for its inner property
             sn, o = tl['struct'], tl['next'] - tl['size']
-        if inner in ('ByteProperty', 'EnumProperty') and n and (len(b) - o) // n == 8: inner = 'NameProperty'
+        # an enum's elements are its enumerators' FNames, a byte array's bytes: the array's own length tells
+        if inner in ('ByteProperty', 'EnumProperty'): inner = 'NameProperty' if n and len(b) - o == 8 * n else 'Byte1'
         out = []
         for _ in range(n):
             v, o = item(pkg, inner, b, o, None, sn)
             out.append(v)
         return out, o
+    if ty in ('MapProperty', 'SetProperty'):
+        kt, vt = (t['inner'], t.get('value_type')) if t else (None, None)
+        out = []
+        for part in ('removed', 'kept'):
+            n = struct.unpack_from('<i', b, o)[0]; o += 4
+            for _ in range(n):
+                k, o = item(pkg, kt, b, o)
+                if ty == 'MapProperty' and part == 'kept':
+                    v, o = item(pkg, vt, b, o)
+                    out.append((k, v))
+                else: out.append((part, k))
+        return out, o
     return ('raw', ty, b[o:]), len(b)
+
+
+INTS = {'UInt16Property': '<H', 'Int16Property': '<h', 'Int8Property': '<b', 'Int64Property': '<q', 'UInt64Property': '<Q',
+        'DoubleProperty': '<d'}
+NATIVE = ('GameplayTagContainer', 'NiagaraVariableBase', 'NiagaraVariable', 'NiagaraVariableWithOffset')
+
+
+def native(pkg, sname, b, o):
+    """(value, offset after it) of a struct with a Serialize of its own (bpdecomp.native_form): a tag container's
+    names; a Niagara variable's Name, type definition as tags, then its VarData or Offset."""
+    if sname == 'GameplayTagContainer':
+        n = struct.unpack_from('<i', b, o)[0]; o += 4
+        return [V.name_at(pkg, b, o + 8 * k) for k in range(n)], o + 8 * n
+    out = {'name': V.name_at(pkg, b, o)}
+    tdef, o = V.read_tags(pkg, b, o + 8)
+    out['type'] = {x['name'].lower(): value(pkg, x) for x in tdef}
+    if sname == 'NiagaraVariable':
+        n = struct.unpack_from('<i', b, o)[0]
+        out['data'] = b[o + 4:o + 4 + n].hex(); o += 4 + n
+    elif sname == 'NiagaraVariableWithOffset':
+        out['offset'] = struct.unpack_from('<i', b, o)[0]; o += 4
+    return out, o
 
 
 def close(a, b, tol=1e-4):
     if isinstance(a, dict): return isinstance(b, dict) and a.keys() == b.keys() and all(close(a[k], b[k], tol) for k in a)
     if isinstance(a, (list, tuple)) and not isinstance(a, bytes):
         return type(a) == type(b) and len(a) == len(b) and all(close(x, y, tol) for x, y in zip(a, b))
-    if isinstance(a, float) or isinstance(b, float):
-        return isinstance(b, (int, float)) and isinstance(a, (int, float)) and abs(a - b) <= tol * max(1.0, abs(a))
+    if isinstance(a, float) or isinstance(b, float):     # equal first: inf - inf is nan
+        return isinstance(b, (int, float)) and isinstance(a, (int, float)) and (a == b or abs(a - b) <= tol * max(1.0, abs(a)))
     if isinstance(a, str) and isinstance(b, str): return a.lower() == b.lower()     # FNames and paths: no case
     return a == b
 
@@ -179,6 +241,8 @@ def diffs(van, ours):
             # a tag left out holds the class default; these two are the ones a decompiled source must state (its
             # module would otherwise start at the editor's value, Cascade.cpp kBoolStarts)
             if x is None and y == CLASS_DEFAULTS.get(k): continue
+            # a struct tag with no members (the cook writes FNiagaraParameterStore's so) sets nothing, as no tag does
+            if (x == {} and y is None) or (x is None and y == {}): continue
             if isinstance(x, dict) and isinstance(y, dict) and 'table' in y and x.get('distribution') and not y.get('distribution'):
                 out.append('baked %s.%s (the cook kept %s live)' % (p, k, x['distribution']))
                 continue
@@ -215,7 +279,10 @@ def one(args, path):
     if proc.returncode:
         text = (proc.stdout + proc.stderr).splitlines()
         errs = [l.split(' error: ', 1)[1] for l in text if ' error: ' in l]
-        return 'compile', sorted(set(errs))[:6] or [l for l in text if 'FAILED' in l][:2] or text[-6:]
+        failed = [l for l in text if 'FAILED' in l]
+        # a GPU emitter's shader maps: AssetGen does not build them yet (REFERENCE.md#niagara-systems.gpu-compute-script)
+        if not errs and failed and all('GPU shader maps' in l for l in failed): return 'gap', failed[:1]
+        return 'compile', sorted(set(errs))[:6] or failed[:2] or text[-6:]
     # an asset name C++ cannot spell (P_Tri-Jaw_...) cooks under bpdecomp's respelling: assets have no __UeName marker
     spelled = re.sub(r'\W', '_', name)
     renamed = spelled != name and not os.path.exists(os.path.join(out, name + '.uasset'))
@@ -243,19 +310,22 @@ def main():
     ap.add_argument('--assetgen', default=os.path.join(REPO, 'x64', 'Release', 'assetgen.exe'))
     ap.add_argument('--ueapi', default=os.path.join(REPO, 'BpMods', 'UeApi'))
     ap.add_argument('--jobs', type=int, default=4); ap.add_argument('--keep', action='store_true')
+    ap.add_argument('--niagara', action='store_true', help='NiagaraSystem packages (NS_*) instead of Cascade P_*')
+    ap.add_argument('--list', help='a file of /Game package paths to run, instead of a walk of the content dir')
     args = ap.parse_args()
+    args.prefix, args.cls = ('NS_', 'NiagaraSystem') if args.niagara else ('P_', 'ParticleSystem')
     # one spelling of every path: a header reached as D:/a and as D: is two files to #pragma once
     args.content, args.work, args.ueapi, args.assetgen = (os.path.abspath(x) for x in (args.content, args.work, args.ueapi, args.assetgen))
-    paths = []
-    for r, _, fs in os.walk(args.content):
+    paths = [l for l in open(args.list).read().split() if not args.only or l.rsplit('/', 1)[1] in args.only] if args.list else []
+    for r, _, fs in [] if args.list else os.walk(args.content):
         for f in fs:
-            if not (f.startswith('P_') and f.endswith('.uasset')): continue
+            if not (f.startswith(args.prefix) and f.endswith('.uasset')): continue
             path = '/Game/' + os.path.relpath(os.path.join(r, f[:-7]), args.content).replace(os.sep, '/')
             if args.root and not any(path.startswith(x.rstrip('/') + '/') for x in args.root): continue
             if args.only and f[:-7] not in args.only: continue
             try:
                 p = invariants.Package(os.path.join(r, f[:-7]))
-                if not any(not e['outer'] and p.class_of(k + 1) == 'ParticleSystem' for k, e in enumerate(p.exports)): continue
+                if not any(not e['outer'] and p.class_of(k + 1) == args.cls for k, e in enumerate(p.exports)): continue
             except Exception: continue
             paths.append(path)
     os.makedirs(args.work, exist_ok=True)

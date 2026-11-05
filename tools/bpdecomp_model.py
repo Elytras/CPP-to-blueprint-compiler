@@ -192,7 +192,7 @@ def classify(pkg):
             st = pkg.struct(i)
             if st.class_flags & CLASS_Interface: return 'interface', i
             return 'widget' if c == 'WidgetBlueprintGeneratedClass' else 'class', i
-        if c == 'ParticleSystem': return 'particles', i
+        if c in ('ParticleSystem', 'NiagaraSystem'): return 'particles', i
     for i, e in enumerate(pkg.exports):
         if e['outer'] or e['name'].startswith('Default__'): continue
         if e['flags'] & 0x1 and pkg.class_of(i + 1).endswith('_C'): return 'data', i   # RF_Public, a BP class's object
