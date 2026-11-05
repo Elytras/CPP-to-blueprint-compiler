@@ -5119,6 +5119,82 @@ def particle_starts():
     print('ok  ParticleStarts: unset distributions start where the editor starts them')
 
 
+def behaviour_trees():
+    """BehaviorTree: a blackboard's key types and a tree's nodes are objects under their asset. Each node gets the
+    TreeAsset and ParentNode the editor keeps: the tree, and the composite holding it (of a child, its decorators, a
+    composite's and a child task's Services); none on the root and the RootDecorators. The rule is the one all 3053
+    nodes of DRG's 79 cooked trees follow (btdecomp.py, BehaviorTree.h)."""
+    import btdecomp, invariants
+    folder = os.path.dirname(asset('BehaviorTree'))
+    mod = '/Game/_ElytrasMods/BehaviorTree/'
+    proves('behaviour-trees-and.ue-asset-defaults')
+    bb_base = os.path.join(folder, 'BB_Test')
+    bb = {x.name: x for x in btdecomp.read(bb_base)[1]}
+    keys = [(k['EntryName'][1], k['KeyType'].rsplit(':', 1)[-1], k['bInstanceSynced']) for k in bb['BB_Test'].values['Keys']]
+    assert keys == [('Target', 'BlackboardKeyType_Object_0', False), ('Destination', 'BlackboardKeyType_Vector_0', False),
+                    ('IsStunned', 'BlackboardKeyType_Bool_0', False), ('State', 'BlackboardKeyType_Enum_0', False)], keys
+    assert all(bb[n].outer == mod + 'BB_Test.BB_Test' for n in bb if n != 'BB_Test')
+    assert bb['BlackboardKeyType_Object_0'].values == {'BaseClass': '/Script/Engine.Actor'}, bb['BlackboardKeyType_Object_0'].values
+    proves('behaviour-trees-and.ue-asset-at-uenum-estate')
+    assert bb['BlackboardKeyType_Enum_0'].values['EnumType'] == '/Script/FSD.EWoodLouseState'
+    p = invariants.Package(bb_base)
+    assert ('/Script/CoreUObject', 'Enum', 'EWoodLouseState') in [(i['class_package'], i['class_name'], i['name']) for i in p.imports]
+    keeps_invariants(bb_base)
+
+    proves('behaviour-trees-and.ue-asset-defaults-ubehaviortree')
+    bt_base = os.path.join(folder, 'BT_Test')
+    nodes = {x.name: x for x in btdecomp.read(bt_base)[1]}
+    tree = mod + 'BT_Test.BT_Test'
+    at = lambda n: tree + ':' + n
+    parents = {n: (x.values.get('ParentNode') or '').rsplit(':', 1)[-1] or None for n, x in nodes.items() if n != 'BT_Test'}
+    assert parents == {'Alive': None, 'Root': None, 'Focus': 'Root', 'Stunned': 'Root', 'Recover': 'Root', 'Roam': 'Root',
+                       'Near': 'Root', 'Far': 'Root', 'Pick': 'Roam', 'Go': 'Roam', 'Watch': 'Roam'}, parents
+    assert all(x.values.get('TreeAsset') == tree for n, x in nodes.items() if n != 'BT_Test')
+    assert all(x.outer == tree and x.flags == 0x8 for n, x in nodes.items() if n != 'BT_Test')
+    top = nodes['BT_Test'].values
+    assert (top['RootNode'], top['RootDecorators'], top['BlackboardAsset']) == (at('Root'), [at('Alive')], mod + 'BB_Test.BB_Test'), top
+    proves('behaviour-trees-and.root-children-nullptr-wait', 'behaviour-trees-and.nested-block')
+    kids = lambda n: [(c['ChildComposite'], c['ChildTask'], c['Decorators'],
+                       [(o['Operation'][1], o['Number']) for o in c['DecoratorOps']]) for c in nodes[n].values['Children']]
+    assert kids('Root') == [(None, at('Recover'), [at('Stunned')], []),
+                            (at('Roam'), None, [at('Near'), at('Far')],
+                             [('EBTDecoratorLogic::Or', 2), ('EBTDecoratorLogic::Test', 0), ('EBTDecoratorLogic::Test', 1)])], kids('Root')
+    assert kids('Roam') == [(None, at('Pick'), [], []), (None, at('Go'), [], [])], kids('Roam')
+    assert nodes['Go'].values['Services'] == [at('Watch')] and nodes['Root'].values['Services'] == [at('Focus')]
+    proves('behaviour-trees-and.go-blackboardkey-selectedkeyname')
+    assert dict(nodes['Go'].values['BlackboardKey']) == {'SelectedKeyName': ('name', 'Destination')}
+    assert dict(nodes['Stunned'].values['BlackboardKey']) == {'SelectedKeyName': ('name', 'IsStunned')}
+    proves('behaviour-trees-and.ue-instanced-game-ai-tasks')
+    assert nodes['Pick'].cls == '/Game/AI/Tasks/TSK_FindRandomPointFrom_WIthinHeight.TSK_FindRandomPointFrom_WithinHeight_C', nodes['Pick'].cls
+    assert dict(nodes['Pick'].values['NewLocationKey']) == {'SelectedKeyName': ('name', 'Destination')}
+    keeps_invariants(bt_base)
+    rows = registry_rows(registry_of('BehaviorTree'))
+    assert {(mod + 'BT_Test.BT_Test', 'BehaviorTree'), (mod + 'BB_Test.BB_Test', 'BlackboardData')} <= rows, rows
+    print('ok  BehaviorTree: a blackboard and a tree, each node with the TreeAsset and ParentNode the editor keeps')
+
+
+def behaviour_tree_refusals():
+    """What the editor never makes and the engine would misbehave on: a node's TreeAsset or ParentNode set by hand, a
+    child that is no composite or task, or both, and a node in two places; and a block in a class's UE_DEFAULTS, whose
+    component scans read only the top-level statements."""
+    ai = '#include "UeApi/AIModule.h"\n'
+    tree = lambda body: 'UE_ASSET_DEFAULTS(UBehaviorTree, BT_R) {\n  auto *R = UE_INSTANCED(UBTComposite_Selector, this, "R");\n' \
+                        '  RootNode = R;\n%s}\n' % body
+    proves('behaviour-trees-and.wait-treeasset')
+    refused('BtSetParent', '', 'ParentNode is set from the tree\'s shape, as the editor sets it; leave it out', top=ai,
+            after=tree('  auto *W = UE_INSTANCED(UBTTask_Wait, this, "W");\n  W->ParentNode = R;\n'
+                       '  R->Children = {{nullptr, W, {}, {}}};\n'))
+    refused('BtEmptyChild', '', "R's child 0 has neither a ChildComposite nor a ChildTask", top=ai,
+            after=tree('  R->Children = {{nullptr, nullptr, {}, {}}};\n'))
+    refused('BtTwice', '', 'W is in the tree twice', top=ai,
+            after=tree('  auto *W = UE_INSTANCED(UBTTask_Wait, this, "W");\n'
+                       '  R->Children = {{nullptr, W, {}, {}}, {nullptr, W, {}, {}}};\n'))
+    proves('behaviour-trees-and.nested-block')
+    refused('BlockInClass', '  UE_DEFAULTS { { InitialLifeSpan = 2.0f; } }\n',
+            'a block `{ ... }` groups the statements of a UE_ASSET_DEFAULTS')
+    print('ok  BehaviorTree refusals')
+
+
 def ue_assets():
     """genueassets names each asset a registry lists by its content path, one header per class; a mod reaching one
     through that header imports exactly that object. The registry here is AssetTest's, the game's in real use."""
@@ -13005,6 +13081,8 @@ asset_defaults_refusals()
 particle_bake()
 particle_lod_validity()
 particle_starts()
+behaviour_trees()
+behaviour_tree_refusals()
 particle_refusals()
 
 

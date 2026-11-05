@@ -29,6 +29,7 @@
 #include <nlohmann/json.hpp>
 
 #include "Blueprint.h"
+#include "BehaviorTree.h"
 #include "Cascade.h"
 #include "Command.h"
 #include "Cooked.h"
@@ -3386,7 +3387,9 @@ void BadClassMeta(const FRecord& R, std::string* Err, bool* bOk)
 
     const size_t Slash = R.UePackage.rfind('/');
     const std::string Asset = Slash == std::string::npos ? R.UePackage : R.UePackage.substr(Slash + 1);
-    if (Asset + "_C" == R.UeName) return;
+    /* Without case, as FNames match: DRG's TSK_FindRandomPointFrom_WIthinHeight package declares
+       TSK_FindRandomPointFrom_WithinHeight_C. */
+    if (Lower(Asset + "_C") == Lower(R.UeName)) return;
 
     *Err = "UE_CLASS on " + R.CppName + " names the package \"" + R.UePackage + "\", which does"
            " not end in the asset that declares " + R.UeName + ". Did you mean \"" + R.UePackage
@@ -21291,9 +21294,20 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         const Json* Body = nullptr;
         ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
         bool bOk = true;
-        if (Body)
-            ForEach(*Body, [&](const Json& S) {
+        /* A nested block `{ ... }` of UE_ASSET_DEFAULTS is its statements: a behaviour tree's source holds each composite's
+           subtree in one. A class's is refused: the scans of its components (RestatedSubobjects, OverridesComponent)
+           read the top-level statements only. */
+        std::function<void(const Json&)> Statement;
+        Statement = [&](const Json& S) {
                 if (!bOk) return;
+                if (Kind(S) == "CompoundStmt")
+                {
+                    if (R.AssetOf.empty())
+                    { *Err = S.value("ueWhere", Block) + ": a block `{ ... }` groups the statements of a UE_ASSET_DEFAULTS; "
+                             "in a class's UE_DEFAULTS write them in place"; bOk = false; return; }
+                    ForEach(S, Statement);
+                    return;
+                }
                 Where = S.value("ueWhere", Block);
                 /* `UDotStatusEffectItem* Burn = UE_INSTANCED(...);`: made where a default points at it. One nothing points at
                    would be an object no one reaches; the editor keeps none such. */
@@ -21504,7 +21518,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 FOverride& O = ComponentOverrides[CompName];
                 O.Owner = DR;
                 Put(O.Defaults);
-            });
+            };
+        if (Body) ForEach(*Body, Statement);
         if (!bOk) return false;
         /* Attached to one another, this class's components must still form a tree: a node in a cycle is no root node
            and no child of one, so ExecuteScriptOnActor never reaches it and the component is never made. */
@@ -22152,6 +22167,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
         Insts = std::move(KeptInsts);
         InstDefaults = std::move(KeptDefaults);
+    }
+    /* A behaviour tree: each node's TreeAsset and ParentNode, as the editor keeps them (BehaviorTree.cpp). */
+    if (!R.AssetOf.empty() && Derives(B, "BehaviorTree"))
+    {
+        std::vector<FTreeObject> Objs;
+        for (size_t I = 0; I < Insts.size(); ++I) Objs.push_back({ Insts[I].Name, InstDefaults[I] });
+        if (!CookBehaviorTree(InheritedDefaults, Objs, Err)) { *Err = R.AssetOf + ": " + *Err; return false; }
+        for (size_t I = 0; I < Insts.size(); ++I) InstDefaults[I] = std::move(Objs[I].Tags);
     }
     for (size_t I = 0; I < Insts.size(); ++I)
     {

@@ -4084,6 +4084,66 @@ Notes:
   several LOD levels.
 - Curve distributions, and the per-particle event modules, are the next slice ([TODO.md](../TODO.md)).
 
+### Behaviour trees and blackboards
+
+A blackboard (`UBlackboardData`) and a behaviour tree (`UBehaviorTree`) are assets with objects inside, declared with
+`UE_ASSET_DEFAULTS`: a blackboard's key types, a tree's composites, tasks, decorators and services are `UE_INSTANCED`
+under the asset. A nested block `{ ... }` holds a composite's subtree, so the source reads as the tree does.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="behaviour-trees-and.ue-asset-defaults"></a>`UE_ASSET_DEFAULTS(UBlackboardData, BB_Mine) { Keys = {{"Target", UE_INSTANCED(UBlackboardKeyType_Object, this, "K"), false}}; Parent = &BB_Base; }` | A blackboard: each key an `FBlackboardEntry` of its name and its key type object, under the blackboard as the editor makes it. `Parent` names another blackboard whose keys come first. | Yes |
+| <a id="behaviour-trees-and.ue-asset-defaults-ubehaviortree"></a>`UE_ASSET_DEFAULTS(UBehaviorTree, BT_Mine) { BlackboardAsset = &BB_Mine; auto *Root = UE_INSTANCED(UBTComposite_Selector, this, "Root"); RootNode = Root; ... }` | A behaviour tree. Each node gets the `TreeAsset` and `ParentNode` the editor keeps on it: the tree, and the composite holding it (of a child, a child's decorators, a composite's and a child task's `Services`). The root and the tree's `RootDecorators` have no parent. The engine sets both again when it loads the tree. | Yes |
+| <a id="behaviour-trees-and.root-children-nullptr-wait"></a>`Root->Children = {{nullptr, Wait, {Stunned}, {}}, {Roam, nullptr, {}, {}}};` | A composite's children in order, each an `FBTCompositeChild`: a composite or a task, its decorators, and their logic (`DecoratorOps`, empty for all of them to pass). | Yes |
+| <a id="behaviour-trees-and.nested-block"></a>`{ ... }`, a block inside a `UE_ASSET_DEFAULTS` block | Its statements, as if written in place. A local declared in it is seen only inside, as in C++. In a class's `UE_DEFAULTS` it is refused: "a block `{ ... }` groups the statements of a UE_ASSET_DEFAULTS". | Yes |
+| <a id="behaviour-trees-and.go-blackboardkey-selectedkeyname"></a>`Go->BlackboardKey.SelectedKeyName = "Destination";` | A key selector by its key's name, as the cook writes it: the engine finds the key in the tree's blackboard when it loads the tree. | Yes |
+| <a id="behaviour-trees-and.ue-instanced-game-ai-tasks"></a>`UE_INSTANCED(::Game::AI::Tasks::UTSK_FindRandomPoint, this, "Pick")` | A node of a game Blueprint class (a task, decorator or service written in Blueprint), with its variables set as any member. A class whose package name differs from it in case only (`TSK_FindRandomPointFrom_WIthinHeight`) is taken, as FNames match without case. | Yes |
+| <a id="behaviour-trees-and.ue-asset-at-uenum-estate"></a>`UE_ASSET_AT(::UEnum, EState_Enum, "/Script/FSD.EWoodLouseState");` then `Key->EnumType = &EState_Enum;` | A native object by its path: here an enum key's `UEnum`, an import of `/Script/CoreUObject.Enum` as the cook writes it. | Yes |
+| <a id="behaviour-trees-and.wait-treeasset"></a>`Wait->TreeAsset = ...` or `ParentNode`, a child with neither or both of `ChildComposite` and `ChildTask`, a node in two places | Refused: "is set from the tree's shape, as the editor sets it; leave it out", "has neither a ChildComposite nor a ChildTask", "is in the tree twice". | Refused |
+
+```cpp
+UE_ASSET_DEFAULTS(UBlackboardData, BB_Roamer) {
+  Keys = {{"Destination", UE_INSTANCED(UBlackboardKeyType_Vector, this, "Destination"), false},
+          {"IsStunned", UE_INSTANCED(UBlackboardKeyType_Bool, this, "IsStunned"), false}};
+}
+
+UE_ASSET_DEFAULTS(UBehaviorTree, BT_Roamer) {
+  BlackboardAsset = &BB_Roamer;
+  auto *Root = UE_INSTANCED(UBTComposite_Selector, this, "Root");
+  RootNode = Root;
+  {
+    auto *Stunned = UE_INSTANCED(UBTDecorator_Blackboard, this, "Stunned");
+    Stunned->BlackboardKey.SelectedKeyName = "IsStunned";
+    Stunned->FlowAbortMode = EBTFlowAbortMode::LowerPriority;
+    auto *Recover = UE_INSTANCED(UBTTask_Wait, this, "Recover");
+    Recover->WaitTime = 1.5f;
+
+    auto *Roam = UE_INSTANCED(UBTComposite_Sequence, this, "Roam");
+    {
+      auto *Pick = UE_INSTANCED(::Game::AI::Tasks::UTSK_FindRandomPoint, this, "Pick");
+      Pick->LocationKey.SelectedKeyName = "Destination";
+      auto *Go = UE_INSTANCED(UBTTask_MoveToTarget, this, "Go");
+      Go->BlackboardKey.SelectedKeyName = "Destination";
+      Roam->Children = {{nullptr, Pick, {}, {}}, {nullptr, Go, {}, {}}};
+    }
+    Root->Children = {{nullptr, Recover, {Stunned}, {}}, {Roam, nullptr, {}, {}}};
+  }
+}
+```
+
+Notes:
+
+- `AssetGen/tools/btdecomp.py emit` writes a cooked tree or blackboard in this form, and `btdecomp.py roundtrip`
+  compiles each one back and compares it with the original. All 79 trees and 39 blackboards of DRG (CL 158958),
+  and EEE's three, come back equal. What changes is counted, not reported, as the game reads it the same: a tree saved
+  without `RF_Transactional` (the editor's undo flag), a tag's or an object's name in another case (FNames match
+  without case), an empty struct tag, and a regular enum's value spelled with its type
+  (`ECollisionChannel::ECC_Visibility`; the engine loads either name).
+- A decorator's `CachedDescription` is what the editor shows on it. The source may leave it out; the game never reads
+  it.
+- A key name the blackboard lacks is not checked when the mod is built: the engine logs it when it loads the tree, and
+  the node reads no key.
+
 ## Game assets
 
 An asset that another package holds, the game's or another mod's, is named with `UE_ASSET_AT`, and `&Name` then points
