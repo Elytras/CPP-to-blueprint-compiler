@@ -121,6 +121,18 @@ class AssetEmit:
             return '{%s}' % ', '.join(s.cx.cenum_entry(e, x) or '(%s)%d' % (e, x) for x in b[4:])
         return None
 
+    # Bools AssetGen starts at the editor's value when the source leaves them unset (Cascade.cpp kBoolStarts), each
+    # with its class default: a cooked module without the tag holds the class default, so the source must say it.
+    BOOL_STARTS = (('UParticleModuleRequired', 'bUseLegacyEmitterTime', 'true'),
+                   ('UParticleModuleAccelerationBase', 'bAlwaysInWorldSpace', 'false'))
+
+    def class_defaults(s, cls, tags, lhs):
+        chain, c = [], cls
+        while c: chain.append(c); c = s.run.api.bases.get(c)
+        have = {t['name'].lower() for t in tags}
+        for owner, member, default in s.BOOL_STARTS:
+            if owner in chain and member.lower() not in have: s.lines.append('%s%s = %s;' % (lhs, member, default))
+
     def tags(s, i, lhs):
         vals = Values(s.cx)     # its own: one mid-container (Emitters = {...}) writes elements whole
         cls = s.run.types.cls(s.pkg, s.pkg.exports[i]['cls'], s.a)
@@ -135,6 +147,7 @@ class AssetEmit:
                 continue
             v = s.enum_bytes(cls, t) or vals.tag(s.pkg, t, None, s.a)
             if v is not None: s.lines += field_assigns(lhs + s.member(cls, t['name']), v, partial=True)
+        s.class_defaults(cls, tags, lhs)
 
     def instanced(s, i):
         if i in s.locals: return s.locals[i]

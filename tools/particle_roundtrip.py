@@ -151,6 +151,9 @@ def tree(pkg):
     return out, vals
 
 
+CLASS_DEFAULTS = {'buselegacyemittertime': True, 'balwaysinworldspace': False}
+
+
 def diffs(van, ours):
     """What differs, by meaning, between a cooked particle system and AssetGen's compile of its decompiled source: an
     object either side lacks, a class, a tag. A live distribution the cook kept (it never baked it) that AssetGen
@@ -173,6 +176,9 @@ def diffs(van, ours):
             if close(x, y): continue
             # read only by the editor (its LOD fixups are WITH_EDITOR); AssetGen derives it, and vanilla keeps stale bits
             if k == 'lodvalidity': continue
+            # a tag left out holds the class default; these two are the ones a decompiled source must state (its
+            # module would otherwise start at the editor's value, Cascade.cpp kBoolStarts)
+            if x is None and y == CLASS_DEFAULTS.get(k): continue
             if isinstance(x, dict) and isinstance(y, dict) and 'table' in y and x.get('distribution') and not y.get('distribution'):
                 out.append('baked %s.%s (the cook kept %s live)' % (p, k, x['distribution']))
                 continue
