@@ -29,6 +29,7 @@
 #include <nlohmann/json.hpp>
 
 #include "Blueprint.h"
+#include "Cascade.h"
 #include "Command.h"
 #include "Cooked.h"
 #include "Package.h"
@@ -1172,6 +1173,9 @@ struct FRecord
     bool bIsPatch = false;      // UE_PATCH: not a class of its own; its UE_DEFAULTS edit its parent's, in the parent's package
     bool bCooked = false;       // UE_COOKED: shipped as the cooked package it was built from; imported here, never cooked
     bool bUeApi = false;        // declared in a UeApi header: the game's (or another mod's) class, imported, never cooked here
+    /* UE_ASSET_DEFAULTS: the marker struct UeAssetDefaults__<Name> deriving from the asset's class. Not a class of its
+       own: its UE_DEFAULTS cook the asset Ns::Name (this, qualified), its UE_INSTANCED objects under it. */
+    std::string AssetOf;
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
     /* Whether an override of component C of this class can name C's construction-script node: a game Blueprint's
@@ -2105,6 +2109,9 @@ private:
     bool GenerateEnum(const std::string& Name, const std::string& OutDir, std::string* Err);
     /* A namespace-scope `UMyDef MD_Big = { .Health = 500 };`: an instance of a UE class as its own package. */
     bool GenerateAsset(const Json& Var, const std::string& OutDir, std::string* Err);
+    /* UE_ASSET_DEFAULTS, once Generate has lowered its block: the asset's tags and its objects, saved. */
+    bool FinishAssetDefaults(const FRecord& R, const FRecord& Class, FPackage& P, FBlueprintClass& BP,
+                             const std::vector<FPropertyDef>& Tags, const std::string& OutDir, std::string* Err);
     bool TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
                         const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err);
     /* The signature function of `TDelegate<...>` Type in the class Generate is building, made the first time the type
@@ -2673,10 +2680,12 @@ private:
        game's carry theirs in UE_CLASS. */
     std::string PackageOf(const FRecord& R) const
     {
+        if (!R.AssetOf.empty()) return PathIn(ModPackage, R.AssetOf);
         return R.UePackage.empty() ? PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName) : R.UePackage;
     }
     std::string ClassOf(const FRecord& R) const
     {
+        if (!R.AssetOf.empty()) return LeafOf(R.AssetOf);       // the asset's object, not a class
         return !R.UePackage.empty() ? R.UeName : R.bIsStruct ? LeafOf(CookedQual(R.CppName)) : LeafOf(R.CppName) + "_C";
     }
     /* OutDir holds UE_MOD_PACKAGE, and is <Content>/<that path without /Game>, as bpbuild stages a mod. A package under
@@ -2906,6 +2915,7 @@ private:
     std::vector<const Json*> AssetDecls;        // namespace-scope variables brace-initialized, see GenerateAsset
     std::map<std::string, std::string> AssetPaths;  // UE_ASSET_AT: Ns::variable -> the path of an asset cooked elsewhere
     std::map<std::string, std::string> ModCurves;   // UE_FLOAT_CURVE and kin: Ns::variable -> "<kind F/V/C>|<keys>"
+    std::set<std::string> ModAssetBlocks;           // UE_ASSET_DEFAULTS: each asset's Ns::variable
     std::map<std::string, std::string> VarScope;    // a namespace-scope variable's decl id -> its namespace, "A::B::"
     std::map<std::string, const Json*> NsVars;      // a namespace-scope variable's decl id -> the decl
     std::map<std::string, const Json*> NsVarNamed;  // Ns::variable -> the decl
@@ -3522,6 +3532,15 @@ bool FCompiler::Collect(std::string* Err)
             if (RecIt == Records.end()) return;
             RecIt->second.MethodDefs[Name(N)] = &N;
             MethodOwner[N.value("id", std::string())] = OwnerIt->second;
+            /* UE_ASSET_DEFAULTS defines its block out of the marker struct (the macro cannot close the struct after it):
+               that definition is the block. */
+            if (FRecord& AR = RecIt->second; Name(N) == "UeDefaults__" && LeafOf(AR.CppName).compare(0, 17, "UeAssetDefaults__") == 0)
+            {
+                AR.Defaults = &N;
+                const std::string Leaf = LeafOf(AR.CppName);
+                AR.AssetOf = AR.CppName.substr(0, AR.CppName.size() - Leaf.size()) + Leaf.substr(17);
+                ModAssetBlocks.insert(AR.AssetOf);
+            }
             auto& Inlines = RecIt->second.Inlines;
             if (N.value("inline", false) || Inlines.count(PrevId)) Inlines[PrevId] = Inlines[N.value("id", std::string())] = &N;
             return;
@@ -3853,8 +3872,10 @@ bool FCompiler::Collect(std::string* Err)
             }
             else if (Kind(C) == "CXXMethodDecl" && Name(C) == "UeDefaults__")
             {
-                /* Not a UFunction: AssetGen reads its assignments as defaults, never lowers them. */
+                /* Not a UFunction: AssetGen reads its assignments as defaults, never lowers them. Its owner is known by
+                   the declaration's id, for UE_ASSET_DEFAULTS' definition out of the struct. */
                 R.Defaults = &C;
+                MethodOwner[C.value("id", std::string())] = R.CppName;
             }
             else if (Kind(C) == "CXXMethodDecl" && R.bIsInterface && Name(C) == "StaticClass")
             {
@@ -8183,6 +8204,8 @@ std::pair<const FRecord*, std::string> FCompiler::PureMethod(const FRecord& R) c
    - UHierarchicalInstancedStaticMeshComponent: its ClusterTree, BulkSerialize again (64 per FClusterNode).
    - USkyAtmosphereComponent: bStaticLightingBuiltGUID, an FGuid.
    - UAtmosphericFogComponent: three empty bulk-data headers (flags, count, size on disk, offset), then CounterVal.
+   - UParticleModuleRequired: bCooked, which a cooked load requires true (else Fatal), then DerivedData's
+     BoundingGeometry, empty without a cutout texture (ParticleModules.cpp, SubUVAnimation.cpp 33-36).
    Too little or too much is fatal alike: the loader checks each export's size ("Serial size mismatch"). */
 std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
 {
@@ -8199,6 +8222,7 @@ std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
         else if (A->UeName == "HierarchicalInstancedStaticMeshComponent") I32({ 64, 0 });
         else if (A->UeName == "SkyAtmosphereComponent") Tail.resize(Tail.size() + 16);
         else if (A->UeName == "AtmosphericFogComponent") Tail.resize(Tail.size() + 3 * 20 + 4);
+        else if (A->UeName == "ParticleModuleRequired") I32({ 1, 0 });
     }
     return Tail;
 }
@@ -17043,7 +17067,7 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
     const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + Var;
     if (auto At = AssetPaths.find(Qual); At != AssetPaths.end())
         Package = At->second;
-    else if (ModCurves.count(Qual) || std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
+    else if (ModCurves.count(Qual) || ModAssetBlocks.count(Qual) || std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
         Package = PathIn(ModPackage, Qual);
     else return false;
 
@@ -18755,7 +18779,14 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
 
     const auto Scope = VarScope.find(Var.value("id", std::string()));
     const std::string AssetName = Name(Var);
-    const std::string PackageName = PathIn(ModPackage, (Scope == VarScope.end() ? std::string() : Scope->second) + AssetName);
+    const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + AssetName;
+    /* `extern T X;` from UE_ASSET_DEFAULTS and `T X = {...};` are one variable to C++, and two cooks of one package. */
+    if (ModAssetBlocks.count(Qual))
+    {
+        *Err = Qual + ": declared by UE_ASSET_DEFAULTS and with braces; keep one: the block sets the members the braces would";
+        return false;
+    }
+    const std::string PackageName = PathIn(ModPackage, Qual);
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, AssetName, "", "", false);
@@ -18774,6 +18805,22 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     RegistryRows.push_back({ PackageName, AssetName, ClassName });
     printf("  %-14s -> %s.uasset  (asset, a %s)\n", AssetName.c_str(), Shown(PackageName).c_str(), R->CppName.c_str());
+    return true;
+}
+
+/* UE_ASSET_DEFAULTS(Class, Name): the asset Name of Class, its tags the block's assignments to its own members (Tags, which
+   Generate lowered as a class's UE_DEFAULTS against its parent's), its objects the block's UE_INSTANCED, already added
+   to BP. Cooked as a braced asset is (GenerateAsset), with the objects under it. */
+bool FCompiler::FinishAssetDefaults(const FRecord& R, const FRecord& Class, FPackage& P, FBlueprintClass& BP,
+                                    const std::vector<FPropertyDef>& Tags, const std::string& OutDir, std::string* Err)
+{
+    for (const FPropertyDef& PD : Tags) BP.AddVariable(PD);
+    const std::string ClassPkg = PackageOf(Class), ClassName = ClassOf(Class), PackageName = PackageOf(R);
+    const FIndex Cdo = BP.ClassDefaultObject(ClassPkg, ClassName);
+    BP.FinishAsset(BP.EngineClass(ClassPkg, ClassName), Cdo);
+    if (!SavePackage(P, OutDir, PackageName, Err)) return false;
+    RegistryRows.push_back({ PackageName, ClassOf(R), ClassName });
+    printf("  %-14s -> %s.uasset  (asset, a %s)\n", ClassOf(R).c_str(), Shown(PackageName).c_str(), Class.CppName.c_str());
     return true;
 }
 
@@ -22064,6 +22111,48 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        exports the objects its own UE_DEFAULTS make there; one that makes none of that name inherits it, so the class
        above is asked next. A game Blueprint's package exports every one it has, which UeApi lists. Found, it is an
        import; this class's own copy loads from it what its tags leave unset. */
+    /* A particle system: the cooker's work on its tags (Cascade.cpp), before its objects are exported. A baked
+       distribution object is left out, and the rest renumbered. */
+    if (!R.AssetOf.empty() && Derives(B, "ParticleSystem"))
+    {
+        std::vector<FCascadeObject> Objs;
+        for (size_t I = 0; I < Insts.size(); ++I)
+        {
+            FCascadeObject O;
+            O.Class = ClassOf(*Insts[I].Class);
+            O.Name = Insts[I].Name;
+            O.Outer = Insts[I].Parent;
+            O.Tags = InstDefaults[I];
+            for (const FRecord* C = Insts[I].Class; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+                for (const Json* F : C->Fields)
+                    if (const std::string T = TypeOf(*F); T.find("FRawDistributionFloat") != std::string::npos
+                                                          || T.find("FRawDistributionVector") != std::string::npos)
+                        O.RawDists.emplace_back(UeNameOf(C, Name(*F)), T.find("FRawDistributionVector") != std::string::npos);
+            Objs.push_back(std::move(O));
+        }
+        std::vector<int32> Kept;
+        std::vector<std::string> Warnings;
+        if (!CookCascade(InheritedDefaults, Objs, Kept, Warnings, Err)) { *Err = R.AssetOf + ": " + *Err; return false; }
+        for (const std::string& W : Warnings) printf("  warning: %s: %s\n", R.AssetOf.c_str(), W.c_str());
+        std::vector<int32> NewOf(Insts.size(), -1);
+        for (size_t K = 0; K < Kept.size(); ++K)
+        {
+            if (size_t(Kept[K]) >= Insts.size())
+            { *Err = R.AssetOf + ": a starting distribution was left in the package unbaked (AssetGen bug)"; return false; }
+            NewOf[size_t(Kept[K])] = int32(K);
+        }
+        std::vector<FInstSpec> KeptInsts;
+        std::vector<std::vector<FPropertyDef>> KeptDefaults;
+        for (size_t K = 0; K < Kept.size(); ++K)
+        {
+            FInstSpec S = Insts[size_t(Kept[K])];
+            if (S.Parent >= 0) S.Parent = NewOf[size_t(S.Parent)];
+            KeptInsts.push_back(S);
+            KeptDefaults.push_back(std::move(Objs[K].Tags));
+        }
+        Insts = std::move(KeptInsts);
+        InstDefaults = std::move(KeptDefaults);
+    }
     for (size_t I = 0; I < Insts.size(); ++I)
     {
         const FInstSpec& S = Insts[I];
@@ -22175,6 +22264,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         O.NativeTail = NativeTail(S.Class);
         BP.AddInstanced(O);
     }
+    if (!R.AssetOf.empty()) return FinishAssetDefaults(R, *B, P, BP, InheritedDefaults, OutDir, Err);
 
     /* The OOL definition carries body/parms; only the in-class decl carries storageClass. */
     struct FMethod { std::string Name; const Json* Decl; const Json* Def; const Json* Body; };
@@ -24174,10 +24264,16 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
        case-blind. */
     GAg.Mark("NormalizePointers (generated/mod records)");
     std::map<std::string, std::string> Cooked;
-    for (const auto& [Cpp, R] : Records)
-        if (R.IsGenerated())
+    for (const auto& [Key, R] : Records)
+        if (const std::string Cpp = R.AssetOf.empty() ? Key : R.AssetOf; R.IsGenerated())     // an asset by its own name
             if (const auto [At, bNew] = Cooked.emplace(Lower(PackageOf(R)), Cpp); !bNew)
             { *Err = Cpp + " and " + At->second + " would both be cooked as " + PackageOf(R); return false; }
+    /* A UE_ASSET_DEFAULTS name a curve macro or a UE_ASSET_AT also declares is one variable to C++: a curve would be
+       cooked over the asset at one path, and a UE_ASSET_AT would point every reference elsewhere. */
+    for (const std::string& Qual : ModAssetBlocks)
+        if (const char* Other = ModCurves.count(Qual) ? "UE_FLOAT_CURVE (or UE_VECTOR_CURVE / UE_COLOR_CURVE)"
+                              : AssetPaths.count(Qual) ? "UE_ASSET_AT" : nullptr)
+        { *Err = Qual + ": declared by UE_ASSET_DEFAULTS and by " + Other + "; keep one: both name one asset"; return false; }
 
     /* A UE_ASSET_AT whose class this mod cooks: the asset is an instance of the copy its own mod cooked, so the
        import's class check fails in game and the reference loads as null. Pinning the class to its owner with

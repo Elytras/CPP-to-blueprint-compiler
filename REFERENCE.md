@@ -4002,6 +4002,88 @@ Notes:
   the rest of the session, and nothing is saved.
 - [examples/EnemyInfo.cpp](examples/EnemyInfo.cpp) declares a data-asset class, its instances and soft references.
 
+### Objects inside an asset
+
+Some assets hold objects of their own: a particle system holds its emitters, their LOD levels and modules, and a
+behaviour tree its nodes. Braces cannot make an object, so such an asset is declared with `UE_ASSET_DEFAULTS(Type, Name)`
+and a block of statements, read as a class's `UE_DEFAULTS` is, with `this` the asset. `UE_INSTANCED` makes an object
+under the asset or under another of its objects, and a default points at it.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="objects-inside-an.ue-asset-defaults-uholder-ad"></a>`UE_ASSET_DEFAULTS(UHolder, AD_Held) { Scale = 2.5f; Items = {UE_INSTANCED(UStatChangeStatusEffectItem, this, "B")}; }` at namespace scope | An asset of the class, cooked at `<mod package>/AD_Held` with the members the block sets, as a braced one is. Each `UE_INSTANCED` is an export of its own under the asset, `RF_Transactional`, as the cook writes a particle system's modules, and the default points at it. | Yes |
+| <a id="objects-inside-an.udotstatuseffectitem-a-ue"></a>`UDotStatusEffectItem *A = UE_INSTANCED(UDotStatusEffectItem, this, "A");` then `A->OverrideDamageImpulse = true;` and `A->DamageImpulseOverride = UE_INSTANCED(UDamageImpulse, A, "Impulse");` | A local holds an object so its own members can be set, and objects nest under it, as in [Instanced objects](#instanced-objects). | Yes |
+| <a id="objects-inside-an.namespace-folder-ue-asset"></a>`namespace Folder { UE_ASSET_DEFAULTS(UHolder, AD_Deep) { ... } }` | A namespace is a folder: `<mod package>/Folder/AD_Deep`. | Yes |
+| <a id="objects-inside-an.uholder-picked-ad-held"></a>`UHolder *Picked = &AD_Held;` | `&Name` points at the asset, as at a braced one. | Yes |
+| <a id="objects-inside-an.ue-asset-defaults-uhold-ad"></a>`UE_ASSET_DEFAULTS(UHold, AD_X) {...}` and `UHold AD_X = {};`, or a class of the same name | Refused: "declared by UE_ASSET_DEFAULTS and with braces; keep one", or "AdClash and AdClash would both be cooked as ...". The same for a name a `UE_FLOAT_CURVE` (or `UE_VECTOR_CURVE` / `UE_COLOR_CURVE`) or a `UE_ASSET_AT` declares: "declared by UE_ASSET_DEFAULTS and by UE_ASSET_AT; keep one". C++ takes both as one name, and both would be cooked at one path. | Refused |
+| <a id="objects-inside-an.ue-instanced-udamageimpulse"></a>`UE_INSTANCED(UDamageImpulse, nullptr, "I")` in the block | Refused: "UE_INSTANCED's outer is `this`, one of the class's components, or a local holding another UE_INSTANCED". | Refused |
+
+```cpp
+class UHolder : public UPrimaryDataAsset {
+public:
+  UObject *Inner = nullptr;
+  TArray<UObject *> Items;
+  float Scale = 1;
+};
+
+UE_ASSET_DEFAULTS(UHolder, AD_Held) {
+  UDotStatusEffectItem *A = UE_INSTANCED(UDotStatusEffectItem, this, "A");
+  A->OverrideDamageImpulse = true;
+  A->DamageImpulseOverride = UE_INSTANCED(UDamageImpulse, A, "Impulse");
+  Items = {A, UE_INSTANCED(UStatChangeStatusEffectItem, this, "B")};
+  Inner = A;
+  Scale = 2.5f;
+}
+```
+
+Notes:
+
+- An object nothing points at is refused, as in a class's `UE_DEFAULTS`: the editor keeps none such.
+- Each object starts from its class's defaults. The asset's members the block leaves unset keep the class defaults.
+
+### Particle systems
+
+A Cascade particle system (`UParticleSystem`) is an asset with objects inside: its emitters, each emitter's LOD levels,
+the modules each LOD level names, and the distributions the modules read. AssetGen does to them what DRG's cooker does,
+so the asset loads as a cooked one. Niagara systems are not compiled yet: their scripts are compiled Vector VM code.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="particle-systems.life-lifetime-distribution-span"></a>`Life->LifeTime.Distribution = Span;` with `Span` a `UDistributionFloatUniform` (`Min`, `Max`), or a `UDistributionFloatConstant`, `UDistributionVectorConstant` or `UDistributionVectorUniform` | The raw distribution is baked as the cook bakes it: its lookup table filled, `MinValue` / `MaxValue` set, `Distribution` null, and the distribution object left out of the package. | Yes |
+| <a id="particle-systems.spawn-rate-distribution-three"></a>`Spawn->Rate.Distribution = Three;` and `Spawn->RateScale.Distribution = Three;` | One distribution object several raw distributions point at is baked into each of them. | Yes |
+| <a id="particle-systems.spawn-burstscale"></a>A module's distribution left unset, as `Spawn->BurstScale` | Gets the value Cascade's editor starts a new module with, baked: `InitializeDefaults`, then `SetToSensibleDefaults` (a Light's colour scale (1, 1, 1), brightness 32, radius scale 15, exponent 16; a Lifetime of 1). The editor sets them when it adds the module; neither runs for a loaded object, so left unset it reads as 0 in game (an unset `BurstScale` turns every burst off). Covered: Required, Spawn, Lifetime, Size, Color, Light, Velocity, and the beam modules. | Yes |
+| <a id="particle-systems.uparticlemoduleacceleration"></a>An unset distribution of a module outside that list, as `UParticleModuleAcceleration`'s `Acceleration` | Warns: "Acceleration is left unset and reads as 0 in game (Cascade's editor starts it at a value of its own); set it". | Warns |
+| <a id="particle-systems.a-lodlevels-a0-a1"></a>`A->LODLevels = {A0, A1};` and `LODDistances = {0.0f, 1500.0f};` | Each module's `LODValidity` is set to the LOD levels that name it, as bits, and each LOD level's `Level` to its place in `LODLevels`, as the editor keeps them. | Yes |
+| <a id="particle-systems.loddistances"></a>An emitter with fewer or more LOD levels than `LODDistances` has entries, a `LODSettings` of another count, a LOD level whose `Level` is not its place, or one without a `RequiredModule` or `SpawnModule` | Refused, saying which: "has 1 LOD levels and the system's LODDistances 2", "its Level is 1", "has no SpawnModule". The engine asserts on these or patches them at load. | Refused |
+| <a id="particle-systems.spawn-rate-distribution-c"></a>`Spawn->Rate.Distribution = C;` with `C` a `UDistributionFloatConstantCurve`, or another distribution class | Refused: "which AssetGen does not bake yet; use a DistributionFloatConstant / DistributionFloatUniform (Vector for a vector one)". | Not yet |
+
+```cpp
+UE_ASSET_DEFAULTS(UParticleSystem, P_Sparks) {
+  UParticleSpriteEmitter *Sparks = UE_INSTANCED(UParticleSpriteEmitter, this, "Sparks");
+  UParticleLODLevel *Lod = UE_INSTANCED(UParticleLODLevel, Sparks, "LOD0");
+  UParticleModuleRequired *Required = UE_INSTANCED(UParticleModuleRequired, this, "Required");
+  UParticleModuleSpawn *Spawn = UE_INSTANCED(UParticleModuleSpawn, this, "Spawn");
+  Spawn->BurstList = {FParticleBurst(4, -1, 0.0f)};
+  UParticleModuleLifetime *Life = UE_INSTANCED(UParticleModuleLifetime, this, "Life");
+  UDistributionFloatUniform *Span = UE_INSTANCED(UDistributionFloatUniform, Life, "Span");
+  Span->Min = 0.5f;
+  Span->Max = 1.15f;
+  Life->LifeTime.Distribution = Span;
+  Lod->RequiredModule = Required;
+  Lod->SpawnModule = Spawn;
+  Lod->Modules = {Life};
+  Sparks->LODLevels = {Lod};
+  Emitters = {Sparks};
+  LODDistances = {0.0f};
+}
+```
+
+Notes:
+
+- The modules are made under the system, as the editor makes them, and a LOD level names them; one module may serve
+  several LOD levels.
+- Curve distributions, and the per-particle event modules, are the next slice ([TODO.md](../TODO.md)).
+
 ## Game assets
 
 An asset that another package holds, the game's or another mod's, is named with `UE_ASSET_AT`, and `&Name` then points
