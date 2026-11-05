@@ -180,8 +180,9 @@ class Mod:
 
 
 def classify(pkg):
-    """(kind, export index) of a package's main object: enum, struct, interface, class, widget, data (a data asset
-    instance of some class), or raw (textures, materials, fonts, sounds - kept as cooked)."""
+    """(kind, export index) of a package's main object: enum, struct, interface, class, widget, particles (a Cascade
+    UParticleSystem, every object of it tags), data (a data asset instance of some class), or raw (textures, materials,
+    fonts, sounds - kept as cooked)."""
     for i, e in enumerate(pkg.exports):
         if e['outer']: continue
         c = pkg.class_of(i + 1)
@@ -191,6 +192,7 @@ def classify(pkg):
             st = pkg.struct(i)
             if st.class_flags & CLASS_Interface: return 'interface', i
             return 'widget' if c == 'WidgetBlueprintGeneratedClass' else 'class', i
+        if c == 'ParticleSystem': return 'particles', i
     for i, e in enumerate(pkg.exports):
         if e['outer'] or e['name'].startswith('Default__'): continue
         if e['flags'] & 0x1 and pkg.class_of(i + 1).endswith('_C'): return 'data', i   # RF_Public, a BP class's object

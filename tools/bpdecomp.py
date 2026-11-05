@@ -32,7 +32,8 @@ NATIVE_FORMS = ('GameplayTagContainer', 'NiagaraVariableBase', 'NiagaraVariable'
 
 IMMUTABLE = {'Vector': ('<fff', 'FVector'), 'Vector2D': ('<ff', 'FVector2D'), 'Rotator': ('<fff', 'FRotator'),
              'Vector4': ('<ffff', 'FVector4'), 'Quat': ('<ffff', 'FQuat'), 'IntPoint': ('<ii', 'FIntPoint'),
-             'IntVector': ('<iii', 'FIntVector'), 'LinearColor': ('<ffff', 'FLinearColor'), 'Guid': ('<IIII', 'FGuid')}
+             'IntVector': ('<iii', 'FIntVector'), 'LinearColor': ('<ffff', 'FLinearColor'), 'Guid': ('<IIII', 'FGuid'),
+             'Box': ('<ffffffB', 'FBox')}
 
 
 def tpkg(prop, pkg):
@@ -86,6 +87,8 @@ class Values:
         if ty == 'IntProperty': return str(struct.unpack('<i', b)[0])
         if ty == 'Int64Property': return '(int64)%d' % struct.unpack('<q', b)[0]
         if ty == 'UInt64Property': return '%dULL' % struct.unpack('<Q', b)[0]
+        if ty in ('UInt32Property', 'UInt16Property', 'Int16Property', 'Int8Property'):
+            return str(struct.unpack({'UInt32Property': '<I', 'UInt16Property': '<H', 'Int16Property': '<h', 'Int8Property': '<b'}[ty], b)[0])
         if ty == 'FloatProperty': return B.cfloat(struct.unpack('<f', b)[0])
         if ty == 'BoolProperty': return 'true' if (t['bool'] if t else b[0]) else 'false'
         if ty == 'StrProperty': return B.cstring(read_fstring(b, 0)[0])
@@ -164,6 +167,8 @@ class Values:
             for _ in range(n):
                 if sname in NATIVE_FORMS:
                     v, o = s.native_form(pkg, sname, b, o, cur); out.append(v)
+                elif sname == 'Color':      # FColor is atomic too: four bytes, B G R A
+                    out.append(s.struct_value(pkg, sname, b[o:o + 4], prop, cur)); o += 4
                 elif sname in IMMUTABLE:
                     fmt, cpp = IMMUTABLE[sname]
                     size = struct.calcsize(fmt)
@@ -205,7 +210,7 @@ class Values:
         other subobject is noted."""
         if idx > 0 and pkg.exports[idx - 1]['outer']:
             hook = getattr(s.cx, 'instanced', None)
-            if hook and instanced_export(pkg, idx - 1): return hook(idx - 1)
+            if hook and (getattr(s.cx, 'all_instanced', False) or instanced_export(pkg, idx - 1)): return hook(idx - 1)
             raise ValueError('a subobject %s, which AssetGen cannot point at' % pkg.exports[idx - 1]['name'])
         return s.cx.object_ref_static(pkg, idx, cur)
 
@@ -243,6 +248,8 @@ class Values:
             fmt, cpp = IMMUTABLE[sname]
             vals = struct.unpack(fmt, b[:struct.calcsize(fmt)])
             if sname == 'Guid': return 'FGuid(%s)' % ', '.join('%d' % v for v in vals)
+            if sname == 'Box':
+                return 'FBox(FVector(%s), FVector(%s), %d)' % (', '.join(fmt_num(v) for v in vals[:3]), ', '.join(fmt_num(v) for v in vals[3:6]), vals[6])
             return '%s(%s)' % (cpp, ', '.join(fmt_num(v) for v in vals))
         if sname == 'Color':
             bb, g, r, a = b[:4]

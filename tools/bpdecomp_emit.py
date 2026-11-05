@@ -80,6 +80,77 @@ def emit_enum(run, a):
     return o
 
 
+class AssetEmit:
+    """A standalone asset whose objects are all tags (a Cascade UParticleSystem) as a UE_ASSET_DEFAULTS block: each object
+    under it a UE_INSTANCED local, declared (outer first) before the first statement that points at it, then its own
+    tags. The asset's tags come last, so its `Emitters = {...}` pulls in the tree. An object nothing points at is
+    written too, except a distribution: DRG's cook keeps a baked one's object, which nothing reads. LODValidity is not
+    written: AssetGen derives it from the LOD levels."""
+    DERIVED = ('LODValidity',)
+
+    def __init__(s, run, a):
+        s.run, s.a, s.pkg = run, a, a.pkg
+        s.cx = Ctx(run, a)
+        s.cx.instanced, s.cx.all_instanced = s.instanced, True
+        s.lines, s.locals = [], {}
+
+    def member(s, cls, name):
+        """A tag's member as UeApi spells it on the class or a parent: the tag holds the FName's first spelling, which
+        may differ in case (`Lifetime` for UParticleModuleLifetime's `LifeTime`)."""
+        c = cls
+        while c:
+            hit = s.run.api.members(c).get(name.lower())
+            if hit: return hit
+            c = s.run.api.bases.get(c)
+        return ident(name)
+
+    def tags(s, i, lhs):
+        vals = Values(s.cx)     # its own: one mid-container (Emitters = {...}) writes elements whole
+        cls = s.run.types.cls(s.pkg, s.pkg.exports[i]['cls'], s.a)
+        tags = s.pkg.tags(i)
+        for t in tags:
+            if t['name'] in s.DERIVED: continue
+            if t.get('index') or sum(x['name'] == t['name'] for x in tags) > 1:
+                # a C array's elements, a tag each by index (DistributionVectorParticleParameter::ParamModes): UeApi
+                # has no such member and AssetGen no C arrays
+                if not t.get('index'):
+                    s.cx.notes.append('%s: default %s not rendered (a C array, which AssetGen has not)' % (s.a.path, t['name']))
+                continue
+            v = vals.tag(s.pkg, t, None, s.a)
+            if v is not None: s.lines += field_assigns(lhs + s.member(cls, t['name']), v, partial=True)
+
+    def instanced(s, i):
+        if i in s.locals: return s.locals[i]
+        e = s.pkg.exports[i]
+        o = e['outer'] - 1
+        outer = 'this' if o == s.a.export else s.instanced(o)
+        cls = s.run.types.cls(s.pkg, e['cls'], s.a)
+        local, n = ident(e['name']), 2
+        while local in s.locals.values() or local == 'this': local, n = '%s_%d' % (ident(e['name']), n), n + 1
+        s.locals[i] = local
+        s.lines.append('%s *%s = UE_INSTANCED(%s, %s, %s);' % (cls, local, cls, outer, B.cstring(e['name'])))
+        s.tags(i, local + '->')
+        return local
+
+    def emit(s):
+        a, pkg = s.a, s.pkg
+        o = Out(a)
+        s.tags(a.export, '')
+        for i, e in enumerate(pkg.exports):
+            if i == a.export or i in s.locals or not e['outer']: continue
+            if pkg.class_of(i + 1).startswith('Distribution'): continue
+            s.instanced(i)
+        cls = s.run.types.cls(pkg, pkg.exports[a.export]['cls'], a)
+        o.header = ''.join([HEADER_BANNER % a.path, '#pragma once\n', ns_open(a.ns),
+                            'UE_ASSET_DEFAULTS(%s, %s) {\n' % (cls, a.cpp), ''.join('  %s\n' % l for l in s.lines), '}\n',
+                            ns_close(a.ns)])
+        return o
+
+
+def emit_particles(run, a):
+    return AssetEmit(run, a).emit()
+
+
 def prop_decl(run, a, p, cur=None):
     return '%s %s' % (run.types.of(a.pkg, p, cur or a), ident(authored(p.name)))
 
@@ -1001,6 +1072,8 @@ def main():
     ap.add_argument('--mod', action='append', required=True)
     ap.add_argument('--names'); ap.add_argument('--raw'); ap.add_argument('--keep', action='append', default=[])
     ap.add_argument('--cook', action='append', default=[], help='<asset path>=<why>: ship that class cooked (UE_COOKED)')
+    ap.add_argument('--kinds', help='only these kinds, comma-separated (enum, struct, interface, class, widget, '
+                                    'particles); the others are neither written nor kept as cooked')
     args = ap.parse_args()
     mods = [tuple(m.split('=', 1)) for m in args.mod]
     model = Model(args.content, mods, args.names)
@@ -1009,11 +1082,13 @@ def main():
     run.cook = dict(c.split('=', 1) for c in args.cook)
     per_mod = defaultdict(list)
     raw = []
+    kinds = set(args.kinds.split(',')) if args.kinds else None
     for a in model.assets.values():
+        if kinds is not None and a.kind not in kinds: continue
         if a.path in run.keep or a.kind in ('raw', 'data'):
             raw.append(a); continue
         try:
-            o = {'enum': emit_enum, 'struct': emit_struct}.get(a.kind, emit_class)(run, a)
+            o = {'enum': emit_enum, 'struct': emit_struct, 'particles': emit_particles}.get(a.kind, emit_class)(run, a)
         except Exception as ex:
             import traceback; traceback.print_exc()
             run.notes.append('%s: not decompiled (%s: %s)' % (a.path, type(ex).__name__, ex))
