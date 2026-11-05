@@ -104,6 +104,23 @@ class AssetEmit:
             c = s.run.api.bases.get(c)
         return ident(name)
 
+    def enum_bytes(s, cls, t):
+        """An array of enum bytes (TArray<EObjectTypeQuery>) as its enumerators, or None. Its tag names no enum, so the
+        type is UeApi's; Values alone would write bare numbers, which C++ will not convert to the enum."""
+        if t['type'] != 'ArrayProperty' or t.get('inner') != 'ByteProperty': return None
+        c, ty = cls, None
+        while c and not ty: ty, c = s.run.api.member_type(c, t['name']), s.run.api.bases.get(c)
+        m = re.match(r'TArray<\s*(?:TEnumAsByte<\s*)?(E\w+)\s*>?\s*>$', ty or '')
+        b = bytes(t['value'])
+        n = struct.unpack_from('<i', b)[0]
+        if not m or not n: return None
+        e = m.group(1)
+        if len(b) == 4 + 8 * n:      # each its enumerator's FName (TEnumAsByte serializes so)
+            return '{%s}' % ', '.join('%s::%s' % (e, Values.name_at(None, s.pkg, b, 4 + 8 * k).split('::')[-1]) for k in range(n))
+        if len(b) == 4 + n:
+            return '{%s}' % ', '.join(s.cx.cenum_entry(e, x) or '(%s)%d' % (e, x) for x in b[4:])
+        return None
+
     def tags(s, i, lhs):
         vals = Values(s.cx)     # its own: one mid-container (Emitters = {...}) writes elements whole
         cls = s.run.types.cls(s.pkg, s.pkg.exports[i]['cls'], s.a)
@@ -116,7 +133,7 @@ class AssetEmit:
                 if not t.get('index'):
                     s.cx.notes.append('%s: default %s not rendered (a C array, which AssetGen has not)' % (s.a.path, t['name']))
                 continue
-            v = vals.tag(s.pkg, t, None, s.a)
+            v = s.enum_bytes(cls, t) or vals.tag(s.pkg, t, None, s.a)
             if v is not None: s.lines += field_assigns(lhs + s.member(cls, t['name']), v, partial=True)
 
     def instanced(s, i):

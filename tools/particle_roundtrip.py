@@ -89,7 +89,10 @@ def item(pkg, ty, b, o, t=None, sname=None):
             n = struct.calcsize(FIXED[sname])
             return struct.unpack_from(FIXED[sname], b, o), o + n
         tags, o = V.read_tags(pkg, b, o)
-        return {x['name'].lower(): value(pkg, x) for x in tags}, o
+        out = {x['name'].lower(): value(pkg, x) for x in tags}
+        if sname == 'Transform':        # a member left out holds the identity's
+            out = dict({'rotation': (0.0, 0.0, 0.0, 1.0), 'translation': (0.0, 0.0, 0.0), 'scale3d': (1.0, 1.0, 1.0)}, **out)
+        return out, o
     if ty == 'ArrayProperty':
         n = struct.unpack_from('<i', b, o)[0]; o += 4
         inner, sn = t['inner'], None
@@ -143,7 +146,8 @@ def tree(pkg):
     for i in range(len(pkg.exports)):
         p = pkg.path(i + 1)
         if pkg.class_of(i + 1).startswith('Distribution') and p not in refs: continue
-        out[rel(pkg, p) or p] = i
+        r = rel(pkg, p)
+        out[(r if r else p if r is None else "<the asset>").lower()] = i     # FNames: no case
     return out, vals
 
 
@@ -167,6 +171,8 @@ def diffs(van, ours):
         for k in sorted(set(a) | set(b)):
             x, y = a.get(k), b.get(k)
             if close(x, y): continue
+            # read only by the editor (its LOD fixups are WITH_EDITOR); AssetGen derives it, and vanilla keeps stale bits
+            if k == 'lodvalidity': continue
             if isinstance(x, dict) and isinstance(y, dict) and 'table' in y and x.get('distribution') and not y.get('distribution'):
                 out.append('baked %s.%s (the cook kept %s live)' % (p, k, x['distribution']))
                 continue
@@ -204,14 +210,24 @@ def one(args, path):
         text = (proc.stdout + proc.stderr).splitlines()
         errs = [l.split(' error: ', 1)[1] for l in text if ' error: ' in l]
         return 'compile', sorted(set(errs))[:6] or [l for l in text if 'FAILED' in l][:2] or text[-6:]
-    d = diffs(invariants.Package(src), invariants.Package(os.path.join(out, name)))
-    hard = [x for x in d if not x.startswith('baked ')]
+    # an asset name C++ cannot spell (P_Tri-Jaw_...) cooks under bpdecomp's respelling: assets have no __UeName marker
+    spelled = re.sub(r'\W', '_', name)
+    renamed = spelled != name and not os.path.exists(os.path.join(out, name + '.uasset'))
+    d = diffs(invariants.Package(src), invariants.Package(os.path.join(out, spelled if renamed else name)))
+    if renamed: notes.append('%s: cooks as %s, a name C++ can spell (no __UeName marker for an asset)' % (path, spelled))
+    hard = [x for x in d if not x.startswith('baked ') and not (renamed and x.endswith('(ParticleSystem)'))]
     if not args.keep: shutil.rmtree(work, ignore_errors=True)
     # a member bpdecomp said it could not write (a C array) is a known gap, not a difference
     noted = {m.group(1).lower() for n in notes for m in [re.search(r': default (\w+) not rendered', n)] if m}
-    unexplained = [x for x in hard if x.split(':', 2)[1].rsplit('.', 1)[-1] not in noted]
-    verdict = 'differs' if unexplained else 'gap' if hard else 'ok'
+    unexplained = [x for x in hard if x.split(': ', 1)[0].rsplit('.', 1)[-1] not in noted]
+    verdict = 'differs' if unexplained else 'gap' if hard or renamed else 'ok'
     return verdict, hard + [n for n in notes if n.strip()] + [x for x in d if x.startswith('baked ')]
+
+
+def guarded(args, path):
+    """one(), with a failure of the tool itself reported as that package's `error` instead of ending the run."""
+    try: return one(args, path)
+    except Exception as e: return 'error', ['%s: %s' % (type(e).__name__, e)]
 
 
 def main():
@@ -239,7 +255,7 @@ def main():
     os.makedirs(args.work, exist_ok=True)
     tally, lines = {}, []
     with ThreadPoolExecutor(args.jobs) as ex:
-        for path, (verdict, detail) in zip(paths, ex.map(lambda p: one(args, p), paths)):
+        for path, (verdict, detail) in zip(paths, ex.map(lambda p: guarded(args, p), paths)):
             tally[verdict] = tally.get(verdict, 0) + 1
             if verdict != 'ok' or args.only:
                 lines.append('%s %s' % (verdict.upper(), path))
