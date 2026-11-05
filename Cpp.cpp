@@ -13240,6 +13240,24 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
         for (const auto& [N, D] : A->Methods)
             if (!D->value("inline", false) && !IsInlineMethod(*A, N) && !Inherited(N, true)) return false;
     }
+    /* The functions of each interface this class or an ancestor lists (and those it extends) are the class's too: an
+       implementing class carries one of each, so `Order` beside an interface's `order` would cook two exports of one
+       FName, which the loader takes for the same object and fails on ("found in memory and is an export but does not
+       have all load flags"). Only functions: an interface's variables are the class's own fields (Held). */
+    for (const FRecord* C = &R; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+        for (const std::string& I : C->Interfaces)
+            for (const FRecord* Link : InterfaceChain(Find(I)))
+                for (const auto& [N, D] : Link->Methods)
+                {
+                    if (D->value("inline", false) || IsInlineMethod(*Link, N)) continue;
+                    const auto U = Link->UeNames.find(N);
+                    const std::string Ue = U == Link->UeNames.end() ? N : U->second;
+                    auto It = Own.find(Lower(Ue));
+                    if (It == Own.end() || (It->second.second && It->second.first == Ue)) continue;   // an implementation
+                    *Err = R.CppName + "::" + It->second.first + ": interface " + Link->CppName + " already has a function " + Ue
+                         + ", and an FName ignores case; rename it to " + Ue + " to implement it";
+                    return false;
+                }
     return true;
 }
 

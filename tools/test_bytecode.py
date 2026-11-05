@@ -14675,6 +14675,26 @@ print('ok  InterfaceVarNames: a mod interface\'s variable is held to its impleme
       'and a subclass of the implementer to the interface\'s')
 
 
+def interface_case_names():
+    """An implementation spelled other than its interface function (`Pull` for `pull`) is a second C++ method, which cooked
+    a second function export of the one FName: the game's loader finds the second already in memory and fails the load
+    (HubPluginDemo's `Order` beside UeApi's IModListOrder `order`). Refused, for the class's own interface and for one
+    a parent lists; two of the class's own functions that differ only in case likewise."""
+    iface = 'class IIcnTrigger {\npublic:\n  UE_INTERFACE;\n  void pull(int32 N);\n};\n'
+    proves('implementing-an.pull-case')
+    refused('IcnImpl', '  void Pull(int32 N) {}\n', 'IcnImpl::Pull: interface IIcnTrigger already has a function pull',
+            top=iface, base='AActor, public IIcnTrigger')
+    refused('IcnKid', '  void Pull(int32 N) {}\n', 'IcnKid::Pull: interface IIcnTrigger already has a function pull',
+            top=iface + 'class IcnParent : public AActor, public IIcnTrigger {\npublic:\n};\n', base='IcnParent')
+    proves('overloading.int32-get')
+    refused('IcnTwins', '  int32 Get() { return 1; }\n  int32 get() { return 2; }\n', 'IcnTwins::get: differs from Get only in case')
+
+
+interface_case_names()
+print('ok  InterfaceCaseNames: an implementation spelled other than its interface function, the class\'s or a parent\'s, '
+      'and two functions that differ only in case, are refused')
+
+
 def uds_init_defaults():
     """Every member initializer of a UE_STRUCT is in its default instance, the Data stream the engine copies into each
     new value of the struct (UUserDefinedStruct::InitializeStruct). A member at its type's default may be left out, and
