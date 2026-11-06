@@ -63,6 +63,7 @@ struct FPropertyDef
     std::string RepNotify;              // CPF_RepNotify: the function the client runs when the value arrives
     uint8 RepCondition = 0;             // CPF_Net: ELifetimeCondition
     bool bApiHidden = false;            // a C++ `private:` member: cooked as ever, left out of the editor API stub
+    int32 ArrayIndex = 0;               // a C array member's element (`ParamModes[1]`): its tag's ArrayIndex
 };
 
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);

@@ -369,13 +369,26 @@ static bool DefaultTarget(const Json* Lhs, const Json*& Through)
 }
 
 bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through,
-                       std::vector<const Json*>* Path = nullptr);
+                       std::vector<const Json*>* Path = nullptr, const Json** Element = nullptr);
+
+/* With Element, `X[2] = value` is X's element: Lhs the member X, Element the subscript (a C array member's, as
+   UDistributionVectorParticleParameter's ParamModes). Without it, or for any other left side, Element is null. */
+static void PeelElement(const Json*& Lhs, const Json** Element)
+{
+    if (!Element) return;
+    *Element = nullptr;
+    const Json* Base = Lhs && Kind(*Lhs) == "ArraySubscriptExpr" ? Strip(First(*Lhs)) : nullptr;
+    if (Base && Kind(*Base) == "MemberExpr") { *Element = Lhs; Lhs = Base; }
+}
 
 /* `Field = value;` or `Comp->Field = value;`. With Path, also a part of the member, `Comp->Style.Normal.DrawAs = value;`:
    Lhs is then the member (Style) and Path the member expressions below it, Normal then DrawAs, each reached with `.`. */
-bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through, std::vector<const Json*>* Path)
+bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through, std::vector<const Json*>* Path,
+                       const Json** Element)
 {
-    if (!AssignmentSides(S, Lhs, Rhs) || Kind(*Lhs) != "MemberExpr") return false;
+    if (!AssignmentSides(S, Lhs, Rhs)) return false;
+    PeelElement(Lhs, Element);
+    if (Kind(*Lhs) != "MemberExpr") return false;
     if (Path) Path->clear();
     while (!DefaultTarget(Lhs, Through))
     {
@@ -428,9 +441,12 @@ std::string LayoutHelperCall(const Json& S)
 /* `At->Padding.Top = value;`, a member of what a local points at, or a part of one: Lhs is the member reached through the
    local (Padding), Path the parts below it (Top), and the local's DeclRefExpr is returned; null for any other statement.
    A widget layout's way to set a part of a slot's struct, which a setter sets whole. */
-const Json* LocalMemberAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, std::vector<const Json*>& Path)
+const Json* LocalMemberAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, std::vector<const Json*>& Path,
+                                  const Json** Element = nullptr)
 {
-    if (!AssignmentSides(S, Lhs, Rhs) || Kind(*Lhs) != "MemberExpr") return nullptr;
+    if (!AssignmentSides(S, Lhs, Rhs)) return nullptr;
+    PeelElement(Lhs, Element);
+    if (Kind(*Lhs) != "MemberExpr") return nullptr;
     Path.clear();
     while (!Lhs->value("isArrow", false))
     {
@@ -21396,9 +21412,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 std::vector<const Json*> Part;      // `Comp->Style.Normal.DrawAs = value;`: Normal, DrawAs
                 FLayoutSlot* SlotOf = nullptr;      // `At->Padding.Top = value;`: the slot the layout's local At holds
                 std::vector<FPropertyDef>* InstOf = nullptr;    // `Burn->DamageAmount = value;`: the UE_INSTANCED local Burn's tags
-                const bool bDefault = DefaultAssignment(S, Lhs, Rhs, Owner, &Part);
+                const Json* Element = nullptr;     // `D->ParamModes[1] = value;`: the subscript of a C array member
+                const bool bDefault = DefaultAssignment(S, Lhs, Rhs, Owner, &Part, &Element);
                 if (!bDefault)
-                    if (const Json* Local = LocalMemberAssignment(S, Lhs, Rhs, Part))
+                    if (const Json* Local = LocalMemberAssignment(S, Lhs, Rhs, Part, &Element))
                     {
                         const std::string Id = Local->value("referencedDecl", Json::object()).value("id", std::string());
                         if (const auto L = SlotLocals.find(Id); L != SlotLocals.end() && !R.Widgets.empty())
@@ -21441,7 +21458,25 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 const std::string LhsDeclarer = OwnerOf(*Lhs);
                 const std::string TagName = UeNameOf(LhsDeclarer.empty() ? DR : Find(LhsDeclarer), Name(*Lhs));
                 const FRecord* LhsRec = LhsDeclarer.empty() ? DR : Find(LhsDeclarer);
-                if (!TypeToProperty(TypeOf(*Lhs), TagName, 0, NativeMemberWhere(LhsRec, TypeOf(*Lhs), Name(*Lhs), Where), BP, &PD, Err))
+                /* A C array member's element is a tag of its own, of the element's type at its index (ArrayIndex). */
+                if (Element)
+                {
+                    FConstVal I;
+                    const std::string Arr = TypeOf(*Lhs);
+                    const size_t Open = Arr.rfind('[');
+                    const int64 Dim = Open == std::string::npos ? 0 : std::atoll(Arr.c_str() + Open + 1);
+                    if (!Dim || !Part.empty())
+                    { *Err = Where + ": " + Name(*Lhs) + (Dim ? ": a part of a C array's element is not written; assign the element"
+                                                             : " is no C array member"); bOk = false; return; }
+                    if (!FoldConst(*Nth(*Element, 1), I) || I.I < 0 || I.I >= Dim)
+                    { *Err = Where + ": " + Name(*Lhs) + "[...]: the index is a constant below " + std::to_string(Dim); bOk = false; return; }
+                    if (!TypeToProperty(TypeOf(*Element), TagName, 0, NativeMemberWhere(LhsRec, TypeOf(*Element), Name(*Lhs), Where), BP, &PD, Err))
+                    { bOk = false; return; }
+                    if (PD.Type == "BoolProperty")
+                    { *Err = Where + ": " + Name(*Lhs) + ": a bool C array is not written"; bOk = false; return; }
+                    PD.ArrayIndex = int32(I.I);
+                }
+                else if (!TypeToProperty(TypeOf(*Lhs), TagName, 0, NativeMemberWhere(LhsRec, TypeOf(*Lhs), Name(*Lhs), Where), BP, &PD, Err))
                 { bOk = false; return; }
                 /* Zero is a real value here: an archetype deltas against the component CDO (where
                    bVisible is already true) and an inherited property against the parent's CDO,
@@ -21453,7 +21488,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* A part of a struct member is a tag of that struct holding only the part, as the cook writes a struct that
                    differs from its default in one member: on load the rest keeps the archetype's value. Only a struct
                    written as tags has parts; one with a native Serialize (Vector2D, LinearColor) is written whole. */
-                const Json* Leaf = Part.empty() ? Lhs : Part.back();
+                const Json* Leaf = Element ? Element : Part.empty() ? Lhs : Part.back();
                 std::vector<FPropertyDef> Outer;    // the structs above the part, the member first
                 if (!Part.empty())
                 {
@@ -21481,7 +21516,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 }
                 if (!LowerDefault(*Leaf, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
-                { *Err = Where + ": " + Name(*Leaf) + " needs a literal value"; bOk = false; return; }
+                { *Err = Where + ": " + Name(Element ? *Lhs : *Leaf) + " needs a literal value"; bOk = false; return; }
                 for (size_t I = Outer.size(); I-- > 0;)
                 {
                     FPropertyDef Up = Outer[I];
@@ -21509,7 +21544,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     Into.Default.Members = nullptr;
                 };
                 auto Put = [&](std::vector<FPropertyDef>& Into) {
-                    auto At = std::find_if(Into.begin(), Into.end(), [&](const FPropertyDef& X) { return X.Name == PD.Name; });
+                    auto At = std::find_if(Into.begin(), Into.end(), [&](const FPropertyDef& X) {
+                        return X.Name == PD.Name && X.ArrayIndex == PD.ArrayIndex; });
                     if (At == Into.end()) Into.push_back(PD);
                     else Merge(*At, PD);
                 };
@@ -21551,7 +21587,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 {
                     if (Part.empty())
                         InheritedDefaults.erase(std::remove_if(InheritedDefaults.begin(), InheritedDefaults.end(),
-                                                               [&](const FPropertyDef& P) { return P.Name == PD.Name; }),
+                                                               [&](const FPropertyDef& P) { return P.Name == PD.Name && P.ArrayIndex == PD.ArrayIndex; }),
                                                 InheritedDefaults.end());
                     Put(InheritedDefaults);
                     return;

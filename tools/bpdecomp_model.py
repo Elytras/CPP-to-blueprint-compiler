@@ -155,6 +155,14 @@ class Api:
         t = re.search(r'^\s+(?:UE_\w+\s+)*((?:class\s+)?[\w:<>,* ]+?)\s*\b%s(?:\[\d+\])?;' % re.escape(real), m.group(1), re.M)
         return t.group(1).replace('class ', '').strip() if t else None
 
+    def member_dim(s, cpp, name):
+        """The length of class cpp's C array member `name` (`ParamModes[3]`, the engine's name, any case), or 0."""
+        rel = s.headers.get(cpp)
+        body = re.search(r'\nclass %s\b[^{;]*\{(.*?)\n\};' % re.escape(cpp), s._text.get(rel, '') if rel else '', re.S)
+        real = s.members(cpp).get(name.lower())
+        m = body and real and re.search(r'\b%s\[(\d+)\];' % re.escape(real), body.group(1))
+        return int(m.group(1)) if m else 0
+
     def header_of(s, cpp):
         return s.headers.get(cpp.split('::')[-1])
 

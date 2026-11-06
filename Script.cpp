@@ -400,7 +400,7 @@ void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P)
 {
     const FDefaultValue& D = P.Default;
     if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
-    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName);
+    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName, P.ArrayIndex);
 }
 }   // namespace
 
@@ -408,7 +408,7 @@ void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
 {
     const FDefaultValue& D = P.Default;
     if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
-    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName);
+    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName, P.ArrayIndex);
 }
 
 void WriteDefaultValue(FArc& Ar, const FPropertyDef& P)

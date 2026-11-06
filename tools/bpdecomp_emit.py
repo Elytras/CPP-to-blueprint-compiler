@@ -94,6 +94,15 @@ class AssetEmit:
         s.cx.instanced, s.cx.all_instanced = s.instanced, True
         s.lines, s.locals = [], {}
 
+    def member_dim(s, cls, name):
+        """The length of a tag's member as a C array on the class or a parent, or 0 for any other member."""
+        c = cls
+        while c:
+            n = s.run.api.member_dim(c, name)
+            if n: return n
+            c = s.run.api.bases.get(c)
+        return 0
+
     def member(s, cls, name):
         """A tag's member as UeApi spells it on the class or a parent: the tag holds the FName's first spelling, which
         may differ in case (`Lifetime` for UParticleModuleLifetime's `LifeTime`)."""
@@ -139,14 +148,15 @@ class AssetEmit:
         tags = s.pkg.tags(i)
         for t in tags:
             if t['name'] in s.DERIVED: continue
-            if t.get('index') or sum(x['name'] == t['name'] for x in tags) > 1:
-                # a C array's elements, a tag each by index (DistributionVectorParticleParameter::ParamModes): UeApi
-                # has no such member and AssetGen no C arrays
+            # a C array's elements, a tag each by index (DistributionVectorParticleParameter::ParamModes[3])
+            dim = s.member_dim(cls, t['name'])
+            if not dim and (t.get('index') or sum(x['name'] == t['name'] for x in tags) > 1):
                 if not t.get('index'):
-                    s.cx.notes.append('%s: default %s not rendered (a C array, which AssetGen has not)' % (s.a.path, t['name']))
+                    s.cx.notes.append('%s: default %s not rendered (a C array UeApi does not declare)' % (s.a.path, t['name']))
                 continue
             v = s.enum_bytes(cls, t) or vals.tag(s.pkg, t, None, s.a)
-            if v is not None: s.lines += field_assigns(lhs + s.member(cls, t['name']), v, partial=True)
+            at = '[%d]' % t.get('index', 0) if dim else ''
+            if v is not None: s.lines += field_assigns(lhs + s.member(cls, t['name']) + at, v, partial=True)
         s.class_defaults(cls, tags, lhs)
 
     def instanced(s, i):
