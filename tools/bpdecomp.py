@@ -30,9 +30,11 @@ from bpdecomp_model import *
 # Engine structs serialized in a form of their own (WithSerializer), not as tags: Values.native_form reads each.
 NATIVE_FORMS = ('GameplayTagContainer', 'NiagaraVariableBase', 'NiagaraVariable', 'NiagaraVariableWithOffset')
 
+# A Guid's parts are signed: UeApi's FGuid takes int, and clang warns on a literal past INT_MAX.
 IMMUTABLE = {'Vector': ('<fff', 'FVector'), 'Vector2D': ('<ff', 'FVector2D'), 'Rotator': ('<fff', 'FRotator'),
              'Vector4': ('<ffff', 'FVector4'), 'Quat': ('<ffff', 'FQuat'), 'IntPoint': ('<ii', 'FIntPoint'),
-             'IntVector': ('<iii', 'FIntVector'), 'LinearColor': ('<ffff', 'FLinearColor'), 'Guid': ('<IIII', 'FGuid')}
+             'IntVector': ('<iii', 'FIntVector'), 'LinearColor': ('<ffff', 'FLinearColor'), 'Guid': ('<iiii', 'FGuid'),
+             'Box': ('<ffffffB', 'FBox')}
 
 
 def tpkg(prop, pkg):
@@ -86,6 +88,8 @@ class Values:
         if ty == 'IntProperty': return str(struct.unpack('<i', b)[0])
         if ty == 'Int64Property': return '(int64)%d' % struct.unpack('<q', b)[0]
         if ty == 'UInt64Property': return '%dULL' % struct.unpack('<Q', b)[0]
+        if ty in ('UInt32Property', 'UInt16Property', 'Int16Property', 'Int8Property'):
+            return str(struct.unpack({'UInt32Property': '<I', 'UInt16Property': '<H', 'Int16Property': '<h', 'Int8Property': '<b'}[ty], b)[0])
         if ty == 'FloatProperty': return B.cfloat(struct.unpack('<f', b)[0])
         if ty == 'BoolProperty': return 'true' if (t['bool'] if t else b[0]) else 'false'
         if ty == 'StrProperty': return B.cstring(read_fstring(b, 0)[0])
@@ -164,6 +168,8 @@ class Values:
             for _ in range(n):
                 if sname in NATIVE_FORMS:
                     v, o = s.native_form(pkg, sname, b, o, cur); out.append(v)
+                elif sname == 'Color':      # FColor is atomic too: four bytes, B G R A
+                    out.append(s.struct_value(pkg, sname, b[o:o + 4], prop, cur)); o += 4
                 elif sname in IMMUTABLE:
                     fmt, cpp = IMMUTABLE[sname]
                     size = struct.calcsize(fmt)
@@ -176,6 +182,8 @@ class Values:
             if ty == 'IntProperty': out.append(str(struct.unpack_from('<i', b, o)[0])); o += 4
             elif ty == 'FloatProperty': out.append(B.cfloat(struct.unpack_from('<f', b, o)[0])); o += 4
             elif ty == 'Int64Property': out.append(str(struct.unpack_from('<q', b, o)[0])); o += 8
+            elif ty == 'UInt32Property': out.append('%du' % struct.unpack_from('<I', b, o)[0]); o += 4
+            elif ty == 'UInt16Property': out.append(str(struct.unpack_from('<H', b, o)[0])); o += 2
             elif ty == 'BoolProperty': out.append('true' if b[o] else 'false'); o += 1
             elif ty in ('ByteProperty', 'EnumProperty'):
                 if prop is not None and (prop.type == 'EnumProperty' or prop.ref) and ty != 'ByteProperty' or \
@@ -205,7 +213,7 @@ class Values:
         other subobject is noted."""
         if idx > 0 and pkg.exports[idx - 1]['outer']:
             hook = getattr(s.cx, 'instanced', None)
-            if hook and instanced_export(pkg, idx - 1): return hook(idx - 1)
+            if hook and (getattr(s.cx, 'all_instanced', False) or instanced_export(pkg, idx - 1)): return hook(idx - 1)
             raise ValueError('a subobject %s, which AssetGen cannot point at' % pkg.exports[idx - 1]['name'])
         return s.cx.object_ref_static(pkg, idx, cur)
 
@@ -243,6 +251,8 @@ class Values:
             fmt, cpp = IMMUTABLE[sname]
             vals = struct.unpack(fmt, b[:struct.calcsize(fmt)])
             if sname == 'Guid': return 'FGuid(%s)' % ', '.join('%d' % v for v in vals)
+            if sname == 'Box':
+                return 'FBox(FVector(%s), FVector(%s), %d)' % (', '.join(fmt_num(v) for v in vals[:3]), ', '.join(fmt_num(v) for v in vals[3:6]), vals[6])
             return '%s(%s)' % (cpp, ', '.join(fmt_num(v) for v in vals))
         if sname == 'Color':
             bb, g, r, a = b[:4]
@@ -290,21 +300,23 @@ class Values:
             return s.transform(pkg, tags, cur)
         parts = []
         uname = sname or (tp.path(ref).rsplit('.', 1)[-1] if ref else '')
-        fields = s.cx.api.fields.get(uname, {})
+        # a tag holds its FName's first spelling in the package, which may differ in case from UeApi's member
+        # (FNiagaraEmitterHandle's `ID` is tagged `Id` where FGuid's `Id` was named first)
+        fields = {k.lower(): v for k, v in s.cx.api.fields.get(uname, {}).items()}
         for t in tags:
             mp = members.get(t['name']) if members else None
-            if mp is None and t['name'] in fields: t = dict(t, cpp=fields[t['name']])     # a native struct's member
+            if mp is None and t['name'].lower() in fields: t = dict(t, cpp=fields[t['name'].lower()])     # a native struct's member
             v = s.value(pkg, t['type'], bytes(t['value']), mp, cur, t)
             parts.append((t['name'], v))
         tname = s.cx.types.struct(tp, ref, cur) if ref else 'F' + (sname or '')
         native = not ref or tp.path(ref).startswith('/Script/')
         order = s.cx.api.ctor_fields.get(uname) if getattr(s, 'in_element', 0) and native else None
-        if order and uname != 'Color' and all(n in order for n, _ in parts):
+        if order and uname != 'Color' and all(n.lower() in {o.lower() for o in order} for n, _ in parts):
             # its constructor, every member in order; one the cooked value leaves out is UE_KEEP, unwritten, so it
             # holds what the engine's constructor sets, as the cooked value does
-            given = dict(parts)
+            given = {n.lower(): v for n, v in parts}
             if not given: return '%s()' % tname
-            return '%s(%s)' % (tname, ', '.join(given.get(n, 'UE_KEEP') for n in order))
+            return '%s(%s)' % (tname, ', '.join(given.get(n.lower(), 'UE_KEEP') for n in order))
         return '%s{%s}' % (tname, ', '.join('.%s = %s' % (ident(authored(n)), v) for n, v in parts))
 
     def transform(s, pkg, tags, cur):

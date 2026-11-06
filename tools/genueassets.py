@@ -19,14 +19,11 @@ import collections
 import keyword
 import os
 import re
-import subprocess
 import sys
 import tempfile
 
-import dumpar
-import dumpedl
-
-UNREALPAK = os.environ.get("UNREALPAK") or r"C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe"
+import pakkit
+import uasset
 
 CPP_KEYWORDS = set(keyword.kwlist) | {
     "alignas", "alignof", "asm", "auto", "bool", "case", "catch", "char", "class", "const", "constexpr", "consteval",
@@ -60,7 +57,7 @@ def folder_rows(folder):
         for f in files:
             if not f.endswith(".uasset"):
                 continue
-            _names, imports, exports, _deps = dumpedl.read_tables(open(os.path.join(here, f), "rb").read())
+            _names, imports, exports, _deps = uasset.read_tables(open(os.path.join(here, f), "rb").read())
             for e in exports:
                 if e["is_asset"] and e["class"] < 0:
                     rows.append({"asset_class": imports[-e["class"] - 1][1], "asset_name": e["name"],
@@ -72,9 +69,8 @@ def pak_rows(pak):
     if os.path.isdir(pak):
         return folder_rows(pak)
     with tempfile.TemporaryDirectory() as tmp:
-        if subprocess.run([UNREALPAK, os.path.abspath(pak), "-Extract", tmp, "-Filter=*.uasset"],
-                          capture_output=True).returncode != 0:
-            sys.exit("UnrealPak could not extract %s (UNREALPAK=%s)" % (pak, UNREALPAK))
+        if pakkit.unpack(os.path.abspath(pak), tmp, "*.uasset").returncode != 0:
+            sys.exit("UnrealPak could not extract %s (UNREALPAK=%s)" % (pak, pakkit.UNREALPAK))
         return folder_rows(tmp)
 
 
@@ -108,7 +104,7 @@ def main():
     if len(args) != 3:
         sys.exit(__doc__.strip().splitlines()[0])
     registry, ueapi, out = args
-    _version, _names, rows, *_ = dumpar.read(registry)
+    _version, _names, rows, *_ = uasset.read_registry(registry)
     by_path = {(r["package_name"], r["asset_name"]): r for r in rows}
     for pak in paks:
         by_path.update(((r["package_name"], r["asset_name"]), r) for r in pak_rows(pak))

@@ -7,7 +7,7 @@ row each with the type in the way, and prints a summary of it (write_gaps).
 
 --game reads the game's cooked Blueprints for what the dump does not carry: each game Blueprint class's tail
 (UeClassTail) and the subobjects under its CDO (UeDefaultSubobjects), the native interfaces a native class
-implements (UeNativeInterfaces, see native_interfaces), which subobject a component member points at where the types
+implements (its C++ bases after the first, see native_interfaces), which subobject a component member points at where the types
 cannot tell (map_subobjects), and the form of an enum only a local or a container element shows (scan_game).
 Blueprint classes' implemented interfaces become C++ bases, and imported Blueprint interface declarations carry
 their interface marker, from the cooked class metadata too. A game Blueprint's enum and struct take their cooked
@@ -61,7 +61,9 @@ CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
 # 6: a game Blueprint's functions marked UE_PROTECTED / UE_PRIVATE / UE_BLUEPRINT_PURE / UE_BLUEPRINT_CALLABLE, and left out of Events.json;
 #    no NotCallable.json. The compiler still takes 5: it reads an older Events.json's game rows where they are.
 # 7: a game Blueprint class is UE-prefixed without _C (bp_name), Foo_C an alias of it. The compiler still takes 6.
-GENUEAPI_VERSION = 7
+# 8: a native class's interfaces are its C++ bases after the first, not UeNativeInterfaces; more of them, from game
+#    Blueprints' calls on self. The compiler still takes 7: there a member call to an interface function does not compile.
+GENUEAPI_VERSION = 8
 
 
 def dump_identity(sdk_dir):
@@ -81,7 +83,7 @@ def class_refs(t):
 
 def split_args(text):
     return [a.strip() for a in split_params(text)]
-FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ()\"]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
+FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ()\"]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?(?:\[0x([0-9A-Fa-f]+)\])?;\s*//")
 WEAK = re.compile(r"^TWeakObjectPtr<class\s+(\w+)>$")     # a native struct's weak member, of a native class
 NO_STRUCT_LITERAL = ("TDelegate<", "TMulticast", "TScriptInterface<")    # EX_StructConst has no zero for these
 # The engine's C++ constructor where it takes the members in another order than the reflected one (FColor's are B, G,
@@ -368,7 +370,9 @@ def parse_structs(path, pkg):
             m = FIELD.match(line)
             # A member Dumper-7 adds by hand (UE5's FInstancedStruct: ScriptStruct, uint8* StructMemory) is no FProperty,
             # so neither a field EX_StructConst writes nor one a stub can declare (`uint8*` reads as an out-parm).
-            if m and not m.group(2).startswith(("Pad_", "BitPad_")) and "NOT AUTO-GENERATED PROPERTY" not in line:
+            # ponytail: a struct's C array member (FExpressionInput Inputs[0x3]) stays out, as before genueapi read them;
+            # a class's is declared (parse_field), and a struct's would need its constructor and literals to take one.
+            if m and not m.group(4) and not m.group(2).startswith(("Pad_", "BitPad_")) and "NOT AUTO-GENERATED PROPERTY" not in line:
                 # The flag comment, `(Edit, Transient, ...)`, or a bitfield's `(BitIndex: .., PropSize: .. (flags))`.
                 transient = bool(TRANSIENT.search(line[line.index("//"):]))
                 cur_struct.raw_fields.append(("bool" if m.group(3) else m.group(1), m.group(2), transient))
@@ -1377,6 +1381,8 @@ def parse_field(cur, m, skipped):
         GAPS.append(("member", cur, fname, raw, mapped if mapped in KINDS else "other"))
         return
     cur.fields.append((mapped, fname))
+    if m.group(4):
+        cur.dims[fname] = int(m.group(4), 16)
     # BlueprintReadOnly: the stub declares it UE_READONLY (`mutable`), so a child's UE_DEFAULTS may still set it.
     if re.search(r"\bBlueprintReadOnly\b", flags):
         cur.readonly.add(fname)
@@ -1411,6 +1417,7 @@ class Klass(object):
         self.raw_funcs = []      # (return, name, params) as Dumper-7 spelled them, before any mapping
         self.fields = []
         self.readonly = set()    # the fields Dumper-7 flags BlueprintReadOnly
+        self.dims = {}           # a C array member (`ParamModes[0x3]`) -> its length; a tag per element
         self.replicated = {}     # field -> its RepNotify function, "" when none (or the dump predates the name)
         self.offsets = {}        # field -> (offset, ordinal among the members at that offset): the join to REAL_FIELDS
         self.scs_nodes = {}      # component variable -> its SCS node's VariableGuid, 32 hex digits
@@ -1738,6 +1745,7 @@ GAME_TEMPLATE_SUBOBJECTS = {}       # game Blueprint class path -> ["<class path
 GAME_MEMBER_SUBOBJECTS = {}         # (native class path, member's engine name lowered) -> {subobject names} (scan_game)
 GAME_INTERFACES = {}                # Blueprint class path -> directly implemented interface paths (scan_game)
 GAME_INTERFACE_TYPES = set()        # Blueprint classes flagged CLASS_Interface (scan_game)
+GAME_FUNCTIONS = {}                 # Blueprint class path -> the names of its own functions and events (scan_game)
 OBJECT_PATH = "/Script/CoreUObject.Object"
 DEFAULT_TAIL = (0, OBJECT_PATH, "Engine")   # UObject's: Object.h:57-60
 
@@ -1750,10 +1758,11 @@ def scan_game(content, container_members):
     {native enum path: {"EnumProperty" / "ByteProperty"}}, how the Blueprints' properties of each enum are reflected -
     variables, parameters and locals, the editor's own choice of the two (read_enum_forms) - and how the native
     objects' tags of the container members container_members names hold their elements (container_enum_members).
+    And each (class path, function name) a function of the class calls by name on self (native_interfaces).
     Fills the GAME_* metadata maps, including the class's own implemented interfaces."""
     import invariants
     import struct
-    classes, overrides, enums, unread = {}, set(), {}, []
+    classes, overrides, enums, unread, self_calls = {}, set(), {}, [], set()
 
     def enum_kinds(p, prop):
         idx = prop.enum if prop.type == "EnumProperty" else prop.ref if prop.type == "ByteProperty" else 0
@@ -1839,6 +1848,15 @@ def scan_game(content, container_members):
                     continue
                 for prop in st.props if st is not None else ():
                     enum_kinds(p, prop)
+                # Its calls by name on self (EX_VirtualFunction outside any context): native_interfaces' second source.
+                GAME_FUNCTIONS.setdefault(p.path(e["outer"]), set()).add(e["name"])
+                try:
+                    for s in p.script(i):
+                        for n, mine in s.on_self():
+                            if mine and n.op == 0x1B and n.ops:
+                                self_calls.add((p.path(e["outer"]), n.ops[0][1]))
+                except Exception:
+                    unread.append(p.path(i + 1))
             elif e["cls"] < 0 and p.path(e["cls"]) in container_members:
                 # A native object's tag of a TArray / TSet / TMap member names its element's field class, which the
                 # dump does not: GD_TreasureSettings' CrateTreasureTypes holds EnumProperty elements.
@@ -1856,7 +1874,7 @@ def scan_game(content, container_members):
           "named" % (len(classes), len(overrides), len(enums), len(GAME_MEMBER_SUBOBJECTS)))
     if unread:
         print("  game objects whose properties could not be read, left out: %d, e.g. %s" % (len(unread), "; ".join(unread[:3])))
-    return classes, overrides, enums
+    return classes, overrides, enums, self_calls
 
 
 def container_enum_members(classes, by_name):
@@ -1926,22 +1944,48 @@ def class_tails(classes, by_name, game):
     return out
 
 
-def native_interfaces(classes, by_name, game, overrides):
+def native_interfaces(classes, by_name, game, overrides, self_calls=()):
     """{native class: [interface C++ names]}: for each game Blueprint function whose super is a native interface's
     function, the interface goes on the Blueprint's nearest native ancestor, unless one of its ancestors has it. The
     dump lists no class's interfaces; the Kismet compiler finds such a super through the parent's Interfaces
-    (UClass::FindFunctionByName, Class.cpp:5281-5323)."""
+    (UClass::FindFunctionByName, Class.cpp:5281-5323).
+    A call by name on self (self_calls) to a function only one native interface declares says the same: the editor
+    calls an interface function the class implements as one of its own (EX_VirtualFunction QueueMontage in
+    ENE_SpiderBase_Large), unless an interface of a Blueprint's own list has it, or a class up its chain has a function
+    of that name (BP_BurrowAttackComponent's own ShowDamageEffects event is not ITargetable's). Only a function some
+    Blueprint calls so is seen: an interface none does stays unlisted."""
     by_path = dict((k.path + "." + k.ue_name, k) for k in classes)
-    found = {}
-    for cls, iface in overrides:
-        i = by_path.get(iface)
-        if not i or i.is_bp or i.base or not i.cpp.startswith("I"):
-            continue
+    native = [k for k in classes if not k.is_bp and not k.base and k.cpp.startswith("I")]
+    declaring = {}
+    for i in native:
+        for f in set(f for _, _, f, _ in i.funcs):
+            declaring.setdefault(f, []).append(i)
+
+    def native_of(cls, iface_path=None, fname=None):
+        """cls's nearest native ancestor's path, or None where a Blueprint on the way lists iface_path or has a
+        function fname."""
         for _ in range(64):
             if cls is None or cls.startswith("/Script/"):
-                break
+                return cls
+            if iface_path in GAME_INTERFACES.get(cls, ()) or fname in GAME_FUNCTIONS.get(cls, ()):
+                return None
             cls = game.get(cls, (0, 0, 0, None))[3]
-        if cls in by_path:
+        return None
+
+    pairs = [(native_of(cls), by_path.get(iface)) for cls, iface in overrides]
+    for cls, fname in self_calls:
+        if len(declaring.get(fname, ())) != 1:
+            continue
+        i = declaring[fname][0]
+        k = by_path.get(native_of(cls, i.path + "." + i.ue_name, fname))
+        up = k
+        while up is not None and fname not in set(f for _, _, f, _ in up.funcs):
+            up = by_name.get(up.base) if up.base else None
+        if k is not None and up is None:
+            pairs.append((k.path + "." + k.ue_name, i))
+    found = {}
+    for cls, i in pairs:
+        if i and not i.is_bp and not i.base and i.cpp.startswith("I") and cls in by_path:
             found.setdefault(by_path[cls].cpp, set()).add(i.cpp)
     out = {}
     for cpp, ifaces in found.items():
@@ -2127,8 +2171,8 @@ def main():
     old_unique = set(n for n, c in old_count.items() if c == 1 and n not in natives and n not in bp_names)
 
     by_name = dict((k.cpp, k) for k in classes)
-    game, overrides, game_enums = scan_game(game_dir, container_enum_members(classes, by_name)) if game_dir \
-        else ({}, set(), {})
+    game, overrides, game_enums, self_calls = scan_game(game_dir, container_enum_members(classes, by_name)) if game_dir \
+        else ({}, set(), {}, set())
     map_subobjects(classes, by_name)
     read_enum_forms(sdk_dir, game_enums)
     for k in classes:
@@ -2136,11 +2180,13 @@ def main():
         k.template_subobjects = GAME_TEMPLATE_SUBOBJECTS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
         k.ich_records = GAME_ICH_RECORDS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
     tails = class_tails(classes, by_name, game)
-    ifaces = native_interfaces(classes, by_name, game, overrides)
+    ifaces = native_interfaces(classes, by_name, game, overrides, self_calls)
     # Not one a mod of ours cooks (ModHubApi's IHubMod, which an extracted mod pak shows CD2 implementing): its C++ is
     # that mod's header, and a base from UeApi's copy would clash with it in any mod including both.
     bp_ifaces = blueprint_interfaces(classes, by_name, dict(
         (k, [i for i in v if not (i + "/").startswith(cooked_here)]) for k, v in GAME_INTERFACES.items()))
+    # A native class's are its C++ bases too, so a mod calls `GetTargetCenterMass()` on a spider as a member.
+    bp_ifaces.update(ifaces)
     ordered, seen = [], set()
 
     def place(k):
@@ -2322,8 +2368,6 @@ def main():
                 marks.append('static constexpr bool UeInterfaceMeta = true;')
             if k.cpp in tails:
                 marks.append('static constexpr const char* UeClassTail = "%s";' % tails[k.cpp])
-            if k.cpp in ifaces:
-                marks.append('static constexpr const char* UeNativeInterfaces = "%s";' % " ".join(ifaces[k.cpp]))
             if k.default_subobjects:
                 # Every default subobject this game Blueprint's CDO exports, "<class path> <name>" joined by ';' (a
                 # name can hold a space): a child is serialized after each.
@@ -2340,7 +2384,8 @@ def main():
             for ftype, fname in k.fields:
                 if fname in names:
                     continue
-                body.append("    %s%s %s;" % ("UE_READONLY " if fname in k.readonly else "", rewrite(named(ftype), short, k), fname))
+                body.append("    %s%s %s%s;" % ("UE_READONLY " if fname in k.readonly else "", rewrite(named(ftype), short, k), fname,
+                                             "[%d]" % k.dims[fname] if fname in k.dims else ""))
                 real = real_field(k, fname)
                 if real:
                     marks.append('static constexpr const char* %s__UeName = "%s";' % (fname, c_literal(real)))

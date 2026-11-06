@@ -9,10 +9,15 @@ every instruction it reached. Parms not given start at 0, the way a frame zeroes
 As a module: run(base, function, **parms) -> (return value, locals)."""
 import copy, math, struct, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import dumpexp
-from walkscript import W
+import uasset_io
+from uasset import W
 
 FLOW_OPS = {6, 7, 0x4C, 0x4D, 0x4E, 0x4F}
+
+
+# The package tools that became uasset.py subcommands, by their old file names, which the suite still calls:
+UASSET_TOOLS = {'dumpexp.py': ['exports'], 'dumpstruct.py': ['struct'], 'dumptags.py': ['tags'], 'dumpedl.py': ['deps'],
+                'dumpar.py': ['registry'], 'walkscript.py': ['walk'], 'walk5.py': ['walk', '--ue5']}
 
 
 def tool_output(tool, *args):
@@ -22,10 +27,11 @@ def tool_output(tool, *args):
     process's stdout did; what it writes to stderr is dropped, as it was."""
     import contextlib, importlib, io
     out, argv = io.StringIO(), sys.argv
-    sys.argv = [tool] + [str(a) for a in args]
+    sub = UASSET_TOOLS.get(tool)
+    sys.argv = (['uasset.py'] + sub if sub else [tool]) + [str(a) for a in args]
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            importlib.import_module(tool[:-3]).main()
+            importlib.import_module('uasset' if sub else tool[:-3]).main()
     except (SystemExit, Exception):
         pass
     finally:
@@ -39,7 +45,7 @@ class Node:
 
 
 class P(W):
-    """walkscript's reader, building a tree instead of a log."""
+    """uasset.W's bytecode reader, building a tree instead of a log."""
     def of_own_class(s, p):
         """imp[i]: a function of this package's own class, which a compile names as an import (a call bound to it)."""
         i = int(p[4:p.index(']')])
@@ -118,7 +124,7 @@ class P(W):
 
 
 def script_of(base, function):
-    ua, ue, total, names, imports, exports = dumpexp.load(base)
+    ua, ue, total, names, imports, exports = uasset_io.load(base)
     for e in exports:
         if e['name'] != function: continue
         blob = ue[e['off'] - total: e['off'] - total + e['size']]
@@ -141,7 +147,7 @@ def params_of(base, function, flag=0x80):
     AssetGen cooked it before it named such a parameter P<index>) is listed as '': the VM fills a callee's parameters
     by their order, so it keeps its place."""
     import re
-    exports = dumpexp.load(base)[5]
+    exports = uasset_io.load(base)[5]
     idx = next(i for i, e in enumerate(exports) if e['name'] == function)
     out = tool_output('dumpstruct.py', base, idx)
     found = re.findall(r'^\s+\w+Property (\w*) .*? flags=(0x[0-9a-fA-F]+)', out, re.M)
@@ -153,7 +159,7 @@ def props_of(base, function, _cache={}):
     An EnumProperty over a byte (an enum class) reads as the ByteProperty it is to the VM."""
     import re
     if (base, function) not in _cache:
-        exports = dumpexp.load(base)[5]
+        exports = uasset_io.load(base)[5]
         idx = next(i for i, e in enumerate(exports) if e['name'] == function)
         out = tool_output('dumpstruct.py', base, idx)
         _cache[base, function] = dict((n, 'ByteProperty' if (t, size) == ('EnumProperty', '1') else t)
@@ -513,7 +519,9 @@ def int64_to_text(v, sign, grouping, lo, hi):
 # running object, None is null. A few engine calls the test mods make are stubbed: MESSAGES collects PostGameMessage.
 SELF, GAME_STATE, MESSAGES = 'Self', 'GameState', []
 MATH.update({
-    'Concat_StrStr': lambda a, b: a + b, 'Len': len, 'EqualEqual_StriStri': lambda a, b: a.lower() == b.lower(),
+    'Concat_StrStr': lambda a, b: a + b, 'Len': len,
+    'GetCharacterAsNumber': lambda s, i: ord(s[i]) if 0 <= i < len(s) else 0,
+    'EqualEqual_StriStri': lambda a, b: a.lower() == b.lower(),
     'Conv_IntToString': str, 'Conv_FloatToString': sanitize_float, 'Conv_BoolToString': lambda b: 'true' if b else 'false',
     'Conv_StringToInt': atoi, 'Conv_Int64ToText': int64_to_text, 'Conv_ObjectToString': lambda o: str(o) if o else 'None',
     'Conv_StringToName': str, 'Conv_NameToString': str, 'Conv_NameToText': str, 'Conv_StringToText': str, 'Conv_TextToString': str,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""usage: bpbuild.py <mods dir (holds mods.yaml) or a parent with BpMods/> <UeApi dir> <assetgen executable> [--force] [--no-pak]"""
+"""usage: bpbuild.py <mods dir (holds mods.yaml) or a parent with BpMods/> <UeApi dir> <assetgen executable> [--force] [--no-pak] [--only <mod>[,<mod>...]]"""
 import glob
 import io
 import json
@@ -15,30 +15,13 @@ from concurrent.futures import ThreadPoolExecutor
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dumpexp import load as load_package
+from uasset_io import load as load_package
+from pakkit import UNREALPAK, drive_path, mount as pak_mount  # noqa: F401  BpMods/ElytrasModManager/check_icons.py reads UNREALPAK
+import pakkit
 import mintcache
 from mintcache import MINT_CACHE, MODIO_URL   # MINT's download cache: what a mod.io `game_content` names
 
 MOD_PACKAGE = re.compile(r'UE_MOD_PACKAGE\s*\(\s*"([^"]+)"')
-
-# Off Windows, a `C:/...` path in mods.yaml is one on that Windows drive as this machine mounts it (a dual boot's
-# drives): BPBUILD_DRIVES="C=/mnt/c;D=/media/me/Data" names the mounts, else the first of /mnt/<x>, /mnt/win<x> that exists.
-DRIVES = dict((d.strip().upper(), root.strip()) for d, _eq, root in
-              (e.partition("=") for e in os.environ.get("BPBUILD_DRIVES", "").split(";") if "=" in e))
-WINDOWS_PATH = re.compile(r"^([A-Za-z]):[\\/]")
-
-
-def drive_path(path):
-    """Off Windows, Windows drive path `path` on that drive's mount (DRIVES), or None when the drive is not mounted;
-    any other path as it is."""
-    m = WINDOWS_PATH.match(path) if os.name != "nt" else None
-    if not m:
-        return path
-    drive = m.group(1).upper()
-    root = DRIVES.get(drive) or next((r for r in ("/mnt/" + drive.lower(), "/mnt/win" + drive.lower())
-                                      if os.path.isdir(r)), None)
-    return os.path.join(root, *re.split(r"[\\/]+", path[3:])) if root else None
-
 
 def manifest_path(bp, path):
     """A path mods.yaml gives, absolute: relative ones resolve against BpMods/, $VARS expand, and a Windows drive
@@ -50,18 +33,6 @@ def manifest_path(bp, path):
         sys.exit("mods.yaml: %s is on drive %s:, which is not mounted here (set BPBUILD_DRIVES=\"%s=<its mount>\")"
                  % (path, drive, drive))
     return os.path.abspath(os.path.join(bp, host))
-
-
-# UnrealPak: UNREALPAK, else UE 4.27's default install. Off Windows, a Linux UnrealPak on PATH, else that default
-# install's UnrealPak.exe on the mounted Windows drive; an .exe there runs under Wine. With none of those, repak
-# (github.com/trumank/repak, what MINT packs with) on PATH packs and extracts instead; UNREALPAK=<repak> picks it.
-UNREALPAK_DEFAULT = r"C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe"
-UNREALPAK = os.environ.get("UNREALPAK") or (UNREALPAK_DEFAULT if os.name == "nt" else
-                                            shutil.which("UnrealPak") or drive_path(UNREALPAK_DEFAULT) or "UnrealPak")
-UNREALPAK_RUN = ([shutil.which("wine") or "wine", UNREALPAK]
-                 if os.name != "nt" and UNREALPAK.lower().endswith(".exe") else [UNREALPAK])
-REPAK = (UNREALPAK if os.path.basename(UNREALPAK).lower().startswith("repak") else
-         shutil.which("repak") if not os.environ.get("UNREALPAK") and not os.path.exists(UNREALPAK) else None)
 
 
 def newest(paths):
@@ -330,9 +301,11 @@ def content_of(src, bp, root):
                     if len(paks) != 1:
                         sys.exit("%s holds %d .pak files, not one" % (src, len(paks)))
                     pak = z.extract(paks[0], os.path.join(root, ".zip"))
-            extract = [REPAK, "unpack", pak, "-o", root, "-f", "-q"] if REPAK else UNREALPAK_RUN + [pak, "-Extract", root]
-            proc = subprocess.run(extract, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True, errors="replace")
+            # Both tools write paths relative to the pak's mount point, so a pak mounted on its own folder
+            # (Colorful Sugar's ../../../FSD/Content/Colorful_Sugar/) is extracted into that folder:
+            dest = os.path.join(root, *[p for p in pak_mount(pak).split("/") if p not in ("", "..")])
+            os.makedirs(dest, exist_ok=True)
+            proc = pakkit.unpack(pak, dest)
             if proc.returncode != 0:
                 sys.exit("UnrealPak could not extract %s:\n%s" % (pak, proc.stdout[-2000:]))
             io.open(stamp, "w", encoding="utf-8").write(want)
@@ -441,35 +414,6 @@ def run_compile(cmd):
     """One assetgen compile, on a pool thread. Its output is captured, for the caller to print in build order."""
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     return proc.returncode == 0, proc.stdout
-
-
-def run_unrealpak(fsd_dir, pak_path):
-    if REPAK:
-        # What UnrealPak writes for the response file below: UE 4.27's pak version, zlib, the tree under ../../../FSD/.
-        if os.path.exists(pak_path):
-            os.remove(pak_path)
-        proc = subprocess.run([REPAK, "pack", "--version", "V11", "--compression", "Zlib", "-m", "../../../%s/" % PROJECT,
-                               fsd_dir, pak_path, "-q"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        if proc.returncode != 0:
-            print("  repak failed (%d):" % proc.returncode)
-            print("    " + "\n    ".join(proc.stdout.strip().splitlines()[-6:]))
-            return False
-        return True
-    if not os.path.exists(UNREALPAK):
-        print("  UnrealPak not found at %s - skipping the pak." % UNREALPAK)
-        return False
-
-    response = os.path.join(os.path.dirname(fsd_dir), "autogen.txt")
-    io.open(response, "w", encoding="utf-8", newline="\n").write(
-        '"%s" "..\\..\\..\\%s\\*.*"\n' % (os.path.join(fsd_dir, "*.*"), PROJECT))
-
-    cmd = UNREALPAK_RUN + [pak_path, "-platform=Windows", "-create=" + response, "-compress"]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if proc.returncode != 0:
-        print("  UnrealPak failed (%d):" % proc.returncode)
-        print("    " + "\n    ".join(proc.stdout.strip().splitlines()[-6:]))
-        return False
-    return True
 
 
 def check_mod_imports(staged, mod_packages):
@@ -635,6 +579,8 @@ def main():
     PROJECT = ueapi_project(ue_api)
     force = "--force" in sys.argv[4:]
     no_pak = "--no-pak" in sys.argv[4:]
+    flags = sys.argv[4:]
+    only = flags[flags.index("--only") + 1].split(",") if "--only" in flags[:-1] else None
 
     bp = repo if os.path.exists(os.path.join(repo, "mods.yaml")) else os.path.join(repo, "BpMods")
     write_vs_filters(bp)
@@ -670,6 +616,13 @@ def main():
     toolchain_time = max(newest(tree_files(ue_api)), newest(tree_files(ue_assets)), newest([assetgen]))
 
     by_name = dict((m["name"], m) for m in mods)
+    # --only builds the named mods and what they `need`, which an embed bakes in; the rest stay as they are:
+    if only:
+        unknown = [n for n in only if n not in by_name]
+        if unknown:
+            sys.exit("--only: mods.yaml has no mod %s" % ", ".join(unknown))
+        keep = set(only).union(*(transitive_needs(n, by_name) for n in only))
+        mods = [m for m in mods if m["name"] in keep]
 
     built, packed, skipped, failed = [], [], [], []
     staged = []
@@ -834,7 +787,7 @@ def main():
             print("%-16s kept     %d files" % (name, place_kept(mod, bp, stage_fsd)))
         if not os.path.isdir(os.path.dirname(pak)):
             os.makedirs(os.path.dirname(pak))
-        if run_unrealpak(stage_fsd, pak):
+        if pakkit.pack(stage_fsd, pak, "../../../%s/" % PROJECT):
             print("%-16s packed   -> %s" % (name, pak))
             packed.append(name)
         else:

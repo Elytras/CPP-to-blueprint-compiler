@@ -3,7 +3,7 @@ from invariants import *
 
 # ---- PRELOAD: the event-driven loader's preload dependencies, and what a payload names being created in time.
 #
-# Every cooked package carries, per export, four lists of FPackageIndex (dumpexp.preload order): serialize-before-
+# Every cooked package carries, per export, four lists of FPackageIndex (uasset_io.preload order): serialize-before-
 # serialize, create-before-serialize, serialize-before-create, create-before-create. FAsyncPackage::SetupExports_Event
 # turns each entry into an arc of the load graph (AsyncLoading.cpp 2459-2499), next to the implicit arc from an
 # object's create to its serialize (1498-1538); nothing else orders one export against another within a package. So
@@ -90,25 +90,9 @@ def edl_needs(pkg, dep, phase_dep, k, phase_me, what):
 
 
 def edl_summary(pkg):
-    """(PreloadDependencyCount, ExportOffset) off a cooked package summary, walked as dumpexp.preload walks it."""
-    r = dumpexp.R(pkg.ua, 8)
-    def skip(size):
-        n = r.i32(); r.o += size * n
-    r.o += 12
-    skip(20)
-    r.i32(); r.fstr(); r.u32()
-    r.o += 16
-    ecount, eoff = r.i32(), r.i32()
-    r.o += 8 + 4 + 8 + 4 + 4 + 16
-    skip(8)
-    for _ in range(2):
-        r.o += 10; r.fstr()
-    r.u32(); skip(16)
-    r.u32()
-    for _ in range(r.i32()): r.fstr()
-    r.i32(); r.i64(); r.i32()
-    skip(4)
-    return r.i32(), eoff
+    """(PreloadDependencyCount, ExportOffset) off the package summary."""
+    sm = uasset_io.summary(pkg.ua)
+    return sm['pcount'], sm['eoff']
 
 
 @rule

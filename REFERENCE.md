@@ -516,6 +516,7 @@ Notes:
 |---|---|---|
 | <a id="names.index-0-7"></a>`Index_0 = 7;`, for a member the SDK spells `Index_0` | Write the SDK's spelling. Dumper-7 respells names that C++ cannot use: a clash gets a suffix (`Name` becomes `Name_0`), an illegal character becomes `_` (`Audio Flying` becomes `Audio_Flying`), and a leading digit becomes a word (`3P` becomes `ThreeP`). The SDK keeps the real name beside the member, and everything the compiler cooks uses the real name. | Yes |
 | <a id="names.ue-name-marker"></a>`struct UeMarkers { static constexpr const char *Compare_Function__UeName = "Compare Function"; };` in a class or interface | The function `Compare_Function` cooks as `Compare Function`, a name C++ cannot spell, as an editor names one. A call, an override and every class implementing the interface use that name, so a caller cooked against the editor's asset finds it. A variable takes a marker the same way. bpdecomp writes these for the names it respells. | Yes |
+| <a id="names.asset-ue-name"></a>`static constexpr const char *P_Tri_Jaw__UeName = "P_Tri-Jaw";` beside `UE_ASSET_DEFAULTS(UParticleSystem, P_Tri_Jaw)` | The asset cooks as `P_Tri-Jaw`, a name C++ cannot spell: its package, its object, its registry row and every `&P_Tri_Jaw` that points at it. bpdecomp writes the marker for an asset name it respells, so a decompiled `P_Tri-Jaw_Projectile_Explosion_A` cooks back under its own name. A marker that names no asset, struct or enum declared there is refused. | Yes |
 | <a id="names.class-gr-e-public-aactor"></a>`class Größe : public AActor { FName Umlaut = "Größe"; };` | Non-ASCII class, member and asset names, and non-ASCII name and string defaults, are cooked and registered correctly. | Yes |
 | <a id="names.using-ftarget-aactor"></a>`using FTarget = AActor;`, then `FTarget *Aimed;` | An alias of a UObject class is still an object reference, not an address. It works at namespace scope and at class scope. | Yes |
 | <a id="names.using-fmoods-tarray-emood"></a>`using FMoods = TArray<EMood>;`, `using Factory = TScriptInterface<IFoo>;` | A global alias of a template type is that type wherever it is used, in out-of-line method definitions too. A global alias of a class is that class the same way, so an override may spell a parameter through it. | Yes |
@@ -1878,13 +1879,14 @@ and warns, with one message for every form:
 warning: RangeTest::WarnRemove: unsafe to mutate iterated container (Scores.Remove)
 ```
 
-| The body does | Warned as |
-|---|---|
-| a count-changing method on the walked container: Add, AddItems, AddUnique, Append, Clear, Emplace, Empty, FindAndRemoveChecked, FindOrAdd, Insert, Remove, RemoveAndCopyValue, RemoveItem, RemoveItems, Reset, Resize, Set, Shrink, Compact, a sort | `(Scores.Remove)` |
-| a whole assignment to it | `(Scores =)` |
-| a TMap store with any key but the current one, `Scores[Other] = 1`, which adds the key when the map lacks it | `(Scores[] =)` |
-| the container passed to a non-const reference parameter | `(Prune(Scores))` |
-| a call to one of the class's own methods whose body may change a container of that type, followed through the calls it makes | `(Prune())` |
+| You write | What it does | Status |
+|---|---|---|
+| <a id="changing-the-container.scores-remove-key"></a>`Scores.Remove(Key)` in the body, or another count-changing method on the walked container | Warned `(Scores.Remove)`. The methods: Add, AddItems, AddUnique, Append, Clear, Emplace, Empty, FindAndRemoveChecked, FindOrAdd, Insert, Remove, RemoveAndCopyValue, RemoveItem, RemoveItems, Reset, Resize, Set, Shrink, Compact, a sort. | Warns |
+| <a id="changing-the-container.items-other"></a>`Items = Other` in the body | A whole assignment to the walked container, warned `(Items =)`. | Warns |
+| <a id="changing-the-container.scores-other-1"></a>`Scores[Other] = 1` in the body | A TMap store with any key but the current one, which adds the key when the map lacks it, warned `(Scores[] =)`. | Warns |
+| <a id="changing-the-container.prune-scores"></a>`Prune(Scores)` in the body, Prune taking a non-const reference | Warned `(Prune(Scores))`, and `(Prune())` as well when Prune's body changes what it was passed. | Warns |
+| <a id="changing-the-container.dropall"></a>`DropAll()` in the body, one of the class's own methods | Followed through the calls it makes: a change to a member of the walked container's type, or to a container behind a reference parameter, is warned `(DropAll())`. Only names and types are compared, so a change to another member of that type is warned too. | Warns |
+| <a id="changing-the-container.countmore-x"></a>`CountMore(X)` in the body, whose own changes are to its locals; any own method called while walking a local or a by-value parameter | Not warned. A callee's locals and by-value parameters are its own, and the walking function's own local reaches a callee only when passed by reference, warned as `(Prune(Scores))` is. | Yes |
 
 What happens if you do it anyway: every walk reads its length, and a TSet or TMap walk its free slots, once, before the
 first pass. An added element is not visited. In a TSet or TMap walk, a removed element leaves a free slot that a later
@@ -2734,6 +2736,7 @@ Notes:
 |---|---|---|
 | <a id="calling-the-parent.superbase-receivebeginplay"></a>`SuperBase::ReceiveBeginPlay();` inside an override | Runs the parent's own implementation once and comes back: the editor's "Add call to parent function". Write the class you derive from; C++ has no `Super`. | Yes |
 | <a id="calling-the-parent.aactor-receivebeginplay"></a>`AActor::ReceiveBeginPlay();` | Calls the engine's function. For a BlueprintImplementableEvent it does nothing, because there is no parent body. For a BlueprintNativeEvent it runs the C++ default. | Yes |
+| <a id="calling-the-parent.ancestor-skip"></a>`Grandparent::ReceiveBeginPlay();` in a class whose parent overrides it too | Grandparent's own function, past every override between, as C++ runs it: its body copied in where the source cooks it, else a call to that class's function without dispatch. The same when Grandparent is a game Blueprint or an engine class, whose bodies are not in the source; one that does not declare the function names the nearest class above it that does. | Yes |
 | <a id="calling-the-parent.superbase-twice-1"></a>`SuperBase::Twice(1)` in a class that does not declare Twice | SuperBase's Twice, its body copied in: C++ runs that function without dispatch, so an object of a subclass that overrides Twice does not reach its own. `this->SuperBase::Twice(1)` is the same call. | Yes |
 | <a id="calling-the-parent.noinline"></a>The same call to a function whose body cannot be copied in: authority-only, cosmetic, a server or client RPC, `noinline`, one that waits, one whose body makes such a call itself, or any from a `UE_NO_OPTIMIZE` caller | SuperBase's function, without dispatch. Blueprint calls a parent's function that way only from a class that has its own function of that name, so AssetGen adds one to your class: an override of the method that only calls the nearest parent's version with the same arguments, compiled like one you write, with an override's flags and super. The call is then bound to SuperBase's function, and a subclass's override of the method overrides the added one. A call by name runs what it ran before: the added override passes it on, and the engine routes both calls the same way. | Yes |
 | <a id="calling-the-parent.the-same-call-to-a"></a>The same call to a multicast RPC | A call by name, with a warning: an object of a subclass that overrides the function runs its override. On a server a multicast runs locally and is also sent, so an added override would send it once, then again when it calls the parent's. An override you declare yourself does that too, as an editor override that calls its parent does. | Warns |
@@ -3317,7 +3320,7 @@ Notes:
 | <a id="components-a-parent.staticmesh-relativescale3d"></a>`StaticMesh->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f);` in a child of a game Blueprint | A game Blueprint's component is a construction-script node, as a mod parent's is. The override is keyed on that node's GUID, which the SDK records as `<Component>__UeScsNode`. The node's real name is used, even when it contains spaces. | Yes |
 | <a id="components-a-parent.controller-battachtopawn-true"></a>`Controller->bAttachToPawn = true;` in an `APawn` child | Refused: "UeApi does not say which default subobject Controller is". Either the member is not a default subobject, and you set the value at run time, or the SDK predates the markers, and you regenerate it with genueapi. | Refused |
 | <a id="components-a-parent.uescsnode"></a>a component of a game Blueprint whose header has no `__UeScsNode` marker | Refused: "its header does not say which SCS node it is". Regenerate the SDK from a dump made with the Dumper-7 fork, which writes the markers. | Refused |
-| <a id="components-a-parent.ue-class"></a>a component of a mod parent that another mod owns (pinned with `UE_CLASS`) | Not yet: refused with the same SCS node message, and its advice to re-dump the game does not apply. Set the value at run time, for example in `ReceiveBeginPlay`. | Not yet |
+| <a id="components-a-parent.ue-class"></a>`Lamp->Intensity = 250.0f;`, where a parent in another mod's folder (or pinned with `UE_CLASS_IN`) declares `Lamp` | As for a parent of this mod: the record is keyed on the node its owner cooked, whose GUID AssetGen derives from the class and component names, so it needs no marker. A parent pinned with a hand-written `UE_CLASS` is still refused with the SCS node message. | Yes |
 
 ```cpp
 #include "UeApi/Game/BP_ExplosiveBarrel_C.h"
@@ -3999,6 +4002,178 @@ Notes:
 - The pointer is the loaded asset, which everything that uses it shares. A write through it changes the asset for
   the rest of the session, and nothing is saved.
 - [examples/EnemyInfo.cpp](examples/EnemyInfo.cpp) declares a data-asset class, its instances and soft references.
+
+### Objects inside an asset
+
+Some assets hold objects of their own: a particle system holds its emitters, their LOD levels and modules, and a
+behaviour tree its nodes. Braces cannot make an object, so such an asset is declared with `UE_ASSET_DEFAULTS(Type, Name)`
+and a block of statements, read as a class's `UE_DEFAULTS` is, with `this` the asset. `UE_INSTANCED` makes an object
+under the asset or under another of its objects, and a default points at it.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="objects-inside-an.ue-asset-defaults-uholder-ad"></a>`UE_ASSET_DEFAULTS(UHolder, AD_Held) { Scale = 2.5f; Items = {UE_INSTANCED(UStatChangeStatusEffectItem, this, "B")}; }` at namespace scope | An asset of the class, cooked at `<mod package>/AD_Held` with the members the block sets, as a braced one is. Each `UE_INSTANCED` is an export of its own under the asset, `RF_Transactional`, as the cook writes a particle system's modules, and the default points at it. | Yes |
+| <a id="objects-inside-an.udotstatuseffectitem-a-ue"></a>`UDotStatusEffectItem *A = UE_INSTANCED(UDotStatusEffectItem, this, "A");` then `A->OverrideDamageImpulse = true;` and `A->DamageImpulseOverride = UE_INSTANCED(UDamageImpulse, A, "Impulse");` | A local holds an object so its own members can be set, and objects nest under it, as in [Instanced objects](#instanced-objects). | Yes |
+| <a id="objects-inside-an.namespace-folder-ue-asset"></a>`namespace Folder { UE_ASSET_DEFAULTS(UHolder, AD_Deep) { ... } }` | A namespace is a folder: `<mod package>/Folder/AD_Deep`. | Yes |
+| <a id="objects-inside-an.uholder-picked-ad-held"></a>`UHolder *Picked = &AD_Held;` | `&Name` points at the asset, as at a braced one. | Yes |
+| <a id="objects-inside-an.ue-asset-defaults-uhold-ad"></a>`UE_ASSET_DEFAULTS(UHold, AD_X) {...}` and `UHold AD_X = {};`, or a class of the same name | Refused: "declared by UE_ASSET_DEFAULTS and with braces; keep one", or "AdClash and AdClash would both be cooked as ...". The same for a name a `UE_FLOAT_CURVE` (or `UE_VECTOR_CURVE` / `UE_COLOR_CURVE`) or a `UE_ASSET_AT` declares: "declared by UE_ASSET_DEFAULTS and by UE_ASSET_AT; keep one". C++ takes both as one name, and both would be cooked at one path. | Refused |
+| <a id="objects-inside-an.ue-instanced-udamageimpulse"></a>`UE_INSTANCED(UDamageImpulse, nullptr, "I")` in the block | Refused: "UE_INSTANCED's outer is `this`, one of the class's components, or a local holding another UE_INSTANCED". | Refused |
+
+```cpp
+class UHolder : public UPrimaryDataAsset {
+public:
+  UObject *Inner = nullptr;
+  TArray<UObject *> Items;
+  float Scale = 1;
+};
+
+UE_ASSET_DEFAULTS(UHolder, AD_Held) {
+  UDotStatusEffectItem *A = UE_INSTANCED(UDotStatusEffectItem, this, "A");
+  A->OverrideDamageImpulse = true;
+  A->DamageImpulseOverride = UE_INSTANCED(UDamageImpulse, A, "Impulse");
+  Items = {A, UE_INSTANCED(UStatChangeStatusEffectItem, this, "B")};
+  Inner = A;
+  Scale = 2.5f;
+}
+```
+
+Notes:
+
+- An object nothing points at is refused, as in a class's `UE_DEFAULTS`: the editor keeps none such.
+- Each object starts from its class's defaults. The asset's members the block leaves unset keep the class defaults.
+
+### Particle systems
+
+A Cascade particle system (`UParticleSystem`) is an asset with objects inside: its emitters, each emitter's LOD levels,
+the modules each LOD level names, and the distributions the modules read. AssetGen does to them what DRG's cooker does,
+so the asset loads as a cooked one. Niagara systems are the next section.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="particle-systems.life-lifetime-distribution-span"></a>`Life->LifeTime.Distribution = Span;` with `Span` a `UDistributionFloatUniform` (`Min`, `Max`), or a `UDistributionFloatConstant`, `UDistributionVectorConstant` or `UDistributionVectorUniform` | The raw distribution is baked as the cook bakes it: its lookup table filled, `MinValue` / `MaxValue` set, `Distribution` null, and the distribution object left out of the package. | Yes |
+| <a id="particle-systems.spawn-rate-distribution-ramp"></a>`Spawn->Rate.Distribution = Ramp;` with `Ramp` a `UDistributionFloatConstantCurve` (`Ramp->ConstantCurve.Points = {{0.0f, 0.0f, 0.0f, 0.0f, EInterpCurveMode::CIM_Linear}, {1.0f, 10.0f, 0.0f, 0.0f, EInterpCurveMode::CIM_Linear}};`), or a `UDistributionFloatUniformCurve`, `UDistributionVectorConstantCurve` or `UDistributionVectorUniformCurve` | Baked as the cook bakes it: the curve sampled 128 times over its points' `InVal` span, kept at the fewest samples (a power of two) within 0.05 of those, `MinValue` / `MaxValue` its bounds. Auto keys (`CIM_CurveAuto`, `CIM_CurveAutoClamped`) get the tangents the editor sets on every edit, whatever the source gives; `CIM_CurveUser` and `CIM_CurveBreak` keep theirs. A curve without points reads 0. | Yes |
+| <a id="particle-systems.spawn-rate-distribution-three"></a>`Spawn->Rate.Distribution = Three;` and `Spawn->RateScale.Distribution = Three;` | One distribution object several raw distributions point at is baked into each of them. | Yes |
+| <a id="particle-systems.spawn-burstscale"></a>A module's distribution left unset, as `Spawn->BurstScale` | Gets the value Cascade's editor starts a new module with, baked: `InitializeDefaults`, then `SetToSensibleDefaults` (a Light's colour scale (1, 1, 1), brightness 32, radius scale 15, exponent 16; a Lifetime of 1). The editor sets them when it adds the module; neither runs for a loaded object, so left unset it reads as 0 in game (an unset `BurstScale` turns every burst off). | Yes |
+| <a id="particle-systems.every-module-unset"></a>Any module left unset, as a `UParticleModuleLocationPrimitiveSphere`, `UParticleModuleColorOverLife` or `UParticleModuleEventReceiverSpawn` | Every module with an `InitializeDefaults` starts as the editor starts it: the class's own and each base's (a Sphere's `VelocityScale` is `LocationPrimitiveBase`'s), then `SetToSensibleDefaults`, which makes some two-key curves (`ColorOverLife` white to black, `AlphaOverLife` 1 to 0, a `SubUV`'s `SubImageIndex`) and a `Color`'s `StartColor` white. Two bools it sets against the class default are set too, unless given: a `Required`'s `bUseLegacyEmitterTime` false, an acceleration module's `bAlwaysInWorldSpace` true. | Yes |
+| <a id="particle-systems.a-lodlevels-a0-a1"></a>`A->LODLevels = {A0, A1};` and `LODDistances = {0.0f, 1500.0f};` | Each module's `LODValidity` is set to the LOD levels that name it, as bits, and each LOD level's `Level` to its place in `LODLevels`, as the editor keeps them. | Yes |
+| <a id="particle-systems.loddistances"></a>An emitter with fewer or more LOD levels than `LODDistances` has entries, a `LODSettings` of another count, a LOD level whose `Level` is not its place, or one without a `RequiredModule` or `SpawnModule` | Refused, saying which: "has 1 LOD levels and the system's LODDistances 2", "its Level is 1", "has no SpawnModule". The engine asserts on these or patches them at load. | Refused |
+| <a id="particle-systems.c-constantcurve-points-1-0f"></a>`C->ConstantCurve.Points = {{1.0f, ...}, {0.0f, ...}};`, a curve's points out of `InVal` order | Refused: "its ConstantCurve's point 1 has a smaller InVal than point 0; give the points in InVal order". The engine's lookup assumes them sorted; the editor keeps them so. | Refused |
+| <a id="particle-systems.spawn-rate-distribution-c"></a>`Spawn->Rate.Distribution = C;` with `C` a `UDistributionFloatParticleParameter` or `UDistributionVectorParticleParameter`, or any distribution with `bCanBeBaked = false` | Kept live, as the cook keeps it: no table, the raw distribution's `Distribution` pointing at the object, which the game evaluates each frame (a particle parameter reads the component's instance parameter). | Yes |
+| <a id="particle-systems.c-array-element"></a>`VParam->ParamModes[0] = EDistributionParamMode::DPM_Abs;` (an engine class's C array member, as `UDistributionVectorParticleParameter::ParamModes[3]`) | Each element is a tag of its own, at its index (`FPropertyTag::ArrayIndex`), as the cook writes one; elements left unset keep the class default. The index is a constant below the array's length. A part of an element and a bool C array are refused. Needs a UeApi from genueapi with C array members (2026-11-05). bpdecomp writes each element tag this way. | Yes |
+| <a id="particle-systems.e-detailmodebitmask-5"></a>`E->DetailModeBitmask = 5;`, an engine class's `uint32` (or `uint16`) member | Written as its tag. A mod's own variable of those types is still refused ([variable-types.uint32-mask](#variable-types.uint32-mask)). | Yes |
+| <a id="particle-systems.bpdecomp-particles"></a>A cooked `P_*` given to bpdecomp (`bpdecomp_emit.py <Content> <out> --mod /Game/Path=Mod --kinds particles`) | Written as a `UE_ASSET_DEFAULTS(UParticleSystem, P_X)` block: each object a `UE_INSTANCED` local under its export's name, then its tags; baked tables as given, live distributions as objects. It compiles back to the same package by meaning; `tools/particle_roundtrip.py` checks that over a game's `P_*`. | Yes |
+| <a id="particle-systems.sl-modules-gen-hit"></a>`SL->Modules = {Gen, Hit};` with `Gen` a `UParticleModuleEventGenerator` (`Gen->Events = {FParticleEvent_GenerateInfo(EParticleEventType::EPET_Collision, 0, 0, false, false, false, false, "SparkHit", {})};`), and a `UParticleModuleEventReceiverSpawn` in another emitter (`EventGeneratorType`, `EventName = "SparkHit"`, `SpawnCount`) | The LOD level's `EventGenerator` is set to the generator, as the editor keeps it; the engine finds the generator in `Modules` at load. The receiver spawns its `SpawnCount` where the named events happen. | Yes |
+| <a id="particle-systems.l-eventgenerator-g"></a>`L->EventGenerator = G;` with `G` not in `L->Modules` | Refused: "its EventGenerator G is not in its Modules, where the engine looks for it; put it first in Modules". The engine resets the slot at load and looks in `Modules`, so the generator would never fire. | Refused |
+| <a id="particle-systems.l-typedatamodule-gpu"></a>`L->TypeDataModule = UE_INSTANCED(UParticleModuleTypeDataGpu, this, "Gpu");` without `Gpu->ResourceData` | Refused: "a GPU sprite emitter needs the EmitterInfo and ResourceData the editor builds from its modules, which AssetGen does not build yet". The game's `Build` is editor-only, so it would simulate off empty data. Given both (as bpdecomp writes a vanilla `P_*`'s), it compiles. | Not yet |
+
+```cpp
+UE_ASSET_DEFAULTS(UParticleSystem, P_Sparks) {
+  UParticleSpriteEmitter *Sparks = UE_INSTANCED(UParticleSpriteEmitter, this, "Sparks");
+  UParticleLODLevel *Lod = UE_INSTANCED(UParticleLODLevel, Sparks, "LOD0");
+  UParticleModuleRequired *Required = UE_INSTANCED(UParticleModuleRequired, this, "Required");
+  UParticleModuleSpawn *Spawn = UE_INSTANCED(UParticleModuleSpawn, this, "Spawn");
+  Spawn->BurstList = {FParticleBurst(4, -1, 0.0f)};
+  UParticleModuleLifetime *Life = UE_INSTANCED(UParticleModuleLifetime, this, "Life");
+  UDistributionFloatUniform *Span = UE_INSTANCED(UDistributionFloatUniform, Life, "Span");
+  Span->Min = 0.5f;
+  Span->Max = 1.15f;
+  Life->LifeTime.Distribution = Span;
+  Lod->RequiredModule = Required;
+  Lod->SpawnModule = Spawn;
+  Lod->Modules = {Life};
+  Sparks->LODLevels = {Lod};
+  Emitters = {Sparks};
+  LODDistances = {0.0f};
+}
+```
+
+Notes:
+
+- The modules are made under the system, as the editor makes them, and a LOD level names them; one module may serve
+  several LOD levels.
+
+### Niagara systems
+
+A Niagara system (`UNiagaraSystem`) is an asset with objects inside, like a Cascade one: its emitters, each emitter's
+scripts and renderers, the data interfaces the scripts read. A script's `CachedScriptVM` is its compiled Vector VM code,
+which AssetGen does not compile: a system is written from a vanilla one's (bpdecomp writes them), its scripts kept and
+what lives outside the bytecode changed. The one part of a cooked system that is no tag, its emitters' compiled data,
+AssetGen works out as the editor does.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="niagara-systems.emitterhandles"></a>`EmitterHandles = {FNiagaraEmitterHandle(FGuid(1, 2, 3, 4), "IdSparks", true, "Sparks", Sparks)};` with each emitter's scripts (`SU->CachedScriptVM.Attributes = {FNiagaraVariable("Age", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), {})};`, `LastCompileStatus`) and the system's `SystemSpawnScript` / `SystemUpdateScript` | After the system's tags, its `EmitterCompiledData`, as `UNiagaraSystem::InitEmitterCompiledData` builds it: per handle the system scripts' `FNiagaraSpawnInfo` attributes named `<emitter>.`, the emitter's alias variables (`Sparks.SpawnInterval`, `Engine.Sparks.InstanceSeed`, ...), its particle attributes (the update script's, then the spawn script's not there yet) each with its register layout, the handle's `IdName` as the data set's, and persistent IDs when the emitter asks or a `Particles.ID` is among them. None while a system script has not compiled. | Yes |
+| <a id="niagara-systems.bpdecomp-niagara"></a>A cooked `NS_*` given to bpdecomp (`bpdecomp_emit.py <Content> <out> --mod /Game/Path=Mod --kinds particles`) | Written as a `UE_ASSET_DEFAULTS(UNiagaraSystem, NS_X)` block: each object a `UE_INSTANCED` local, then its tags, the compiled scripts' bytecode and parameter stores included; `SystemCompiledData` as its tags (the editor builds it from bindings only the editor has). It compiles back to the same package by meaning, the emitters' compiled data included, for each of DRG's CPU systems. | Yes |
+| <a id="niagara-systems.disabled-emitter"></a>`FNiagaraEmitterHandle(FGuid(9, 10, 11, 12), "IdOld", false, "Old", Old)` (a disabled handle) | The emitter, and everything under it, is left out of the package and the handle's `Instance` is null, as the cook does (`UNiagaraEmitter::NeedsLoadForTargetPlatform`). Its compiled data is kept: its name, sim target and persistent IDs, and the variables its scripts hold (none for a script the editor did not compile). A compiled GPU script under it goes with it, so it is not refused. bpdecomp writes such a handle's lost emitter back as a stand-in `<Name>_Disabled` holding what the compiled data kept. | Yes |
+| <a id="niagara-systems.gpu-compute-script"></a>A `UNiagaraScript` with `Usage = ENiagaraScriptUsage::ParticleGPUComputeScript` and a `LastCompileStatus` (a GPU emitter's) | Refused: "a compiled GPU compute script carries the GPU shader maps the editor compiles from its HLSL, which AssetGen does not build yet; use a CPU emitter". The engine reads them after the script's tags. | Not yet |
+| <a id="niagara-systems.gpu-emitter"></a>An enabled emitter with `SimTarget = ENiagaraSimTarget::GPUComputeSim`, its script compiled or not | Refused: "a GPU emitter runs on the GPU shader maps the editor compiles from its scripts' HLSL, which AssetGen does not build yet; use a CPU emitter". A disabled one is left out, so it is not refused. | Not yet |
+| <a id="niagara-systems.attribute-type"></a>A particle attribute of a type other than the Niagara and math ones (`FNiagaraTypeDefinition(StaticStructOf<FRotator>(), 2)`) | Refused, naming the attribute and type: its register layout is not known. | Not yet |
+| <a id="niagara-systems.handle-without-emitter"></a>`FNiagaraEmitterHandle(FGuid(), "Id", true, "E", nullptr)` (an enabled handle) | Refused: "EmitterHandles[0] names no emitter of the block, which the editor's compile needs". | Refused |
+
+Notes:
+
+- An empty `RapidIterationParameters` the cook writes as an empty struct tag loads the same as none, so bpdecomp
+  writes nothing for it.
+
+### Behaviour trees and blackboards
+
+A blackboard (`UBlackboardData`) and a behaviour tree (`UBehaviorTree`) are assets with objects inside, declared with
+`UE_ASSET_DEFAULTS`: a blackboard's key types, a tree's composites, tasks, decorators and services are `UE_INSTANCED`
+under the asset. A nested block `{ ... }` holds a composite's subtree, so the source reads as the tree does.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="behaviour-trees-and.ue-asset-defaults"></a>`UE_ASSET_DEFAULTS(UBlackboardData, BB_Mine) { Keys = {{"Target", UE_INSTANCED(UBlackboardKeyType_Object, this, "K"), false}}; Parent = &BB_Base; }` | A blackboard: each key an `FBlackboardEntry` of its name and its key type object, under the blackboard as the editor makes it. `Parent` names another blackboard whose keys come first. | Yes |
+| <a id="behaviour-trees-and.ue-asset-defaults-ubehaviortree"></a>`UE_ASSET_DEFAULTS(UBehaviorTree, BT_Mine) { BlackboardAsset = &BB_Mine; auto *Root = UE_INSTANCED(UBTComposite_Selector, this, "Root"); RootNode = Root; ... }` | A behaviour tree. Each node gets the `TreeAsset` and `ParentNode` the editor keeps on it: the tree, and the composite holding it (of a child, a child's decorators, a composite's and a child task's `Services`). The root and the tree's `RootDecorators` have no parent. The engine sets both again when it loads the tree. | Yes |
+| <a id="behaviour-trees-and.root-children-nullptr-wait"></a>`Root->Children = {{nullptr, Wait, {Stunned}, {}}, {Roam, nullptr, {}, {}}};` | A composite's children in order, each an `FBTCompositeChild`: a composite or a task, its decorators, and their logic (`DecoratorOps`, empty for all of them to pass). | Yes |
+| <a id="behaviour-trees-and.nested-block"></a>`{ ... }`, a block inside a `UE_ASSET_DEFAULTS` block | Its statements, as if written in place. A local declared in it is seen only inside, as in C++. In a class's `UE_DEFAULTS` it is refused: "a block `{ ... }` groups the statements of a UE_ASSET_DEFAULTS". | Yes |
+| <a id="behaviour-trees-and.go-blackboardkey-selectedkeyname"></a>`Go->BlackboardKey.SelectedKeyName = "Destination";` | A key selector by its key's name, as the cook writes it: the engine finds the key in the tree's blackboard when it loads the tree. | Yes |
+| <a id="behaviour-trees-and.ue-instanced-game-ai-tasks"></a>`UE_INSTANCED(::Game::AI::Tasks::UTSK_FindRandomPoint, this, "Pick")` | A node of a game Blueprint class (a task, decorator or service written in Blueprint), with its variables set as any member. A class whose package name differs from it in case only (`TSK_FindRandomPointFrom_WIthinHeight`) is taken, as FNames match without case. | Yes |
+| <a id="behaviour-trees-and.ue-asset-at-uenum-estate"></a>`UE_ASSET_AT(::UEnum, EState_Enum, "/Script/FSD.EWoodLouseState");` then `Key->EnumType = &EState_Enum;` | A native object by its path: here an enum key's `UEnum`, an import of `/Script/CoreUObject.Enum` as the cook writes it. | Yes |
+| <a id="behaviour-trees-and.wait-treeasset"></a>`Wait->TreeAsset = ...` or `ParentNode`, a child with neither or both of `ChildComposite` and `ChildTask`, a node in two places | Refused: "is set from the tree's shape, as the editor sets it; leave it out", "has neither a ChildComposite nor a ChildTask", "is in the tree twice". | Refused |
+
+```cpp
+UE_ASSET_DEFAULTS(UBlackboardData, BB_Roamer) {
+  Keys = {{"Destination", UE_INSTANCED(UBlackboardKeyType_Vector, this, "Destination"), false},
+          {"IsStunned", UE_INSTANCED(UBlackboardKeyType_Bool, this, "IsStunned"), false}};
+}
+
+UE_ASSET_DEFAULTS(UBehaviorTree, BT_Roamer) {
+  BlackboardAsset = &BB_Roamer;
+  auto *Root = UE_INSTANCED(UBTComposite_Selector, this, "Root");
+  RootNode = Root;
+  {
+    auto *Stunned = UE_INSTANCED(UBTDecorator_Blackboard, this, "Stunned");
+    Stunned->BlackboardKey.SelectedKeyName = "IsStunned";
+    Stunned->FlowAbortMode = EBTFlowAbortMode::LowerPriority;
+    auto *Recover = UE_INSTANCED(UBTTask_Wait, this, "Recover");
+    Recover->WaitTime = 1.5f;
+
+    auto *Roam = UE_INSTANCED(UBTComposite_Sequence, this, "Roam");
+    {
+      auto *Pick = UE_INSTANCED(::Game::AI::Tasks::UTSK_FindRandomPoint, this, "Pick");
+      Pick->LocationKey.SelectedKeyName = "Destination";
+      auto *Go = UE_INSTANCED(UBTTask_MoveToTarget, this, "Go");
+      Go->BlackboardKey.SelectedKeyName = "Destination";
+      Roam->Children = {{nullptr, Pick, {}, {}}, {nullptr, Go, {}, {}}};
+    }
+    Root->Children = {{nullptr, Recover, {Stunned}, {}}, {Roam, nullptr, {}, {}}};
+  }
+}
+```
+
+Notes:
+
+- `AssetGen/tools/btdecomp.py emit` writes a cooked tree or blackboard in this form, and `btdecomp.py roundtrip`
+  compiles each one back and compares it with the original. All 79 trees and 39 blackboards of DRG (CL 158958),
+  and EEE's three, come back equal. What changes is counted, not reported, as the game reads it the same: a tree saved
+  without `RF_Transactional` (the editor's undo flag), a tag's or an object's name in another case (FNames match
+  without case), an empty struct tag, and a regular enum's value spelled with its type
+  (`ECollisionChannel::ECC_Visibility`; the engine loads either name).
+- A decorator's `CachedDescription` is what the editor shows on it. The source may leave it out; the game never reads
+  it.
+- A key name the blackboard lacks is not checked when the mod is built: the engine logs it when it loads the tree, and
+  the node reads no key.
 
 ## Game assets
 
@@ -4759,7 +4934,7 @@ The node's input pins are functions of the component, called on the timeline's v
 | <a id="playing-a-timeline.fade-stop"></a>`Fade->Stop()` | Stop: halts it where it is. Play goes on from there. | Yes |
 | <a id="playing-a-timeline.fade-setnewtime-1-0f"></a>`Fade->SetNewTime(1.0f)` | Set New Time: moves it to 1 s without passing the event tracks' times, and calls the update method. | Yes |
 | <a id="playing-a-timeline.fade-setplayrate-2-0f"></a>`Fade->SetPlayRate(2.0f)`, `Fade->SetLooping(true)`, `Fade->SetTimelineLength(3.0f)` | The component's settings, changed as it runs. | Yes |
-| <a id="playing-a-timeline.fade-getplaybackposition"></a>`Fade->GetPlaybackPosition()`, `Fade->IsPlaying()`, `Fade->IsReversing()` | Where it is and how it plays. IsReversing is the node's Direction output: true while it plays backward. | Yes |
+| <a id="playing-a-timeline.fade-getplaybackposition"></a>`Fade->GetPlaybackPosition()`, `Fade->IsPlaying()`, `Fade->IsReversing()` | Where it is and how it plays. IsReversing is true only while it plays backward: in the finished method a reverse run has ended, so it is false there (the engine's `bPlaying && bReversePlayback`). To know which run finished, keep a flag of your own. | Yes |
 
 Notes:
 
@@ -4804,7 +4979,8 @@ declares and implements one.
 | <a id="interface-values.tscriptinterface-iaimable-target"></a>`TScriptInterface<IAimable> Target = Mark;` | Converts one interface value to another. The result is empty if the object behind it does not implement the target interface. Converting to the same interface is a plain copy. | Yes |
 | <a id="interface-values.health-getobject"></a>`Health.GetObject()` | The object behind the interface. GetObject() is the only method a TScriptInterface has. | Yes |
 | <a id="interface-values.current-getpriority"></a>`Current->GetPriority()` | Calls the interface function on the object behind it, with the interface value as Target. The implementation is whatever that object has under that name. | Yes |
-| <a id="interface-values.tscriptinterface-itargetable"></a>`TScriptInterface<ITargetable>(Player)->GetTargetHealthComponent()` | Calls the interface function on an object directly, as the editor does when the object's class implements the interface: InterfaceContext of the object, with no Cast To in between. The way to call a game interface's function on a game object, since UeApi does not record which interfaces a game class implements. | Yes |
+| <a id="interface-values.tscriptinterface-itargetable"></a>`TScriptInterface<ITargetable>(Player)->GetTargetHealthComponent()` | Calls the interface function on an object directly, as the editor does when the object's class implements the interface: InterfaceContext of the object, with no Cast To in between. For an object whose class UeApi lists the interface on, the member call below says the same. | Yes |
+| <a id="interface-values.native-interface-member"></a>`GetTargetCenterMass()` in a child of `ASpiderEnemy`, `Spider->QueueMontage(M)` | A native interface's function called as a member of a game class that implements it, as the editor calls it: on self by name, with no context; on another object through InterfaceContext of it. UeApi makes such an interface a base of the class, from the game's Blueprints (with `--game`) that override one of its functions or call one on self: an interface no game Blueprint shows is not listed, and its functions take the `TScriptInterface` call above. | Yes |
 | <a id="interface-values.if-seen"></a>`if (Seen)`, `!Seen`, `Seen == nullptr`, `Seen != nullptr`, `Seen ? A : B` | Whether an object is behind the interface. | Yes |
 | <a id="interface-values.health-nullptr"></a>`Health = nullptr;`, `TakeIface(nullptr)` | The null interface. It clears both halves of the value. | Yes |
 | <a id="interface-values.cast-iaimable-other"></a>`Cast<IAimable>(Other)` | Refused for a mod interface: "Cast<> to an unknown class". Write `TScriptInterface<IAimable> I = Other;` instead. | Refused |
@@ -4865,6 +5041,7 @@ Notes:
 |---|---|---|
 | <a id="implementing-an.class-singer-public-aactor"></a>`class Singer : public AActor, public ICurveSourceInterface` | Class Settings > Implemented Interfaces. The first base is the UE parent, and every base after it is an implemented interface. A class can implement several, game and mod interfaces alike. | Yes |
 | <a id="implementing-an.float-getcurvevalue-fname"></a>`float GetCurveValue(FName CurveName) const { return 0.5f; }` | An implementation is an ordinary method, matched to the interface function by name. Of a native interface, only functions it marks BlueprintNativeEvent or BlueprintImplementableEvent can be implemented; AssetGen checks this against the SDK's Events.json. Every function of a Blueprint interface can. | Yes |
+| <a id="implementing-an.pull-case"></a>`void Pull(int32 N)` implementing an interface whose function is `pull` | Refused: "interface ITrigger already has a function pull, and an FName ignores case; rename it to pull to implement it". C++ takes `Pull` for a new function beside the interface's, so the class would cook two functions of one FName, and the game fails at load ("... was found in memory and is an export but does not have all load flags"). The same holds for an interface a parent lists. | Refused |
 | <a id="implementing-an.a-function-left-out"></a>A function left out | Gets an empty stub, as the editor compiles one. The stub returns the zero value (0, false, None, null) and leaves out-parameters unchanged. | Yes |
 | <a id="implementing-an.a-function-left-out-that"></a>A function left out that a parent this source cooks already has, without listing the interface | The parent's function implements it, as in C++: AssetGen adds an override of it that only calls the parent's (or expands it, if inline), the editor's override with a parent call, so calls through the interface and by name run the parent's body. An empty stub would replace it for every caller, and with no function at all a call would find the interface's own empty one first. | Yes |
 | <a id="implementing-an.the-same-where-the-parent"></a>The same, where the parent's function has a parameter with no name | The added override names it (`P0`, `P1`, ... by position) and passes it on, as the editor's override names every pin. | Yes |
@@ -4928,8 +5105,8 @@ Notes:
   interface that extends another. Without it, a call through the interface would reach the interface's own function.
 - The native-only message names the first such function in alphabetical order.
 - The already-implemented check sees mod ancestors, and native ones only for the interfaces UeApi lists on them
-  (`UeNativeInterfaces`): the dump lists no class's interfaces, so genueapi takes, with `--game`, those a game
-  Blueprint shows by overriding one's function. A method named like a function of such an interface is an override of
+  as bases: the dump lists no class's interfaces, so genueapi takes, with `--game`, those a game Blueprint shows by
+  overriding one's function or calling one on self. A method named like a function of such an interface is an override of
   it, as `OnMessageAI` (ITriggerAI) is in an `AWoodLouse` child: its parameters must match.
 - For some of these base lists clang also prints a harmless warning, "direct base 'IAimable' is inaccessible due to
   ambiguity".
@@ -6060,7 +6237,7 @@ Notes:
   only for tokens whose on-disk and in-memory forms are the same size. A wrong size shifts every later jump target.
 - The bytes are not checked. Invalid bytes still cook, and the VM runs them.
 - A malformed string, such as an odd digit count or the `x` of `0x0B`, compiles with no error or warning, and the
-  statement emits nothing. Write bare hex digits, two per byte, and check the result with `tools/walkscript.py`.
+  statement emits nothing. Write bare hex digits, two per byte, and check the result with `tools/uasset.py walk`.
 
 ### __EmbedFile__
 
@@ -6977,9 +7154,9 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 - `<Class>::UE_DEFAULTS: <Component> is a component of the Blueprint <BlueprintClass>, and its header does not say
   which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi`: a default on a
   component of a game Blueprint parent whose header has no `<Component>__UeScsNode` marker. The same message appears
-  for a component of a mod parent that another mod cooks (a class pinned with UE_CLASS); the advice to re-dump does
-  not apply there. Fix: for a game Blueprint, regenerate UeApi from a dump made with the Dumper-7 fork; for another
-  mod's class, set the component's value at run time, for example in ReceiveBeginPlay. See
+  for a component of a mod parent pinned with a hand-written UE_CLASS; the advice to re-dump does not apply there.
+  Fix: for a game Blueprint, regenerate UeApi from a dump made with the Dumper-7 fork; for another mod's class, pin it
+  with UE_CLASS_IN or include it from its own folder, or set the value at run time. See
   [Class defaults](#class-defaults).
 - `<Class>::UE_DEFAULTS: <Parent> is a variable of the Blueprint <BlueprintClass>, and its header does not say it is a
   node of its construction script - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi`:
@@ -7633,8 +7810,10 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 - `mods.yaml lists no mods.`: the `mods:` list is empty or missing. Exit code 0. Fix: add an entry with `name` and
   `sources`. See [Building mods](GUIDE.md#building-mods).
 - `usage: bpbuild.py ...`: fewer than three arguments. Fix:
-  `python tools/bpbuild.py <mods dir> <UeApi dir> <assetgen> [--force] [--no-pak]`. See
+  `python tools/bpbuild.py <mods dir> <UeApi dir> <assetgen> [--force] [--no-pak] [--only <mod>[,<mod>...]]`. See
   [Building mods](GUIDE.md#building-mods).
+- `--only: mods.yaml has no mod <Name>`: a name after `--only` that no entry of `mods.yaml` has. Fix: spell it as the
+  entry's `name`. See [Building mods](GUIDE.md#building-mods).
 
 #### genueapi.py and genueassets.py
 
@@ -7672,12 +7851,13 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 
 #### Other tools
 
-- `usage: dumpar.py <AssetRegistry.bin>`: `dumpar.py` was run without a file. Fix: pass the registry to read, such as
-  a mod's `build/<mod>/FSD/AssetRegistry.bin`. See [Testing and inspecting](GUIDE.md#testing-and-inspecting).
+- `usage: uasset.py registry <AssetRegistry.bin>`: `uasset.py registry` (or `dumpar.py`) was run without a file. Fix:
+  pass the registry to read, such as a mod's `build/<mod>/FSD/AssetRegistry.bin`. See
+  [Testing and inspecting](GUIDE.md#testing-and-inspecting).
 - `truncated at 0x<Offset>: wanted <N> bytes`, `name batch: <N> string bytes unread`, `tag store: bad begin magic`,
   `tag store: bad end magic`, `not an asset registry: guid <Guid>` and `<N> trailing byte(s) after the body`:
-  `dumpar.py` could not parse the whole file as an AssetRegistry.bin. Fix: check that the file is a registry. If
-  assetgen wrote it, report it. See [Testing and inspecting](GUIDE.md#testing-and-inspecting).
+  `uasset.py registry` could not parse the whole file as an AssetRegistry.bin. Fix: check that the file is a
+  registry. If assetgen wrote it, report it. See [Testing and inspecting](GUIDE.md#testing-and-inspecting).
 - `<Function>: no such export`: `runscript.py` was asked to run a function the package does not export. Fix: check
   the function name and the package's base path, which is the path without `.uasset`. The interpreter's other
   messages are listed under Internal errors below. See [Testing and inspecting](GUIDE.md#testing-and-inspecting).
@@ -7738,7 +7918,7 @@ Until it is fixed, write the statement it points at in another form.
   `<Intrinsic> takes exactly one argument`, and the `__Asm__` checks listed above. Their messages are dropped and the
   compile still succeeds. A function that misbehaves in game after a clean build can be one of these; report
   it with the source.
-- **walkscript.py.** `unknown op <Op> at <Offset>`: an opcode that its UE 4.27 grammar does not know. Report it with
+- **uasset.py walk.** `unknown op <Op> at <Offset>`: an opcode that its UE 4.27 grammar does not know. Report it with
   the package.
 - **runscript.py and runvm.py**, the offline interpreters the test suite uses. runvm reports some of the same checks
   with a `vm: ` prefix and slightly different wording. Their messages are of three kinds:

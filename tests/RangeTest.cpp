@@ -334,4 +334,30 @@ public:
   void WarnCalls() {
     for (auto &[Key, Value] : Scores) DropAll();
   }
+  void WarnAssign(TArray<int32> Other) {
+    for (int32 X : Items) Items = Other;
+  }
+
+  /* Neither is warned, and both run: CountMore changes only a local of its own, and GrowItems changes Items, which
+     LocalWalk does not walk; its Copy is its own local, which no callee can reach. */
+  int32 CountMore(int32 X) {
+    TArray<int32> More = Items;
+    More.Add(X);
+    return More.Num();
+  }
+  int32 CallsLocalOnly() {
+    int32 Sum = 0;
+    for (int32 X : Items) Sum += CountMore(X);
+    return Sum;
+  }
+  void GrowItems(int32 X) { Items.Add(X); }
+  int32 LocalWalk() {
+    TArray<int32> Copy = Items;
+    int32 Sum = 0;
+    for (int32 X : Copy) {
+      GrowItems(X);
+      Sum += X;
+    }
+    return Sum;
+  }
 };

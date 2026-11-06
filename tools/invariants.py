@@ -10,25 +10,12 @@ Epic's cooked Blueprints break is a wrong rule, not a finding. --sample N checks
 As a module: Package(base) is one cooked package read into tables, check(pkg) -> [(rule, export, message)]."""
 import glob, json, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import dumpexp
-from walkscript import W
+import uasset_io
+from uasset import W
+from uasset_io import R as Rd
 
 
 # ---- the package, read into tables
-
-class Rd:
-    def __init__(s, b, o=0): s.b, s.o = b, o
-    def i32(s): v = struct.unpack_from('<i', s.b, s.o)[0]; s.o += 4; return v
-    def u32(s): v = struct.unpack_from('<I', s.b, s.o)[0]; s.o += 4; return v
-    def i64(s): v = struct.unpack_from('<q', s.b, s.o)[0]; s.o += 8; return v
-    def u64(s): v = struct.unpack_from('<Q', s.b, s.o)[0]; s.o += 8; return v
-    def u16(s): v = struct.unpack_from('<H', s.b, s.o)[0]; s.o += 2; return v
-    def u8(s): v = s.b[s.o]; s.o += 1; return v
-    def fstr(s):
-        n = s.i32()
-        if n == 0: return ''
-        if n < 0: t = s.b[s.o:s.o - 2 * n - 2].decode('utf-16-le', 'replace'); s.o -= 2 * n; return t
-        t = s.b[s.o:s.o + n - 1].decode('latin-1', 'replace'); s.o += n; return t
 
 
 class Prop:
@@ -53,7 +40,7 @@ class Node:
 
 
 class Walk(W):
-    """walkscript's grammar, keeping every expression as a Node instead of a log line."""
+    """uasset.W's bytecode grammar, keeping every expression as a Node instead of a log line."""
     def __init__(s, b, o, pkg):
         W.__init__(s, b, o, pkg.names, pkg.dumps_imports, pkg.dumps_exports)
         s.stack = [Node(None, 0, o)]
@@ -92,36 +79,26 @@ class Package:
 
     def __init__(s, base):
         s.base = base
-        ua, ue, total, names, imports, exports = dumpexp.load(base)
+        ua, ue, total, names, imports, exports = uasset_io.load(base)
         s.ua, s.ue, s.total, s.names = ua, ue, total, names
         s.dumps_imports, s.dumps_exports = imports, exports
-        r = Rd(ua, 4)
-        legacy = r.i32()
-        if legacy != -4: r.i32()
-        s.file_version, s.licensee = r.i32(), r.i32()
-        s.custom_versions = r.i32(); r.o += 20 * s.custom_versions
-        s.total_header_size = r.i32(); s.folder = r.fstr(); s.package_flags = r.u32()
-        s.name_count, s.name_offset = r.i32(), r.i32()
-        if not s.package_flags & 0x80000000: r.fstr()
-        r.o += 8                                            # gatherable text
-        s.export_count, s.export_offset = r.i32(), r.i32()
-        s.import_count, s.import_offset = r.i32(), r.i32()
-        ir = Rd(ua, s.import_offset)
-        s.imports = []
-        for _ in range(s.import_count):
-            cp, cn, outer, obj = s._name(ir), s._name(ir), ir.i32(), s._name(ir)
-            if not s.package_flags & 0x80000000: ir.o += 8
-            s.imports.append(dict(class_package=cp, class_name=cn, outer=outer, name=obj))
-        er = Rd(ua, s.export_offset)
+        sm = uasset_io.summary(ua)
+        s.file_version, s.licensee, s.custom_versions = sm['ue4'], sm['licensee'], len(sm['customs'])
+        s.total_header_size, s.folder, s.package_flags = sm['total'], sm['folder'], sm['flags']
+        s.name_count, s.name_offset = sm['ncount'], sm['noff']
+        s.export_count, s.export_offset = sm['ecount'], sm['eoff']
+        s.import_count, s.import_offset = sm['icount'], sm['ioff']
+        _, irows, erows = uasset_io.tables(ua, sm)
+        fname = lambda v: names[v[0]] + ('_%d' % (v[1] - 1) if v[1] else '')
+        s.imports = [dict(class_package=fname(i['class_package']), class_name=fname(i['class_name']), outer=i['outer'],
+                          name=fname(i['name'])) for i in irows]
         s.exports = []
-        deps = dumpexp.preload(base) if s.package_flags & 0x80000000 else [[[], [], [], []]] * s.export_count
-        for k in range(s.export_count):
-            e = dict(cls=er.i32(), super=er.i32(), tmpl=er.i32(), outer=er.i32())
-            e['name'] = s._name(er); e['flags'] = er.u32(); e['size'], e['off'] = er.i64(), er.i64()
-            e['forced'], e['not_client'], e['not_server'] = er.i32(), er.i32(), er.i32()
-            er.o += 16; e['package_flags'] = er.u32()
-            e['not_always_loaded'], e['is_asset'] = er.i32(), er.i32()
-            er.o += 20
+        deps = uasset_io.preload(base) if s.package_flags & 0x80000000 else [[[], [], [], []]] * s.export_count
+        for k, r in enumerate(erows):
+            e = {f: r[f] for f in ('cls', 'super', 'tmpl', 'outer')}
+            e['name'] = fname(r['name'])
+            e.update((f, r[f]) for f in ('flags', 'size', 'off', 'forced', 'not_client', 'not_server', 'package_flags',
+                                         'not_always_loaded', 'is_asset'))
             e['deps'] = deps[k]                                 # serBeforeSer, createBeforeSer, serBeforeCreate, createBeforeCreate
             s.exports.append(e)
         s._structs, s._tags = {}, {}

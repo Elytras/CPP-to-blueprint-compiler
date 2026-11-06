@@ -78,6 +78,23 @@ FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlag
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Class };
 }
 
+void ForEachValue(FDefaultValue& D, const std::function<void(FDefaultValue&)>& Fn)
+{
+    Fn(D);
+    for (FDefaultValue& I : D.Items) ForEachValue(I, Fn);
+    for (FDefaultValue& I : D.Removed) ForEachValue(I, Fn);
+    if (D.Members) for (FPropertyDef& M : *D.Members) ForEachValue(M.Default, Fn);
+}
+
+void ForEachRef(std::vector<FPropertyDef>& Tags, const std::function<void(FDefaultValue&)>& Fn)
+{
+    for (FPropertyDef& T : Tags)
+    {
+        ForEachValue(T.Default, Fn);
+        if (T.Members) ForEachRef(*T.Members, Fn);
+    }
+}
+
 /* Container elements carry no parm flags of their own; the element property is named like its container. */
 FPropertyDef Element(const FPropertyDef& In)
 {
@@ -300,6 +317,7 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         else if (P.Type == "DoubleProperty") V.Raw(&D.F, 8);
         else if (P.Type == "Int64Property") V.I64(D.I);
         else if (P.Type == "UInt16Property") V.U16(uint16(D.I));
+        else if (P.Type == "UInt32Property") V.U32(uint32(D.I));
         else if (P.Type == "EnumProperty") V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero);
         else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(uint8(D.I)); else V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero); }   // an enum byte is its enumerator's name
         else if (P.Type == "StrProperty") WriteFStringValue(V, D.S);
@@ -382,7 +400,7 @@ void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P)
 {
     const FDefaultValue& D = P.Default;
     if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
-    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName);
+    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName, P.ArrayIndex);
 }
 }   // namespace
 
@@ -390,7 +408,7 @@ void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
 {
     const FDefaultValue& D = P.Default;
     if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
-    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName);
+    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName, P.ArrayIndex);
 }
 
 void WriteDefaultValue(FArc& Ar, const FPropertyDef& P)

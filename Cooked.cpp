@@ -938,8 +938,8 @@ bool FCookedPackage::Save(const std::string& HeaderPath, std::string* Err) const
     std::vector<uint8> Header, Exp;
     Write(Header, Exp);
     std::filesystem::path Path = std::filesystem::u8path(HeaderPath);
-    if (!WriteAll(Path, Header)) { *Err = "cannot write " + HeaderPath; return false; }
-    if (!WriteAll(Path.replace_extension(".uexp"), Exp)) { *Err = "cannot write the .uexp"; return false; }
+    if (!WriteAll(Path, Header)) { *Err = CannotWrite(HeaderPath); return false; }
+    if (!WriteAll(Path.replace_extension(".uexp"), Exp)) { *Err = CannotWrite(Path.u8string()); return false; }
     return true;
 }
 

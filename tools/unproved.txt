@@ -153,7 +153,6 @@ parameters-and-return.auto-half-int32-v-return
 parameters-and-return.int32-byval-tarray-int32-a
 reference-parameters-and.bump-p
 overloading.int32-ov-int32-a
-overloading.int32-get
 lambdas-function.auto-p-inc1-return-p
 lambdas-function.inline-fpairx-operator-fpairx-l
 engine-and-game.k2-setactorlocation-home-false
@@ -172,7 +171,6 @@ messages-on-screen.ugamefunctionlibrary-2
 overriding-engine-and.void-onjumped-acharacter
 overriding-engine-and.bool-canjumpinternal-const
 overriding-engine-and.namespace-game
-calling-the-parent.aactor-receivebeginplay
 inline-functions.other-twice-3
 inline-functions.an-inline-function-that-calls
 inline-functions.inline-int32-nope-int32-x
@@ -204,7 +202,6 @@ the-root-s.body-relativescale3d-fvector-2
 components-a-parent.staticmesh-relativescale3d
 components-a-parent.controller-battachtopawn-true
 components-a-parent.uescsnode
-components-a-parent.ue-class
 instanced-objects.ue-instanced-2
 instanced-objects.ue-instanced-3
 instanced-objects.ue-instanced-getowner

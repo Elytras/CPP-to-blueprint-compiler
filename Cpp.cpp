@@ -29,6 +29,9 @@
 #include <nlohmann/json.hpp>
 
 #include "Blueprint.h"
+#include "BehaviorTree.h"
+#include "Cascade.h"
+#include "Niagara.h"
 #include "Command.h"
 #include "Cooked.h"
 #include "Package.h"
@@ -366,13 +369,26 @@ static bool DefaultTarget(const Json* Lhs, const Json*& Through)
 }
 
 bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through,
-                       std::vector<const Json*>* Path = nullptr);
+                       std::vector<const Json*>* Path = nullptr, const Json** Element = nullptr);
+
+/* With Element, `X[2] = value` is X's element: Lhs the member X, Element the subscript (a C array member's, as
+   UDistributionVectorParticleParameter's ParamModes). Without it, or for any other left side, Element is null. */
+static void PeelElement(const Json*& Lhs, const Json** Element)
+{
+    if (!Element) return;
+    *Element = nullptr;
+    const Json* Base = Lhs && Kind(*Lhs) == "ArraySubscriptExpr" ? Strip(First(*Lhs)) : nullptr;
+    if (Base && Kind(*Base) == "MemberExpr") { *Element = Lhs; Lhs = Base; }
+}
 
 /* `Field = value;` or `Comp->Field = value;`. With Path, also a part of the member, `Comp->Style.Normal.DrawAs = value;`:
    Lhs is then the member (Style) and Path the member expressions below it, Normal then DrawAs, each reached with `.`. */
-bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through, std::vector<const Json*>* Path)
+bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through, std::vector<const Json*>* Path,
+                       const Json** Element)
 {
-    if (!AssignmentSides(S, Lhs, Rhs) || Kind(*Lhs) != "MemberExpr") return false;
+    if (!AssignmentSides(S, Lhs, Rhs)) return false;
+    PeelElement(Lhs, Element);
+    if (Kind(*Lhs) != "MemberExpr") return false;
     if (Path) Path->clear();
     while (!DefaultTarget(Lhs, Through))
     {
@@ -425,9 +441,12 @@ std::string LayoutHelperCall(const Json& S)
 /* `At->Padding.Top = value;`, a member of what a local points at, or a part of one: Lhs is the member reached through the
    local (Padding), Path the parts below it (Top), and the local's DeclRefExpr is returned; null for any other statement.
    A widget layout's way to set a part of a slot's struct, which a setter sets whole. */
-const Json* LocalMemberAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, std::vector<const Json*>& Path)
+const Json* LocalMemberAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, std::vector<const Json*>& Path,
+                                  const Json** Element = nullptr)
 {
-    if (!AssignmentSides(S, Lhs, Rhs) || Kind(*Lhs) != "MemberExpr") return nullptr;
+    if (!AssignmentSides(S, Lhs, Rhs)) return nullptr;
+    PeelElement(Lhs, Element);
+    if (Kind(*Lhs) != "MemberExpr") return nullptr;
     Path.clear();
     while (!Lhs->value("isArrow", false))
     {
@@ -1125,7 +1144,7 @@ struct FRecord
     std::vector<const Json*> Fields;
     std::vector<const Json*> Ctors;                 // CXXConstructorDecls: their parameter names place a value's arguments
     const Json* Dtor = nullptr;                     // the destructor the source declares, if any (LowerCtor refuses it)
-    std::vector<std::string> Interfaces;            // every base after the first; a native class's from UeNativeInterfaces
+    std::vector<std::string> Interfaces;            // every base after the first; a native class's those genueapi found
     std::string Tail;                               // genueapi's UeClassTail: "<ScriptInherit flags> <ClassWithin> <ConfigName>"
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
@@ -1172,8 +1191,15 @@ struct FRecord
     bool bIsPatch = false;      // UE_PATCH: not a class of its own; its UE_DEFAULTS edit its parent's, in the parent's package
     bool bCooked = false;       // UE_COOKED: shipped as the cooked package it was built from; imported here, never cooked
     bool bUeApi = false;        // declared in a UeApi header: the game's (or another mod's) class, imported, never cooked here
+    /* UE_ASSET_DEFAULTS: the marker struct UeAssetDefaults__<Name> deriving from the asset's class. Not a class of its
+       own: its UE_DEFAULTS cook the asset Ns::Name (this, qualified), its UE_INSTANCED objects under it. */
+    std::string AssetOf;
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
+    /* Whether an override of component C of this class can name C's construction-script node: a game Blueprint's
+       through its dumped `<C>__UeScsNode`, another mod's class (bClassIn) through its own UE_COMPONENT, whose node
+       guid its owner cooked as ScsNodeGuid(class, C) and so is the same here. */
+    bool KnowsScsNode(const std::string& C) const { return ScsNodes.count(C) || (bClassIn && Components.count(C)); }
     /* A game Blueprint from UeApi's Game/, or another mod's class from the header it shares: every function of one is a
        Blueprint function (GameFunctionFlags). */
     bool IsGameBlueprint() const { return IsNative() && UePackage.compare(0, 6, "/Game/") == 0; }
@@ -2101,6 +2127,9 @@ private:
     bool GenerateEnum(const std::string& Name, const std::string& OutDir, std::string* Err);
     /* A namespace-scope `UMyDef MD_Big = { .Health = 500 };`: an instance of a UE class as its own package. */
     bool GenerateAsset(const Json& Var, const std::string& OutDir, std::string* Err);
+    /* UE_ASSET_DEFAULTS, once Generate has lowered its block: the asset's tags and its objects, saved. */
+    bool FinishAssetDefaults(const FRecord& R, const FRecord& Class, FPackage& P, FBlueprintClass& BP,
+                             const std::vector<FPropertyDef>& Tags, const std::string& OutDir, std::string* Err);
     bool TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
                         const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err);
     /* The signature function of `TDelegate<...>` Type in the class Generate is building, made the first time the type
@@ -2570,6 +2599,8 @@ private:
     const FRecord* NamedQualifier(const Json& Ref) const;
     /* The class a StaticClass call names, Callee its DeclRefExpr and Slot the type it fills; null when unknown. */
     const FRecord* StaticClassOf(const Json& Callee, const std::string& Slot) const;
+    std::string NativeMemberWhere(const FRecord* Declarer, const std::string& Type, const std::string& Name,
+                                  const std::string& Where) const;
     const FRecord* HeldClassOf(const Json& ClassExpr) const;
     const FRecord* TemplateParamOf(const Json& Callee) const;
     FIndex StructObjectOf(const FRecord& R, FBlueprintClass& BP) const;
@@ -2669,10 +2700,12 @@ private:
        game's carry theirs in UE_CLASS. */
     std::string PackageOf(const FRecord& R) const
     {
+        if (!R.AssetOf.empty()) return PathIn(ModPackage, CookedQual(R.AssetOf));
         return R.UePackage.empty() ? PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName) : R.UePackage;
     }
     std::string ClassOf(const FRecord& R) const
     {
+        if (!R.AssetOf.empty()) return LeafOf(CookedQual(R.AssetOf));       // the asset's object, not a class
         return !R.UePackage.empty() ? R.UeName : R.bIsStruct ? LeafOf(CookedQual(R.CppName)) : LeafOf(R.CppName) + "_C";
     }
     /* OutDir holds UE_MOD_PACKAGE, and is <Content>/<that path without /Game>, as bpbuild stages a mod. A package under
@@ -2902,6 +2935,7 @@ private:
     std::vector<const Json*> AssetDecls;        // namespace-scope variables brace-initialized, see GenerateAsset
     std::map<std::string, std::string> AssetPaths;  // UE_ASSET_AT: Ns::variable -> the path of an asset cooked elsewhere
     std::map<std::string, std::string> ModCurves;   // UE_FLOAT_CURVE and kin: Ns::variable -> "<kind F/V/C>|<keys>"
+    std::set<std::string> ModAssetBlocks;           // UE_ASSET_DEFAULTS: each asset's Ns::variable
     std::map<std::string, std::string> VarScope;    // a namespace-scope variable's decl id -> its namespace, "A::B::"
     std::map<std::string, const Json*> NsVars;      // a namespace-scope variable's decl id -> the decl
     std::map<std::string, const Json*> NsVarNamed;  // Ns::variable -> the decl
@@ -3372,7 +3406,9 @@ void BadClassMeta(const FRecord& R, std::string* Err, bool* bOk)
 
     const size_t Slash = R.UePackage.rfind('/');
     const std::string Asset = Slash == std::string::npos ? R.UePackage : R.UePackage.substr(Slash + 1);
-    if (Asset + "_C" == R.UeName) return;
+    /* Without case, as FNames match: DRG's TSK_FindRandomPointFrom_WIthinHeight package declares
+       TSK_FindRandomPointFrom_WithinHeight_C. */
+    if (Lower(Asset + "_C") == Lower(R.UeName)) return;
 
     *Err = "UE_CLASS on " + R.CppName + " names the package \"" + R.UePackage + "\", which does"
            " not end in the asset that declares " + R.UeName + ". Did you mean \"" + R.UePackage
@@ -3493,9 +3529,9 @@ bool FCompiler::Collect(std::string* Err)
             }
             return;
         }
-        /* `static constexpr const char *FBoolArray__UeName = "BoolArray";` beside a mod struct or enum: the name it is
-           cooked under, which its package path and object name take and every import of it holds - one rebuilt from
-           an editor's, or renamed in C++ after it shipped. */
+        /* `static constexpr const char *FBoolArray__UeName = "BoolArray";` beside a mod struct, enum or UE_ASSET_DEFAULTS
+           asset: the name it is cooked under, which its package path and object name take and every import of it holds -
+           one rebuilt from an editor's, or renamed in C++ after it shipped, or an asset name C++ cannot spell. */
         if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 8 && Name(N).compare(Name(N).size() - 8, 8, "__UeName") == 0)
         {
             FindLiteral(N, TypeUeNames[Ns + Name(N).substr(0, Name(N).size() - 8)]);
@@ -3518,6 +3554,15 @@ bool FCompiler::Collect(std::string* Err)
             if (RecIt == Records.end()) return;
             RecIt->second.MethodDefs[Name(N)] = &N;
             MethodOwner[N.value("id", std::string())] = OwnerIt->second;
+            /* UE_ASSET_DEFAULTS defines its block out of the marker struct (the macro cannot close the struct after it):
+               that definition is the block. */
+            if (FRecord& AR = RecIt->second; Name(N) == "UeDefaults__" && LeafOf(AR.CppName).compare(0, 17, "UeAssetDefaults__") == 0)
+            {
+                AR.Defaults = &N;
+                const std::string Leaf = LeafOf(AR.CppName);
+                AR.AssetOf = AR.CppName.substr(0, AR.CppName.size() - Leaf.size()) + Leaf.substr(17);
+                ModAssetBlocks.insert(AR.AssetOf);
+            }
             auto& Inlines = RecIt->second.Inlines;
             if (N.value("inline", false) || Inlines.count(PrevId)) Inlines[PrevId] = Inlines[N.value("id", std::string())] = &N;
             return;
@@ -3744,18 +3789,6 @@ bool FCompiler::Collect(std::string* Err)
             {
                 FindLiteral(C, R.Tail);
             }
-            else if (Kind(C) == "VarDecl" && Name(C) == "UeNativeInterfaces")
-            {
-                /* The native interfaces a native class implements, which the dump does not list: genueapi takes them
-                   from the game's Blueprints that override one's function. */
-                std::string List;
-                if (FindLiteral(C, List))
-                    for (size_t At = 0, End; At < List.size(); At = End + 1)
-                    {
-                        End = std::min(List.find(' ', At), List.size());
-                        if (End > At) R.Interfaces.push_back(List.substr(At, End - At));
-                    }
-            }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeIchRecords")
             {
                 std::string List;
@@ -3861,8 +3894,10 @@ bool FCompiler::Collect(std::string* Err)
             }
             else if (Kind(C) == "CXXMethodDecl" && Name(C) == "UeDefaults__")
             {
-                /* Not a UFunction: AssetGen reads its assignments as defaults, never lowers them. */
+                /* Not a UFunction: AssetGen reads its assignments as defaults, never lowers them. Its owner is known by
+                   the declaration's id, for UE_ASSET_DEFAULTS' definition out of the struct. */
                 R.Defaults = &C;
+                MethodOwner[C.value("id", std::string())] = R.CppName;
             }
             else if (Kind(C) == "CXXMethodDecl" && R.bIsInterface && Name(C) == "StaticClass")
             {
@@ -4042,11 +4077,12 @@ bool FCompiler::Collect(std::string* Err)
         if (T.find('<') != std::string::npos || Records.count(StripTypeKeywords(T)) || EnumDecls.count(StripTypeKeywords(T))) Expand[A] = T;
     ExpandAliases(const_cast<Json&>(Doc), Expand);   // with none to expand it still drops a global `::`
     InferFromSources(EnumMarks, EnumUnderlying);
-    /* A `__UeName` marker names a struct or enum the source declares, or it would rename nothing. Another mod's struct
-       (UE_STRUCT_IN, or a folder's) was given the path its C++ name makes; the marker's name replaces that leaf. */
+    /* A `__UeName` marker names a struct, enum or UE_ASSET_DEFAULTS asset the source declares, or it would rename
+       nothing. Another mod's struct (UE_STRUCT_IN, or a folder's) was given the path its C++ name makes; the marker's
+       name replaces that leaf. */
     for (const auto& [Type, Ue] : TypeUeNames)
-        if (Ue.empty() || (!Records.count(Type) && !EnumDecls.count(Type)))
-        { *Err = Type + "__UeName: " + (Ue.empty() ? "give the name it is cooked under" : "names no struct or enum declared here"); return false; }
+        if (Ue.empty() || (!Records.count(Type) && !EnumDecls.count(Type) && !ModAssetBlocks.count(Type)))
+        { *Err = Type + "__UeName: " + (Ue.empty() ? "give the name it is cooked under" : "names no struct, enum or asset declared here"); return false; }
     for (auto& [Key, R] : Records)
     {
         const std::string Natural = PathIn("", R.CppName);
@@ -7300,6 +7336,17 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         if (Kind(*Obj) == "CXXThisExpr" || Out.Sub->bReceiverIsArg) return true;
         Out.Sub->Target = std::make_shared<FArgIR>();
         if (!LowerArg(*Obj, BP, *Out.Sub->Target, Err)) return false;
+        /* `Spider->QueueMontage(M)`, a native interface's function on an object of a class implementing it: the
+           editor's EX_InterfaceContext of the object, as for `TScriptInterface<INetMontageAble>(Spider)->...`. */
+        if (Out.Sub->Target->K != FArgIR::InterfaceCtx && !Out.Sub->VirtualName.empty())
+            if (auto Owner = MethodOwner.find(Callee->value("referencedMemberDecl", std::string())); Owner != MethodOwner.end())
+                if (const FRecord* IR = Find(Owner->second); IR && IR->IsNative() && IR->CppName[0] == 'I')
+                {
+                    FArgIR Ctx;
+                    Ctx.K = FArgIR::InterfaceCtx;
+                    Ctx.Base = std::make_shared<FArgIR>(std::move(*Out.Sub->Target));
+                    *Out.Sub->Target = std::move(Ctx);
+                }
         /* Through an interface the implementation is found by name, as the Blueprint compiler calls it. */
         if (Out.Sub->Target->K == FArgIR::InterfaceCtx)
         {
@@ -8180,6 +8227,10 @@ std::pair<const FRecord*, std::string> FCompiler::PureMethod(const FRecord& R) c
    - UHierarchicalInstancedStaticMeshComponent: its ClusterTree, BulkSerialize again (64 per FClusterNode).
    - USkyAtmosphereComponent: bStaticLightingBuiltGUID, an FGuid.
    - UAtmosphericFogComponent: three empty bulk-data headers (flags, count, size on disk, offset), then CounterVal.
+   - UParticleModuleRequired: bCooked, which a cooked load requires true (else Fatal), then DerivedData's
+     BoundingGeometry, empty without a cutout texture (ParticleModules.cpp, SubUVAnimation.cpp 33-36).
+   - UNiagaraSpriteRendererProperties: its cutout DerivedData's BoundingGeometry the same way, empty in all 1,332 of
+     DRG's (NiagaraSpriteRendererProperties.cpp Serialize).
    Too little or too much is fatal alike: the loader checks each export's size ("Serial size mismatch"). */
 std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
 {
@@ -8196,6 +8247,8 @@ std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
         else if (A->UeName == "HierarchicalInstancedStaticMeshComponent") I32({ 64, 0 });
         else if (A->UeName == "SkyAtmosphereComponent") Tail.resize(Tail.size() + 16);
         else if (A->UeName == "AtmosphericFogComponent") Tail.resize(Tail.size() + 3 * 20 + 4);
+        else if (A->UeName == "ParticleModuleRequired") I32({ 1, 0 });
+        else if (A->UeName == "NiagaraSpriteRendererProperties") I32({ 0 });
     }
     return Tail;
 }
@@ -9606,7 +9659,11 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            so a subclass's override would never run. The editor calls it by name (backend 1222, 1253-1282); a qualified
            or parent call stays final. */
         const bool bNativeEvent = !bStatic && !bParentCall && !bNamesQualified && !Out.bReceiverIsArg && IsNativeEvent(*R, MethodName);
-        if ((!R->IsNative() || bImportedScript || bNativeEvent) && !bStatic && !bParentCall && !Bound)
+        /* A native interface's function called as a member of a class implementing it (`GetTargetCenterMass()` in a
+           spider) is found by name, as the editor calls it: on self a plain EX_VirtualFunction (ENE_SpiderBase_Large's
+           QueueMontage), on another object through EX_InterfaceContext (LowerArg's member call). */
+        const bool bInterfaceFn = R->IsNative() && R->CppName[0] == 'I' && !bStatic && !Out.bReceiverIsArg;
+        if ((!R->IsNative() || bImportedScript || bNativeEvent || bInterfaceFn) && !bStatic && !bParentCall && !Bound)
             Out.VirtualName = UeNameOf(R, MethodName);      // an override of `Set is Extruded` is found by that name
         Out.bLocal = (!Out.VirtualName.empty() || Bound) && bLocal;
         /* A call whose one body is known here - bound on `this`, a parent's, or a static of this mod - is that body,
@@ -13199,6 +13256,24 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
         for (const auto& [N, D] : A->Methods)
             if (!D->value("inline", false) && !IsInlineMethod(*A, N) && !Inherited(N, true)) return false;
     }
+    /* The functions of each interface this class or an ancestor lists (and those it extends) are the class's too: an
+       implementing class carries one of each, so `Order` beside an interface's `order` would cook two exports of one
+       FName, which the loader takes for the same object and fails on ("found in memory and is an export but does not
+       have all load flags"). Only functions: an interface's variables are the class's own fields (Held). */
+    for (const FRecord* C = &R; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+        for (const std::string& I : C->Interfaces)
+            for (const FRecord* Link : InterfaceChain(Find(I)))
+                for (const auto& [N, D] : Link->Methods)
+                {
+                    if (D->value("inline", false) || IsInlineMethod(*Link, N)) continue;
+                    const auto U = Link->UeNames.find(N);
+                    const std::string Ue = U == Link->UeNames.end() ? N : U->second;
+                    auto It = Own.find(Lower(Ue));
+                    if (It == Own.end() || (It->second.second && It->second.first == Ue)) continue;   // an implementation
+                    *Err = R.CppName + "::" + It->second.first + ": interface " + Link->CppName + " already has a function " + Ue
+                         + ", and an FName ignores case; rename it to " + Ue + " to implement it";
+                    return false;
+                }
     return true;
 }
 
@@ -15037,14 +15112,34 @@ bool FCompiler::SameContainer(const Json& A, const Json& B) const
     return Same(&UA, &UB);
 }
 
+/* Whether N is a local or by-value parameter of the function that names it, or part of one (`L.Items`, `Lists[K]`):
+   no other function reaches it unless handed it by reference. A member, a reference, or what a pointer points at is
+   not. */
+static bool IsOwnLocal(const Json* N)
+{
+    N = Strip(N);
+    if (!N) return false;
+    if (IsTArrayElement(*N) || IsTMapElement(*N)) return IsOwnLocal(Nth(*N, 1));
+    const std::string K = Kind(*N);
+    if (K == "MemberExpr") return !N->value("isArrow", false) && IsOwnLocal(First(*N));
+    if (K != "DeclRefExpr") return false;
+    const Json& D = (*N)["referencedDecl"];
+    const std::string DK = D.value("kind", std::string());
+    return (DK == "VarDecl" || DK == "ParmVarDecl") && D.contains("type")
+        && D["type"].value("qualType", std::string()).find('&') == std::string::npos;
+}
+
 /* Each place in N that may change a container Hit picks, as Out names it (`Scores.Remove`, `Scores[] =`,
    `Prune(Scores)`, `Shrink()`): a count-changing method called on it, a whole assignment to it, a TMap store `M[k] = v`
    (Map_Add, which inserts a key the map lacks) unless k is one of KeyNames, it passed to a non-const reference parameter,
-   or a call to one of the class's own methods whose body may change a container of Type. bWrite: N is written. */
+   or a call to one of the class's own methods whose body may change a container of Type that it can reach: a member,
+   or one behind a reference, never the callee's own locals. An empty Type checks no callee: the walked container is
+   the caller's own local, which a callee reaches only when passed it, warned as that. bWrite: N is written. */
 bool FCompiler::MutatesType(const Json& Body, const std::string& Type, std::set<std::string>* Seen) const
 {
     std::vector<std::string> Hits;
-    CollectMutations(Body, false, [&](const Json& E) { return TypeTag(TypeOf(E)) == TypeTag(Type); }, Type, {}, *Seen, Hits);
+    CollectMutations(Body, false, [&](const Json& E) { return TypeTag(TypeOf(E)) == TypeTag(Type) && !IsOwnLocal(&E); },
+                     Type, {}, *Seen, Hits);
     return !Hits.empty();
 }
 
@@ -15080,7 +15175,7 @@ void FCompiler::CollectMutations(const Json& N, bool bWrite, const std::function
         const std::string M = Callee.value("name", std::string());
         const bool bCounts = Obj && CountMethod(KindOf(*Obj), M);
         if (bCounts && Hit(*Obj)) Out.push_back(ContainerName(Obj) + "." + M);
-        if (Cur && Obj && Kind(*Strip(Obj)) == "CXXThisExpr" && Seen.insert(M).second)
+        if (Cur && !Type.empty() && Obj && Kind(*Strip(Obj)) == "CXXThisExpr" && Seen.insert(M).second)
         {
             const auto D = Cur->MethodDefs.find(M);
             const auto Decl = Cur->Methods.find(M);
@@ -15130,7 +15225,8 @@ void FCompiler::WarnIteratedMutation(const Json& Body, const Json& Walked, const
 {
     std::vector<std::string> Hits;
     std::set<std::string> Seen;
-    CollectMutations(Body, false, [&](const Json& E) { return SameContainer(E, Walked); }, Type, KeyNames, Seen, Hits);
+    CollectMutations(Body, false, [&](const Json& E) { return SameContainer(E, Walked); },
+                     IsOwnLocal(&Walked) ? std::string() : Type, KeyNames, Seen, Hits);
     for (const std::string& What : Hits)
         if (WarnedMutation.insert(CurFnName + "|" + What).second)
             printf("  warning: %s::%s: unsafe to mutate iterated container (%s)\n", Cur ? Cur->CppName.c_str() : "",
@@ -17015,8 +17111,8 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
     const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + Var;
     if (auto At = AssetPaths.find(Qual); At != AssetPaths.end())
         Package = At->second;
-    else if (ModCurves.count(Qual) || std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
-        Package = PathIn(ModPackage, Qual);
+    else if (ModCurves.count(Qual) || ModAssetBlocks.count(Qual) || std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
+        Package = PathIn(ModPackage, CookedQual(Qual));
     else return false;
 
     const std::string Object = SplitAssetPath(Package);
@@ -17046,7 +17142,7 @@ static void ZeroDefault(FPropertyDef& PD)
 {
     FDefaultValue& D = PD.Default;
     const std::string& T = PD.Type;
-    if (T == "IntProperty" || T == "Int64Property" || T == "UInt16Property" || (T == "ByteProperty" && PD.StructName.empty())) { D.K = FDefaultValue::Int; D.I = 0; }
+    if (T == "IntProperty" || T == "Int64Property" || T == "UInt16Property" || T == "UInt32Property" || (T == "ByteProperty" && PD.StructName.empty())) { D.K = FDefaultValue::Int; D.I = 0; }
     else if (T == "FloatProperty" || T == "DoubleProperty") { D.K = FDefaultValue::Float; D.F = 0.0; }
     else if (T == "BoolProperty") { D.K = FDefaultValue::Bool; D.I = 0; }
     else if (T == "ByteProperty" || T == "EnumProperty") { D.K = FDefaultValue::Str; D.S = PD.EnumZero; }
@@ -17428,6 +17524,17 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         PD.Default.Object = ClassImportOf(*C, BP);
         return true;
     }
+    /* `X::StaticClass()` in a UObject* member: the class as an object, as the cook writes a Niagara data interface's
+       type definition's ClassStructOrEnum (FNiagaraTypeDefinition(UNiagaraDataInterfaceCurve::StaticClass(), 1)). */
+    if (const Json* Callee = PD.Type == "ObjectProperty" && K == "CallExpr" ? Strip(First(*Init)) : nullptr;
+        Callee && Kind(*Callee) == "DeclRefExpr" && (*Callee)["referencedDecl"].value("name", std::string()) == "StaticClass")
+    {
+        const FRecord* C = StaticClassOf(*Callee, TypeOf(F));
+        if (!C) { *Err = Name(F) + ": StaticClass() on an unknown class"; return false; }
+        PD.Default.K = FDefaultValue::Obj;
+        PD.Default.Object = ClassImportOf(*C, BP);
+        return true;
+    }
     /* `StaticStructOf<X>()`: the struct object, as the cook writes a Niagara type definition's ClassStructOrEnum. */
     if (const Json* Callee = PD.Type == "ObjectProperty" && K == "CallExpr" ? Strip(First(*Init)) : nullptr;
         Callee && Kind(*Callee) == "DeclRefExpr"
@@ -17606,7 +17713,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     const std::string& T = PD.Type;
     /* A number is whatever the initializer comes to: `40`, `-1.5f`, `kMax * 2 + 1`, `1 << 3 | 2`. An enum-typed
        byte keeps its named-constant path below. */
-    if (FConstVal V; (T == "IntProperty" || T == "Int64Property" || T == "UInt16Property" || (T == "ByteProperty" && PD.StructName.empty())
+    if (FConstVal V; (T == "IntProperty" || T == "Int64Property" || T == "UInt16Property" || T == "UInt32Property" || (T == "ByteProperty" && PD.StructName.empty())
                       || T == "FloatProperty" || T == "DoubleProperty" || T == "BoolProperty") && FoldConst(*Whole, V))
     {
         const double Num = V.Num();
@@ -17857,13 +17964,14 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
     if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
     if (Type == "uint8" || Type == "unsigned char") { *Out = ByteParam(PName, ExtraFlags); return true; }
-    /* A native struct's uint16 member, for its tag in a value AssetGen writes (FNiagaraTypeDefinition::UnderlyingType). No
-       Blueprint variable is one, so a mod's own is still refused. */
-    if ((Type == "uint16" || Type == "unsigned short") && Where.compare(0, 7, "member ") == 0)
+    /* A native uint16 or uint32 member, for its tag in a value AssetGen writes (FNiagaraTypeDefinition::UnderlyingType,
+       UParticleEmitter::DetailModeBitmask). No Blueprint variable is one, so a mod's own is still refused. */
+    if ((Type == "uint16" || Type == "unsigned short" || Type == "uint32" || Type == "unsigned int") && Where.compare(0, 7, "member ") == 0)
     {
+        const bool b16 = Type == "uint16" || Type == "unsigned short";
         *Out = IntParam(PName, ExtraFlags);
-        Out->Type = "UInt16Property";
-        Out->ElementSize = 2;
+        Out->Type = b16 ? "UInt16Property" : "UInt32Property";
+        Out->ElementSize = b16 ? 2 : 4;
         return true;
     }
     if (Type == "char *" || Type == "char*" || Type == "FString")
@@ -17872,21 +17980,25 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     if (Type == "FText") { *Out = TextParam(PName, ExtraFlags); return true; }
     if (auto E = Enums.find(Type); E != Enums.end())
     {
-        if (E->second.Underlying == "int32" || E->second.Underlying == "int64")
+        const std::string& U = E->second.Underlying;
+        if (U == "int32" || U == "int64" || ((U == "uint32" || U == "uint16") && Where.compare(0, 7, "member ") == 0))
         {
-            /* An EnumProperty over an Int/Int64Property, the way UHT reflects `enum class : int32`. No editor-made
-               Blueprint has one, but FEnumProperty takes any numeric underlying property and UEnum values are int64. */
-            const bool b64 = E->second.Underlying == "int64";
+            /* An EnumProperty over an Int/Int64Property, the way UHT reflects `enum class : int32`; an engine member's
+               over a UInt32/UInt16Property too (Niagara's ribbon UV modes are `: uint32`). No editor-made Blueprint has
+               one, but FEnumProperty takes any numeric underlying property and UEnum values are int64. */
+            const bool b64 = U == "int64";
             *Out = b64 ? Int64Param(PName, ExtraFlags) : IntParam(PName, ExtraFlags);
             Out->Type = "EnumProperty";
             Out->Extra = BP.Enum(E->second.Package, E->second.UeName);
             Out->StructName = E->second.UeName;
             Out->EnumZero = E->second.UeName + "::" + E->second.First;
             Out->Inner = std::make_shared<FPropertyDef>(b64 ? Int64Param("UnderlyingType") : IntParam("UnderlyingType"));
+            if (U == "uint32") Out->Inner->Type = "UInt32Property";
+            if (U == "uint16") { Out->Inner->Type = "UInt16Property"; Out->Inner->ElementSize = 2; }
             Out->Inner->PropertyFlags = 0;
             return true;
         }
-        if (E->second.Underlying != "uint8")
+        if (U != "uint8")
         { *Err = "TODO: unimplemented " + Where + ": " + QualType + " (a uint8, int32 or int64 enum only)"; return false; }
         *Out = ByteParam(PName, ExtraFlags);
         Out->Extra = BP.Enum(E->second.Package, E->second.UeName);
@@ -18727,7 +18839,14 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
 
     const auto Scope = VarScope.find(Var.value("id", std::string()));
     const std::string AssetName = Name(Var);
-    const std::string PackageName = PathIn(ModPackage, (Scope == VarScope.end() ? std::string() : Scope->second) + AssetName);
+    const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + AssetName;
+    /* `extern T X;` from UE_ASSET_DEFAULTS and `T X = {...};` are one variable to C++, and two cooks of one package. */
+    if (ModAssetBlocks.count(Qual))
+    {
+        *Err = Qual + ": declared by UE_ASSET_DEFAULTS and with braces; keep one: the block sets the members the braces would";
+        return false;
+    }
+    const std::string PackageName = PathIn(ModPackage, Qual);
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, AssetName, "", "", false);
@@ -18746,6 +18865,22 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     RegistryRows.push_back({ PackageName, AssetName, ClassName });
     printf("  %-14s -> %s.uasset  (asset, a %s)\n", AssetName.c_str(), Shown(PackageName).c_str(), R->CppName.c_str());
+    return true;
+}
+
+/* UE_ASSET_DEFAULTS(Class, Name): the asset Name of Class, its tags the block's assignments to its own members (Tags, which
+   Generate lowered as a class's UE_DEFAULTS against its parent's), its objects the block's UE_INSTANCED, already added
+   to BP. Cooked as a braced asset is (GenerateAsset), with the objects under it. */
+bool FCompiler::FinishAssetDefaults(const FRecord& R, const FRecord& Class, FPackage& P, FBlueprintClass& BP,
+                                    const std::vector<FPropertyDef>& Tags, const std::string& OutDir, std::string* Err)
+{
+    for (const FPropertyDef& PD : Tags) BP.AddVariable(PD);
+    const std::string ClassPkg = PackageOf(Class), ClassName = ClassOf(Class), PackageName = PackageOf(R);
+    const FIndex Cdo = BP.ClassDefaultObject(ClassPkg, ClassName);
+    BP.FinishAsset(BP.EngineClass(ClassPkg, ClassName), Cdo);
+    if (!SavePackage(P, OutDir, PackageName, Err)) return false;
+    RegistryRows.push_back({ PackageName, ClassOf(R), ClassName });
+    printf("  %-14s -> %s.uasset  (asset, a %s)\n", ClassOf(R).c_str(), Shown(PackageName).c_str(), Class.CppName.c_str());
     return true;
 }
 
@@ -18955,11 +19090,25 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
 /* S38: one assignment of an edit, `Root<Steps> = Rhs`: the member Root names (Declarer's), each step's def down the
    path, and the value lowered against the last. Zero is a real value here: it replaces the game's own, which need not
    be zero. */
+/* Where, or TypeToProperty's "member <Name>" for an engine class's uint16 / uint32 member, or one of an enum over them:
+   its unsigned ints (UParticleEmitter::DetailModeBitmask, UNiagaraRibbonRendererProperties::UV0Settings'
+   DistributionMode) are then tags AssetGen writes, which a mod's own variable may not be. */
+std::string FCompiler::NativeMemberWhere(const FRecord* Declarer, const std::string& Type, const std::string& Name,
+                                         const std::string& Where) const
+{
+    const std::string T = StripTypeKeywords(Type);
+    const auto E = Enums.find(T);
+    const std::string U = E == Enums.end() ? T : E->second.Underlying;
+    const bool bUnsigned = U == "uint16" || U == "uint32" || U == "unsigned short" || U == "unsigned int";
+    return Declarer && Declarer->IsNative() && bUnsigned ? "member " + Name : Where;
+}
+
 bool FCompiler::EditAssignment(const Json& Root, const FRecord& Declarer, const std::vector<const Json*>& Steps,
                                const Json* Rhs, const std::string& Where, FBlueprintClass& BP, FEditDef& Out, std::string* Err)
 {
     Out.Chain.emplace_back();
-    if (!TypeToProperty(TypeOf(Root), UeNameOf(&Declarer, Name(Root)), 0, Where, BP, &Out.Chain.back(), Err)) return false;
+    if (!TypeToProperty(TypeOf(Root), UeNameOf(&Declarer, Name(Root)), 0, NativeMemberWhere(&Declarer, TypeOf(Root), Name(Root), Where),
+                        BP, &Out.Chain.back(), Err)) return false;
     std::string Path = Name(Root);
     /* One element of a TMap or TSet: `Score["a"] = 1` (the last step a map's key), `Score.Add("a", 1)`, `Ids.Add(7)`,
        `X.Remove(Key)` (Rhs the call). */
@@ -19106,7 +19255,8 @@ bool FCompiler::EditStep(const Json& Step, const FPropertyDef& Parent, const std
         const FRecord* SR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
         if (!SR || Parent.Type != "StructProperty") { *Err = Where + ": cannot tell which struct declares " + Name(Step); return false; }
         Out.Member = UeNameOf(SR, Name(Step));
-        if (!TypeToProperty(TypeOf(Step), Out.Member, 0, Where, BP, &Reached, Err)) return false;
+        if (!TypeToProperty(TypeOf(Step), Out.Member, 0, NativeMemberWhere(SR, TypeOf(Step), Name(Step), Where), BP, &Reached, Err))
+            return false;
         const int32 Native = NativeStructSize(Parent.StructName);
         if (!Native) return true;
         /* A native struct's bytes are its members' in declaration order, each of a fixed size. */
@@ -19114,7 +19264,8 @@ bool FCompiler::EditStep(const Json& Step, const FPropertyDef& Parent, const std
         for (const Json* F : SR->Fields)
         {
             FPropertyDef M;
-            if (!TypeToProperty(TypeOf(*F), UeNameOf(SR, Name(*F)), 0, Where, BP, &M, Err)) return false;
+            if (!TypeToProperty(TypeOf(*F), UeNameOf(SR, Name(*F)), 0, NativeMemberWhere(SR, TypeOf(*F), Name(*F), Where), BP, &M, Err))
+                return false;
             const int32 Size = FixedValueSize(M);
             if (!Size) { *Err = Where + ": " + SR->CppName + "::" + Name(*F) + " is not a fixed size, so its bytes cannot be found"; return false; }
             if (Name(*F) == Name(Step)) { Out.Offset = At; Out.Size = Size; }
@@ -19836,7 +19987,7 @@ bool FCompiler::MergeElement(const FCookedPackage& P, int32 Export, FEditDef& Ed
 
 /* Each FFieldPath operand of a cooked script, B[Begin, End) being its serialized bytes: Visit gets the offset of the
    operand's owner, an FPackageIndex after its name segments. The grammar is the loader's (ScriptSerialization.h, UE
-   4.27), as tools/walkscript.py reads it. False when the bytes do not read as that grammar. */
+   4.27), as tools/uasset.py walk reads it. False when the bytes do not read as that grammar. */
 static bool ForEachFieldPath(const std::vector<uint8>& B, size_t Begin, size_t End, const std::function<void(size_t)>& Visit)
 {
     size_t O = Begin;
@@ -20674,7 +20825,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!IR->IsNative() && !IR->bIsInterface)
         { *Err = R.CppName + " implements " + I + ", which is not an interface"; return false; }
         /* clang already rejects one listed twice; an ancestor's copy it only warns about. A native
-           ancestor's interfaces are not in the dump: only those UeNativeInterfaces names are checked. */
+           ancestor's interfaces are not in the dump: only those genueapi found and made its bases are checked. */
         /* Through an interface that extends it as well: this class's empty stubs would otherwise override the
            functions the ancestor implemented. */
         for (const FRecord* A = Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
@@ -21186,7 +21337,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (S.Outer == FInstSpec::NativeSubobject && !SubobjectDefaults.count(S.Component))
                 SubobjectDefaults[S.Component].Owner = S.Declarer;
             if (S.Outer != FInstSpec::InheritedComponent || ComponentOverrides.count(S.Component)) continue;
-            if (S.Declarer->IsNative() && !S.Declarer->ScsNodes.count(S.Component))
+            if (S.Declarer->IsNative() && !S.Declarer->KnowsScsNode(S.Component))
             { *Err = S.Where + ": " + S.Component + " is a component of the Blueprint " + S.Declarer->UeName + ", and its header "
                      "does not say which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi";
               return false; }
@@ -21216,9 +21367,20 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         const Json* Body = nullptr;
         ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
         bool bOk = true;
-        if (Body)
-            ForEach(*Body, [&](const Json& S) {
+        /* A nested block `{ ... }` of UE_ASSET_DEFAULTS is its statements: a behaviour tree's source holds each composite's
+           subtree in one. A class's is refused: the scans of its components (RestatedSubobjects, OverridesComponent)
+           read the top-level statements only. */
+        std::function<void(const Json&)> Statement;
+        Statement = [&](const Json& S) {
                 if (!bOk) return;
+                if (Kind(S) == "CompoundStmt")
+                {
+                    if (R.AssetOf.empty())
+                    { *Err = S.value("ueWhere", Block) + ": a block `{ ... }` groups the statements of a UE_ASSET_DEFAULTS; "
+                             "in a class's UE_DEFAULTS write them in place"; bOk = false; return; }
+                    ForEach(S, Statement);
+                    return;
+                }
                 Where = S.value("ueWhere", Block);
                 /* `UDotStatusEffectItem* Burn = UE_INSTANCED(...);`: made where a default points at it. One nothing points at
                    would be an object no one reaches; the editor keeps none such. */
@@ -21250,9 +21412,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 std::vector<const Json*> Part;      // `Comp->Style.Normal.DrawAs = value;`: Normal, DrawAs
                 FLayoutSlot* SlotOf = nullptr;      // `At->Padding.Top = value;`: the slot the layout's local At holds
                 std::vector<FPropertyDef>* InstOf = nullptr;    // `Burn->DamageAmount = value;`: the UE_INSTANCED local Burn's tags
-                const bool bDefault = DefaultAssignment(S, Lhs, Rhs, Owner, &Part);
+                const Json* Element = nullptr;     // `D->ParamModes[1] = value;`: the subscript of a C array member
+                const bool bDefault = DefaultAssignment(S, Lhs, Rhs, Owner, &Part, &Element);
                 if (!bDefault)
-                    if (const Json* Local = LocalMemberAssignment(S, Lhs, Rhs, Part))
+                    if (const Json* Local = LocalMemberAssignment(S, Lhs, Rhs, Part, &Element))
                     {
                         const std::string Id = Local->value("referencedDecl", Json::object()).value("id", std::string());
                         if (const auto L = SlotLocals.find(Id); L != SlotLocals.end() && !R.Widgets.empty())
@@ -21294,7 +21457,27 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* The tag is read back by the engine's name of the member, which its declarer's header knows. */
                 const std::string LhsDeclarer = OwnerOf(*Lhs);
                 const std::string TagName = UeNameOf(LhsDeclarer.empty() ? DR : Find(LhsDeclarer), Name(*Lhs));
-                if (!TypeToProperty(TypeOf(*Lhs), TagName, 0, Where, BP, &PD, Err)) { bOk = false; return; }
+                const FRecord* LhsRec = LhsDeclarer.empty() ? DR : Find(LhsDeclarer);
+                /* A C array member's element is a tag of its own, of the element's type at its index (ArrayIndex). */
+                if (Element)
+                {
+                    FConstVal I;
+                    const std::string Arr = TypeOf(*Lhs);
+                    const size_t Open = Arr.rfind('[');
+                    const int64 Dim = Open == std::string::npos ? 0 : std::atoll(Arr.c_str() + Open + 1);
+                    if (!Dim || !Part.empty())
+                    { *Err = Where + ": " + Name(*Lhs) + (Dim ? ": a part of a C array's element is not written; assign the element"
+                                                             : " is no C array member"); bOk = false; return; }
+                    if (!FoldConst(*Nth(*Element, 1), I) || I.I < 0 || I.I >= Dim)
+                    { *Err = Where + ": " + Name(*Lhs) + "[...]: the index is a constant below " + std::to_string(Dim); bOk = false; return; }
+                    if (!TypeToProperty(TypeOf(*Element), TagName, 0, NativeMemberWhere(LhsRec, TypeOf(*Element), Name(*Lhs), Where), BP, &PD, Err))
+                    { bOk = false; return; }
+                    if (PD.Type == "BoolProperty")
+                    { *Err = Where + ": " + Name(*Lhs) + ": a bool C array is not written"; bOk = false; return; }
+                    PD.ArrayIndex = int32(I.I);
+                }
+                else if (!TypeToProperty(TypeOf(*Lhs), TagName, 0, NativeMemberWhere(LhsRec, TypeOf(*Lhs), Name(*Lhs), Where), BP, &PD, Err))
+                { bOk = false; return; }
                 /* Zero is a real value here: an archetype deltas against the component CDO (where
                    bVisible is already true) and an inherited property against the parent's CDO,
                    not against the type's zero the way a fresh class variable does. */
@@ -21305,7 +21488,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* A part of a struct member is a tag of that struct holding only the part, as the cook writes a struct that
                    differs from its default in one member: on load the rest keeps the archetype's value. Only a struct
                    written as tags has parts; one with a native Serialize (Vector2D, LinearColor) is written whole. */
-                const Json* Leaf = Part.empty() ? Lhs : Part.back();
+                const Json* Leaf = Element ? Element : Part.empty() ? Lhs : Part.back();
                 std::vector<FPropertyDef> Outer;    // the structs above the part, the member first
                 if (!Part.empty())
                 {
@@ -21314,7 +21497,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     {
                         FPropertyDef M;
                         const std::string MD = OwnerOf(*Part[I]);
-                        if (!TypeToProperty(TypeOf(*Part[I]), UeNameOf(MD.empty() ? nullptr : Find(MD), Name(*Part[I])), 0, Where, BP, &M, Err))
+                        const FRecord* MR = MD.empty() ? nullptr : Find(MD);
+                        if (!TypeToProperty(TypeOf(*Part[I]), UeNameOf(MR, Name(*Part[I])), 0,
+                                            NativeMemberWhere(MR, TypeOf(*Part[I]), Name(*Part[I]), Where), BP, &M, Err))
                         { bOk = false; return; }
                         Outer.push_back(M);
                     }
@@ -21323,13 +21508,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         { *Err = Where + ": " + (I ? Name(*Part[I - 1]) : Name(*Lhs)) + " is " + (Outer[I].Type == "StructProperty"
                                  ? "a " + Outer[I].StructName + ", which is written whole: assign all of it" : "no struct"); bOk = false; return; }
                     const std::string LD = OwnerOf(*Leaf);
+                    const FRecord* LR = LD.empty() ? nullptr : Find(LD);
                     PD = FPropertyDef();
-                    if (!TypeToProperty(TypeOf(*Leaf), UeNameOf(LD.empty() ? nullptr : Find(LD), Name(*Leaf)), 0, Where, BP, &PD, Err))
+                    if (!TypeToProperty(TypeOf(*Leaf), UeNameOf(LR, Name(*Leaf)), 0, NativeMemberWhere(LR, TypeOf(*Leaf), Name(*Leaf), Where),
+                                        BP, &PD, Err))
                     { bOk = false; return; }
                 }
                 if (!LowerDefault(*Leaf, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
-                { *Err = Where + ": " + Name(*Leaf) + " needs a literal value"; bOk = false; return; }
+                { *Err = Where + ": " + Name(Element ? *Lhs : *Leaf) + " needs a literal value"; bOk = false; return; }
                 for (size_t I = Outer.size(); I-- > 0;)
                 {
                     FPropertyDef Up = Outer[I];
@@ -21357,7 +21544,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     Into.Default.Members = nullptr;
                 };
                 auto Put = [&](std::vector<FPropertyDef>& Into) {
-                    auto At = std::find_if(Into.begin(), Into.end(), [&](const FPropertyDef& X) { return X.Name == PD.Name; });
+                    auto At = std::find_if(Into.begin(), Into.end(), [&](const FPropertyDef& X) {
+                        return X.Name == PD.Name && X.ArrayIndex == PD.ArrayIndex; });
                     if (At == Into.end()) Into.push_back(PD);
                     else Merge(*At, PD);
                 };
@@ -21399,7 +21587,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 {
                     if (Part.empty())
                         InheritedDefaults.erase(std::remove_if(InheritedDefaults.begin(), InheritedDefaults.end(),
-                                                               [&](const FPropertyDef& P) { return P.Name == PD.Name; }),
+                                                               [&](const FPropertyDef& P) { return P.Name == PD.Name && P.ArrayIndex == PD.ArrayIndex; }),
                                                 InheritedDefaults.end());
                     Put(InheritedDefaults);
                     return;
@@ -21412,7 +21600,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                    subobject path below would cook an export the engine never looks at - so that is refused. */
                 const bool bBlueprintParent = DR->IsNative() && DR->UeName.size() > 2
                                               && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0;
-                if (bBlueprintParent && !DR->ScsNodes.count(CompName))
+                if (bBlueprintParent && !DR->KnowsScsNode(CompName))
                 {
                     *Err = Where + ": " + CompName + " is a component of the Blueprint " + DR->UeName + ", and its header does "
                            "not say which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi";
@@ -21429,7 +21617,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 FOverride& O = ComponentOverrides[CompName];
                 O.Owner = DR;
                 Put(O.Defaults);
-            });
+            };
+        if (Body) ForEach(*Body, Statement);
         if (!bOk) return false;
         /* Attached to one another, this class's components must still form a tree: a node in a cycle is no root node
            and no child of one, so ExecuteScriptOnActor never reaches it and the component is never made. */
@@ -22036,6 +22225,86 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        exports the objects its own UE_DEFAULTS make there; one that makes none of that name inherits it, so the class
        above is asked next. A game Blueprint's package exports every one it has, which UeApi lists. Found, it is an
        import; this class's own copy loads from it what its tags leave unset. */
+    /* The objects a cook below left in the package (Kept: their indices before, in order), with their tags after it,
+       each outer renumbered. */
+    auto KeepInstanced = [&](const std::vector<int32>& Kept, std::vector<std::vector<FPropertyDef>>&& Tags) {
+        std::vector<int32> NewOf(Insts.size(), -1);
+        for (size_t K = 0; K < Kept.size(); ++K) NewOf[size_t(Kept[K])] = int32(K);
+        std::vector<FInstSpec> KeptInsts;
+        for (int32 Old : Kept)
+        {
+            FInstSpec S = Insts[size_t(Old)];
+            if (S.Parent >= 0) S.Parent = NewOf[size_t(S.Parent)];
+            KeptInsts.push_back(S);
+        }
+        Insts = std::move(KeptInsts);
+        InstDefaults = std::move(Tags);
+    };
+    /* A particle system: the cooker's work on its tags (Cascade.cpp), before its objects are exported. A baked
+       distribution object is left out, and the rest renumbered. */
+    if (!R.AssetOf.empty() && Derives(B, "ParticleSystem"))
+    {
+        std::vector<FCascadeObject> Objs;
+        for (size_t I = 0; I < Insts.size(); ++I)
+        {
+            FCascadeObject O;
+            O.Class = ClassOf(*Insts[I].Class);
+            O.Name = Insts[I].Name;
+            O.Outer = Insts[I].Parent;
+            O.Tags = InstDefaults[I];
+            for (const FRecord* C = Insts[I].Class; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+                O.Chain.push_back(ClassOf(*C));
+            for (const FRecord* C = Insts[I].Class; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+                for (const Json* F : C->Fields)
+                    if (const std::string T = TypeOf(*F); T.find("FRawDistributionFloat") != std::string::npos
+                                                          || T.find("FRawDistributionVector") != std::string::npos)
+                        O.RawDists.emplace_back(UeNameOf(C, Name(*F)), T.find("FRawDistributionVector") != std::string::npos);
+            Objs.push_back(std::move(O));
+        }
+        std::vector<int32> Kept;
+        std::vector<std::string> Warnings;
+        if (!CookCascade(InheritedDefaults, Objs, Kept, Warnings, Err)) { *Err = R.AssetOf + ": " + *Err; return false; }
+        for (const std::string& W : Warnings) printf("  warning: %s: %s\n", R.AssetOf.c_str(), W.c_str());
+        for (int32 Old : Kept)
+            if (size_t(Old) >= Insts.size())
+            { *Err = R.AssetOf + ": a starting distribution was left in the package unbaked (AssetGen bug)"; return false; }
+        std::vector<std::vector<FPropertyDef>> Tags;
+        for (FCascadeObject& O : Objs) Tags.push_back(std::move(O.Tags));
+        KeepInstanced(Kept, std::move(Tags));
+    }
+    /* A Niagara system: the cooker's work on it (Niagara.cpp). A disabled emitter is left out, and the rest renumbered;
+       its EmitterCompiledData, which UNiagaraSystem::Serialize writes after the tags (a count, then each emitter's as
+       tags), is worked out first. */
+    if (!R.AssetOf.empty() && Derives(B, "NiagaraSystem"))
+    {
+        std::vector<FNiagaraObject> Objs;
+        for (size_t I = 0; I < Insts.size(); ++I) Objs.push_back({ ClassOf(*Insts[I].Class), Insts[I].Name, Insts[I].Parent, InstDefaults[I] });
+        std::vector<int32> Kept;
+        std::vector<std::vector<FPropertyDef>> Compiled;
+        if (!CookNiagara(InheritedDefaults, Objs, Kept,
+                         [&](FIndex V) { const FImport* Im = P.ImportAt(V); return Im ? Im->ObjectName : std::string(); },
+                         [&](const std::string& S) { return BP.ScriptStruct("/Script/Niagara", S); }, Compiled, Err))
+        { *Err = R.AssetOf + ": " + *Err; return false; }
+        std::vector<std::vector<FPropertyDef>> Tags;
+        for (FNiagaraObject& O : Objs) Tags.push_back(std::move(O.Tags));
+        KeepInstanced(Kept, std::move(Tags));
+        BP.AssetTail = [Compiled](FArc& Ar) {
+            Ar.I32(int32(Compiled.size()));
+            for (const std::vector<FPropertyDef>& Tags : Compiled)
+            {
+                for (const FPropertyDef& T : Tags) WriteDefaultTag(Ar, T);
+                TagEnd(Ar);
+            }
+        };
+    }
+    /* A behaviour tree: each node's TreeAsset and ParentNode, as the editor keeps them (BehaviorTree.cpp). */
+    if (!R.AssetOf.empty() && Derives(B, "BehaviorTree"))
+    {
+        std::vector<FTreeObject> Objs;
+        for (size_t I = 0; I < Insts.size(); ++I) Objs.push_back({ Insts[I].Name, InstDefaults[I] });
+        if (!CookBehaviorTree(InheritedDefaults, Objs, Err)) { *Err = R.AssetOf + ": " + *Err; return false; }
+        for (size_t I = 0; I < Insts.size(); ++I) InstDefaults[I] = std::move(Objs[I].Tags);
+    }
     for (size_t I = 0; I < Insts.size(); ++I)
     {
         const FInstSpec& S = Insts[I];
@@ -22147,6 +22416,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         O.NativeTail = NativeTail(S.Class);
         BP.AddInstanced(O);
     }
+    if (!R.AssetOf.empty()) return FinishAssetDefaults(R, *B, P, BP, InheritedDefaults, OutDir, Err);
 
     /* The OOL definition carries body/parms; only the in-class decl carries storageClass. */
     struct FMethod { std::string Name; const Json* Decl; const Json* Def; const Json* Body; };
@@ -24146,10 +24416,16 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
        case-blind. */
     GAg.Mark("NormalizePointers (generated/mod records)");
     std::map<std::string, std::string> Cooked;
-    for (const auto& [Cpp, R] : Records)
-        if (R.IsGenerated())
+    for (const auto& [Key, R] : Records)
+        if (const std::string Cpp = R.AssetOf.empty() ? Key : R.AssetOf; R.IsGenerated())     // an asset by its own name
             if (const auto [At, bNew] = Cooked.emplace(Lower(PackageOf(R)), Cpp); !bNew)
             { *Err = Cpp + " and " + At->second + " would both be cooked as " + PackageOf(R); return false; }
+    /* A UE_ASSET_DEFAULTS name a curve macro or a UE_ASSET_AT also declares is one variable to C++: a curve would be
+       cooked over the asset at one path, and a UE_ASSET_AT would point every reference elsewhere. */
+    for (const std::string& Qual : ModAssetBlocks)
+        if (const char* Other = ModCurves.count(Qual) ? "UE_FLOAT_CURVE (or UE_VECTOR_CURVE / UE_COLOR_CURVE)"
+                              : AssetPaths.count(Qual) ? "UE_ASSET_AT" : nullptr)
+        { *Err = Qual + ": declared by UE_ASSET_DEFAULTS and by " + Other + "; keep one: both name one asset"; return false; }
 
     /* A UE_ASSET_AT whose class this mod cooks: the asset is an instance of the copy its own mod cooked, so the
        import's class check fails in game and the reference loads as null. Pinning the class to its owner with

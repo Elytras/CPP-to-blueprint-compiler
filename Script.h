@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -62,6 +63,7 @@ struct FPropertyDef
     std::string RepNotify;              // CPF_RepNotify: the function the client runs when the value arrives
     uint8 RepCondition = 0;             // CPF_Net: ELifetimeCondition
     bool bApiHidden = false;            // a C++ `private:` member: cooked as ever, left out of the editor API stub
+    int32 ArrayIndex = 0;               // a C array member's element (`ParamModes[1]`): its tag's ArrayIndex
 };
 
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);
@@ -97,6 +99,12 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked = false);
 
 /* The property as a tagged-property entry holding P.Default (its zero value when unset). */
 void WriteDefaultTag(FArc& Ar, const FPropertyDef& P);
+
+/* Fn on D and on every value inside it: a container's elements (removed ones too), a struct's members. */
+void ForEachValue(FDefaultValue& D, const std::function<void(FDefaultValue&)>& Fn);
+/* ForEachValue over each tag and its members: every object reference a tag list holds reaches Fn (a cook renumbering
+   or nulling FDefaultValue::Instanced ids). */
+void ForEachRef(std::vector<FPropertyDef>& Tags, const std::function<void(FDefaultValue&)>& Fn);
 /* P.Default alone, as a tag's value or a container element holds it: no tag around it. */
 void WriteDefaultValue(FArc& Ar, const FPropertyDef& P);
 /* The bytes a struct the engine serializes natively takes (FVector's three floats: 12, UE5's three doubles: 24), or 0

@@ -91,7 +91,7 @@ def native_classes():
     _NATIVE = {}
     folder = next((d for d in _ueapi_dirs() if os.path.exists(os.path.join(d, 'Engine.h'))), None)
     if not folder: return _NATIVE
-    decl = re.compile(r'^class (\w+)(?: : public (\w+))?\s*\{\s*public:\s*UE_CLASS\("(/Script/[^"]+)", "([^"]+)"\);', re.M)
+    decl = re.compile(r'^class (\w+)(?: : public (\w+)[^\n{]*)?\s*\{\s*public:\s*UE_CLASS\("(/Script/[^"]+)", "([^"]+)"\);', re.M)
     sub = re.compile(r'static constexpr const char\* (\w+)__UeSubobject = "(\S+) (\S+)";')
     cpp = {}
     for f in sorted(os.listdir(folder)):

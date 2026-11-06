@@ -80,6 +80,164 @@ def emit_enum(run, a):
     return o
 
 
+class AssetEmit:
+    """A standalone asset whose objects are all tags (a Cascade UParticleSystem) as a UE_ASSET_DEFAULTS block: each object
+    under it a UE_INSTANCED local, declared (outer first) before the first statement that points at it, then its own
+    tags. The asset's tags come last, so its `Emitters = {...}` pulls in the tree. An object nothing points at is
+    written too, except a distribution: DRG's cook keeps a baked one's object, which nothing reads. LODValidity is not
+    written: AssetGen derives it from the LOD levels."""
+    DERIVED = ('LODValidity',)
+
+    def __init__(s, run, a):
+        s.run, s.a, s.pkg = run, a, a.pkg
+        s.cx = Ctx(run, a)
+        s.cx.instanced, s.cx.all_instanced = s.instanced, True
+        s.lines, s.locals = [], {}
+
+    def member_dim(s, cls, name):
+        """The length of a tag's member as a C array on the class or a parent, or 0 for any other member."""
+        c = cls
+        while c:
+            n = s.run.api.member_dim(c, name)
+            if n: return n
+            c = s.run.api.bases.get(c)
+        return 0
+
+    def member(s, cls, name):
+        """A tag's member as UeApi spells it on the class or a parent: the tag holds the FName's first spelling, which
+        may differ in case (`Lifetime` for UParticleModuleLifetime's `LifeTime`)."""
+        c = cls
+        while c:
+            hit = s.run.api.members(c).get(name.lower())
+            if hit: return hit
+            c = s.run.api.bases.get(c)
+        return ident(name)
+
+    def enum_bytes(s, cls, t):
+        """An array of enum bytes (TArray<EObjectTypeQuery>) as its enumerators, or None. Its tag names no enum, so the
+        type is UeApi's; Values alone would write bare numbers, which C++ will not convert to the enum."""
+        if t['type'] != 'ArrayProperty' or t.get('inner') != 'ByteProperty': return None
+        c, ty = cls, None
+        while c and not ty: ty, c = s.run.api.member_type(c, t['name']), s.run.api.bases.get(c)
+        m = re.match(r'TArray<\s*(?:TEnumAsByte<\s*)?(E\w+)\s*>?\s*>$', ty or '')
+        b = bytes(t['value'])
+        n = struct.unpack_from('<i', b)[0]
+        if not m or not n: return None
+        e = m.group(1)
+        if len(b) == 4 + 8 * n:      # each its enumerator's FName (TEnumAsByte serializes so)
+            return '{%s}' % ', '.join('%s::%s' % (e, Values.name_at(None, s.pkg, b, 4 + 8 * k).split('::')[-1]) for k in range(n))
+        if len(b) == 4 + n:
+            return '{%s}' % ', '.join(s.cx.cenum_entry(e, x) or '(%s)%d' % (e, x) for x in b[4:])
+        return None
+
+    # Bools AssetGen starts at the editor's value when the source leaves them unset (Cascade.cpp kBoolStarts), each
+    # with its class default: a cooked module without the tag holds the class default, so the source must say it.
+    BOOL_STARTS = (('UParticleModuleRequired', 'bUseLegacyEmitterTime', 'true'),
+                   ('UParticleModuleAccelerationBase', 'bAlwaysInWorldSpace', 'false'))
+
+    def class_defaults(s, cls, tags, lhs):
+        chain, c = [], cls
+        while c: chain.append(c); c = s.run.api.bases.get(c)
+        have = {t['name'].lower() for t in tags}
+        for owner, member, default in s.BOOL_STARTS:
+            if owner in chain and member.lower() not in have: s.lines.append('%s%s = %s;' % (lhs, member, default))
+
+    def tags(s, i, lhs):
+        vals = Values(s.cx)     # its own: one mid-container (Emitters = {...}) writes elements whole
+        cls = s.run.types.cls(s.pkg, s.pkg.exports[i]['cls'], s.a)
+        tags = s.pkg.tags(i)
+        for t in tags:
+            if t['name'] in s.DERIVED: continue
+            # a C array's elements, a tag each by index (DistributionVectorParticleParameter::ParamModes[3])
+            dim = s.member_dim(cls, t['name'])
+            if not dim and (t.get('index') or sum(x['name'] == t['name'] for x in tags) > 1):
+                if not t.get('index'):
+                    s.cx.notes.append('%s: default %s not rendered (a C array UeApi does not declare)' % (s.a.path, t['name']))
+                continue
+            v = s.enum_bytes(cls, t) or vals.tag(s.pkg, t, None, s.a)
+            at = '[%d]' % t.get('index', 0) if dim else ''
+            if v is not None: s.lines += field_assigns(lhs + s.member(cls, t['name']) + at, v, partial=True)
+        s.class_defaults(cls, tags, lhs)
+
+    def instanced(s, i):
+        if i in s.locals: return s.locals[i]
+        e = s.pkg.exports[i]
+        o = e['outer'] - 1
+        outer = 'this' if o == s.a.export else s.instanced(o)
+        cls = s.run.types.cls(s.pkg, e['cls'], s.a)
+        local, n = ident(e['name']), 2
+        while local in s.locals.values() or local == 'this' or local.lower() in s.own_members():
+            local, n = '%s_%d' % (ident(e['name']), n), n + 1
+        s.locals[i] = local
+        s.lines.append('%s *%s = UE_INSTANCED(%s, %s, %s);' % (cls, local, cls, outer, B.cstring(e['name'])))
+        s.tags(i, local + '->')
+        return local
+
+    HANDLE = re.compile(r'FNiagaraEmitterHandle\((FGuid\([^)]*\)), ("[^"]*"|FName\(\)), (true|false), "([^"]*)", (\w+)\)')
+
+    def disabled_emitters(s):
+        """A Niagara system's disabled emitter, which the cook left out (its handle's Instance null), as a UE_INSTANCED
+        stand-in AssetGen leaves out again: its name, and the sim target and persistent IDs its compiled data kept
+        (UNiagaraSystem's EmitterCompiledData, after the tags), which AssetGen works out from it."""
+        pkg, i = s.pkg, s.a.export
+        at = next((k for k, l in enumerate(s.lines) if l.startswith('EmitterHandles = ')), None)
+        if pkg.class_of(i + 1) != 'NiagaraSystem' or at is None: return
+        b, o = bytes(pkg.blob(i)), pkg.tags(i).end + 4
+        if len(b) < o + 4: return
+        vals, kept, count = Values(s.cx), [], struct.unpack_from('<i', b, o)[0]
+        o += 4
+        for _ in range(count):
+            tags, o = vals.read_tags(pkg, b, o)
+            d = next((t for t in tags if t['name'] == 'DataSetCompiledData'), None)
+            inner = vals.read_tags(pkg, bytes(d['value']), 0)[0] if d else []
+            sim = next((vals.name_at(pkg, bytes(t['value']), 0) for t in inner if t['name'] == 'SimTarget'), '')
+            kept.append((sim.split('::')[-1], any(t['name'] == 'bRequiresPersistentIDs' and t['bool'] for t in inner)))
+        add, k = [], [0]
+
+        def stand_in(m):
+            n, k[0] = k[0], k[0] + 1
+            if m.group(3) != 'false' or m.group(5) != 'nullptr' or n >= len(kept): return m.group(0)
+            local, j = ident(m.group(4)), 2
+            while local in s.locals.values() or local.lower() in s.own_members(): local, j = '%s_%d' % (ident(m.group(4)), j), j + 1
+            s.locals[('disabled', n)] = local
+            add.append('UNiagaraEmitter *%s = UE_INSTANCED(UNiagaraEmitter, this, %s);' % (local, B.cstring(m.group(4) + '_Disabled')))
+            add.append('%s->UniqueEmitterName = %s;' % (local, B.cstring(m.group(4))))
+            if kept[n][0] and kept[n][0] != 'CPUSim': add.append('%s->SimTarget = ENiagaraSimTarget::%s;' % (local, kept[n][0]))
+            if kept[n][1]: add.append('%s->bRequiresPersistentIDs = true;' % local)
+            return m.group(0)[:-len('nullptr)')] + local + ')'
+        s.lines[at] = s.HANDLE.sub(stand_in, s.lines[at])
+        s.lines[at:at] = add
+
+    def own_members(s):
+        """The asset class's members (its bases' too), lowercased: a local of one's name would hide it, and
+        `SystemSpawnScript = SystemSpawnScript;` assign the local to itself."""
+        if not hasattr(s, '_own'):
+            s._own, c = set(), s.run.types.cls(s.pkg, s.pkg.exports[s.a.export]['cls'], s.a)
+            while c: s._own |= set(s.run.api.members(c)); c = s.run.api.bases.get(c)
+        return s._own
+
+    def emit(s):
+        a, pkg = s.a, s.pkg
+        o = Out(a)
+        s.tags(a.export, '')
+        s.disabled_emitters()
+        for i, e in enumerate(pkg.exports):
+            if i == a.export or i in s.locals or not e['outer']: continue
+            if pkg.class_of(i + 1).startswith('Distribution'): continue
+            s.instanced(i)
+        cls = s.run.types.cls(pkg, pkg.exports[a.export]['cls'], a)
+        o.header = ''.join([HEADER_BANNER % a.path, '#pragma once\n', ns_open(a.ns),
+                            'UE_ASSET_DEFAULTS(%s, %s) {\n' % (cls, a.cpp), ''.join('  %s\n' % l for l in s.lines), '}\n',
+                            # a name C++ cannot spell (P_Tri-Jaw_...) cooks under its own by the marker
+                            'static constexpr const char *%s__UeName = %s;\n' % (a.cpp, B.cstring(a.name)) if a.cpp != a.name else '',
+                            ns_close(a.ns)])
+        return o
+
+
+def emit_particles(run, a):
+    return AssetEmit(run, a).emit()
+
+
 def prop_decl(run, a, p, cur=None):
     return '%s %s' % (run.types.of(a.pkg, p, cur or a), ident(authored(p.name)))
 
@@ -1001,6 +1159,8 @@ def main():
     ap.add_argument('--mod', action='append', required=True)
     ap.add_argument('--names'); ap.add_argument('--raw'); ap.add_argument('--keep', action='append', default=[])
     ap.add_argument('--cook', action='append', default=[], help='<asset path>=<why>: ship that class cooked (UE_COOKED)')
+    ap.add_argument('--kinds', help='only these kinds, comma-separated (enum, struct, interface, class, widget, '
+                                    'particles); the others are neither written nor kept as cooked')
     args = ap.parse_args()
     mods = [tuple(m.split('=', 1)) for m in args.mod]
     model = Model(args.content, mods, args.names)
@@ -1009,11 +1169,13 @@ def main():
     run.cook = dict(c.split('=', 1) for c in args.cook)
     per_mod = defaultdict(list)
     raw = []
+    kinds = set(args.kinds.split(',')) if args.kinds else None
     for a in model.assets.values():
+        if kinds is not None and a.kind not in kinds: continue
         if a.path in run.keep or a.kind in ('raw', 'data'):
             raw.append(a); continue
         try:
-            o = {'enum': emit_enum, 'struct': emit_struct}.get(a.kind, emit_class)(run, a)
+            o = {'enum': emit_enum, 'struct': emit_struct, 'particles': emit_particles}.get(a.kind, emit_class)(run, a)
         except Exception as ex:
             import traceback; traceback.print_exc()
             run.notes.append('%s: not decompiled (%s: %s)' % (a.path, type(ex).__name__, ex))

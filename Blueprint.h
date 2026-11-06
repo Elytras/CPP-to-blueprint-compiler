@@ -317,8 +317,11 @@ public:
     bool WriteApiEnum(const std::string& OutDir, const std::vector<std::pair<std::string, int64>>& Enumerators,
                       std::string* Err) const;
 
-    /* Writes the package as one instance of Class (a data asset): a tag per AddVariable(), each holding its Default. */
+    /* Writes the package as one instance of Class (a data asset): a tag per AddVariable(), each holding its Default,
+       then AssetTail's bytes, what the class's native Serialize writes after its tags (a Niagara system's
+       EmitterCompiledData). */
     void FinishAsset(FIndex Class, FIndex ClassCdo);
+    std::function<void(FArc&)> AssetTail;
 
     /* Writes the package as one curve asset of Class (CurveFloat, CurveVector, CurveLinearColor) holding Curve's keys,
        the body a timeline track's own curve has. */

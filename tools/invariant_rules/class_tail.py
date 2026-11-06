@@ -57,7 +57,7 @@ def ueapi():
     if _API is not None: return _API
     _API, folder = {}, _ueapi_dir()
     if not folder: return _API
-    decl = re.compile(r'^class (\w+)(?: : public (\w+))?\s*\{\s*public:\s*UE_CLASS\("(/Script/[^"]+)", "([^"]+)"\);(.*?)^\};',
+    decl = re.compile(r'^class (\w+)(?: : public (\w+)[^\n{]*)?\s*\{\s*public:\s*UE_CLASS\("(/Script/[^"]+)", "([^"]+)"\);(.*?)^\};',
                       re.M | re.S)
     cpp = {}
     for f in sorted(os.listdir(folder)):

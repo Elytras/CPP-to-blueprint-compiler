@@ -22,6 +22,7 @@ from collections import defaultdict, OrderedDict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import invariants
+from uasset_io import fstring as read_fstring
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UEAPI = os.path.normpath(os.path.join(HERE, '..', '..', 'BpMods', 'UeApi'))
@@ -154,6 +155,14 @@ class Api:
         t = re.search(r'^\s+(?:UE_\w+\s+)*((?:class\s+)?[\w:<>,* ]+?)\s*\b%s(?:\[\d+\])?;' % re.escape(real), m.group(1), re.M)
         return t.group(1).replace('class ', '').strip() if t else None
 
+    def member_dim(s, cpp, name):
+        """The length of class cpp's C array member `name` (`ParamModes[3]`, the engine's name, any case), or 0."""
+        rel = s.headers.get(cpp)
+        body = re.search(r'\nclass %s\b[^{;]*\{(.*?)\n\};' % re.escape(cpp), s._text.get(rel, '') if rel else '', re.S)
+        real = s.members(cpp).get(name.lower())
+        m = body and real and re.search(r'\b%s\[(\d+)\];' % re.escape(real), body.group(1))
+        return int(m.group(1)) if m else 0
+
     def header_of(s, cpp):
         return s.headers.get(cpp.split('::')[-1])
 
@@ -179,8 +188,9 @@ class Mod:
 
 
 def classify(pkg):
-    """(kind, export index) of a package's main object: enum, struct, interface, class, widget, data (a data asset
-    instance of some class), or raw (textures, materials, fonts, sounds - kept as cooked)."""
+    """(kind, export index) of a package's main object: enum, struct, interface, class, widget, particles (a Cascade
+    UParticleSystem, every object of it tags), data (a data asset instance of some class), or raw (textures, materials,
+    fonts, sounds - kept as cooked)."""
     for i, e in enumerate(pkg.exports):
         if e['outer']: continue
         c = pkg.class_of(i + 1)
@@ -190,6 +200,7 @@ def classify(pkg):
             st = pkg.struct(i)
             if st.class_flags & CLASS_Interface: return 'interface', i
             return 'widget' if c == 'WidgetBlueprintGeneratedClass' else 'class', i
+        if c in ('ParticleSystem', 'NiagaraSystem'): return 'particles', i
     for i, e in enumerate(pkg.exports):
         if e['outer'] or e['name'].startswith('Default__'): continue
         if e['flags'] & 0x1 and pkg.class_of(i + 1).endswith('_C'): return 'data', i   # RF_Public, a BP class's object
@@ -278,13 +289,6 @@ class Model:
                 text, o = read_ftext(v, o)
                 out[k] = text
         return out
-
-
-def read_fstring(b, o):
-    n = struct.unpack_from('<i', b, o)[0]; o += 4
-    if n == 0: return '', o
-    if n > 0: return b[o:o + n - 1].decode('latin-1'), o + n
-    return b[o:o - 2 * n - 2].decode('utf-16-le'), o - 2 * n
 
 
 def read_ftext(b, o):

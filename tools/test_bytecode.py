@@ -2353,13 +2353,23 @@ for m in maps:
     want = {k: v for k, v in m.items() if v > 0}
     got = run(asset('RangeTest'), 'CopyPositive', self_vars=mine)[0]
     assert (got, mine['Positive'], mine['Scores']) == (len(want), want, m), (m, got, mine)
-proves('range-for-over.seen-remove-x', 'range-for-over.scores-remove-key')
+proves('range-for-over.seen-remove-x', 'range-for-over.scores-remove-key', 'changing-the-container.scores-remove-key',
+       'changing-the-container.items-other', 'changing-the-container.scores-other-1', 'changing-the-container.prune-scores',
+       'changing-the-container.dropall')
 warned = sorted(l.strip() for l in LOGS['RangeTest'].splitlines() if 'unsafe to mutate' in l)
 assert warned == sorted('warning: RangeTest::%s: unsafe to mutate iterated container (%s)' % w for w in (
     ('WarnRemove', 'Scores.Remove'), ('WarnByValue', 'Scores.Remove'), ('WarnStore', 'Scores[] ='), ('WarnSetAdd', 'Seen.Add'), ('WarnArrayAdd', 'Items.Add'),
-    ('WarnPassed', 'Prune()'), ('WarnPassed', 'Prune(Scores)'), ('WarnCalls', 'DropAll()'))), warned
+    ('WarnPassed', 'Prune()'), ('WarnPassed', 'Prune(Scores)'), ('WarnCalls', 'DropAll()'), ('WarnAssign', 'Items ='))), warned
+# An own method that changes only its own locals, or any own method under a walk of the caller's own local: no
+# warning (the list above is exact), and each runs as written.
+proves('changing-the-container.countmore-x')
+for a in arrays:
+    mine = range_self(Items=a)
+    assert run(asset('RangeTest'), 'CallsLocalOnly', self_vars=mine)[0] == len(a) * (len(a) + 1) and mine == range_self(Items=a), (a, mine)
+    mine = range_self(Items=a)
+    assert run(asset('RangeTest'), 'LocalWalk', self_vars=mine)[0] == sum(a) and mine == range_self(Items=a + a), (a, mine)
 print('ok  RangeTest: a change to the container a range-for walks is warned, and only that; another map of its type is'
-      ' changed directly  (%d cases)' % len(maps))
+      ' changed directly, and a callee\'s or the caller\'s own locals are not the walked container  (%d cases)' % (len(maps) + len(arrays)))
 
 
 def range_members():
@@ -4057,7 +4067,8 @@ def type_ue_name():
     """TypeUeName: `FTunRow__UeName = "TunRow"` beside a struct, and the same beside an enum, is the name it cooks
     under: its package, its object and every reference to it - a variable, a container, a replicated variable, an RPC's
     and a function's parameters, an enum default, the registry row. TypeUeNameOther imports both (UE_STRUCT_IN /
-    UE_ENUM_IN) by those names. A type with no marker keeps its C++ name, prefix and all (every other test)."""
+    UE_ENUM_IN) by those names. A type with no marker keeps its C++ name, prefix and all (every other test). The marker
+    beside a UE_ASSET_DEFAULTS asset names it so: P_Tun_Burst cooks as P_Tun-Burst, and the class's default points there."""
     import dumpexp
     base, other = asset('TypeUeName'), asset('TypeUeNameOther')
     here = os.path.dirname(base)
@@ -4075,9 +4086,15 @@ def type_ue_name():
                 'TunMood::Angry'} <= set(names), b
         assert not [n for n in names if 'FTunRow' in n or 'ETunMood' in n], b
     assert run(base, 'Call')[0] == 5
-    refused('TypeUeNameNone', '  int32 X;\n', 'FNothing__UeName: names no struct or enum declared here',
+    proves('names.asset-ue-name')
+    assert os.path.exists(os.path.join(here, 'P_Tun-Burst.uasset')) and not os.path.exists(os.path.join(here, 'P_Tun_Burst.uasset'))
+    assert '/Game/_ElytrasMods/TypeUeName/P_Tun-Burst.P_Tun-Burst' in rows, rows
+    assert {'/Game/_ElytrasMods/TypeUeName/P_Tun-Burst', 'P_Tun-Burst'} <= set(dumpexp.load(base)[3])
+    assert not [n for n in dumpexp.load(base)[3] if 'P_Tun_Burst' in n]
+    keeps_invariants(os.path.join(here, 'P_Tun-Burst'))
+    refused('TypeUeNameNone', '  int32 X;\n', 'FNothing__UeName: names no struct, enum or asset declared here',
             'static constexpr const char *FNothing__UeName = "Nothing";\n')
-    print('ok  TypeUeName: a struct and an enum cook, and are named by this mod and another, under their __UeName names')
+    print('ok  TypeUeName: a struct, an enum and an asset cook, and are named by this mod and another, under their __UeName names')
 
 
 type_ue_name()
@@ -4404,6 +4421,60 @@ def parent_call():
     flags = lambda b, fn: re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', b, exports_of(b).index(fn))).group(1)
     assert flags(test, 'Bump') == flags(base, 'Bump') and flags(test, 'ReceiveBeginPlay') == flags(base, 'ReceiveBeginPlay') == '0x8080800'
     print('ok  SuperTest: Base::Method() is the parent\'s body, expanded or a final call; overrides bind to it')
+
+
+def engine_parent_call():
+    """EngineParentCall: a qualified call to an ancestor above the direct parent runs that ancestor's own function, past
+    every override between, and never the caller's own by name (that would re-enter, forever). A function outside the
+    mod (the engine's, a cooked game Blueprint's) runs as a recorder of which one was called; the mod's own run.
+    - EngineParentCall: `AActor::ReceiveBeginPlay()` past EpcBase's: the engine's, once, and Count 5 -> 15.
+    - EpcSkip, past EpcMid (which adds 100 per step): EpcBase's ReceiveBeginPlay, Bump (its body copied in) and its
+      noinline Slow (a final call), each as C++ runs them.
+    - EpcGame, a child of the cooked BP_Spider_RadiationCloud: BP_Damage_Cloud_Base's ReceiveBeginPlay, and not
+      RadiationCloud's own."""
+    import runscript
+    folder = os.path.dirname(asset('EngineParentCall'))
+    at = lambda name: os.path.join(folder, name)
+
+    def outside(cls, fn, chain):
+        """Runs cls's fn on Count 5 with each final call it makes out of the mod recorded; (fields, result, calls)."""
+        paths, calls = import_paths(cls), []
+        w = dump('walkscript.py', cls, exports_of(cls).index(fn))
+        imps = {int(i) for i in re.findall(r'FinalFunction\s+imp\[(\d+)\]', w)
+                if not paths[int(i)].startswith('/Game/_ElytrasMods/')}
+        for i in imps: runscript.MATH[cls, i] = (lambda p: lambda *a: calls.append(p))(paths[i])
+        try:
+            fields = {'Count': 5}
+            got = run_as(chain, fn, fields) if chain else runscript.run(cls, fn, fields)[0]
+        finally:
+            for i in imps: del runscript.MATH[cls, i]
+        return fields, got, calls
+
+    fields, _, calls = outside(at('EngineParentCall'), 'ReceiveBeginPlay', [at('EngineParentCall'), at('EpcBase')])
+    assert calls == ['/Script/Engine.Actor:ReceiveBeginPlay'] and fields['Count'] == 15, (calls, fields)
+
+    class Base:                                   # EngineParentCall.cpp's EpcBase and EpcSkip, as Python
+        def __init__(s, Count): s.Count = Count
+        def ReceiveBeginPlay(s): s.Count = 1
+        def Bump(s, By): s.Count += By; return s.Count
+        Slow = Bump
+
+    class Skip(Base):                             # EpcMid's versions are never reached
+        def ReceiveBeginPlay(s): Base.ReceiveBeginPlay(s); s.Count += 10
+        def Bump(s, By): return Base.Bump(s, By) + 1000
+        def Slow(s, By): return Base.Slow(s, By) + 1000
+
+    chain = [at('EpcSkip'), at('EpcMid'), at('EpcBase')]
+    for fn, args in (('ReceiveBeginPlay', {}), ('Bump', {'By': 3}), ('Slow', {'By': 2})):
+        fields, obj = {'Count': 5}, Skip(5)
+        got, want = run_as(chain, fn, fields, **args), getattr(obj, fn)(**args)
+        assert (got in (None, 0) if want is None else got == want) and fields['Count'] == obj.Count, (fn, got, want, fields)
+
+    fields, _, calls = outside(at('EpcGame'), 'ReceiveBeginPlay', None)
+    want = '/Game/Enemies/BaseItems/BP_Damage_Cloud_Base.BP_Damage_Cloud_Base_C:ReceiveBeginPlay'
+    assert calls == [want] and fields['Count'] == 15, (calls, fields)
+    print("ok  EngineParentCall: Ancestor::Fn() runs that ancestor's function past the overrides between: the engine's, "
+          "a mod class's, a cooked game Blueprint's")
 
 
 def pure_virtual():
@@ -4882,6 +4953,651 @@ def static_assets():
         (MOD + 'EDefMood.EDefMood', 'UserDefinedEnum'), (MOD + 'MD_Plain.MD_Plain', 'UMoodDef_C'), (MOD + 'MD_Calm.MD_Calm', 'UMoodDef_C'),
         (MOD + 'MD_Big.MD_Big', 'UMoodDef_C'), (MOD + 'ED_AssetTest.ED_AssetTest', 'EnemyDescriptor')}, ar
     print('ok  AssetTest: the asset registry lists every asset with its class')
+
+
+def asset_defaults():
+    """AssetDefaults: UE_ASSET_DEFAULTS cooks an asset as a braced one is, and each UE_INSTANCED of its block as an export
+    under its outer (the asset, or another such object), RF_Transactional as the cook writes a particle system's
+    modules; a default pointing at one points at its export."""
+    import invariants
+    folder = os.path.dirname(asset('AssetDefaults'))
+    mod = '/Game/_ElytrasMods/AssetDefaults/'
+    p = invariants.Package(os.path.join(folder, 'AD_Held'))
+    proves('objects-inside-an.ue-asset-defaults-uholder-ad')
+    rows = [(e['name'], p.class_of(i + 1), e['flags'] & 0xF) for i, e in enumerate(p.exports)]
+    assert rows[0] == ('AD_Held', 'UHolder_C', 0xB), rows                 # Public | Standalone | Transactional
+    outer = {e['name']: p.exports[e['outer'] - 1]['name'] if e['outer'] > 0 else None for e in p.exports}
+    assert outer == {'AD_Held': None, 'A': 'AD_Held', 'B': 'AD_Held', 'Impulse': 'A'}, outer
+    assert sorted(r[1:] for r in rows[1:]) == [('DamageImpulse', 0x8), ('DotStatusEffectItem', 0x8),
+                                               ('StatChangeStatusEffectItem', 0x8)], rows
+    held = tag_values(p, 0, p.tags(0))
+    assert held == {'Items': [mod + 'AD_Held.AD_Held:A', mod + 'AD_Held.AD_Held:B'], 'Inner': mod + 'AD_Held.AD_Held:A',
+                    'Scale': 2.5}, held
+    proves('objects-inside-an.udotstatuseffectitem-a-ue')
+    a = next(i for i, e in enumerate(p.exports) if e['name'] == 'A')
+    assert tag_values(p, a, p.tags(a)) == {'OverrideDamageImpulse': True,
+                                            'DamageImpulseOverride': mod + 'AD_Held.AD_Held:A:Impulse'}, p.tags(a)
+    assert ('/Game/_ElytrasMods/AssetDefaults/AD_Held.AD_Held', 'UHolder_C') in registry_rows(registry_of('AssetDefaults'))
+    keeps_invariants(p.base)
+    proves('objects-inside-an.namespace-folder-ue-asset')
+    deep = invariants.Package(os.path.join(folder, 'Folder', 'AD_Deep'))
+    assert [e['name'] for e in deep.exports] == ['AD_Deep'] and tag_values(deep, 0, deep.tags(0)) == {'Scale': 4.0}
+    proves('objects-inside-an.uholder-picked-ad-held')
+    user = invariants.Package(os.path.join(folder, 'AssetDefaults'))
+    cdo = next(i for i, e in enumerate(user.exports) if e['name'] == 'Default__AssetDefaults_C')
+    assert tag_values(user, cdo, user.tags(cdo)) == {'Picked': mod + 'AD_Held.AD_Held', 'Deep': mod + 'Folder/AD_Deep.AD_Deep'}
+    print('ok  AssetDefaults: an asset of statements holds objects of its own')
+
+
+def asset_defaults_refusals():
+    """UE_ASSET_DEFAULTS refuses an asset two declarations cook at one path, and an object made under anything but the
+    asset or another of its objects."""
+    hold = 'class UHold : public UPrimaryDataAsset {\npublic:\n  UObject *Inner = nullptr;\n};\n'
+    proves('objects-inside-an.ue-asset-defaults-uhold-ad')
+    refused('AdTwice', '', 'declared by UE_ASSET_DEFAULTS and with braces',
+            after=hold + 'UE_ASSET_DEFAULTS(UHold, AD_X) { Inner = nullptr; }\nUHold AD_X = {};\n')
+    refused('AdClash', '', 'AdClash and AdClash would both be cooked as', after=hold + 'UE_ASSET_DEFAULTS(UHold, AdClash) { Inner = nullptr; }\n')
+    proves('objects-inside-an.ue-instanced-udamageimpulse')
+    refused('AdOuter', '', "UE_INSTANCED's outer is `this`",
+            after=hold + 'UE_ASSET_DEFAULTS(UHold, AD_Y) { Inner = UE_INSTANCED(UDamageImpulse, nullptr, "I"); }\n')
+    proves('objects-inside-an.ue-asset-defaults-uhold-ad')
+    refused('AdCurve', '', 'C_X: declared by UE_ASSET_DEFAULTS and by UE_FLOAT_CURVE',
+            after='UE_FLOAT_CURVE(C_X, (0, 0), (1, 2));\nUE_ASSET_DEFAULTS(UCurveFloat, C_X) {}\n')
+    refused('AdAt', '', 'C_Y: declared by UE_ASSET_DEFAULTS and by UE_ASSET_AT',
+            after='UE_ASSET_AT(::UCurveFloat, C_Y, "/Game/Elsewhere/C_Y.C_Y");\nUE_ASSET_DEFAULTS(UCurveFloat, C_Y) {}\n')
+    print('ok  AssetDefaults refusals')
+
+
+def particle_tables(p, name):
+    """Each raw distribution of the export named name, as {member: its tags (tag_values)}, its Table's float values
+    rounded to 4 places."""
+    i = next(k for k, e in enumerate(p.exports) if e['name'] == name)
+    out = {}
+    for k, v in tag_values(p, i, p.tags(i)).items():
+        if isinstance(v, dict) and 'Table' in v:
+            v['Table']['Values'] = [round(f, 4) for f in v['Table']['Values']]
+            out[k] = v
+    return out
+
+
+def baked(op, values):
+    """The table FRawDistribution::Initialize leaves for a Constant or Uniform distribution (Distributions.cpp 109-160,
+    613-679), written independently of Cascade.cpp. Their input range is [0, 0], so the 128 samples BuildLookupTable
+    takes are equal and OptimizeLookupTable keeps one: EntryCount 1, TimeScale and TimeBias 0. op 1 (RDO_None) keeps
+    the entry's first ValuesPerEntry values (the stride); op 2 (RDO_Random) keeps min and max, the stride twice that,
+    SubEntryStride the count of one. Only what differs from zero is a tag, as the cook writes it."""
+    t = dict(Values=[round(f, 4) for f in values], Op=op, EntryCount=1, EntryStride=len(values))
+    if op != 1: t['SubEntryStride'] = len(values) // 2
+    return t
+
+
+LINEAR, AUTO, CONSTANT, USER, BREAK, CLAMPED = range(6)      # EInterpCurveMode
+
+
+def curve_baked(kind, points, looped=False, offset=0.0, lock=0, extremes=False):
+    """What FRawDistribution*::Initialize leaves for a curve distribution, written from the engine source independently
+    of Cascade.cpp, as the raw distribution's tags (as tag_values reads them). kind is 'float' (ConstantCurve),
+    'float2' (FloatUniformCurve: min, max), 'vector' (VectorConstantCurve, lock its LockedAxes) or 'two'
+    (VectorUniformCurve, extremes its bUseExtremes); points are (InVal, OutVal components, mode). The editor's
+    AutoSetTangents (InterpCurve.h 618-683, tension 0, stationary ends) sets the tangents first, as it does on every
+    edit. Then BuildLookupTable samples the curve 128 times over its keys' span (Distributions.cpp 109-160), and
+    OptimizeLookupTable keeps the fewest samples, a power of two, within 0.05 of those (613-679). Worked in double, so
+    compare it with close(), not ==."""
+    n, last = len(points), len(points) - 1
+    pts = [dict(t=float(t), v=[float(x) for x in v], m=m, at=[0.0] * len(v), lt=[0.0] * len(v)) for t, v, m in points]
+    width = 1 if kind == 'float' else 2 if kind == 'float2' else 3 if kind == 'vector' else 6
+
+    def is_curve(pt): return pt['m'] in (AUTO, USER, BREAK, CLAMPED)
+
+    def clamp_tangent(pv, pt, cv, ct, nv, nt):     # ClampFloatTangent, UnrealMath.cpp 2552-2620
+        pn, pc, cn = max(1e-4, nt - pt), max(1e-4, ct - pt), max(1e-4, nt - ct)
+        dn, dc, dcn = nv - pv, cv - pv, nv - cv
+        if (dc >= 0 and dcn <= 0) or (dc <= 0 and dcn >= 0): return 0.0
+        tan = dn / pn
+        alpha = dc / dn
+        lower = lambda a: dn / pn + (dc / pc - dn / pn) * a
+        upper = lambda a: dn / pn + (dcn / cn - dn / pn) * a
+        pick = min if dn > 0 else max
+        if alpha < 0.333: tan = pick(tan, lower(1 - alpha / 0.333))
+        if alpha > 1 - 0.333: tan = pick(tan, upper((alpha - (1 - 0.333)) / 0.333))
+        return tan
+
+    for i, pt in enumerate(pts):
+        prev = pts[(last if looped else 0) if i == 0 else i - 1]
+        nxt = pts[(0 if looped else last) if i == last else i + 1]
+        if pt['m'] in (AUTO, CLAMPED):
+            if i == 0 or (i == last and not looped):
+                tan = [0.0] * width
+            elif is_curve(prev):
+                pt_ = pt['t'] - offset if looped and i == 0 else prev['t']
+                nt = pt['t'] + offset if looped and i == last else nxt['t']
+                if pt['m'] == CLAMPED:
+                    tan = [clamp_tangent(prev['v'][k], pt_, pt['v'][k], pt['t'], nxt['v'][k], nt) for k in range(width)]
+                else:
+                    tan = [((pt['v'][k] - prev['v'][k]) + (nxt['v'][k] - pt['v'][k])) / max(1e-4, nt - pt_) for k in range(width)]
+            else:
+                pt['at'], pt['lt'] = list(prev['at']), list(prev['lt'])
+                continue
+            pt['at'], pt['lt'] = list(tan), list(tan)
+        elif pt['m'] == LINEAR:
+            pt['at'] = pt['lt'] = [nxt['v'][k] - pt['v'][k] for k in range(width)]
+        elif pt['m'] == CONSTANT:
+            pt['at'] = pt['lt'] = [0.0] * width
+
+    def cubic(p0, t0, p1, t1, a):
+        a2, a3 = a * a, a * a * a
+        return (2 * a3 - 3 * a2 + 1) * p0 + (a3 - 2 * a2 + a) * t0 + (a3 - a2) * t1 + (-2 * a3 + 3 * a2) * p1
+
+    def evaluate(t):                                # FInterpCurve::Eval, InterpCurve.h 289-352
+        if not n: return [0.0] * width
+        if t < pts[0]['t']: return list(pts[0]['v'])
+        i = max(k for k in range(n) if pts[k]['t'] <= t)
+        if i == last:
+            if not looped: return list(pts[last]['v'])
+            if t >= pts[last]['t'] + offset: return list(pts[0]['v'])
+        a, b = pts[i], pts[0 if (looped and i == last) else i + 1]
+        diff = offset if (looped and i == last) else b['t'] - a['t']
+        if diff > 0 and a['m'] != CONSTANT:
+            al = (t - a['t']) / diff
+            if a['m'] == LINEAR: return [a['v'][k] + (b['v'][k] - a['v'][k]) * al for k in range(width)]
+            return [cubic(a['v'][k], a['lt'][k] * diff, b['v'][k], b['at'][k] * diff, al) for k in range(width)]
+        return list(a['v'])
+
+    def bounds():                                   # FInterpCurve::CalcBounds, InterpCurve.h 686-712; FindBounds
+        if not n: return [0.0] * width, [0.0] * width
+        lo, hi = list(pts[0]['v']), list(pts[0]['v'])
+        for i in range(n if looped and n > 1 else n - 1):
+            a, b = pts[i], pts[(i + 1) % n]
+            for k in range(width):
+                s0, e0 = a['v'][k], b['v'][k]
+                mn, mx = min(s0, e0), max(s0, e0)
+                if is_curve(a):
+                    d = b['t'] - a['t']
+                    st, et = a['lt'][k] * d, b['at'][k] * d
+                    qa = 6 * s0 + 3 * st + 3 * et - 6 * e0
+                    qb = -6 * s0 - 4 * st - 2 * et + 6 * e0
+                    disc = qb * qb - 4 * qa * st
+                    if disc > 0 and abs(qa) > 1e-8:
+                        for x in ((-qb + disc ** 0.5) / (2 * qa), (-qb - disc ** 0.5) / (2 * qa)):
+                            if a['t'] < a['t'] + x * d < b['t']:
+                                y = cubic(s0, st, e0, et, x)
+                                mn, mx = min(mn, y), max(mx, y)
+                lo[k], hi[k] = min(lo[k], mn), max(hi[k], mx)
+        return lo, hi
+
+    def locked(v):                                  # EDVLF_XY, XZ, YZ, XYZ
+        x, y, z = v
+        return [[x, y, z], [x, x, z], [x, y, x], [x, y, y], [x, x, x]][lock]
+
+    if kind == 'float2':
+        one = n == 1 and pts[0]['v'][0] == pts[0]['v'][1]
+        op, per = (1 if one else 2), 1
+    elif kind == 'two':
+        one = n == 1 and pts[0]['v'][:3] == pts[0]['v'][3:]
+        op, per = (1 if one else 3 if extremes else 2), 3
+    else:
+        op, per = 1, width
+
+    def entry(t):                                   # InitializeRawEntry: a vector constant curve's value is locked
+        v = evaluate(t)
+        return locked(v) if kind == 'vector' else v
+
+    stride = per * (1 if op == 1 else 2)
+    lo_in, hi_in = (min(q['t'] for q in pts), max(q['t'] for q in pts)) if n else (0.0, 0.0)
+    step = (hi_in - lo_in) / 127
+
+    def table(count, sample):                       # sample(t) -> the stride's values
+        sc = (hi_in - lo_in) / (count - 1) if count > 1 else 0.0
+        return dict(count=count, scale=(1 / sc if sc > 0 else 0.0), bias=lo_in,
+                    values=[x for i in range(count) for x in sample(lo_in + i * sc)])
+
+    def lookup(tb, t):                              # FDistributionLookupTable::GetEntry, lerped
+        x = max(0.0, (t - tb['bias']) * tb['scale'])
+        i, a = int(x), x - int(x)
+        e1, e2 = min(i, tb['count'] - 1) * stride, min(i + 1, tb['count'] - 1) * stride
+        return [tb['values'][e1 + k] + (tb['values'][e2 + k] - tb['values'][e1 + k]) * a for k in range(stride)]
+
+    full = dict(count=128, scale=(1 / step if step > 0 else 0.0), bias=lo_in,
+                values=[x for i in range(128) for x in entry(lo_in + i * step)[:stride]])
+    best = full
+    count = 1
+    while count < 128:
+        tb = table(count, lambda t: lookup(full, t))
+        err, t = 0.0, lo_in
+        for _ in range(128):
+            a, b = lookup(full, t), lookup(tb, t)
+            for sub in range(stride // per):
+                d = sum((a[sub * per + k] - b[sub * per + k]) ** 2 for k in range(per)) ** 0.5
+                err = max(err, d)
+            t += step
+        if err < 0.05:
+            best = tb
+            break
+        count <<= 1
+
+    tags = dict(TimeScale=best['scale'], TimeBias=best['bias'], Values=best['values'], Op=op,
+                EntryCount=best['count'], EntryStride=stride, SubEntryStride=0 if op == 1 else per)
+    out = {}
+    lo, hi = bounds()
+    if kind == 'float':
+        out.update(MinValue=lo[0], MaxValue=hi[0])
+    elif kind == 'float2':
+        out.update(MinValue=min(lo), MaxValue=max(hi))
+    elif kind == 'vector':
+        lo, hi = locked(lo), locked(hi)
+        out.update(MinValue=min(lo), MaxValue=max(hi), MinValueVec=tuple(lo), MaxValueVec=tuple(hi))
+    else:
+        out.update(MinValue=min(lo + hi), MaxValue=max(lo + hi),
+                   MinValueVec=tuple(min(lo[k], hi[k]) for k in range(3)), MaxValueVec=tuple(max(lo[3 + k], hi[3 + k]) for k in range(3)))
+    out = {k: v for k, v in out.items() if v != 0 and v != (0.0, 0.0, 0.0)}
+    out['Distribution'] = None
+    out['Table'] = {k: v for k, v in tags.items() if k == 'Values' or v != 0}
+    return out
+
+
+def close(a, b, tol=1e-3):
+    """a and b equal, their floats within tol, through dicts, lists and tuples: a cooked float32 against a double."""
+    if isinstance(a, dict): return isinstance(b, dict) and a.keys() == b.keys() and all(close(a[k], b[k], tol) for k in a)
+    if isinstance(a, (list, tuple)): return type(a) == type(b) and len(a) == len(b) and all(close(x, y, tol) for x, y in zip(a, b))
+    if isinstance(a, float) or isinstance(b, float): return isinstance(b, (int, float)) and abs(a - b) <= tol
+    return a == b
+
+
+def particle_curves():
+    """ParticleCurves: each curve distribution class baked into the table the cook leaves, against curve_baked: a ramp
+    (two entries), a lone point away from 0 (TimeBias), an empty curve (zero), a uniform curve, auto tangents the
+    source left 0, clamped ones, steps (all 128 samples kept), a looped curve, extremes."""
+    import invariants
+    p = invariants.Package(os.path.join(os.path.dirname(asset('ParticleCurves')), 'P_Curves'))
+    proves('particle-systems.spawn-rate-distribution-ramp')
+    assert not [e['name'] for i, e in enumerate(p.exports) if p.class_of(i + 1).startswith('Distribution')], p.exports
+    got = {m: v for name in ('Sp', 'Life', 'Sz', 'Vel', 'Col') for m, v in particle_tables(p, name).items()}
+    want = dict(
+        Rate=curve_baked('float', [(0, [0], LINEAR), (1, [10], LINEAR)]),
+        RateScale=curve_baked('float', [(0.5, [3], LINEAR)]),
+        BurstScale=curve_baked('float', []),
+        LifeTime=curve_baked('float2', [(0, [1, 2], LINEAR), (2, [3, 6], LINEAR)]),
+        StartSize=curve_baked('vector', [(0, [0, 0, 0], AUTO), (0.5, [10, 20, 10], AUTO), (1, [0, 40, 30], AUTO)], lock=1),
+        StartVelocity=curve_baked('two', [(0.5, [1, 2, 3, 4, 5, 6], LINEAR)], extremes=True),
+        StartVelocityRadial=curve_baked('float', [(0, [0], CLAMPED), (1, [1], CLAMPED), (2, [4], CLAMPED), (3, [6], CLAMPED)]),
+        StartColor=curve_baked('vector', [(0, [1, 0, 0], CONSTANT), (1, [0, 1, 0], CONSTANT), (2, [0, 0, 1], CONSTANT)]),
+        StartAlpha=curve_baked('float', [(0, [0], AUTO), (0.5, [1], AUTO), (1, [0.5], AUTO)], looped=True, offset=1.0))
+    # Hand checks on the oracle: the ramp is two entries a second apart; the lone point a TimeBias, no TimeScale; the
+    # steps keep every sample; the uniform curve's entries hold min then max.
+    assert close(want['Rate']['Table'], dict(TimeScale=1.0, Values=[0.0, 10.0], Op=1, EntryCount=2, EntryStride=1)), want['Rate']
+    assert close(want['RateScale']['Table'], dict(TimeBias=0.5, Values=[3.0], Op=1, EntryCount=1, EntryStride=1)), want['RateScale']
+    assert want['StartColor']['Table']['EntryCount'] == 128, want['StartColor']
+    assert close(want['LifeTime']['Table'], dict(TimeScale=0.5, Values=[1.0, 2.0, 3.0, 6.0], Op=2, EntryCount=2,
+                                                 EntryStride=2, SubEntryStride=1)), want['LifeTime']
+    for m in want:
+        assert close(got.get(m), want[m]), (m, got.get(m), want[m])
+    # A BeamNoise module's NoiseScale, left unset, starts as the editor starts it: a ConstantCurve without keys, zero.
+    proves('particle-systems.spawn-burstscale')
+    assert close(particle_tables(p, 'Noise')['NoiseScale'], curve_baked('float', [])), particle_tables(p, 'Noise')
+    assert 'NoiseScale' not in LOGS['ParticleCurves'], LOGS['ParticleCurves']
+    # P_Live: what the engine cannot bake (CanBeBaked false) stays a live object, pointed at, with no table.
+    proves('particle-systems.spawn-rate-distribution-c')
+    live = invariants.Package(os.path.join(os.path.dirname(asset('ParticleCurves')), 'P_Live'))
+    spawn = particle_tables(live, 'Sp')
+    assert sorted(spawn) == ['BurstScale'], spawn             # Rate and RateScale keep no table
+    raw = tag_values(live, live.find('Sp'), live.tags(live.find('Sp')))
+    assert raw['Rate'] == {'Distribution': live.path(live.find('Param') + 1)}, raw
+    assert raw['RateScale'] == {'Distribution': live.path(live.find('Unbaked') + 1)}, raw
+    assert live.class_of(live.find('Param') + 1) == 'DistributionFloatParticleParameter'
+    param = tag_values(live, live.find('Param'), live.tags(live.find('Param')))
+    assert param == dict(ParameterName='Strength', MaxOutput=40.0), param
+    unbaked = tag_values(live, live.find('Unbaked'), live.tags(live.find('Unbaked')))
+    assert unbaked == dict(Constant=2.0, bCanBeBaked=False), unbaked
+    # a C array member's elements: a tag each, at its index (FPropertyTag::ArrayIndex), named as the member
+    proves('particle-systems.c-array-element')
+    import struct
+    modes = [(t['index'], live.names[struct.unpack_from('<i', bytes(t['value']))[0]])
+             for t in live.tags(live.find('VParam')) if t['name'] == 'ParamModes']
+    assert modes == [(0, 'DistributionParamMode::DPM_Abs'), (2, 'DistributionParamMode::DPM_Direct')], modes
+    keeps_invariants(live.base)
+    keeps_invariants(p.base)
+    print('ok  ParticleCurves: curve distributions baked as the cook bakes them')
+
+
+def particle_bake():
+    """ParticleBake: each raw distribution pointing at a Constant or Uniform object is baked as the cook bakes it,
+    MinValue / MaxValue (and the vector's MinValueVec / MaxValueVec) filled, Distribution null, the object left out of
+    the package; one object two raw distributions share is baked into both. A raw distribution left unset gets its
+    module's starting value (InitializeDefaults), baked."""
+    import invariants
+    p = invariants.Package(os.path.join(os.path.dirname(asset('ParticleBake')), 'P_Bake'))
+    proves('particle-systems.life-lifetime-distribution-span')
+    assert not [e['name'] for i, e in enumerate(p.exports) if p.class_of(i + 1).startswith('Distribution')], p.exports
+    color = particle_tables(p, 'Color')
+    # Control: P_CAretakerAoE_ElectricutionAttack's ParticleModuleColor_0 as DRG cooked it, Values [0, 41.67, 500].
+    assert color['StartColor'] == dict(MaxValue=500.0, MinValueVec=(0.0, 41.66999816894531, 500.0),
+                                       MaxValueVec=(0.0, 41.66999816894531, 500.0), Distribution=None,
+                                       Table=baked(1, [0.0, 41.67, 500.0])), color
+    assert color['StartAlpha'] == dict(MinValue=1.0, MaxValue=1.0, Distribution=None, Table=baked(1, [1.0])), color
+    # Control: P_electric_arc's ParticleModuleLifetime_1, Uniform 0.5 to 1.15: Values [0.5, 1.15], Op 2, stride 2, sub 1.
+    life = particle_tables(p, 'Life')['LifeTime']
+    assert life == dict(MinValue=0.5, MaxValue=1.149999976158142, Distribution=None, Table=baked(2, [0.5, 1.15])), life
+    # Control: P_electric_arc's ParticleModuleSize_0, Uniform (1,1,1) to (3,3,3): Op 2, stride 6, sub 3.
+    size = particle_tables(p, 'Size')['StartSize']
+    assert size == dict(MinValue=1.0, MaxValue=3.0, MinValueVec=(1.0, 1.0, 1.0), MaxValueVec=(3.0, 3.0, 3.0),
+                        Distribution=None, Table=baked(2, [1, 1, 1, 3, 3, 3])), size
+    spawn = particle_tables(p, 'Spawn')
+    proves('particle-systems.spawn-rate-distribution-three')
+    assert spawn['Rate']['Table'] == spawn['RateScale']['Table'] == baked(1, [3.0]), spawn
+    proves('particle-systems.spawn-burstscale')
+    assert spawn['BurstScale'] == dict(MinValue=1.0, MaxValue=1.0, Distribution=None, Table=baked(1, [1.0])), spawn
+    assert particle_tables(p, 'Required')['SpawnRate']['Table'] == baked(1, [0.0])
+    keeps_invariants(p.base)
+    print('ok  ParticleBake: distributions baked as the cook bakes them')
+
+
+def particle_lod_validity():
+    """ParticleLod: each module's LODValidity is the bits of the LOD levels naming it, across emitters; a LOD level's
+    Level is its place in LODLevels (0, the default, is no tag); a module AssetGen has no starting values for, left
+    unset, warns."""
+    import invariants
+    p = invariants.Package(os.path.join(os.path.dirname(asset('ParticleLod')), 'P_Lod'))
+    tags = {e['name']: tag_values(p, i, p.tags(i)) for i, e in enumerate(p.exports)}
+    proves('particle-systems.a-lodlevels-a0-a1')
+    got = {m: tags[m].get('LODValidity') for m in ('ReqA', 'SpawnA', 'Near', 'ReqB', 'SpawnB0', 'SpawnB1', 'Fall')}
+    assert got == dict(ReqA=3, SpawnA=3, Near=3, ReqB=3, SpawnB0=1, SpawnB1=2, Fall=1), got
+    assert [tags[l].get('Level') for l in ('A0', 'A1', 'B0', 'B1')] == [None, 1, None, 1], tags
+    assert 'left unset' not in LOGS['ParticleLod'], LOGS['ParticleLod']      # Fall starts as the editor starts it
+    keeps_invariants(p.base)
+    print('ok  ParticleLod: LODValidity and Level as the editor keeps them')
+
+
+def particle_refusals():
+    """A particle system the engine would assert on or patch at load is refused, saying what; so is a distribution
+    class AssetGen does not bake."""
+    def system(mod, body, dists='{0.0f}'):
+        return ('UE_ASSET_DEFAULTS(UParticleSystem, P_%s) {\n'
+                '  UParticleSpriteEmitter *E = UE_INSTANCED(UParticleSpriteEmitter, this, "E");\n'
+                '  UParticleLODLevel *L = UE_INSTANCED(UParticleLODLevel, E, "L");\n'
+                '  UParticleModuleRequired *Req = UE_INSTANCED(UParticleModuleRequired, this, "Req");\n'
+                '  UParticleModuleSpawn *Sp = UE_INSTANCED(UParticleModuleSpawn, this, "Sp");\n'
+                '  L->RequiredModule = Req;\n  L->SpawnModule = Sp;\n  E->LODLevels = {L};\n  Emitters = {E};\n'
+                '  LODDistances = %s;\n%s}\n' % (mod, dists, body))
+    proves('particle-systems.loddistances')
+    refused('PrNoSpawn', '', 'E LOD 0: has no SpawnModule', after=system('NoSpawn', '  L->SpawnModule = nullptr;\n'))
+    refused('PrLods', '', "has 1 LOD levels and the system's LODDistances 2", after=system('Lods', '', '{0.0f, 1000.0f}'))
+    refused('PrLevel', '', 'its Level is 1', after=system('Level', '  L->Level = 1;\n'))
+    refused('PrSettings', '', 'LODSettings has 2 entries and LODDistances 1',
+            after=system('Settings', '  LODSettings = {FParticleSystemLOD(), FParticleSystemLOD()};\n'))
+    proves('particle-systems.c-constantcurve-points-1-0f')
+    refused('PrOrder', '', "Rate is C, and its ConstantCurve's point 1 has a smaller InVal than point 0",
+            after=system('Order', '  UDistributionFloatConstantCurve *C = UE_INSTANCED(UDistributionFloatConstantCurve, Sp, "C");\n'
+                                  '  C->ConstantCurve.Points = {{1.0f, 1.0f, 0.0f, 0.0f, EInterpCurveMode::CIM_Linear},\n'
+                                  '                             {0.0f, 0.0f, 0.0f, 0.0f, EInterpCurveMode::CIM_Linear}};\n'
+                                  '  Sp->Rate.Distribution = C;\n'))
+    proves('particle-systems.l-typedatamodule-gpu')
+    refused('PrGpu', '', 'a GPU sprite emitter needs the EmitterInfo and ResourceData the editor builds',
+            after=system('Gpu', '  L->TypeDataModule = UE_INSTANCED(UParticleModuleTypeDataGpu, this, "Gpu");\n'))
+    proves('particle-systems.l-eventgenerator-g')
+    refused('PrGen', '', 'its EventGenerator G is not in its Modules, where the engine looks for it; put it first in Modules',
+            after=system('Gen', '  L->EventGenerator = UE_INSTANCED(UParticleModuleEventGenerator, this, "G");\n'))
+    print('ok  Particle system refusals')
+
+
+def particle_events():
+    """ParticleEvents: a generator listed in Modules alone gets the LOD level's EventGenerator slot the editor keeps
+    (the engine re-finds it in Modules at load); a receiver's events, name and spawn count are its tags, its unset
+    InheritVelocityScale starts at (1, 1, 1)."""
+    import invariants
+    p = invariants.Package(os.path.join(os.path.dirname(asset('ParticleEvents')), 'P_Events'))
+    proves('particle-systems.sl-modules-gen-hit')
+    sl = tag_values(p, p.find('SL'), p.tags(p.find('SL')))
+    assert sl['EventGenerator'] == p.path(p.find('Gen') + 1), sl
+    assert sl['Modules'] == [p.path(p.find('Gen') + 1), p.path(p.find('Hit') + 1)], sl
+    assert 'EventGenerator' not in tag_values(p, p.find('BL'), p.tags(p.find('BL')))
+    gen = particle_roundtrip_values(p, 'Gen')
+    assert [(e['type'], e['customname']) for e in gen['events']] == [('EPET_Collision', 'SparkHit')], gen
+    recv = particle_roundtrip_values(p, 'Recv')
+    assert (recv['eventgeneratortype'], recv['eventname']) == ('EPET_Collision', 'SparkHit'), recv
+    tables = {m: v['Table'] for m, v in particle_tables(p, 'Recv').items()}
+    assert tables == dict(SpawnCount=baked(1, [5.0]), InheritVelocityScale=baked(1, [1.0, 1.0, 1.0])), tables
+    keeps_invariants(p.base)
+    print('ok  ParticleEvents: the generator in Modules and the slot, the receiver by name')
+
+
+def niagara_compiled():
+    """NiagaraCompiled: a Niagara system's EmitterCompiledData, worked out from its compiled scripts as the editor works
+    it out (UNiagaraSystem::InitEmitterCompiledData) and written after the system's tags: per emitter handle the system
+    scripts' spawn infos named for it (any case, each once), its alias variables, its particle attributes (the update
+    script's, then the spawn script's not there yet), each attribute's register layout (FNiagaraTypeLayoutInfo), the
+    handle's IdName and whether it needs persistent IDs. A disabled emitter is left out of the package, its handle's
+    Instance null, its compiled data kept (NS_Two's Old; NS_Off's GPU script goes with it, so needs no shader maps)."""
+    import invariants, particle_roundtrip as rt
+    p = invariants.Package(os.path.join(os.path.dirname(asset('NiagaraCompiled')), 'NS_Two'))
+    proves('niagara-systems.emitterhandles')
+    sparks, glow, old = rt.values(p, p.find('NS_Two'))['<native>']
+    assert sparks['spawnattributes'] == ['Sparks.Burst', 'Sparks.Rate', 'sparks.Late'], sparks['spawnattributes']
+    assert glow['spawnattributes'] == ['Glow.Spawn'], glow['spawnattributes']
+    names = {k: v['name'] for k, v in sparks.items() if k.endswith('var')}
+    assert names == dict(emitterspawnintervalvar='Sparks.SpawnInterval', emitterinterpspawnstartdtvar='Sparks.InterpSpawnStartDt',
+                         emitterspawngroupvar='Sparks.SpawnGroup', emitteragevar='Sparks.Age', emitterrandomseedvar='Sparks.RandomSeed',
+                         emitterinstanceseedvar='Engine.Sparks.InstanceSeed',
+                         emittertotalspawnedparticlesvar='Engine.Sparks.TotalSpawnedParticles'), names
+    assert sparks['emitterspawngroupvar']['type']['classstructorenum'].endswith('.NiagaraInt32'), sparks['emitterspawngroupvar']
+    d = sparks['datasetcompileddata']
+    assert [v['name'] for v in d['variables']] == ['Age', 'Color', 'Position', 'Particles.ID', 'Pad'], d['variables']
+    layouts = [(l['floatcomponentstart'], l['int32componentstart'], l['halfcomponentstart'],
+                l['layoutinfo']['floatcomponentbyteoffsets'], l['layoutinfo']['int32componentbyteoffsets'],
+                l['layoutinfo']['halfcomponentbyteoffsets'], l['layoutinfo']['halfcomponentregisteroffsets']) for l in d['variablelayouts']]
+    assert layouts == [(0, 0, 0, [0], [], [], []), (1, 0, 0, [0, 4, 8, 12], [], [], []), (5, 0, 0, [0, 4, 8], [], [], []),
+                       (8, 0, 0, [], [0, 4], [], []), (8, 2, 0, [], [], [0, 2], [0, 1])], layouts
+    assert (d['totalfloatcomponents'], d['totalint32components'], d['totalhalfcomponents']) == (8, 2, 2), d
+    assert (d['brequirespersistentids'], d['simtarget'], d['id']) == (True, 'CPUSim', dict(name='IdSparks', type='ParticleData')), d
+    g = glow['datasetcompileddata']
+    assert ([v['name'] for v in g['variables']], g['brequirespersistentids'], g['id']['name']) == (['Age', 'Rand'], True, 'IdGlow'), g
+    rand = g['variablelayouts'][1]
+    assert (rand['floatcomponentstart'], rand['int32componentstart'], rand['layoutinfo']['int32componentbyteoffsets']) == (1, 0, [0, 4, 8]), rand
+    keeps_invariants(p.base)
+    # a disabled emitter is left out, its compiled data kept: Old's here, Off's GPU script with it (no shader maps asked)
+    proves('niagara-systems.disabled-emitter')
+    v = rt.values(p, p.find('NS_Two'))
+    assert [h['instance'] for h in v['emitterhandles']][2] is None and p.find('Old') is None, v['emitterhandles']
+    o = old['datasetcompileddata']
+    assert (o['variables'], o['simtarget'], o['brequirespersistentids'], o['id']['name']) == ([], 'GPUComputeSim', True, 'IdOld'), o
+    assert (old['emitteragevar']['name'], old['spawnattributes']) == ('Old.Age', []), old
+    off = invariants.Package(os.path.join(os.path.dirname(asset('NiagaraCompiled')), 'NS_Off'))
+    assert [e['name'] for e in off.exports] == ['NS_Off', 'Spawn', 'Update'], off.exports
+    o = rt.values(off, off.find('NS_Off'))['<native>'][0]['datasetcompileddata']
+    assert (o['variables'], o['simtarget'], o['id']['name']) == ([], 'GPUComputeSim', 'IdOff'), o
+    keeps_invariants(off.base)
+    print('ok  NiagaraCompiled: the emitters\' compiled data, worked out from their scripts')
+
+
+def niagara_refusals():
+    """A Niagara system the editor could not build either, or whose compiled data AssetGen cannot work out, is refused,
+    saying what."""
+    def system(mod, body):
+        return ('UE_ASSET_DEFAULTS(UNiagaraSystem, NS_%s) {\n'
+                '  UNiagaraScript *Sp = UE_INSTANCED(UNiagaraScript, this, "Sp");\n'
+                '  Sp->CachedScriptVM.LastCompileStatus = ENiagaraScriptCompileStatus::NCS_UpToDate;\n'
+                '  UNiagaraScript *Up = UE_INSTANCED(UNiagaraScript, this, "Up");\n'
+                '  Up->CachedScriptVM.LastCompileStatus = ENiagaraScriptCompileStatus::NCS_UpToDate;\n'
+                '  SystemSpawnScript = Sp;\n  SystemUpdateScript = Up;\n%s}\n' % (mod, body))
+    emitter = ('  UNiagaraEmitter *E = UE_INSTANCED(UNiagaraEmitter, this, "E");\n  E->UniqueEmitterName = "E";\n'
+               '  EmitterHandles = {FNiagaraEmitterHandle(FGuid(), "Id", true, "E", E)};\n')
+    proves('niagara-systems.gpu-compute-script')
+    refused('NgGpu', '', 'G: a compiled GPU compute script carries the GPU shader maps the editor compiles from its HLSL',
+            after=system('Gpu', emitter + '  E->SimTarget = ENiagaraSimTarget::GPUComputeSim;\n'
+                                          '  UNiagaraScript *G = UE_INSTANCED(UNiagaraScript, E, "G");\n'
+                                          '  G->Usage = ENiagaraScriptUsage::ParticleGPUComputeScript;\n'
+                                          '  G->CachedScriptVM.LastCompileStatus = ENiagaraScriptCompileStatus::NCS_UpToDate;\n'
+                                          '  E->GPUComputeScript = G;\n'))
+    proves('niagara-systems.gpu-emitter')
+    refused('NgGpuE', '', 'E: a GPU emitter runs on the GPU shader maps the editor compiles from its scripts\' HLSL',
+            after=system('GpuE', emitter + '  E->SimTarget = ENiagaraSimTarget::GPUComputeSim;\n'))
+    proves('niagara-systems.attribute-type')
+    refused('NgType', '', 'E: particle attribute Spin is a Rotator, whose register layout AssetGen does not know',
+            after=system('Type', emitter + '  UNiagaraScript *U = UE_INSTANCED(UNiagaraScript, E, "U");\n'
+                                           '  U->CachedScriptVM.Attributes = {FNiagaraVariable("Spin", FNiagaraTypeDefinition('
+                                           'StaticStructOf<FRotator>(), 2), {})};\n'
+                                           '  E->UpdateScriptProps.Script = U;\n'))
+    proves('niagara-systems.handle-without-emitter')
+    refused('NgHandle', '', "EmitterHandles[0] names no emitter of the block, which the editor's compile needs",
+            after=system('Handle', '  EmitterHandles = {FNiagaraEmitterHandle(FGuid(), "Id", true, "E", nullptr)};\n'))
+    print('ok  Niagara system refusals')
+
+
+def particle_roundtrip_values(p, name):
+    """An export's tags as particle_roundtrip reads them: names lowercased, structs and arrays of them decoded."""
+    import particle_roundtrip as rt
+    return rt.values(p, p.find(name))
+
+
+def particle_decompile():
+    """The suite's own particle systems (ParticleBake, ParticleCurves) decompiled by bpdecomp and compiled again come
+    out the same by meaning (particle_roundtrip.diffs, the oracle the vanilla round trip uses): baked tables, live
+    distributions, a GPU emitter's given data, an engine uint32 member; a Niagara system with its computed
+    EmitterCompiledData."""
+    import invariants, particle_roundtrip as rt
+    gpu = invariants.Package(os.path.join(os.path.dirname(asset('ParticleCurves')), 'P_Gpu'))
+    proves('particle-systems.e-detailmodebitmask-5')
+    e = rt.values(gpu, gpu.find('E'))
+    assert e['detailmodebitmask'] == 5, e
+    proves('particle-systems.bpdecomp-particles', 'niagara-systems.bpdecomp-niagara')
+    work = tempfile.mkdtemp()
+    try:
+        rt.layout(work, os.path.abspath(UEAPI))
+        for mod in ('ParticleBake', 'ParticleCurves', 'ParticleEvents', 'NiagaraCompiled'):
+            folder = os.path.dirname(asset(mod))
+            content = folder.replace(os.sep, '/').split('/FSD/Content/')[0] + '/FSD/Content'
+            root = '/Game/_ElytrasMods/' + mod
+            proc = rt.decompile(content, root, 'RT' + mod, work, UEAPI)
+            assert not proc.returncode, proc.stdout[-2000:] + proc.stderr[-2000:]
+            notes = open(os.path.join(work, 'BpMods', 'NOTES.md'), encoding='utf-8').read().splitlines()[3:]
+            assert not [n for n in notes if n.strip()], notes
+            proc, out = rt.compile_mod(work, 'RT' + mod, root, os.path.abspath(ASSETGEN))
+            assert not proc.returncode, proc.stdout[-2000:] + proc.stderr[-2000:]
+            names = sorted(f[:-7] for f in os.listdir(folder) if f.startswith(('P_', 'NS_')) and f.endswith('.uasset'))
+            assert names and names == sorted(f[:-7] for f in os.listdir(out) if f.endswith('.uasset')), (names, os.listdir(out))
+            for n in names:
+                d = rt.diffs(invariants.Package(os.path.join(folder, n)), invariants.Package(os.path.join(out, n)))
+                assert not d, (mod, n, d)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print('ok  Particle systems decompile and compile again to the same packages')
+
+
+def particle_starts():
+    """ParticleStarts: a module's unset distributions get the values Cascade's editor gives a new module,
+    InitializeDefaults then SetToSensibleDefaults (ParticleModules.cpp 3242-3282, 3863-3871), baked. P_Starts9 grows the
+    object list past its capacity while filling its Spawn module's three; each is still filled."""
+    import invariants
+    folder = os.path.dirname(asset('ParticleStarts'))
+    proves('particle-systems.spawn-burstscale')
+    spawn = particle_tables(invariants.Package(os.path.join(folder, 'P_Starts9')), 'Sp')
+    assert sorted(spawn) == ['BurstScale', 'Rate', 'RateScale'], spawn
+    assert [spawn[m]['Table'] for m in ('Rate', 'RateScale', 'BurstScale')] == [baked(1, [20.0]), baked(1, [1.0]), baked(1, [1.0])], spawn
+    p = invariants.Package(os.path.join(folder, 'P_Sensible'))
+    light = particle_tables(p, 'Light')
+    assert {m: v['Table'] for m, v in light.items()} == dict(
+        ColorScaleOverLife=baked(1, [1.0, 1.0, 1.0]), BrightnessOverLife=baked(1, [32.0]), RadiusScale=baked(1, [15.0]),
+        LightExponent=baked(1, [16.0])), light
+    # Uniform 1 to 1: Min == Max bakes as a constant (UDistributionFloatUniform::GetOperation, Distributions.cpp 2035-2043).
+    assert particle_tables(p, 'Life')['LifeTime']['Table'] == baked(1, [1.0]), particle_tables(p, 'Life')
+    keeps_invariants(p.base)
+    # P_Every: every module's starts, a base class's among them, and the bools SetToSensibleDefaults sets.
+    proves('particle-systems.every-module-unset')
+    p = invariants.Package(os.path.join(folder, 'P_Every'))
+    tables = lambda name: {m: v['Table'] for m, v in particle_tables(p, name).items()}
+    assert tables('Sphere') == dict(VelocityScale=baked(1, [1.0]), StartLocation=baked(1, [0.0, 0.0, 0.0]),
+                                    StartRadius=baked(1, [50.0])), tables('Sphere')
+    assert tables('Col') == dict(StartColor=baked(1, [1.0, 1.0, 1.0]), StartAlpha=baked(1, [1.0])), tables('Col')
+    fade = particle_tables(p, 'Fade')
+    assert close(fade['ColorOverLife'], curve_baked('vector', [(0, [1, 1, 1], LINEAR), (1, [0, 0, 0], LINEAR)])), fade
+    assert close(fade['AlphaOverLife'], curve_baked('float', [(0, [1], LINEAR), (1, [0], LINEAR)])), fade
+    movie = particle_tables(p, 'Movie')
+    assert close(movie['SubImageIndex'], curve_baked('float', [(0, [0], LINEAR), (1, [0], LINEAR)])), movie
+    assert movie['FrameRate']['Table'] == baked(1, [30.0]), movie
+    assert tables('Recv') == dict(SpawnCount=baked(1, [0.0]), InheritVelocityScale=baked(1, [1.0, 1.0, 1.0])), tables('Recv')
+    assert tables('Acc') == dict(DragCoefficientRaw=baked(1, [1.0])), tables('Acc')
+    flags = lambda name: {k: v for k, v in tag_values(p, p.find(name), p.tags(p.find(name))).items() if k.startswith('b')}
+    assert flags('Req') == dict(bUseLegacyEmitterTime=False), flags('Req')
+    assert flags('Acc') == dict(bAlwaysInWorldSpace=True), flags('Acc')
+    assert flags('Acc2') == dict(bAlwaysInWorldSpace=False), flags('Acc2')
+    assert 'left unset' not in LOGS['ParticleStarts'], LOGS['ParticleStarts']
+    keeps_invariants(p.base)
+    print('ok  ParticleStarts: unset distributions start where the editor starts them')
+
+
+def behaviour_trees():
+    """BehaviorTree: a blackboard's key types and a tree's nodes are objects under their asset. Each node gets the
+    TreeAsset and ParentNode the editor keeps: the tree, and the composite holding it (of a child, its decorators, a
+    composite's and a child task's Services); none on the root and the RootDecorators. The rule is the one all 3053
+    nodes of DRG's 79 cooked trees follow (btdecomp.py, BehaviorTree.h)."""
+    import btdecomp, invariants
+    folder = os.path.dirname(asset('BehaviorTree'))
+    mod = '/Game/_ElytrasMods/BehaviorTree/'
+    proves('behaviour-trees-and.ue-asset-defaults')
+    bb_base = os.path.join(folder, 'BB_Test')
+    bb = {x.name: x for x in btdecomp.read(bb_base)[1]}
+    keys = [(k['EntryName'][1], k['KeyType'].rsplit(':', 1)[-1], k['bInstanceSynced']) for k in bb['BB_Test'].values['Keys']]
+    assert keys == [('Target', 'BlackboardKeyType_Object_0', False), ('Destination', 'BlackboardKeyType_Vector_0', False),
+                    ('IsStunned', 'BlackboardKeyType_Bool_0', False), ('State', 'BlackboardKeyType_Enum_0', False)], keys
+    assert all(bb[n].outer == mod + 'BB_Test.BB_Test' for n in bb if n != 'BB_Test')
+    assert bb['BlackboardKeyType_Object_0'].values == {'BaseClass': '/Script/Engine.Actor'}, bb['BlackboardKeyType_Object_0'].values
+    proves('behaviour-trees-and.ue-asset-at-uenum-estate')
+    assert bb['BlackboardKeyType_Enum_0'].values['EnumType'] == '/Script/FSD.EWoodLouseState'
+    p = invariants.Package(bb_base)
+    assert ('/Script/CoreUObject', 'Enum', 'EWoodLouseState') in [(i['class_package'], i['class_name'], i['name']) for i in p.imports]
+    keeps_invariants(bb_base)
+
+    proves('behaviour-trees-and.ue-asset-defaults-ubehaviortree')
+    bt_base = os.path.join(folder, 'BT_Test')
+    nodes = {x.name: x for x in btdecomp.read(bt_base)[1]}
+    tree = mod + 'BT_Test.BT_Test'
+    at = lambda n: tree + ':' + n
+    parents = {n: (x.values.get('ParentNode') or '').rsplit(':', 1)[-1] or None for n, x in nodes.items() if n != 'BT_Test'}
+    assert parents == {'Alive': None, 'Root': None, 'Focus': 'Root', 'Stunned': 'Root', 'Recover': 'Root', 'Roam': 'Root',
+                       'Near': 'Root', 'Far': 'Root', 'Pick': 'Roam', 'Go': 'Roam', 'Watch': 'Roam'}, parents
+    assert all(x.values.get('TreeAsset') == tree for n, x in nodes.items() if n != 'BT_Test')
+    assert all(x.outer == tree and x.flags == 0x8 for n, x in nodes.items() if n != 'BT_Test')
+    top = nodes['BT_Test'].values
+    assert (top['RootNode'], top['RootDecorators'], top['BlackboardAsset']) == (at('Root'), [at('Alive')], mod + 'BB_Test.BB_Test'), top
+    proves('behaviour-trees-and.root-children-nullptr-wait', 'behaviour-trees-and.nested-block')
+    kids = lambda n: [(c['ChildComposite'], c['ChildTask'], c['Decorators'],
+                       [(o['Operation'][1], o['Number']) for o in c['DecoratorOps']]) for c in nodes[n].values['Children']]
+    assert kids('Root') == [(None, at('Recover'), [at('Stunned')], []),
+                            (at('Roam'), None, [at('Near'), at('Far')],
+                             [('EBTDecoratorLogic::Or', 2), ('EBTDecoratorLogic::Test', 0), ('EBTDecoratorLogic::Test', 1)])], kids('Root')
+    assert kids('Roam') == [(None, at('Pick'), [], []), (None, at('Go'), [], [])], kids('Roam')
+    assert nodes['Go'].values['Services'] == [at('Watch')] and nodes['Root'].values['Services'] == [at('Focus')]
+    proves('behaviour-trees-and.go-blackboardkey-selectedkeyname')
+    assert dict(nodes['Go'].values['BlackboardKey']) == {'SelectedKeyName': ('name', 'Destination')}
+    assert dict(nodes['Stunned'].values['BlackboardKey']) == {'SelectedKeyName': ('name', 'IsStunned')}
+    proves('behaviour-trees-and.ue-instanced-game-ai-tasks')
+    assert nodes['Pick'].cls == '/Game/AI/Tasks/TSK_FindRandomPointFrom_WIthinHeight.TSK_FindRandomPointFrom_WithinHeight_C', nodes['Pick'].cls
+    assert dict(nodes['Pick'].values['NewLocationKey']) == {'SelectedKeyName': ('name', 'Destination')}
+    keeps_invariants(bt_base)
+    rows = registry_rows(registry_of('BehaviorTree'))
+    assert {(mod + 'BT_Test.BT_Test', 'BehaviorTree'), (mod + 'BB_Test.BB_Test', 'BlackboardData')} <= rows, rows
+    print('ok  BehaviorTree: a blackboard and a tree, each node with the TreeAsset and ParentNode the editor keeps')
+
+
+def behaviour_tree_refusals():
+    """What the editor never makes and the engine would misbehave on: a node's TreeAsset or ParentNode set by hand, a
+    child that is no composite or task, or both, and a node in two places; and a block in a class's UE_DEFAULTS, whose
+    component scans read only the top-level statements."""
+    ai = '#include "UeApi/AIModule.h"\n'
+    tree = lambda body: 'UE_ASSET_DEFAULTS(UBehaviorTree, BT_R) {\n  auto *R = UE_INSTANCED(UBTComposite_Selector, this, "R");\n' \
+                        '  RootNode = R;\n%s}\n' % body
+    proves('behaviour-trees-and.wait-treeasset')
+    refused('BtSetParent', '', 'ParentNode is set from the tree\'s shape, as the editor sets it; leave it out', top=ai,
+            after=tree('  auto *W = UE_INSTANCED(UBTTask_Wait, this, "W");\n  W->ParentNode = R;\n'
+                       '  R->Children = {{nullptr, W, {}, {}}};\n'))
+    refused('BtEmptyChild', '', "R's child 0 has neither a ChildComposite nor a ChildTask", top=ai,
+            after=tree('  R->Children = {{nullptr, nullptr, {}, {}}};\n'))
+    refused('BtTwice', '', 'W is in the tree twice', top=ai,
+            after=tree('  auto *W = UE_INSTANCED(UBTTask_Wait, this, "W");\n'
+                       '  R->Children = {{nullptr, W, {}, {}}, {nullptr, W, {}, {}}};\n'))
+    proves('behaviour-trees-and.nested-block')
+    refused('BlockInClass', '  UE_DEFAULTS { { InitialLifeSpan = 2.0f; } }\n',
+            'a block `{ ... }` groups the statements of a UE_ASSET_DEFAULTS')
+    print('ok  BehaviorTree refusals')
 
 
 def ue_assets():
@@ -5818,7 +6534,59 @@ interface_bodies()
 interface_calls()
 interface_to_object()
 inherited_defaults()
+
+
+def inherited_defaults_other_mod():
+    """A default on a component that a parent in another mod's folder declares: the override record is keyed on the
+    node guid the owner cooked, ScsNodeGuid(class, component), as for a parent of the same mod."""
+    import dumptags
+    head = '#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n'
+    files = {
+        'Owner/Lamp.h': '#pragma once\n' + head + 'class AOwnLamp : public AActor {\npublic:\n'
+                        '  UE_COMPONENT(USceneComponent, Root);\n  UE_COMPONENT(UPointLightComponent, Lamp);\n'
+                        '  AOwnLamp() { Lamp->Intensity = 1000.0f; }\n};\n',
+        'Owner/Owner.cpp': '#include "Lamp.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Owner");\n',
+        'User/User.cpp': '#include "../Owner/Lamp.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/User");\n'
+                         'class ADimLamp : public AOwnLamp {\npublic:\n  ADimLamp() { Lamp->Intensity = 250.0f; }\n};\n'}
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, text in files.items():
+            os.makedirs(os.path.join(tmp, os.path.dirname(name)), exist_ok=True)
+            with open(os.path.join(tmp, name), 'w', encoding='utf-8') as f:
+                f.write(text)
+        out = lambda mod: os.path.join(tmp, 'out', mod)
+        for mod in ('Owner', 'User'):
+            os.makedirs(out(mod))
+            proc = assetgen_compile([os.path.join(tmp, mod, mod + '.cpp'), UEAPI, out(mod)])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        cooked = lambda mod: sorted(glob.glob(os.path.join(out(mod), '**', '*.uasset'), recursive=True))
+        assert [os.path.basename(f) for f in cooked('User')] == ['ADimLamp.uasset'], cooked('User')
+        own, dim = (next(f[:-7] for f in cooked(m) if f.endswith(c + '.uasset')) for m, c in (('Owner', 'AOwnLamp'), ('User', 'ADimLamp')))
+        node = next(dump('dumptags.py', own, i) for i, e in enumerate(dumpexp.load(own)[5])
+                    if ref(own, e['cls']) == '/Script/Engine.SCS_Node'
+                    and 'InternalVariableName [0] NameProperty size=8: Lamp' in dump('dumptags.py', own, i))
+        lamp_guid = re.search(r'VariableGuid \[0\] StructProperty size=16 struct=Guid: (\w+)', node).group(1)
+        ua, ue, total, names, imports, exports = dumpexp.load(dim)
+        i, h = next((i, e) for i, e in enumerate(exports) if e['name'].startswith('InheritableComponentHandler'))
+        blob = ue[h['off'] - total: h['off'] - total + h['size']]
+        records = re.search(r'Records \[0\] ArrayProperty size=\d+ inner=StructProperty: (\w+)',
+                            dump('dumptags.py', dim, i)).group(1)
+        assert records.startswith('01000000'), records
+        rec = []
+        dumptags.tags(blob, blob.find(bytes.fromhex(records)) + 4, len(blob), names, 1, rec)
+        rec = '\n'.join(rec)
+        idx = lambda f: int(re.search(r'%s \[0\] ObjectProperty size=4: index (-?\d+)' % f, rec).group(1))
+        proves('components-a-parent.ue-class')
+        assert ref(dim, idx('OwnerClass')) == '/Game/_ElytrasMods/Owner/AOwnLamp.AOwnLamp_C', rec
+        assert 'SCSVariableName [0] NameProperty size=8: Lamp' in rec and 'struct=Guid: ' + lamp_guid in rec, (lamp_guid, rec)
+        t = next(j for j, e in enumerate(exports) if e['name'] == ref(dim, idx('ComponentTemplate')))
+        assert 'Intensity [0] FloatProperty size=4: 250.0' in dump('dumptags.py', dim, t), dump('dumptags.py', dim, t)
+    print('ok  a default on a component another mod\'s class declares: keyed on the node its owner cooked')
+
+
+inherited_defaults_other_mod()
 parent_call()
+proves('calling-the-parent.aactor-receivebeginplay', 'calling-the-parent.ancestor-skip')
+engine_parent_call()
 pure_virtual()
 func_stub_super()
 engine_names()
@@ -9437,6 +10205,30 @@ object_through_interface()
 print('ok  ObjThroughIface: TScriptInterface<I>(Obj)->Fn() is InterfaceContext(Obj); Cast<T> of a weak member casts its read')
 
 
+def native_interface_members():
+    """A native interface a game class implements is a base of its UeApi class, so its functions are members: on self
+    a call by name with no context, as ENE_SpiderBase_Large calls QueueMontage; on another object InterfaceContext of it,
+    as TScriptInterface<I>(Obj)->Fn() is."""
+    tmp, out, _ = compile_to(EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/NativeIfaceMembers");\n'
+                             'class NativeIfaceMembers : public ASpiderEnemy {\npublic:\n  FVector At;\n  float Len = 0.0f;\n'
+                             '  void Mine(UAnimMontage *M) { At = GetTargetCenterMass(); Len = QueueMontage(M); }\n'
+                             '  void Theirs(ASpiderEnemy *Other, UAnimMontage *M) { Len = Other->QueueMontage(M); }\n};\n',
+                             'NativeIfaceMembers')
+    base = os.path.join(out, 'NativeIfaceMembers')
+    keeps_invariants(base)
+    mine = dump('walkscript.py', base, export_index(base, 'Mine'))
+    theirs = dump('walkscript.py', base, export_index(base, 'Theirs'))
+    shutil.rmtree(tmp, ignore_errors=True)
+    proves('interface-values.native-interface-member')
+    assert 'Context' not in mine, mine
+    assert re.search(r"VirtualFunction\s+GetTargetCenterMass", mine) and re.search(r"VirtualFunction\s+QueueMontage", mine), mine
+    assert re.search(r"InterfaceContext\s*\n.*LocalVariable\s+Other@(.*\n)*.*VirtualFunction\s+QueueMontage", theirs), theirs
+
+
+native_interface_members()
+print('ok  NativeIfaceMembers: a native interface\'s function is a member of a class UeApi lists it on')
+
+
 def derived_struct_conv():
     """A struct passes where its base's conversion is wanted: FHitResult's FVector_NetQuantize Location to a const
     FTransform& is Conv_VectorToTransform, as FVector's is; to an FVector it passes as is."""
@@ -12640,6 +13432,8 @@ def tag_values(pkg, i, tags):
         elif ty == 'StructProperty' and t['struct'] in ('Guid', 'Vector2D', 'LinearColor'): x = v   # native: raw bytes
         elif ty == 'StructProperty': x = tag_values(pkg, i, pkg.tags(i, t['at']))
         elif ty == 'ArrayProperty' and t['inner'] == 'IntProperty': x = list(struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4))
+        elif ty == 'ArrayProperty' and t['inner'] == 'FloatProperty': x = list(struct.unpack_from('<%df' % struct.unpack_from('<i', v)[0], v, 4))
+        elif ty == 'ByteProperty' and t['size'] == 1: x = v[0]                 # a byte, no enum
         else: x = ('?', ty)
         out[re.sub(r'_\d+_[0-9A-F]{32}$', '', t['name'])] = x
     return out
@@ -12687,6 +13481,19 @@ def defaults_own_nest():
 defaults_own_nest()
 print('ok  DefaultsOwnNest: braces in a value that starts as a struct\'s default instance leave out what its initializer '
       'leaves out, and are refused at what it gives')
+asset_defaults()
+asset_defaults_refusals()
+particle_bake()
+particle_lod_validity()
+particle_starts()
+particle_curves()
+behaviour_trees()
+behaviour_tree_refusals()
+particle_refusals()
+particle_events()
+niagara_compiled()
+niagara_refusals()
+particle_decompile()
 
 
 def asset_over_cdo():
@@ -13872,6 +14679,26 @@ def interface_var_names():
 interface_var_names()
 print('ok  InterfaceVarNames: a mod interface\'s variable is held to its implementer\'s names, AActor\'s Tags among them, '
       'and a subclass of the implementer to the interface\'s')
+
+
+def interface_case_names():
+    """An implementation spelled other than its interface function (`Pull` for `pull`) is a second C++ method, which cooked
+    a second function export of the one FName: the game's loader finds the second already in memory and fails the load
+    (HubPluginDemo's `Order` beside UeApi's IModListOrder `order`). Refused, for the class's own interface and for one
+    a parent lists; two of the class's own functions that differ only in case likewise."""
+    iface = 'class IIcnTrigger {\npublic:\n  UE_INTERFACE;\n  void pull(int32 N);\n};\n'
+    proves('implementing-an.pull-case')
+    refused('IcnImpl', '  void Pull(int32 N) {}\n', 'IcnImpl::Pull: interface IIcnTrigger already has a function pull',
+            top=iface, base='AActor, public IIcnTrigger')
+    refused('IcnKid', '  void Pull(int32 N) {}\n', 'IcnKid::Pull: interface IIcnTrigger already has a function pull',
+            top=iface + 'class IcnParent : public AActor, public IIcnTrigger {\npublic:\n};\n', base='IcnParent')
+    proves('overloading.int32-get')
+    refused('IcnTwins', '  int32 Get() { return 1; }\n  int32 get() { return 2; }\n', 'IcnTwins::get: differs from Get only in case')
+
+
+interface_case_names()
+print('ok  InterfaceCaseNames: an implementation spelled other than its interface function, the class\'s or a parent\'s, '
+      'and two functions that differ only in case, are refused')
 
 
 def uds_init_defaults():
