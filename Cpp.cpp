@@ -3418,6 +3418,8 @@ void BadClassMeta(const FRecord& R, std::string* Err, bool* bOk)
 
 static void TakeSubobjectInits(FRecord& R);
 
+static bool CompilesMethod(const FRecord& R, const std::string& Method);    // below: Collect warns of a method that is none
+
 bool FCompiler::Collect(std::string* Err)
 {
     bool bMetaOk = true;
@@ -4299,7 +4301,16 @@ bool FCompiler::Collect(std::string* Err)
         if (R.UePackage.empty() || R.bCooked) continue;          // a UE_COOKED class is imported, as another mod's is
         /* UeApi's Game::_ModHub::IHubMod is at the path its namespace and name give, as a mod's class there would be. */
         if (R.bUeApi) continue;
-        if (R.UePackage != PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName)) continue;
+        if (const std::string Own = PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName); R.UePackage != Own)
+        {
+            /* A path under this mod's own root that is not the one the class would get is an import of another package,
+               cooked nowhere: silently, as far as the build goes (EMM's materials port lost two runs to it). */
+            if (R.UePackage.compare(0, ModPackage.size() + 1, ModPackage + "/") == 0)
+                printf("  warning: %s: UE_CLASS names %s, under this mod's own %s, but the class here would be at %s: it is "
+                       "imported from there, not cooked; write the path it gets, or UE_CLASS_IN\n",
+                       R.CppName.c_str(), R.UePackage.c_str(), ModPackage.c_str(), Own.c_str());
+            continue;
+        }
         if (!R.bIsStruct && R.UeName != LeafOf(R.CppName) + "_C")
         {
             *Err = "UE_CLASS on " + R.CppName + " says \"" + R.UeName
@@ -4315,6 +4326,16 @@ bool FCompiler::Collect(std::string* Err)
         FRecord& R = It.second;
         const bool bOtherMod = R.IsNative() && R.UePackage.compare(0, 6, "/Game/") == 0;
         if (!R.IsGenerated() && !R.bIsPatch && !bOtherMod) continue;
+        /* A method declared in a class cooked here and defined nowhere this build compiles (its .cpp is not in the
+           mod's unity source) is no function of the cooked class, and nothing else says so. */
+        if (R.IsGenerated() && !R.bIsInterface && !R.bIsStruct && !R.bIsPatch)
+            for (const auto& [Method, Decl] : R.Methods)
+                if (!R.Forwarders.count(Method) && !Decl->value("isImplicit", false) && Method.rfind("operator", 0) != 0 && Method != "StaticClass"
+                    && !(Method.size() > 19 && Method.compare(Method.size() - 19, 19, "__DelegateSignature") == 0)
+                    && !Decl->contains("explicitlyDefaulted") && !Decl->value("explicitlyDeleted", false) && !CompilesMethod(R, Method))
+                    printf("  warning: %s::%s: declared in the class and defined nowhere this build compiles, so the cooked class "
+                           "has no such function: is the .cpp that defines it missing from the mod's source?\n",
+                           R.CppName.c_str(), Method.c_str());
         if (!LowerCtor(R, Err)) return false;
         /* A Blueprint struct holds no functions, so a call to one of its methods would name a function that exists
            nowhere. An inline one is expanded where it is called instead (a static one anywhere: it needs no object). */

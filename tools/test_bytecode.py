@@ -17261,6 +17261,35 @@ proves('math-and-utility.std-min-a-b-2', 'reading-and-writing.tarray-int32-a-pa-
 row_std()
 
 
+
+# ---- Two silent drops that cost EMM's materials port two drgq runs: a method declared in a cooked class and defined
+# nowhere this build compiles (its .cpp missing from the unity source) cooks the class without the function, and a
+# UE_CLASS path under the mod's own root that is not the path the class would get makes it an import, cooked nowhere.
+# Each now says so with a warning; a method defined out of line, an interface's and a path under another mod's root do not.
+
+def silent_drops():
+    def built(mod, text):
+        proc = row_compile(mod, text)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return [l for l in proc.stdout.splitlines() if 'warning:' in l]
+    body = 'class %s : public AActor {\npublic:\n  int32 Used() { return 1; }\n  int32 Helper(int32 X);\n};\n'
+    lost = built('DropUndef', ROW_HEAD % 'DropUndef' + body % 'DropUndef')
+    assert any('DropUndef::Helper' in l and 'defined nowhere this build compiles' in l for l in lost), lost
+    assert not built('DropDefined', ROW_HEAD % 'DropDefined' + body % 'DropDefined' + 'int32 DropDefined::Helper(int32 X) { return X; }\n')
+    assert not built('DropIface', ROW_HEAD % 'DropIface' + 'class IDropIface {\npublic:\n  UE_INTERFACE;\n  void Aim();\n};\n'
+                     'class DropIface : public AActor, public IDropIface {\npublic:\n  void Aim() {}\n};\n')
+    real = 'class Real : public AActor {\npublic:\n  int32 X;\n};\n'
+    moved = 'class Moved : public AActor {\npublic:\n  UE_CLASS("%s", "Moved_C");\n  int32 Y;\n};\n'
+    warned = built('Moved', ROW_HEAD % 'Moved' + real + moved % '/Game/_ElytrasMods/Moved/Sub/Moved')
+    assert any('UE_CLASS' in l and "this mod's own" in l and '/Game/_ElytrasMods/Moved/Moved' in l for l in warned), warned
+    assert not built('Moved', ROW_HEAD % 'Moved' + real + moved % '/Game/_ElytrasMods/OtherMod/Moved')
+    print('ok  a method no compiled source defines, and a UE_CLASS path under the mod\'s own root that is not the class\'s, are warned about')
+
+
+proves('blueprint-classes.int32-helper-int32-x', 'sharing-a-class.ue-class-game-mymods-turrets-4')
+silent_drops()
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
