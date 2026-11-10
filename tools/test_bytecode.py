@@ -16803,6 +16803,244 @@ def lambda_refusals():
 lambda_refusals()
 
 
+
+# ---- The refusals and warnings REFERENCE.md rows name, each from the smallest source that earns it. A row is a tuple
+# (row id, mod, class body, message, text before the class[, the class's bases]); a body that starts with `#include` is the
+# whole source. The compile must fail (or, in ROW_WARNINGS, succeed with a `warning:` line) saying the message.
+
+ROW_HEAD = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
+ROW_INTRIN = '#include "%s"\n' % os.path.join(AG, 'include', 'Intrin.h').replace('\\', '/')
+ROW_IAIM = 'class IAimable {\npublic:\n  UE_INTERFACE;\n  void Aim();\n};\n'
+ROW_IMARK = 'class IMarkable {\npublic:\n  UE_INTERFACE;\n  int32 Marks = 0;\n  void Mark();\n};\n'
+ROW_FNV = 'consteval int32 Fnv(int32 X) { return (X * 31 + 7) % 1000003; }\n'
+ROW_REFUSALS = [
+    ('the-mod-package.ue-mod-package', 'NoPkg', '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nclass NoPkg : public AActor {\npublic:\n  int32 X;\n};\n',
+     'the source declares no UE_MOD_PACKAGE', ''),
+    ('the-mod-package.ue-mod-package-2', 'TwoPkg', ROW_HEAD % 'TwoPkg' + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/Other");\nclass TwoPkg : public AActor {\npublic:\n  int32 X;\n};\n',
+     "redefinition of 'UeModPackage'", ''),
+    ('the-mod-package.a-source-with-nothing-to', 'Nothing', ROW_HEAD % 'Nothing' + 'class Helper {\npublic:\n  int32 X;\n};\n',
+     'the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit', ''),
+    ('blueprint-classes.class-x-public-anotincluded', 'NotIncl', ROW_HEAD % 'NotIncl' + 'class NotIncl : public ANotIncluded {};\n', 'expected class name', ''),
+    ('namespaces-and-folders.class-pistol-public-rifle', 'NsAmb', '  int32 F() { return 1; }\n', 'derives from an undeclared class: Rifle',
+     'namespace Weapons { class Rifle : public AActor { public: int32 X; }; }\nnamespace Other { class Rifle : public AActor { public: int32 Y; }; }\n'
+     'namespace Weapons { class Pistol : public Rifle { public: int32 Z; }; }\n'),
+    ('sharing-a-class.ue-class-game-mymods-turrets-2', 'UcBad', '  UE_CLASS("/Game/_MyMods/Turrets", "UTurretDef_C");\n  int32 X;\n',
+     'does not end in the asset that declares UTurretDef_C', ''),
+    ('sharing-a-class.ue-class-game-mymods-turrets-3', 'UcBad2', '  UE_CLASS("/Game/_ElytrasMods/UcBad2/UcBad2", "UcBad2");\n  int32 X;\n',
+     'cooking it here requires', ''),
+    ('member-variables.uint16-w', 'U16', '  uint16 W;\n', 'unimplemented property W: uint16', ''),
+    ('member-variables.uint16-w', 'Dbl', '  double D;\n', 'unimplemented property D: double', ''),
+    ('variable-types.uint32-mask', 'U32', '  uint32 Mask;\n', 'unimplemented property Mask: uint32', ''),
+    ('variable-types.double-d', 'Dbl2', '  double D;\n', 'unimplemented property D: double', ''),
+    ('member-variables.a-member-whose-type-is', 'FwdMem', '  class BP_Nothing_C *P;\n', 'is only forward-declared here - #include "UeApi/Game/', 'class BP_Nothing_C;\n'),
+    ('defaults.embedfile-missing-bin', 'EmbMiss', '  TArray<uint8> P = __EmbedFile__("missing.bin");\n', 'cannot read (or empty)', ROW_INTRIN),
+    ('defaults.embedfile-missing-bin', 'EmbVar', '  TArray<uint8> P = __EmbedFile__(kPath);\n', 'the path must be a string literal', ROW_INTRIN + 'constexpr const char *kPath = "x.bin";\n'),
+    ('namespace-scope.umooddef-globaldef', 'GlobDef', '  int32 F() { return GlobalDef.Mood; }\n', 'is an asset, not a value',
+     'class UMoodDef : public UDataAsset {\npublic:\n  int32 Mood;\n};\nUMoodDef GlobalDef;\n'),
+    ('namespace-scope.extern-int32-shared', 'ExtG', '  int32 F() { return Shared; }\n', 'declared extern but not defined in this source', 'extern int32 Shared;\n'),
+    ('globals-across-sources.extern-int32-counter', 'ExtC', '  int32 F() { return Counter + 1; }\n', 'declared extern but not defined in this source', 'extern int32 Counter;\n'),
+    ('casts-and-class.a-b', 'ObjLt', '  bool F(AActor *A, AActor *B) { return A < B; }\n', 'unimplemented binary operator < on ObjectObject', ''),
+    ('number-conversions.uint8-x', 'F2U8', '  uint8 F(float X) { return (uint8)X; }\n', 'no Kismet conversion from float to uint8', ''),
+    ('joining-strings.a-n-b', 'StrJoin', '  FString F(int32 N) { return "a" + N + "b"; }\n', 'invalid operands to binary expression', ''),
+    ('converting-strings.fname-n-big', 'NameBig', '  FName F(int64 Big) { FName N = Big; return N; }\n', "conversion from 'int64' (aka 'long long') to 'FName' is ambiguous", ''),
+    ('comparing-and-testing.a-b-3', 'StrLt', '  bool F(FString A, FString B) { return A < B; }\n', 'invalid operands to binary expression', ''),
+    ('constants-and-constant.tarray-int32-rolls', 'RollDef', '  TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};\n',
+     'a default is a value known when the mod is built', ''),
+    ('copies-and-braced.tarray-int32-rolls', 'RollDef2', '  TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};\n',
+     'a default is a value known when the mod is built', ''),
+    ('consteval-functions.int32-seed-fnv-types', 'FnvDef', '  int32 Seed = Fnv(3);\n', 'a default is a value known when the mod is built', ROW_FNV),
+    ('consteval-functions.fnv-name', 'FnvRun', '  int32 F(int32 N) { return Fnv(N); }\n', 'is not a constant expression', ROW_FNV),
+    ('consteval-functions.int32-v-twice-3', 'TwiceDef', '  int32 V = Twice(3);\n', 'a default is a value known when the mod is built',
+     'constexpr int32 Twice(int32 X) { return X * 2; }\n'),
+    ('constexpr-and-consteval.int32-k-sq-3', 'SqDef', '  int32 K = Sq(3);\n', 'a default is a value known when the mod is built',
+     'constexpr int32 Sq(int32 X) { return X * X; }\n'),
+    ('inline-class-variables.khold-1-0f', 'ConstAssign', '  static inline const float kHold = 1.0f;\n  void F() { kHold = 2.0f; }\n',
+     "cannot assign to variable 'kHold' with const-qualified type", ''),
+    ('game-enums.ecreaturesize-size', 'EnumU32', '  ECreatureSize Size;\n', 'a uint8, int32 or int64 enum only', ''),
+    ('mod-enums-ue.ue-enum-emissing', 'EnumMiss', '  int32 X;\n', 'names no enum with enumerators', 'UE_ENUM(EMissing);\n'),
+    ('struct-operators.home-w', 'VecPlusEq', '  FVector Home;\n  void F(FVector W) { Home += W; }\n', "no viable overloaded '+='", ''),
+    ('struct-operators.v', 'VecNeg', '  FVector F(FVector V) { return -V; }\n', "invalid argument type 'FVector' to unary expression", ''),
+    ('struct-operators.a-b', 'RotPlus', '  FRotator F(FRotator A, FRotator B) { return A + B; }\n',
+     "no viable conversion from returned value of type 'FString' to function return type 'FRotator'", ''),
+    ('struct-operators.a-b-2', 'StructEq', '  bool F(FPt A, FPt B) { return A == B; }\n', 'invalid operands to binary expression', 'struct FPt {\n  UE_STRUCT;\n  int32 X;\n};\n'),
+    ('struct-conversions.fvector-v-facing', 'RotToVec', '  FVector F(FRotator Facing) { FVector V = Facing; return V; }\n',
+     "no viable conversion from 'FRotator' to 'FVector'", ''),
+    ('container-methods.items-empty', 'ArrEmpty', '  TArray<int32> Items;\n  void F() { Items.Empty(); }\n', 'no member named', ''),
+    ('container-methods.items-empty', 'ArrSort', '  TArray<int32> Items;\n  void F() { Items.Sort(); }\n', 'no member named', ''),
+    ('container-methods.items-empty', 'ArrPop', '  TArray<int32> Items;\n  void F() { Items.Pop(); }\n', 'no member named', ''),
+    ('container-methods.seen-0', 'SetIdx', '  TSet<int32> Seen;\n  bool F() { return Seen[0]; }\n', 'does not provide a subscript operator', ''),
+    ('container-methods.getitems-add-3', 'TempAdd', '  TArray<int32> Items;\n  TArray<int32> GetItems() { return Items; }\n  void F() { GetItems().Add(3); }\n',
+     'a container operation needs a variable, not a computed value', ''),
+    ('arithmetic.id-count', 'I64Mod', '  int64 F(int64 Id, int64 Count) { return Id % Count; }\n', 'unimplemented binary operator % on Int64Int64', ''),
+    ('comparisons.a-b', 'ObjLt2', '  bool F(AActor *A, AActor *B) { return A < B; }\n', 'unimplemented binary operator < on ObjectObject', ''),
+    ('validity-and-comparison.a-b', 'ObjLt3', '  bool F(AActor *A, AActor *B) { return A >= B; }\n', 'unimplemented binary operator >= on ObjectObject', ''),
+    ('logical-operators-and.c-left-right-5', 'CondAssign', '  int32 Left;\n  int32 Right;\n  void F(bool C) { (C ? Left : Right) = 5; }\n',
+     'assignment to ConditionalOperator', ''),
+    ('switch.case-1-3', 'CaseRange', '  int32 F(int32 X) { switch (X) { case 1 ... 3: return 1; default: return 0; } }\n', 'unimplemented statement IntegerLiteral', ''),
+    ('switch.switch-x-case-1-return', 'SwNoBrace', '  int32 F(int32 X) { switch (X) case 1: return 1; return 0; }\n', 'needs a braced body', ''),
+    ('switch.case-0-r-1-case', 'CaseNested', '  int32 F(int32 X) { int32 R = 0; switch (X) { case 0: { R = 1; case 1: R += 2; } } return R; }\n',
+     'unimplemented statement CaseStmt', ''),
+    ('statements-and-blocks.c-open-close', 'CondStmt', '  void Open() {}\n  void Close() {}\n  void F(bool C) { C ? Open() : Close(); }\n',
+     'unimplemented statement ConditionalOperator', ''),
+    ('statements-and-blocks.c-open-close', 'BinStmt', '  int32 F(int32 X) { X + 1; return X; }\n', 'unimplemented statement BinaryOperator', ''),
+    ('statements-and-blocks.void-unused', 'VoidUnused', '  void F(int32 Unused) { (void)Unused; }\n', 'unimplemented statement DeclRefExpr', ''),
+    ('statements-and-blocks.try-risky-catch-recover', 'TryCatch', '  void Risky() {}\n  void F() { try { Risky(); } catch (...) { } }\n',
+     'unimplemented statement CXXTryStmt', ''),
+    ('range-for-over.for-auto-x-y-points', 'BindArr', '  TArray<FIntPoint> Points;\n  int32 F() { int32 S = 0; for (auto [X, Y] : Points) S += X; return S; }\n',
+     'a structured binding over a TArray', ''),
+    ('what-a-range.for-int32-x-1-2', 'RangeList', '  int32 F() { int32 S = 0; for (int32 X : {1, 2, 3}) S += X; return S; }\n',
+     'range-for over std::initializer_list<int>', ''),
+    ('other-declarations.auto-a-b-point', 'BindDecl', '  int32 F(FIntPoint Point) { auto [A, B] = Point; return A; }\n',
+     'a declaration statement declares nothing usable', ''),
+    ('overloading.int32-ov-int32-a', 'OvTwo', '  int32 Ov(int32 A) { return A; }\n  int32 Ov(int32 A, int32 B) { return A + B; }\n', 'a second function of that name', ''),
+    ('lambdas-function.auto-p-inc1-return-p', 'FnPtr', '  int32 F(int32 X) { auto *P = &Inc1; return P(X); }\n', 'unimplemented local', 'int32 Inc1(int32 X) { return X + 1; }\n'),
+    ('lambdas-function.inline-fpairx-operator-fpairx-l', 'OpOver', '  FPairX F(FPairX A, FPairX B) { return A + B; }\n', 'unimplemented operator overload',
+     'struct FPairX {\n  UE_STRUCT;\n  int32 A;\n  int32 B;\n};\ninline FPairX operator+(FPairX L, FPairX R) { return {L.A + R.A, L.B + R.B}; }\n'),
+    ('math-and-utility.fmath-clamp-v-0-10', 'FMathUse', '  int32 F(int32 V) { return FMath::Clamp(V, 0, 10); }\n', "use of undeclared identifier 'FMath'", ''),
+    ('inline-functions.an-inline-function-that-calls', 'InlRec', '  inline int32 Loop(int32 X) { return X > 0 ? Loop(X - 1) : 0; }\n  int32 F(int32 X) { return Loop(X); }\n',
+     'calls itself', ''),
+    ('inline-functions.inline-int32-nope-int32-x', 'InlNoBody', '  inline int32 Nope(int32 X);\n  int32 F(int32 X) { return Nope(X); }\n', 'has no body', ''),
+    ('inline-functions.other-twice-3', 'InlOther', '  inline int32 Twice(int32 X) { return X * 2; }\n  int32 F(InlOther *Other) { return Other->Twice(3); }\n',
+     'called on another object (only this)', ''),
+    ('declaring-components.ue-component-utexture2d-icon', 'CompTex', '  UE_COMPONENT(UTexture2D, Icon);\n', 'is not a UActorComponent', ''),
+    ('declaring-components.ue-component-3', 'CompNonActor', '  UE_COMPONENT(UStaticMeshComponent, Hull);\n', 'only an actor has a construction script', '', 'UActorComponent'),
+    ('declaring-components.ue-component-4', 'CompIface', '', 'an interface cannot declare a UE_COMPONENT',
+     'class ICompIface {\npublic:\n  UE_INTERFACE;\n  UE_COMPONENT(UStaticMeshComponent, Hull);\n};\n'),
+    ('declaring-an-interface.ue-component', 'CompIface2', '', 'an interface cannot declare a UE_COMPONENT',
+     'class ICompIface2 {\npublic:\n  UE_INTERFACE;\n  UE_COMPONENT(UStaticMeshComponent, Hull);\n};\n'),
+    ('widget-layouts.grid-addchildtogrid-cell-1-2', 'GridAdd', '  UE_WIDGET(UGridPanel, Grid);\n  UE_WIDGET(UButton, Cell);\n  GridAdd() { Grid->AddChildToGrid(Cell, 1, 2); }\n',
+     "the slot's other values are its setters'", '', 'UUserWidget'),
+    ('widget-layouts.ue-widget-3', 'WidgetActor', '  UE_WIDGET(UVerticalBox, Box);\n', "a UE_WIDGET is a widget of a UUserWidget's tree", ''),
+    ('ue-defaults.home-z-5-0f', 'DefVecMember', '  FVector Home;\n  UE_DEFAULTS { Home.Z = 5.0f; }\n', 'is declared here - give it an initializer instead', ''),
+    ('ue-defaults.int32-charges', 'DefIntMember', '  int32 Charges;\n  UE_DEFAULTS { Charges = 3; }\n', 'is declared here - give it an initializer instead', ''),
+    ('ue-defaults.extra-bvisible-false', 'DefPlainPtr', '  UStaticMeshComponent *Extra;\n  UE_DEFAULTS { Extra->bVisible = false; }\n', 'is not a UE_COMPONENT', ''),
+    ('ue-defaults.lamp-intensity-100-0f', 'DefPlusEq', '  UE_COMPONENT(UPointLightComponent, Lamp);\n  UE_DEFAULTS { Lamp->Intensity += 100.0f; }\n', 'every statement is', ''),
+    ('ue-defaults.lamp-intensity', 'DefCall', '  UE_COMPONENT(UPointLightComponent, Lamp);\n  UE_DEFAULTS { Lamp->Intensity = UKismetMathLibrary::RandomFloat(); }\n',
+     'a default is a value known when the mod is built', ''),
+    ('constructors.lantern-charges-max-1', 'Lantern', '  int32 Max = 3;\n  int32 Charges;\n  Lantern() { Charges = Max + 1; }\n', 'a default is a value known when the mod is built', ''),
+    ('components-a-parent.controller-battachtopawn-true', 'PawnCtl', '  UE_DEFAULTS { Controller->bAttachToPawn = true; }\n',
+     'UeApi does not say which default subobject Controller is', '', 'APawn'),
+    ('objects-and-widgets.newobject-aactor-this', 'NewObjActor', '  AActor *F() { return NewObject<AActor>(this); }\n', 'no matching function', ''),
+    ('uobject-helpers.obj-class', 'ObjClass', '  void F(UObject *Obj) { auto C = Obj->Class; }\n', "no member named 'Class' in 'UObject'", ''),
+    ('pointing-at-data.float-h-md-big-health', 'AssetRead', '  float F() { float H = MD_Big.Health; return H; }\n', 'is an asset, not a value',
+     'class UMoodDef : public UPrimaryDataAsset {\npublic:\n  float Health = 1.0f;\n};\nUMoodDef MD_Big = {.Health = 5.0f};\n'),
+    ('declaring-a-dispatcher.tmulticastinlinedelegate-void', 'DispInline', '  TMulticastInlineDelegate<void(int32 Points)> OnHit;\n',
+     'a dispatcher is declared with UE_DISPATCHER', ''),
+    ('declaring-a-dispatcher.tmulticastsparsedelegate-void', 'DispSparse', '  TMulticastSparseDelegate<void(int32 Points)> OnHit;\n', 'unimplemented property', ''),
+    ('declaring-a-dispatcher.ue-dispatcher', 'DispIface', '', 'an interface cannot declare a UE_DISPATCHER',
+     'class IDispIface {\npublic:\n  UE_INTERFACE;\n  UE_DISPATCHER(OnHit, int32 N);\n};\n'),
+    ('binding-handlers.onhit-isbound', 'DispIsBound', '  UE_DISPATCHER(OnHit, int32 N);\n  bool F() { return OnHit.IsBound(); }\n', "no member named 'IsBound'", ''),
+    ('handler-functions.const', 'HandlerConst', '  UE_DISPATCHER(OnHit, int32 N);\n  void Handler(int32 N) const {}\n  void F() { OnHit.Add(this, &HandlerConst::Handler); }\n',
+     "no matching member function for call to 'Add'", ''),
+    ('delegate-values.k2-cleartimerdelegate', 'ClearEmpty', '  void F() { UKismetSystemLibrary::K2_ClearTimerDelegate({}); }\n', 'a delegate value is {this, &Class::Function}', ''),
+    ('reacting-to-input.pc-wasinputkeyjustpressed-f5', 'KeyStr', '  bool F(APlayerController *PC) { return PC->WasInputKeyJustPressed("F5"); }\n',
+     "no viable conversion from 'const char[3]' to 'FKey'", ''),
+    ('reacting-to-input.inputcomponent-bindkey', 'BindKey', '  void F(UInputComponent *InputComponent) { InputComponent->BindKey(1, 2, this, 3); }\n',
+     "no member named 'BindKey' in 'UInputComponent'", ''),
+    ('interface-values.cast-iaimable-other', 'CastIface', '  void F(AActor *Other) { auto *I = Cast<IAimable>(Other); }\n', 'Cast<> to an unknown class', ROW_IAIM),
+    ('implementing-an.listing-an-interface-a-mod', 'KidBeacon', '  void Aim() {}\n', 'which its parent Beacon already implements',
+     ROW_IAIM + 'class Beacon : public AActor, public IAimable {\npublic:\n  void Aim() {}\n};\n', 'Beacon, public IAimable'),
+    ('implementing-an.class-twoshare-public-aactor', 'TwoShare', '  void Aim() {}\n', 'which both extend IAimable',
+     ROW_IAIM + 'class IMarkable : public IAimable {\npublic:\n  UE_INTERFACE;\n  int32 Marks = 0;\n};\n', 'AActor, public IAimable, public IMarkable'),
+    ('implementing-an.a-base-after-the-parent', 'PlainBase', '  void Aim() {}\n', 'which is not an interface', 'class Plain {\npublic:\n  int32 X;\n};\n', 'AActor, public Plain'),
+    ('declaring-an-interface.tscriptinterface-imarkable-m', 'IfaceVarRead', '  int32 F(AActor *Other) { TScriptInterface<IMarkable> M = Other; return M->Marks; }\n',
+     'Marks is a variable of the interface IMarkable, which holds no state itself', ROW_IMARK),
+    ('declaring-an-interface.class-iboth-public-iaimable', 'IBoth', ROW_HEAD % 'IBoth' + ROW_IAIM + ROW_IMARK + 'class IBoth : public IAimable, public IMarkable {\npublic:\n  UE_INTERFACE;\n};\n',
+     'an interface extends one interface at most', ''),
+    ('declaring-an-interface.class-iactorish-public-aactor', 'IActorish', ROW_HEAD % 'IActorish' + 'class IActorish : public AActor {\npublic:\n  UE_INTERFACE;\n};\n',
+     'IActorish extends AActor, which is not an interface', ''),
+    ('raw-pointers-and.aactor-a-other', 'DerefObj', '  void F(AActor *Other) { AActor &A = *Other; }\n', 'which is not a raw pointer', ''),
+    ('reading-and-writing.uint32-addr-5', 'WriteU32', '  void F(int64 Addr) { *(uint32 *)Addr = 5; }\n', 'no Kismet conversion from int to uint32', ''),
+    ('taking-an-address.makearr-0', 'AddrTemp', '  TArray<int32> MakeArr() { TArray<int32> A; return A; }\n  int64 F() { return (int64)&MakeArr()[0]; }\n',
+     'the address of an element needs an array variable', ''),
+    ('taking-an-address.this-k', 'AddrStatic', '  static inline int32 K = 3;\n  int64 F() { return (int64)&this->K; }\n', 'a static variable has no address', ''),
+    ('objects-and-addresses.aactor-n', 'IntToPtr', '  AActor *F(int32 N) { return (AActor *)N; }\n', 'an int becomes a pointer through int64', ''),
+    ('sizeof-and-alignof.sizeof-aactor', 'SizeofObj', '  int32 F() { return sizeof(AActor); }\n', 'unimplemented struct member type: AActor', ''),
+    ('ptrcast.ptrcast-int64-r-2', 'PtrCastRef', '  int64 F() { int32 Local = 1; int32 &R = Local; return __PtrCast__<int64>(R); }\n',
+     'a reference to a Blueprint variable, which has no address', ROW_INTRIN),
+    ('classof.classof-obj-field', 'ClassOfField', '  FName F(AActor *Obj) { return __ClassOf__(Obj->bHidden); }\n', 'argument must be a bare parameter or local reference', ROW_INTRIN),
+]
+ROW_WARNINGS = [
+    ('number-conversions.float-big', 'I64F', '  float F(int64 Big) { return (float)Big; }\n', 'int64 -> float goes through int32', ''),
+    ('the-root-s.body-relativescale3d-fvector-2', 'RootScale',
+     '  UE_COMPONENT(UStaticMeshComponent, Body);\n  UE_DEFAULTS { Body->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f); }\n',
+     "is the actor's root, which the engine puts at the spawn transform", ''),
+    ('declaring-rpcs.ue-server-void-serverbump-int32', 'RpcRef', '  UE_SERVER void ServerBump(int32 &Count) { Count += 1; }\n',
+     'reaches the caller only when the call runs locally', ''),
+]
+
+
+def row_sources(rows):
+    """Each row as (mod, the source it compiles, the message), a body that starts with #include being the source itself."""
+    for rid, mod, body, why, top, *base in rows:
+        text = body if body.startswith('#include') else (
+            ROW_HEAD % mod + '%sclass %s : public %s {\npublic:\n%s};\n' % (top, mod, (base or ['AActor'])[0], body))
+        yield rid, mod, text, why
+
+
+def row_compile(mod, text):
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, mod + '.cpp')
+        with open(src, 'w', encoding='utf-8') as f: f.write(text)
+        return assetgen_compile([src, UEAPI, tmp])
+
+
+def row_refusals():
+    for rid, mod, text, why in row_sources(ROW_REFUSALS):
+        proc = row_compile(mod, text)
+        assert proc.returncode != 0 and why in proc.stdout, (rid, mod, proc.stdout)
+    for rid, mod, text, why in row_sources(ROW_WARNINGS):
+        proc = row_compile(mod, text)
+        warned = [l for l in proc.stdout.splitlines() if 'warning:' in l and why in l]
+        assert proc.returncode == 0 and warned, (rid, mod, proc.stdout)
+    print('ok  %d REFERENCE rows name a refusal or a warning: each source is refused (or built, warning) with the row\'s message'
+          % len({r[0] for r in ROW_REFUSALS + ROW_WARNINGS}))
+
+
+proves('arithmetic.id-count', 'binding-handlers.onhit-isbound', 'blueprint-classes.class-x-public-anotincluded',
+       'casts-and-class.a-b', 'classof.classof-obj-field', 'comparing-and-testing.a-b-3', 'comparisons.a-b',
+       'components-a-parent.controller-battachtopawn-true', 'constants-and-constant.tarray-int32-rolls',
+       'consteval-functions.fnv-name', 'consteval-functions.int32-seed-fnv-types',
+       'consteval-functions.int32-v-twice-3', 'constexpr-and-consteval.int32-k-sq-3',
+       'constructors.lantern-charges-max-1', 'container-methods.getitems-add-3', 'container-methods.items-empty',
+       'container-methods.seen-0', 'converting-strings.fname-n-big', 'copies-and-braced.tarray-int32-rolls',
+       'declaring-a-dispatcher.tmulticastinlinedelegate-void',
+       'declaring-a-dispatcher.tmulticastsparsedelegate-void', 'declaring-a-dispatcher.ue-dispatcher',
+       'declaring-an-interface.class-iactorish-public-aactor', 'declaring-an-interface.class-iboth-public-iaimable',
+       'declaring-an-interface.tscriptinterface-imarkable-m', 'declaring-an-interface.ue-component',
+       'declaring-components.ue-component-3', 'declaring-components.ue-component-4',
+       'declaring-components.ue-component-utexture2d-icon', 'declaring-rpcs.ue-server-void-serverbump-int32',
+       'defaults.embedfile-missing-bin', 'delegate-values.k2-cleartimerdelegate', 'game-enums.ecreaturesize-size',
+       'globals-across-sources.extern-int32-counter', 'handler-functions.const',
+       'implementing-an.a-base-after-the-parent', 'implementing-an.class-twoshare-public-aactor',
+       'implementing-an.listing-an-interface-a-mod', 'inline-class-variables.khold-1-0f',
+       'inline-functions.an-inline-function-that-calls', 'inline-functions.inline-int32-nope-int32-x',
+       'inline-functions.other-twice-3', 'interface-values.cast-iaimable-other', 'joining-strings.a-n-b',
+       'lambdas-function.auto-p-inc1-return-p', 'lambdas-function.inline-fpairx-operator-fpairx-l',
+       'logical-operators-and.c-left-right-5', 'math-and-utility.fmath-clamp-v-0-10',
+       'member-variables.a-member-whose-type-is', 'member-variables.uint16-w', 'mod-enums-ue.ue-enum-emissing',
+       'namespace-scope.extern-int32-shared', 'namespace-scope.umooddef-globaldef',
+       'namespaces-and-folders.class-pistol-public-rifle', 'number-conversions.float-big',
+       'number-conversions.uint8-x', 'objects-and-addresses.aactor-n', 'objects-and-widgets.newobject-aactor-this',
+       'other-declarations.auto-a-b-point', 'overloading.int32-ov-int32-a', 'pointing-at-data.float-h-md-big-health',
+       'ptrcast.ptrcast-int64-r-2', 'range-for-over.for-auto-x-y-points', 'raw-pointers-and.aactor-a-other',
+       'reacting-to-input.inputcomponent-bindkey', 'reacting-to-input.pc-wasinputkeyjustpressed-f5',
+       'reading-and-writing.uint32-addr-5', 'sharing-a-class.ue-class-game-mymods-turrets-2',
+       'sharing-a-class.ue-class-game-mymods-turrets-3', 'sizeof-and-alignof.sizeof-aactor',
+       'statements-and-blocks.c-open-close', 'statements-and-blocks.try-risky-catch-recover',
+       'statements-and-blocks.void-unused', 'struct-conversions.fvector-v-facing', 'struct-operators.a-b',
+       'struct-operators.a-b-2', 'struct-operators.home-w', 'struct-operators.v', 'switch.case-0-r-1-case',
+       'switch.case-1-3', 'switch.switch-x-case-1-return', 'taking-an-address.makearr-0', 'taking-an-address.this-k',
+       'the-mod-package.a-source-with-nothing-to', 'the-mod-package.ue-mod-package',
+       'the-mod-package.ue-mod-package-2', 'the-root-s.body-relativescale3d-fvector-2',
+       'ue-defaults.extra-bvisible-false', 'ue-defaults.home-z-5-0f', 'ue-defaults.int32-charges',
+       'ue-defaults.lamp-intensity', 'ue-defaults.lamp-intensity-100-0f', 'uobject-helpers.obj-class',
+       'validity-and-comparison.a-b', 'variable-types.double-d', 'variable-types.uint32-mask',
+       'what-a-range.for-int32-x-1-2', 'widget-layouts.grid-addchildtogrid-cell-1-2', 'widget-layouts.ue-widget-3')
+row_refusals()
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
