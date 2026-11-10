@@ -14434,6 +14434,20 @@ def widget_animation():
     assert [(t['name'], struct.unpack('<f', bytes(t['value']))[0]) for t in pad] == [('Top', 6.0)], pad
     keeps_invariants(base)
 
+    # The same assignment where the slot is made, through the untyped call's cast and through the typed adder's result.
+    cp, _ = class_pkg(os.path.join(ROOT, 'WidgetTree', 'FSD', 'Content', '_ElytrasMods', 'WidgetTree', 'UWtChain'))
+    slots = {cp.path(i + 1).split('.')[-1]: i for i in range(len(cp.exports)) if cp.class_of(i + 1) == 'OverlaySlot'}
+    assert len(slots) == 2, slots
+    by_child = {}
+    for i in slots.values():
+        child = [t for t in cp.tags(i) if t['name'] == 'Content'][0]
+        by_child[cp.path(struct.unpack('<i', bytes(child['value'])[:4])[0])] = i
+    left, right = (next(i for k, i in by_child.items() if k.endswith(n)) for n in ('Left', 'Right'))
+    assert [(t['name'], struct.unpack('<f', bytes(t['value']))[0]) for t in cp.tags(left, cp.tag(left, 'Padding')['at'])] == [('Top', 6.0)]
+    hal = cp.tag(right, 'HorizontalAlignment')
+    assert cp.names[struct.unpack_from('<i', bytes(hal['value']))[0]].endswith('HAlign_Center'), hal
+    proves('widget-layouts.cast-uoverlayslot-box-addchild-a')
+
     widgets = '  UE_WIDGET(UCanvasPanel, Root);\n  UE_WIDGET(UTextBlock, Title);\n  UE_ANIMATION(Pop);\n'
     proves('widget-layouts.ue-keys')
     refused('WaNoKeys', widgets + '  WaNoKeys() { Root->AddChildToCanvas(Title); }\n', 'keys nothing and has no length',

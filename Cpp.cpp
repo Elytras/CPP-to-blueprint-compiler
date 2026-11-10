@@ -456,7 +456,7 @@ const Json* LocalMemberAssignment(const Json& S, const Json*& Lhs, const Json*& 
         Lhs = Base;
     }
     const Json* Local = Strip(First(*Lhs));
-    return Local && Kind(*Local) == "DeclRefExpr" ? Local : nullptr;
+    return Local && (Kind(*Local) == "DeclRefExpr" || Kind(*Local) == "CXXMemberCallExpr" || Kind(*Local) == "CallExpr") ? Local : nullptr;
 }
 
 bool WidgetLayoutStatement(const Json& S)
@@ -21441,6 +21441,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         const std::string Id = Local->value("referencedDecl", Json::object()).value("id", std::string());
                         if (const auto L = SlotLocals.find(Id); L != SlotLocals.end() && !R.Widgets.empty())
                             SlotOf = &LayoutSlots[L->second];
+                        else if (Kind(*Local) != "DeclRefExpr" && !R.Widgets.empty())      // `Root->AddChildToCanvas(W)->Padding.Top = 6;`
+                        {
+                            const int32 At = AddCall(Local);
+                            if (At == -1) { bOk = false; return; }
+                            if (At >= 0) SlotOf = &LayoutSlots[size_t(At)];
+                        }
                         if (const int32 I = InstLocal(Id); I >= 0) InstOf = &InstDefaults[size_t(I)];
                     }
                 if (!bDefault && !SlotOf && !InstOf)
