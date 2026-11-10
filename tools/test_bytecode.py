@@ -16989,7 +16989,8 @@ def row_compile(mod, text):
 def row_refusals():
     for rid, mod, text, why in row_sources(ROW_REFUSALS):
         proc = row_compile(mod, text)
-        assert proc.returncode != 0 and why in proc.stdout, (rid, mod, proc.stdout)
+        out = proc.stdout + proc.stderr           # clang's diagnostics are on stderr
+        assert proc.returncode != 0 and why in out, (rid, mod, out)
     for rid, mod, text, why in row_sources(ROW_WARNINGS):
         proc = row_compile(mod, text)
         warned = [l for l in proc.stdout.splitlines() if 'warning:' in l and why in l]
