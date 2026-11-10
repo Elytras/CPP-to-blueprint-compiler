@@ -23407,6 +23407,7 @@ public:
         if (bFileNext && V != CurFile) { CurFile = V; CurId = -1; }
         if (bKindNext && !Skipped)         // "kind" comes before "range"; a TypeTraitExpr's begin is its trait (FoldConst)
             Ranged.back() = V == "DeclRefExpr" || V == "TypeTraitExpr" || V == "LambdaExpr" || V == "CXXMethodDecl" || V == "CXXRecordDecl"
+                              || V == "FunctionDecl"
                           ? ERange::Begin
                           : V == "MemberExpr" || V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
         if (bTypeNext) V = Unrooted(std::move(V));
@@ -24384,6 +24385,68 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         }
     for (const auto& [Id, Var] : ConstVars) WarnKeyLiterals(*Var, Name(*Var));
     for (const FChain* C : ChainOrder) if (C->Def) WarnKeyLiterals(*C->Def, Name(*C->Def));
+    /* A local or a parameter named None, in any case, is NAME_None: the bytecode names a local by its FName and
+       FindFProperty returns null for None, so every read and write of it would be dead in game. The editor never keeps
+       one: its validator calls the name empty (FKismetNameValidator::IsValid, Kismet2NameValidators.cpp 139-142), and
+       a name it makes unique is `<Base>_<N>`, N from 0 (FBlueprintEditorUtils::FindUniqueKismetName,
+       BlueprintEditorUtils.cpp 7746-7784). So here: renamed None_0, or the first N no variable, parameter or member of
+       the class takes, with every reference to it, and a warning once per function and name. The line in it is where
+       the name is first written after the function begins: a variable is declared before it is used, and a member
+       named None is refused already (RefuseNoneNames). A lambda capturing it by name is not followed (CaptureNames
+       reads the capture list from the source). */
+    auto LineOf = [&](const Json& Fn, const std::string& Word) {
+        Json Begin = Fn.value("range", Json::object()).value("begin", Json::object());
+        if (Begin.contains("spellingLoc")) Begin = Begin["spellingLoc"];
+        const std::string* T = SourceOf(Begin);
+        if (!T || !Begin.contains("offset")) return std::string();
+        auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+        for (size_t At = T->find(Word, Begin["offset"].get<size_t>()); At != std::string::npos; At = T->find(Word, At + 1))
+            if ((At == 0 || !Ident((*T)[At - 1])) && (At + Word.size() >= T->size() || !Ident((*T)[At + Word.size()])))
+                return " (" + std::filesystem::path(Doc["files"][Begin["fileId"].get<int32>()].get<std::string>()).filename().string()
+                     + ":" + std::to_string(1 + std::count(T->begin(), T->begin() + At, '\n')) + ")";
+        return std::string();
+    };
+    std::set<std::string> NoneWarned;
+    auto RenameNoneLocals = [&](const std::vector<std::pair<const Json*, std::string>>& Bodies, std::set<std::string> Taken) {
+        std::function<void(const Json&)> Collect = [&](const Json& N) {
+            if (Kind(N) == "VarDecl" || Kind(N) == "ParmVarDecl" || Kind(N) == "FieldDecl" || Kind(N) == "CXXMethodDecl")
+                Taken.insert(Lower(Name(N)));
+            ForEach(N, Collect);
+        };
+        for (const auto& [Body, Where] : Bodies) Collect(*Body);
+        for (const auto& [Body, Where] : Bodies)
+        {
+            std::map<std::string, std::string> Renamed;     // decl id -> its new name
+            std::function<void(Json&)> Rename = [&](Json& N) {
+                if (const std::string K = Kind(N); (K == "VarDecl" || K == "ParmVarDecl") && Lower(Name(N)) == "none")
+                {
+                    std::string New;
+                    for (int32 I = 0; Taken.count(Lower(New = Name(N) + "_" + std::to_string(I))); ++I) {}
+                    if (NoneWarned.insert(Where + "::" + Name(N)).second)
+                        printf("  warning: %s: the %s %s%s is UE's empty name, in any case, whose every read and write "
+                               "would be dead in game: renamed %s, as the editor names it\n", Where.c_str(),
+                               K == "VarDecl" ? "local" : "parameter", Name(N).c_str(), LineOf(*Body, Name(N)).c_str(), New.c_str());
+                    Renamed[N.value("id", std::string())] = New;
+                    N["name"] = New;
+                }
+                if (auto R = N.find("referencedDecl"); R != N.end() && R->is_object())
+                    if (auto It = Renamed.find(R->value("id", std::string())); It != Renamed.end()) (*R)["name"] = It->second;
+                if (auto It = N.find("inner"); It != N.end()) for (Json& C : *It) Rename(C);
+            };
+            Rename(const_cast<Json&>(*Body));
+        }
+    };
+    for (const auto& [Cpp, R] : Records)
+        if (R.IsGenerated() || R.IsModStruct() || R.bIsPatch)
+        {
+            std::vector<std::pair<const Json*, std::string>> Bodies;
+            for (const Json* M : R.AllMethods) Bodies.emplace_back(M, Cpp + "::" + Name(*M));
+            for (const auto& [Method, Def] : R.MethodDefs) Bodies.emplace_back(Def, Cpp + "::" + Method);
+            std::set<std::string> Members;
+            for (const Json* F : R.Fields) Members.insert(Lower(Name(*F)));
+            RenameNoneLocals(Bodies, Members);
+        }
+    for (const FChain* C : ChainOrder) if (C->Def) RenameNoneLocals({ { C->Def, Name(*C->Def) } }, {});
     /* Before anything reads a type: a raw pointer is an int64 from here on (see IsRawPointer). */
     for (const auto& Entry : Records)
     {

@@ -10805,6 +10805,53 @@ print('ok  Names: a member, a UE_STRUCT member, a function, a component or an in
       'case, is refused')
 
 
+def none_locals():
+    """A local or a parameter named None, in any case, is NAME_None: the bytecode names a local by its FName, and
+    FindFProperty returns null for None, so every read and write of it would be dead in game. The editor names a
+    variable it makes unique `<Base>_<N>`, N from 0 (FBlueprintEditorUtils::FindUniqueKismetName), and so does the
+    compiler here: None_0, or None_1 past a member None_0, with every reference, and a warning once naming the function,
+    the variable, its line and the new name. In a method, an event, an out-of-class definition and a free function, as
+    a local and as a parameter; the renamed one is read and written, and the function returns what C++ does."""
+    def compiled(tmp, mod, body, why, top='', after=''):
+        src = os.path.join(tmp, mod + '.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
+                    'class %s : public AActor {\npublic:\n%s};\n%s' % (mod, top, mod, body, after))
+        proc = assetgen_compile([src, UEAPI, tmp])
+        lines = [l for l in proc.stdout.splitlines() if 'warning: ' + why in l]
+        assert proc.returncode == 0 and len(lines) == 1, (mod, proc.stdout)
+        return os.path.join(tmp, mod)
+    with tempfile.TemporaryDirectory() as tmp:
+        proves('overloading.none-local')
+        base = compiled(tmp, 'NoneLocal', '  int32 Sum(int32 V) {\n    int32 None = V + 1;\n    None = None * 2;\n'
+                        '    return None;\n  }\n',
+                        'NoneLocal::Sum: the local None (NoneLocal.cpp:7) is UE\'s empty name, in any case, whose every '
+                        'read and write would be dead in game: renamed None_0')
+        props = runscript.props_of(base, 'Sum')
+        assert 'None_0' in props and 'None' not in props, props
+        for v in (-3, 0, 5):
+            assert run(base, 'Sum', V=v)[0] == (v + 1) * 2, v
+        base = compiled(tmp, 'NoneTaken', '  int32 None_0 = 5;\n  int32 Add(int32 V) { int32 None = V; None = None + 1; return None + None_0; }\n',
+                        'NoneTaken::Add: the local None (NoneTaken.cpp:7) is UE\'s empty name, in any case, whose every '
+                        'read and write would be dead in game: renamed None_1')
+        assert 'None_1' in runscript.props_of(base, 'Add'), runscript.props_of(base, 'Add')
+        assert run(base, 'Add', {'None_0': 5}, V=3)[0] == 9
+        base = compiled(tmp, 'NoneParm', '  int32 Twice(int32 none) { return none * 2; }\n',
+                        'NoneParm::Twice: the parameter none (NoneParm.cpp:6) is UE\'s empty name, in any case, whose '
+                        'every read and write would be dead in game: renamed none_0')
+        assert run(base, 'Twice', None_0=4)[0] == 8     # none_0 is FName (none, 1), stored as the package's "None"
+        compiled(tmp, 'NoneEvent', '  int32 Count = 0;\n  void ReceiveBeginPlay();\n',
+                 'NoneEvent::ReceiveBeginPlay: the local NONE (NoneEvent.cpp:10) is UE\'s empty name',
+                 after='void NoneEvent::ReceiveBeginPlay() {\n  int32 NONE = 2;\n  Count = NONE;\n}\n')
+        compiled(tmp, 'NoneFree', '  int32 Count = 0;\n  void Bump() { Count = Half(Count); }\n',
+                 'Half: the local None (NoneFree.cpp:4) is UE\'s empty name',
+                 top='inline int32 Half(int32 X) { int32 None = X / 2; return None; }\n')
+
+
+none_locals()
+print('ok  Names: a local or a parameter named None, in any case, is renamed None_0 as the editor names it, with a warning')
+
+
 # ---- DELEG: delegates and event dispatchers - signatures, binds, broadcasts, timers by name (invariant_rules/delegates.py)
 
 import invariants
