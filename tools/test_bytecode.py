@@ -17042,6 +17042,183 @@ proves('arithmetic.id-count', 'binding-handlers.onhit-isbound', 'blueprint-class
 row_refusals()
 
 
+
+# ---- Rows whose answer the interpreter can run: tests/RowRuns.cpp has one small function per row, and each is run here
+# against the answer the row gives, written as plain Python.
+
+def row_runs():
+    def check_row(fn, oracle, cases, me=None):
+        for parms in cases:
+            got = run(asset('RowRuns'), fn, self_vars=dict(me or {}), **parms)[0]
+            want = oracle(**parms)
+            assert got == want and type(got) is type(want), 'RowRuns.%s(%s) = %r, want %r' % (fn, parms, got, want)
+    ints = (-7, -1, 0, 1, 5, 6, 300)
+    check_row('HalfLiteral', lambda: 0.75, [{}])
+    check_row('WidenToFloat', lambda N: N / 4, [dict(N=n) for n in (-6, 0, 6, 10)])
+    check_row('WidenToInt64', lambda N: N * 2**32, [dict(N=n) for n in (-3, 0, 3, 2**30)])
+    check_row('ByteWraps', lambda Start: (Start + 200) % 256, [dict(Start=s) for s in (0, 55, 56, 100, 255)])
+    check_row('IntOverFloat', lambda A, B: A / B, [dict(A=7, B=2.0), dict(A=-9, B=4.0), dict(A=0, B=8.0)])
+    check_row('EmptyLen', lambda: 0, [{}])
+    check_row('WideLen', lambda: 4, [{}])
+    check_row('IsGold', lambda S: S.lower() == 'gold', [dict(S=s) for s in ('gold', 'GOLD', 'Gold', 'silver', '')])
+    check_row('NamesDiffer', lambda A, B: A.lower() != B.lower(), [dict(A=a, B=b) for a, b in (('Rock', 'rock'), ('Rock', 'Ore'), ('', ''))])
+    check_row('StrLen', lambda S: len(S), [dict(S=s) for s in ('', 'a', 'hello there')])
+    check_row('InRangeConst', lambda: True, [{}])
+    check_row('ShiftConst', lambda: 16, [{}])
+    check_row('FoldMix', lambda N: N * 4 + 3 * 2 + (1 << 4 | 4), [dict(N=n) for n in ints])
+    check_row('FoldShortCircuit', lambda X: 2, [dict(X=x) for x in (0, 1)])
+    check_row('FoldLeft', lambda N: N * 3 + 8 + 19, [dict(N=n) for n in ints])
+    check_row('FoldIdentity', lambda X: 6 * X, [dict(X=x) for x in ints])
+    check_row('ConstLocal', lambda: 6, [{}])
+    check_row('ConstBranch', lambda N: 0, [dict(N=n) for n in (0, 1, 4)])
+    check_row('WhileFalse', lambda X: X, [dict(X=x) for x in ints])
+    check_row('NegGreater', lambda Ammo: 1 if not Ammo > 0 else 2, [dict(Ammo=a) for a in (-1, 0, 1)])
+    check_row('NegEqual', lambda A, B: 1 if A != B else 2, [dict(A=a, B=b) for a, b in ((1, 1), (1, 2), (0, 0))])
+    check_row('NegStrEqual', lambda S, T: 1 if S.lower() != T.lower() else 2, [dict(S=s, T=t) for s, t in (('a', 'A'), ('a', 'b'))])
+    check_row('NegStrValue', lambda S, T: S.lower() != T.lower(), [dict(S=s, T=t) for s, t in (('a', 'A'), ('a', 'b'))])
+    check_row('NegNeg', lambda X: 1 if X else 2, [dict(X=x) for x in (True, False)])
+    check_row('NegElse', lambda X: 20 if X else 10, [dict(X=x) for x in (True, False)])
+    check_row('DropsUnused', lambda A: A + 1, [dict(A=a) for a in ints])
+    check_row('InlineBoolJump', lambda Item: 10 if Item > 3 else 20, [dict(Item=i) for i in (0, 3, 4, 9)])
+    check_row('UnaryPlus', lambda X: X, [dict(X=x) for x in ints])
+    check_row('BitMix', lambda A, B: (A & 0xFF) | (B ^ 1), [dict(A=a, B=b) for a in (0, 0x1F3, -2) for b in (0, 1, 6)])
+    check_row('FloatTruth', lambda F: 1 if F else 0, [dict(F=f) for f in (0.0, 0.5, -2.0)])
+    check_row('ByteTruth', lambda B: 1 if B else 0, [dict(B=b) for b in (0, 1, 255)])
+    check_row('Int64Truth', lambda I: 1 if I else 0, [dict(I=i) for i in (0, 1, 2**40)])
+    check_row('VoidCall', lambda: 3, [{}], me=dict(Count=2))
+    check_row('DoOnce', lambda X: 1 if X > 0 else 2, [dict(X=x) for x in (-1, 0, 1)])
+    check_row('CondDecl', lambda V: V % 3 + 100 if V % 3 else 0, [dict(V=v) for v in (3, 4, 5, 6)])
+    check_row('AliasMember', lambda By: 5 + By, [dict(By=b) for b in (0, 2, -9)], me=dict(Count=5))
+    proves('references-to-memory.int32-alias-local')
+    check_row('AliasLocal', lambda By: 1 + By, [dict(By=b) for b in (0, 2, -9)])
+    check_row('GetCharges', lambda: 7, [{}], me=dict(Count=7))
+    check_row('Clamp01', lambda V: min(max(V, 0), 1), [dict(V=v) for v in (-3, 0, 1, 9)])
+    check_row('Half', lambda V: cdiv(V, 2), [dict(V=v) for v in (-5, -4, 0, 7, 8)])
+    check_row('CallByVal', lambda: 1, [{}])
+    check_row('AddIndex', lambda: 1, [{}])
+    check_row('SetAt', lambda: 9 * 10 + 2, [{}])
+    # The interpreter has no Remove, RemoveItem, Insert or Identical, but each row's claim is which node the method is:
+    base = asset('RowRuns')
+    paths = import_paths(base)
+
+    def nodes(fn):
+        w = dump('walkscript.py', base, exports_of(base).index(fn))
+        return {paths[int(i)].rsplit(':', 1)[-1] for i in re.findall(r'FinalFunction\s+imp\[(\d+)\]', w)}
+    for fn, node, absent in (('RemoveAt', 'Array_Remove', 'Array_RemoveItem'), ('RemoveEqual', 'Array_RemoveItem', 'Array_Remove'),
+                             ('InsertAt', 'Array_Insert', None), ('SameElements', 'Array_Identical', None)):
+        assert node in nodes(fn) and absent not in nodes(fn), (fn, nodes(fn))
+    # What each rule leaves out is read off the disassembly: the nodes a function calls (the optimizer rows keep the
+    # answer and drop the work).
+    def calls(fn):
+        return set(re.findall(r"Function'(\w+)'", dump('walkscript.py', base, exports_of(base).index(fn))))
+    assert 'Abs_Int' in calls('KeepsUsed')
+    assert not {'Abs_Int', 'Multiply_IntInt'} & calls('DropsUnused'), calls('DropsUnused')
+    assert 'LessEqual_IntInt' in calls('NegGreater') and 'Not_PreBool' not in calls('NegGreater')
+    assert 'NotEqual_IntInt' in calls('NegEqual') and 'Not_PreBool' not in calls('NegEqual')
+    assert 'Not_PreBool' in calls('NegStrValue'), calls('NegStrValue')
+    assert not calls('NegNeg') and not calls('NegElse'), (calls('NegNeg'), calls('NegElse'))
+    assert not calls('ConstLocal') and not calls('InRangeConst') and not calls('ShiftConst')
+    assert 'Greater_IntInt' not in calls('ConstBranch') and 'ReadyBit' not in str(calls('InlineBoolJump'))
+    print('ok  RowRuns: %s' % 'literals and widening, strings and names, folding and negations, the unused-code rules, '
+          'byte wrap, references, by-value containers and the array methods give the answer their rows state')
+
+
+proves('number-literals.float-y-0-5', 'number-conversions.ratio-count', 'number-conversions.big-count',
+       'number-conversions.charges-200', 'number-conversions.a-b', 'string-literals.fstring',
+       'string-literals.fstring-wide-l-wide', 'comparing-and-testing.s-gold', 'comparing-and-testing.a-b',
+       'string-functions.ukismetstringlibrary-len-s', 'constants-and-constant.bool-ready-kstep-2-kstep',
+       'bitwise-operators-and.1-kshift', 'constant-folding.n-kstep-kslots-2-1', 'constant-folding.false-x',
+       'constant-folding.n-3-8-19', 'constant-folding.x-0', 'constant-locals-and.const-int32-three-3',
+       'declaring-locals.const-int32-three-3', 'constant-locals-and.if-lim-3-break',
+       'constant-locals-and.while-false', 'negations.ammo-0', 'negations.a-b', 'negations.x',
+       'what-the-optimizer.ukismetmathlibrary-abs-int-a', 'what-the-optimizer.int32-unused-a-3', 'arithmetic.x-2',
+       'bitwise-operators-and.a-0xff-b-1', 'conditions.if-f', 'statements-and-blocks.void-compute',
+       'while-and-do.do-r-1-if-x', 'names-and-scope.if-int32-rest-v-3', 'reference-locals.int32-alias-count',
+       'parameters-and-return.auto-half-int32-v-return', 'parameters-and-return.int32-byval-tarray-int32-a',
+       'container-methods.scores-add-7', 'container-methods.items-remove-2', 'container-methods.items-removeitem-2',
+       'container-methods.items-insert-9-0', 'container-methods.items-set-0-9-true',
+       'container-methods.a-identical-b')
+row_runs()
+
+
+
+# ---- The memory rows of the same class, run on runscript's stand-in memory (what PointerTest and PointerMore do).
+
+def row_memory_runs():
+    import struct
+    base, A = asset('RowRuns'), 0x7FF600001000
+
+    def put(a, fmt, *v):
+        for i, b in enumerate(struct.pack(fmt, *v)): runscript.MEM[a + i] = b
+
+    def get(a, fmt): return struct.unpack(fmt, bytes(runscript.MEM.get(a + i, 0) for i in range(struct.calcsize(fmt))))
+    runscript.MEM.clear()
+    # The game's layout: FVector is three floats, FTransform is 16-aligned.
+    assert [run(base, fn)[0] for fn in ('SizeOfVector', 'AlignOfTransform')] == [12, 16]
+    assert run(base, 'SizeOfDeref', P=A)[0] == 12
+    # Reads of raw memory, each at the width and type it names.
+    put(A, '<q', -(2**40) - 5)
+    assert run(base, 'Read64At', A=A)[0] == -(2**40) - 5
+    put(A, '<f', 2.5)
+    assert run(base, 'ReadFloatAt', A=A)[0] == 2.5
+    put(A, '<B', 200)
+    assert run(base, 'ReadByteAt', A=A)[0] == 200
+    put(A, '<i', -77)
+    assert run(base, 'Read32Via', P=A)[0] == -77
+    # Pointer arithmetic is in elements of the pointee: difference, steps, the value a post-increment yields.
+    assert run(base, 'PtrDiff', P=A + 40, Q=A + 8)[0] == 8
+    assert run(base, 'PtrDiff', P=A, Q=A + 12)[0] == -3
+    for n in (-2, 0, 3):
+        assert run(base, 'StepAll', P=A, N=n)[0] == A + 4 * (n - 1), n      # +n +1 +1 -1 -1 -1 nets n - 1
+    assert run(base, 'PostStep', P=A)[0] == A * 1000 + 4
+    assert run(base, 'AddrIndexed', P=A, I=5)[0] == A + 20
+    assert run(base, 'AddrDeref', P=A)[0] == A
+    assert [run(base, 'NonNull', P=p)[0] for p in (0, A)] == [0, 1]
+    # A condition that reads memory is read again before each iteration.
+    put(A, '<iiiii', 5, 6, 7, 0, 9)
+    assert run(base, 'CountToZero', Q=A)[0] == 3
+    # A write through a reference parameter lands in the memory behind the pointer.
+    put(A, '<i', 41)
+    assert run(base, 'BumpThrough', P=A)[0] == 42 and get(A, '<i') == (42,)
+    # __PtrCast__: an address as a pointer, as a reference to read and write, and a reference as its address.
+    put(A, '<i', 13)
+    assert run(base, 'PtrCastRead', Addr=A)[0] == 13
+    assert run(base, 'PtrCastRef', Addr=A)[0] == 14 and get(A, '<i') == (14,)
+    assert run(base, 'PtrCastAddr', P=A + 8)[0] == A + 8
+    runscript.MEM.clear()
+    print('ok  RowRuns: sizes in the game\'s layout, raw reads, pointer arithmetic, a memory-reading loop, a reference through '
+          'a pointer and __PtrCast__ behave as their rows say')
+
+
+proves('sizeof-and-alignof.sizeof-fvector', 'sizeof-and-alignof.alignof-ftransform',
+       'constants-and-constant.sizeof-fvector', 'reading-memory.read64-a', 'reading-memory.readfloat-a',
+       'reading-memory.readbyte-a', 'reading-memory.read32-p', 'pointer-arithmetic.p-q', 'pointer-arithmetic.p-n-2',
+       'taking-an-address.p', 'where-pointer-code.while-q-0-q', 'raw-pointers-and.if-p',
+       'references-to-memory.bump-p', 'reference-parameters-and.bump-p', 'ptrcast.ptrcast-int32-addr',
+       'ptrcast.ptrcast-int32-addr-2', 'ptrcast.ptrcast-int64-r')
+row_memory_runs()
+
+
+
+# ---- The class defaults the rows describe: tests/RowDefaults.cpp, read back off the cooked default object.
+
+def row_defaults():
+    folder = os.path.dirname(asset('RowDefaults'))
+    assert global_default(folder, 'RowDefaults', 'Kind') == '/Game/A/BP_A.BP_A_C'
+    assert global_default(folder, 'RowDefaults', 'Kinds') == ['/Game/A/BP_A.BP_A_C', '/Game/B/BP_B.BP_B_C']
+    assert global_default(folder, 'RowDefaults', 'Slow') == '0.75'
+    base = asset('RowDefaults')
+    tags = dump('dumptags.py', base, exports_of(base).index('Default__RowDefaults_C'))
+    assert re.search(r'^  Delay \[0\] StructProperty size=\d+ struct=FloatInterval', tags, re.M), tags
+    assert re.search(r'^    Min \[0\] FloatProperty size=4: 1\.0$', tags, re.M) and re.search(r'^    Max \[0\] FloatProperty size=4: 5\.0$', tags, re.M), tags
+    print('ok  RowDefaults: a soft class path and a list of them, a struct constructor and a float literal are written into Class Defaults as given')
+
+
+proves('soft-references.tsoftclassptr-aactor-kind-game-a', 'soft-references.tarray-tsoftclassptr-aactor',
+       'container-variables.tarray-tsoftclassptr-aactor', 'struct-defaults.ffloatinterval-delay')
+row_defaults()
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
