@@ -47,8 +47,6 @@ container-variables.tmap-aplayercharacter-int32
 arithmetic.hits-shots
 evaluation-order.bump-100-bumpinline
 conditions.target-target-customtimedilation
-jumps.goto
-range-for-over.goto
 reference-locals.int32-r-other-score
 reference-locals.float-x-other-loc-x
 constant-folding.x-0-2
@@ -66,7 +64,6 @@ the-world-context.ugameplaystatics-getplayerpawn
 results-you-ignore.doubled
 math-and-utility.ukismetmathlibrary-clamp-v-0-10
 math-and-utility.s-x
-math-and-utility.std-min-a-b
 math-and-utility.if-constexpr-is-same-t
 messages-on-screen.ugamefunctionlibrary-2
 overriding-engine-and.void-onjumped-acharacter
@@ -141,7 +138,6 @@ implementing-an.an-interface-whose-implementable
 declaring-an-interface.int32-getpriority-return-1
 declaring-an-interface.class-iprioritytarget-public
 declaring-an-interface.ue-replicated-using-int32-score
-declaring-an-interface.int32-marks
 writing-replicated.target-z-100-0f
 replicated-variables-on.ue-replicated-using-int32-points
 replicated-variables-on.void-onrep-points-seen-1
@@ -171,7 +167,6 @@ reading-and-writing.fstring-s-fstring-addr
 reading-and-writing.ftext-t-ftext-addr
 reading-and-writing.uobject-addr
 reading-and-writing.int64-void-addr
-reading-and-writing.tarray-int32-a-pa
 struct-members-through.v-z-5-0f
 struct-members-through.v-x
 taking-an-address.items-i

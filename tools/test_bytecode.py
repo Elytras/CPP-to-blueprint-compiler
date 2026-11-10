@@ -16959,6 +16959,16 @@ ROW_REFUSALS = [
     ('ptrcast.ptrcast-int64-r-2', 'PtrCastRef', '  int64 F() { int32 Local = 1; int32 &R = Local; return __PtrCast__<int64>(R); }\n',
      'a reference to a Blueprint variable, which has no address', ROW_INTRIN),
     ('classof.classof-obj-field', 'ClassOfField', '  FName F(AActor *Obj) { return __ClassOf__(Obj->bHidden); }\n', 'argument must be a bare parameter or local reference', ROW_INTRIN),
+    ('declaring-an-interface.int32-marks', 'IfaceVarTwice', '  int32 Marks;\n  void Mark() {}\n', 'a second member of that name', ROW_IMARK, 'AActor, public IMarkable'),
+    ('jumps.goto', 'GotoWriteBack', '  TMap<FVector4, TArray<int32>> M;\n  int32 F() { for (auto &[K, V] : M) { V.Add(1); goto done; } done: return 0; }\n',
+     'a goto inside a TMap range-for that writes its value back would skip the write', ''),
+    ('range-for-over.goto', 'GotoWriteBack2', '  TMap<FVector4, TArray<int32>> M;\n  int32 F() { for (auto &[K, V] : M) { V.Add(1); if (V.Num() > 3) goto done; } done: return 0; }\n',
+     'a goto inside a TMap range-for that writes its value back would skip the write', ''),
+    ('reading-and-writing.tarray-int32-a-pa', 'WholeSet', '  int32 F(TSet<int32> *Ps) { TSet<int32> S = *Ps; return S.Num(); }\n', 'a whole TSet<int32> through a pointer', ''),
+    ('reading-and-writing.tarray-int32-a-pa', 'WholeMap', '  int32 F(TMap<int32, int32> *Pm) { TMap<int32, int32> M = *Pm; return M.Num(); }\n',
+     'a whole TMap<int32, int32> through a pointer', ''),
+    ('math-and-utility.std-min-a-b', 'StdSqrt', '  float F(float X) { return std::sqrt(X); }\n', 'call to an unknown function', '#include <cmath>\n'),
+    ('math-and-utility.std-min-a-b', 'BiSqrt', '  float F(float X) { return __builtin_sqrtf(X); }\n', 'call to an unknown function', ''),
 ]
 ROW_WARNINGS = [
     ('number-conversions.float-big', 'I64F', '  float F(int64 Big) { return (float)Big; }\n', 'int64 -> float goes through int32', ''),
@@ -17039,6 +17049,8 @@ proves('arithmetic.id-count', 'binding-handlers.onhit-isbound', 'blueprint-class
        'ue-defaults.lamp-intensity', 'ue-defaults.lamp-intensity-100-0f', 'uobject-helpers.obj-class',
        'validity-and-comparison.a-b', 'variable-types.double-d', 'variable-types.uint32-mask',
        'what-a-range.for-int32-x-1-2', 'widget-layouts.grid-addchildtogrid-cell-1-2', 'widget-layouts.ue-widget-3')
+proves('declaring-an-interface.int32-marks', 'jumps.goto', 'range-for-over.goto', 'math-and-utility.std-min-a-b',
+       'reading-and-writing.tarray-int32-a-pa')
 row_refusals()
 
 
@@ -17217,6 +17229,36 @@ def row_defaults():
 proves('soft-references.tsoftclassptr-aactor-kind-game-a', 'soft-references.tarray-tsoftclassptr-aactor',
        'container-variables.tarray-tsoftclassptr-aactor', 'struct-defaults.ffloatinterval-delay')
 row_defaults()
+
+
+
+# ---- Rows that said "refused" and are not: tests/RowStd.cpp. std::min is built into the source's function library, a
+# whole TArray is copied out through a pointer, and a goto in a TMap loop whose value is no container leaves after the
+# write has reached the map.
+
+def row_std():
+    import struct
+    base, A = asset('RowStd'), 0x7FF600001000
+    for a, b in ((3, 9), (9, 3), (-4, -4), (-7, 2)):
+        assert run(base, 'MinOf', A=a, B=b)[0] == min(a, b), (a, b)
+    assert 'BPL_RowStd::std__min__int32 returns const int&: a Blueprint function returns a copy' in LOGS['RowStd'], LOGS['RowStd']
+
+    def put(a, fmt, *v):
+        for i, b in enumerate(struct.pack(fmt, *v)): runscript.MEM[a + i] = b
+    runscript.MEM.clear()
+    put(A, '<qii', A + 64, 3, 4)                         # a TArray: data pointer, count, capacity
+    put(A + 64, '<iiii', 5, 7, 9, 0)
+    assert run(base, 'SumThrough', Pa=A)[0] == 21 * 100 + 3
+    runscript.MEM.clear()
+    w = dump('walkscript.py', base, exports_of(base).index('BumpAndLeave'))
+    first_jump = re.search(r'^\s*\+\s*\d+\s.*\sJump\s', w, re.M)
+    assert first_jump and 0 <= w.index('Map_Add') < first_jump.start(), w
+    print('ok  RowStd: std::min builds and answers right, a whole TArray is read through a pointer, a goto out of a TMap loop '
+          'follows the write into the map')
+
+
+proves('math-and-utility.std-min-a-b-2', 'reading-and-writing.tarray-int32-a-pa-2')
+row_std()
 
 
 PREFETCH.finish()
