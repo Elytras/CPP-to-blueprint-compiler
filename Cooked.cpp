@@ -1111,7 +1111,6 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
             for (const FTag& M : Tags)
             {
                 /* The encoder writes a member's tag with index 0 and no guids: anything else changes the struct's bytes. */
-                if (M.ArrayIndex) { Why = "a struct member of a C array (the encoder writes each at index 0)"; return false; }
                 if (M.HasPropertyGuid) { Why = "a struct member with a property guid"; return false; }
                 if (std::any_of(std::begin(M.StructGuid), std::end(M.StructGuid), [](uint32 G) { return G != 0; }))
                 { Why = "a struct member of a struct with a guid (a user-defined struct)"; return false; }
@@ -1200,6 +1199,7 @@ bool ReadTagValue(const FCookedPackage& P, const FTag& Tag, FPropertyDef& Out, s
     Out = FPropertyDef{};
     Out.Name = P.NameOf(Tag.Name);
     Out.Type = P.NameOf(Tag.Type);
+    Out.ArrayIndex = Tag.ArrayIndex;        // a C array's element is its own tag, written at its index
     const std::string& Ty = Out.Type;
     if (Ty == "StructProperty") Out.StructName = P.NameOf(Tag.StructName);
     else if (Ty == "ByteProperty" || Ty == "EnumProperty")
@@ -1222,6 +1222,7 @@ bool ReadTagValue(const FCookedPackage& P, const FTag& Tag, FPropertyDef& Out, s
     {
         Out.Default.K = FDefaultValue::Bool;
         Out.Default.I = Tag.BoolVal;
+        if (Tag.ArrayIndex) { *Why = "a bool element of a C array (a bool's tag carries no index here)"; return false; }
         if (Tag.Value.empty() && Tag.BoolVal <= 1) return true;
         *Why = "a bool tag with a value, or other than 0 or 1";
         return false;
