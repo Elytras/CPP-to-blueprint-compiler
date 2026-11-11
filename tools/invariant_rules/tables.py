@@ -7,6 +7,7 @@ makes it one. The header is re-read raw here (indices unformatted, negative ones
 and a negative index would wrap in Python."""
 import collections, copy
 import invariants
+import uasset_io
 
 RF_Public, RF_ClassDefaultObject, RF_Transient = 0x1, 0x10, 0x40
 RF_InheritableComponentTemplate = 0x400000
@@ -60,6 +61,8 @@ def parse_tables(ua, base):
     """Raw over the .uasset bytes `ua` (FPackageFileSummary, PackageFileSummary.cpp; FObjectImport / FObjectExport,
     ObjectResource.cpp), the summary walked as dumpexp.preload walks it."""
     t, r = Raw(), Rd(ua, 4)
+    sm = uasset_io.summary(ua)
+    if sm['ue5']: return _parse5(t, ua, base, sm)
 
     def skip(size):                                             # a counted run of rows. Not r.o += size * r.i32():
         n = r.i32(); r.o += size * n                            # that reads r.o before the count moves it
@@ -82,6 +85,12 @@ def parse_tables(ua, base):
     r.i32(); r.i64(); r.i32()                                   # asset registry data, bulk data start, world tile info
     skip(4)                                                     # chunk ids
     t.preload_count, t.preload_offset = r.i32(), r.i32()
+    _read_names(t, ua)
+    _read_rows4(t, ua)
+    return _finish(t, ua, base)
+
+
+def _read_names(t, ua):
     t.names, t.names_raw, t.names_at = [], [], []            # names_at: each entry's length field
     r = Rd(ua, t.name_offset)
     for _ in range(t.name_count):
@@ -92,6 +101,9 @@ def parse_tables(ua, base):
         t.names.append(raw[:-1].decode('latin-1') if n > 0 else raw[:-2].decode('utf-16-le', 'replace') if n < 0 else '')
         r.o += size + 4                                         # the two unused hashes
         if size > 4 * NAME_SIZE or r.o > len(ua): break         # a wild length: table_bounds reports it
+
+
+def _read_rows4(t, ua):
     stride = 28 if t.cooked else 36
     t.imports = []
     for k in range(t.import_count):
@@ -103,6 +115,27 @@ def parse_tables(ua, base):
         t.exports.append(dict(cls=v[0], super=v[1], tmpl=v[2], outer=v[3], obj=(v[4], v[5]), flags=v[6], size=v[7],
                               off=v[8], forced=v[9], package_flags=v[13], not_always_loaded=v[14], is_asset=v[15],
                               first_dep=v[16], dep_counts=v[17:21]))
+
+
+def _parse5(t, ua, base, sm):
+    """The same Raw off a 5.x summary: uasset_io reads the header and the rows (their sizes differ from 4.27's)."""
+    t.flags_at, t.flags = None, sm['flags']
+    t.cooked = bool(t.flags & 0x80000000)
+    t.name_count, t.name_offset = sm['ncount'], sm['noff']
+    t.export_count, t.export_offset = sm['ecount'], sm['eoff']
+    t.import_count, t.import_offset = sm['icount'], sm['ioff']
+    t.preload_count, t.preload_offset = sm['pcount'], sm['poff']
+    _read_names(t, ua)
+    _, irows, erows = uasset_io.tables(ua, sm)
+    t.imports = [dict(cp=i['class_package'], cn=i['class_name'], outer=i['outer'], obj=i['name']) for i in irows]
+    t.exports = [dict(cls=e['cls'], super=e['super'], tmpl=e['tmpl'], outer=e['outer'], obj=e['name'], flags=e['flags'],
+                      size=e['size'], off=e['off'], forced=e['forced'], package_flags=e['package_flags'],
+                      not_always_loaded=e['not_always_loaded'], is_asset=e['is_asset'], first_dep=e['first'],
+                      dep_counts=e['counts']) for e in erows]
+    return _finish(t, ua, base)
+
+
+def _finish(t, ua, base):
     ok = 0 <= t.preload_offset and t.preload_offset + 4 * max(t.preload_count, 0) <= len(ua)
     t.preload = list(struct.unpack_from('<%di' % t.preload_count, ua, t.preload_offset)) if ok and t.preload_count > 0 else []
     t.package = '/Game/' + base.replace(os.sep, '/').split('/Content/')[-1]
@@ -797,6 +830,9 @@ def cdo_body_exact(pkg):
         if st.cdo <= 0: continue
         c = st.cdo - 1
         end, size = pkg.tags(c).end, pkg.exports[c]['size']
+        if end is None: continue                            # unversioned values: the end is not knowable here
+        if pkg.ue5:                                         # 5.x reads a SparseClassDataStruct object index after the tags
+            if end + 4 == size and struct.unpack_from('<i', pkg.blob(c), end)[0] == 0: continue
         if end != size: yield c, 'CDO tags end at %d of %d bytes' % (end, size)
 
 
@@ -979,6 +1015,8 @@ def export_archetype(pkg):
 
 
 PACKAGE_FLAGS = {'.uasset': {0x80000000, 0x80040000}, '.umap': {0x80020000, 0x80060000}}
+# 5.x also sets PKG_Cooked 0x200; RogueCore's own packages add PKG_UnversionedProperties 0x2000, AssetGen's tagged ones do not
+PACKAGE_FLAGS5 = {0x80000200, 0x80002200}
 
 
 @rule
@@ -994,8 +1032,9 @@ def package_flags(pkg):
     1763-1784); the flag values are ObjectMacros.h 105-136. For the bits no loader reads, the rule is the cook's habit,
     which the game keeps without exception."""
     ext = '.umap' if os.path.exists(pkg.base + '.umap') and not os.path.exists(pkg.base + '.uasset') else '.uasset'
-    if pkg.package_flags not in PACKAGE_FLAGS[ext]:
-        yield None, 'PackageFlags %#x, a cooked %s has %s' % (pkg.package_flags, ext, ' or '.join('%#x' % f for f in sorted(PACKAGE_FLAGS[ext])))
+    allowed = PACKAGE_FLAGS5 if pkg.ue5 else PACKAGE_FLAGS[ext]
+    if pkg.package_flags not in allowed:
+        yield None, 'PackageFlags %#x, a cooked %s has %s' % (pkg.package_flags, ext, ' or '.join('%#x' % f for f in sorted(allowed)))
 
 
 TABLES_RULES = ['table_bounds', 'names_split', 'import_chains', 'imports_resolve', 'export_rows', 'export_outer_within',
