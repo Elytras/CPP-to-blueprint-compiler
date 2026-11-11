@@ -884,6 +884,45 @@ is not run at build time.
 Notes:
 - How constant subexpressions fold inside a function body: [The optimizer](#the-optimizer).
 
+### Constant objects
+
+A `const` or `constexpr` variable of a plain C++ struct of the mod's own, one with no base and no `UE_STRUCT`, is
+written with braces and never stored. No Blueprint type stands for the struct and none is cooked: each use of a member
+is what the braces gave it, and a method called on the constant reads its members there. That makes a handle: a name
+and a default written once, and used through its methods.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="constant-objects.constexpr-ftable-ktable-5-2"></a>`constexpr FTable kTable = {5, 2.5f, {-3, 9}, "table"};` then `kTable.X`, `kTable.Range.Low` | Each use is the expression the braces gave that member: in code, in a default, in another constant (`constexpr int32 kTwice = kTable.X * 2;`), and where a constant is needed (`V << kTable.X`). | Yes |
+| <a id="constant-objects.static-constexpr-finthandle"></a>`static constexpr FIntHandle Lives{"Lives", 3};` in a class, then `Lives.Get(Stored)` | A method of the struct called on the constant is expanded at the call, as an inline function is, and every member its body reads is that constant's: `Default` is 3 there. A method may call another method of the same constant, and `(*this).Default` is the member too. | Yes |
+| <a id="constant-objects.static-constexpr-thandle-float"></a>`static constexpr THandle<float> Volume{"Audio.Volume", 0.5f};` then `Volume.Or(Stored, bHas)` | The same for a struct template: `THandle<float>` and `THandle<int32>` are two structs, and each constant has its own members. | Yes |
+| <a id="constant-objects.fname-key-const-return-name"></a>`FName Key() const { return Name; }` in such a struct, where `Name` is a `const char*` member | The string the braces gave, as the type the use asks for: an FName here, an FString or an FText elsewhere. | Yes |
+| <a id="constant-objects.this"></a>`this` as a value in such a method, `Register(this)` | Refused (`the constant has no address`): only the members' values exist. Pass the members. | Refused |
+
+```cpp
+template <class T> struct THandle {
+  const char *Name;
+  T Default;
+  T Or(T Stored, bool bHas) const { return bHas ? Stored : Default; }
+  FName Key() const { return Name; }
+};
+
+class Speaker : public AActor {
+public:
+  static constexpr THandle<float> Volume{"Audio.Volume", 0.5f};
+  float Loudness(float Stored, bool bHas) { return Volume.Or(Stored, bHas); }   // bHas ? Stored : 0.5
+};
+```
+
+Notes:
+
+- Only braces are read. A constant made by a constructor (`constexpr FTable kMade(5);`), or the constant itself
+  passed to a function, stored or returned, is refused as a value no Blueprint type holds.
+- A struct that derives from another, a `UE_STRUCT`, a struct UeApi declares (`FVector`) and a plain struct a
+  reflected position names (so it is cooked: [Mod structs](#mod-structs-ue_struct)) are Blueprint structs, read as
+  those are: a constant of one is a struct value built where it is used.
+- A method defined out of the struct is not expanded this way; write its body in the struct.
+
 ### consteval functions
 
 | You write | What it does | Status |

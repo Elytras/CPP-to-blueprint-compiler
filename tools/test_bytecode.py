@@ -17398,6 +17398,41 @@ proves('soft-references.tsoftclassptr-aactor-kind-game-a', 'soft-references.tarr
 row_defaults()
 
 
+# ---- ConstObjects: a constant of a plain C++ struct is its braces (REFERENCE.md, Constant objects)
+
+def const_objects():
+    base = asset('ConstObjects')
+    folder = os.path.dirname(base)
+    # No Blueprint struct stands for FTable or a handle: the class is all the mod cooks.
+    assert sorted(os.listdir(folder)) == ['ConstObjects.uasset', 'ConstObjects.uexp'], os.listdir(folder)
+    proves('constant-objects.constexpr-ftable-ktable-5-2')
+    assert run(base, 'Members')[0] == 5 * 100 - 3 + 9
+    for v in (0.0, 2.0, -1.5):
+        assert run(base, 'Real', V=v)[0] == f32(v * 2.5), v
+    assert run(base, 'Label')[0] == 'table'
+    check('ConstObjects', 'Shift', lambda V: wrap(V << 5), [dict(V=v) for v in (0, 1, -3, 2**27)])
+    assert global_default(folder, 'ConstObjects', 'Seed') == '18', global_default(folder, 'ConstObjects', 'Seed')
+    proves('constant-objects.static-constexpr-finthandle')
+    check('ConstObjects', 'Handle', lambda Stored: (Stored or 12) + (Stored or 12) * 2000, [dict(Stored=s) for s in (0, 1, 40)])
+    check('ConstObjects', 'Statics', lambda Stored: (Stored or 3) * 10 + 3 + 1100, [dict(Stored=s) for s in (0, 5)])
+    proves('constant-objects.static-constexpr-thandle-float')
+    check('ConstObjects', 'Templated', lambda Stored, bHas: Stored if bHas else 7,
+          [dict(Stored=s, bHas=h) for s in (0, 9) for h in (False, True)])
+    check('ConstObjects', 'TemplatedReal', lambda Stored, bHas: Stored if bHas else 0.5,
+          [dict(Stored=s, bHas=h) for s in (0.0, 0.25) for h in (False, True)])
+    proves('constant-objects.fname-key-const-return-name')
+    check('ConstObjects', 'Keys', lambda Which: ('Waves.Max', 'Audio.Volume', 'Count')[Which], [dict(Which=w) for w in (0, 1, 2)])
+    proves('constant-objects.this')
+    refused('ConstThis', '  int32 F() { return kH.Reg(); }\n', 'the constant has no address',
+            top='inline int32 Take(const void *P) { return 1; }\n'
+                'struct FH {\n  int32 D;\n  int32 Reg() const { return Take(this) + D; }\n};\nconstexpr FH kH = {4};\n')
+    print('ok  ConstObjects: a member of a plain struct constant is what its braces gave it, in code, a default and '
+          "another constant; a method called on one reads that constant's members, a template's too; no struct is cooked")
+
+
+const_objects()
+
+
 # ---- Rows that said "refused" and are not: tests/RowStd.cpp. std::min is built into the source's function library, a
 # whole TArray is copied out through a pointer, and a goto in a TMap loop whose value is no container leaves after the
 # write has reached the map.

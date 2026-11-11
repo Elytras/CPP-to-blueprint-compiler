@@ -2429,6 +2429,15 @@ private:
     const Json* CurFnBody = nullptr;                                    // the body of the function being compiled
     void IndexLambdas(const Json& N);
     void RewriteLambdaCalls(Json& N);
+    /* Constants of the mod's own plain C++ aggregates, `constexpr FTable kTable = {5, 2.5f};`, which no Blueprint type
+       stands for (REFERENCE.md#constant-objects): a field's place in its struct's braces, each method with a body, and
+       the copies of those methods made for one constant each, which are free inline functions. See FoldConstObjects. */
+    std::map<std::string, size_t> PlainFields;          // FieldDecl id -> its index among the struct's fields
+    std::map<std::string, const Json*> PlainMethods;    // CXXMethodDecl id -> its definition
+    std::map<std::string, Json> BoundMethods;           // "<method id>@<variable id>" -> the method with that `this`
+    void IndexPlain(const Json& N, bool bApi, bool bInTemplate);
+    const Json* PlainConstInit(const Json& E, std::string* VarId = nullptr) const;
+    void FoldConstObjects(Json& N, bool bAddressed = false);
     bool CaptureNames(const Json& Lambda, const std::vector<const Json*>& Inits, std::vector<std::string>* Names,
                       std::vector<char>* Kinds, std::string* Err) const;
     bool DeclareLambda(const Json& LambdaExpr, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
@@ -7196,6 +7205,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         }
         return LowerField(*N, BP, Out, Err);
     }
+    if (K == "CXXThisExpr" && N->value("plainThis", false))
+    { *Err = "`this` in a method called on a constant of a plain struct: the constant has no address, only its members' values; name the members"; return false; }
     if (K == "CXXThisExpr") { Out.K = FArgIR::Self; return true; }
     if (K == "CXXNullPtrLiteralExpr") { Out.K = FArgIR::NullObj; return true; }
     if (!RefReturnOf(*N).empty())
@@ -8791,7 +8802,9 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
         if (TypeFile.find(LeafOf(R.CppName)) == TypeFile.end()) continue;      // only C++ of the mods' own
         if (auto S = Plain.find(LeafOf(R.CppName)); S != Plain.end()
             && std::find(S->second.begin(), S->second.end(), &R) != S->second.end()) continue;
-        for (const Json* F : R.Fields) Names(TypeOf(*F));
+        /* A struct that is no candidate and no Blueprint type (`const char* Label;` in it) is C++'s alone, as a
+           constexpr variable is: its members are no properties, so they name nothing (REFERENCE.md#constant-objects). */
+        if (R.IsGenerated() || R.bIsPatch || R.IsNative()) for (const Json* F : R.Fields) Names(TypeOf(*F));
         for (const Json* M : R.AllMethods) { Names(TypeOf(*M)); Body(*M); }
         for (const auto& [Method, Def] : R.MethodDefs) Body(*Def);
         for (const Json* C : R.Ctors) Body(*C);
@@ -14068,6 +14081,140 @@ void FCompiler::RewriteLambdaCalls(Json& N)
     if (!LambdaOps.count((*Callee)["referencedDecl"].value("id", std::string()))) return;
     N["lambdaObj"] = std::move(N["inner"][1]);
     N["inner"].erase(N["inner"].begin() + 1);
+    N["kind"] = "CallExpr";
+}
+
+/* Every struct of the mod's own sources with no base: its fields by their place, its methods that have a body. A
+   template's instantiations are found under the template, whose pattern says where it is written (an instantiation
+   keeps no location). UeApi's types are never indexed, so nothing below touches a TEnum, a TArray or an FVector. */
+void FCompiler::IndexPlain(const Json& N, bool bApi, bool bInTemplate)
+{
+    const std::string K = Kind(N);
+    if (K == "ClassTemplateDecl")
+    {
+        bool bPatternApi = true;
+        ForEach(N, [&](const Json& P) { if (Kind(P) == "CXXRecordDecl") bPatternApi = InUeApi(P); });
+        ForEach(N, [&](const Json& C) { IndexPlain(C, bPatternApi, true); });
+        return;
+    }
+    const bool bInstance = K == "ClassTemplateSpecializationDecl";
+    if (K == "CXXRecordDecl" || bInstance)
+    {
+        if (bInstance ? bApi || !bInTemplate : InUeApi(N)) return;
+        size_t At = 0;
+        if (!N.contains("bases"))
+            ForEach(N, [&](const Json& C) {
+                bool bBody = false;
+                ForEach(C, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+                if (Kind(C) == "FieldDecl") PlainFields[C.value("id", std::string())] = At++;
+                else if (Kind(C) == "CXXMethodDecl" && bBody && !C.value("isImplicit", false))
+                    PlainMethods[C.value("id", std::string())] = &C;
+            });
+        ForEach(N, [&](const Json& C) { IndexPlain(C, false, false); });
+        return;
+    }
+    if (K == "TranslationUnitDecl" || K == "NamespaceDecl" || K == "LinkageSpecDecl")
+        ForEach(N, [&](const Json& C) { IndexPlain(C, false, false); });
+}
+
+/* The braces E's value was written as, when E names a `const` or `constexpr` variable made from braces, or is such
+   braces already (a member FoldConstObjects put in its use's place): null for anything else. VarId gets the variable. */
+const Json* FCompiler::PlainConstInit(const Json& E, std::string* VarId) const
+{
+    auto Peel = [](const Json* N) {
+        for (;;)
+        {
+            const std::string K = Kind(*N);
+            const Json* In = First(*N);
+            const bool bWrap = K == "ParenExpr" || K == "ExprWithCleanups" || K == "MaterializeTemporaryExpr" || K == "CXXBindTemporaryExpr"
+                            || K == "CXXFunctionalCastExpr" || (K == "ImplicitCastExpr" && N->value("castKind", std::string()) == "NoOp")
+                            || (K == "CXXConstructExpr" && In && (*N)["inner"].size() == 1);     // a copy of the braces
+            if (!bWrap || !In) return N;
+            N = In;
+        }
+    };
+    const Json* N = Peel(&E);
+    if (Kind(*N) == "InitListExpr") return N;
+    std::string Id;
+    if (Kind(*N) == "DeclRefExpr" && N->contains("referencedDecl")) Id = (*N)["referencedDecl"].value("id", std::string());
+    else if (Kind(*N) == "MemberExpr") Id = N->value("referencedMemberDecl", std::string());    // `this->kTable`, a static
+    const auto V = ConstVars.find(Id);
+    const Json* Init = V == ConstVars.end() ? nullptr : First(*V->second);
+    if (Init) Init = Peel(Init);
+    if (!Init || Kind(*Init) != "InitListExpr") return nullptr;
+    if (VarId) *VarId = Id;
+    return Init;
+}
+
+/*
+A constant of a plain C++ struct has no Blueprint value: its uses are rewritten here, before anything is lowered, into
+what they come to (REFERENCE.md#constant-objects).
+    kTable.X                    the expression X was given in kTable's braces, as a constant's use is its initializer
+    Volume.Get(this)            a call of Get's body with `this->Name` and `this->Default` read off Volume's braces: a
+                                copy of the method per constant, registered as a free inline function, so the call
+                                expands like any other and the copy is the expansion's identity (a method that calls
+                                itself is still caught)
+A member of a struct UeApi declares or the mod cooks is left to LowerField, as before: IndexPlain has none of its
+fields. `&kTable.X` is left alone too, and refused where it was. Children first, so `kTable.Inner.X` reads the braces
+`kTable.Inner` became.
+*/
+void FCompiler::FoldConstObjects(Json& N, bool bAddressed)
+{
+    if (!N.is_structured()) return;
+    if (N.is_array()) { for (Json& C : N) FoldConstObjects(C, false); return; }
+    const std::string K = Kind(N);
+    if (auto In = N.find("inner"); In != N.end() && In->is_array())
+    {
+        const bool bAddress = K == "UnaryOperator" && N.value("opcode", std::string()) == "&";
+        for (Json& C : *In) FoldConstObjects(C, bAddress);
+    }
+    if (K == "MemberExpr" && !bAddressed && !N.value("isArrow", false))
+    {
+        const auto F = PlainFields.find(N.value("referencedMemberDecl", std::string()));
+        const Json* Obj = F == PlainFields.end() ? nullptr : First(N);
+        const Json* Init = Obj ? PlainConstInit(*Obj) : nullptr;
+        if (!Init || !Init->contains("inner") || F->second >= (*Init)["inner"].size()) return;
+        Json Value = (*Init)["inner"][F->second];
+        N = std::move(Value);
+        return;
+    }
+    if (K != "CXXMemberCallExpr" || !N.contains("inner") || N["inner"].empty()) return;
+    const Json* Callee = Strip(&N["inner"][0]);
+    const auto M = Callee && Kind(*Callee) == "MemberExpr" ? PlainMethods.find(Callee->value("referencedMemberDecl", std::string()))
+                                                          : PlainMethods.end();
+    const Json* Obj = M == PlainMethods.end() ? nullptr : First(*Callee);
+    std::string Var;
+    if (!Obj || !PlainConstInit(*Obj, &Var) || Var.empty()) return;
+    const std::string Key = M->first + "@" + Var;
+    const auto [Bound, bNew] = BoundMethods.try_emplace(Key);
+    if (bNew)
+    {
+        Json& Def = Bound->second;
+        Def = *M->second;
+        Def["id"] = Key;
+        Def["inline"] = true;
+        Def.erase("previousDecl");
+        FreeInlines[Key] = &Def;        // before its body is read: it may call itself
+        /* `this->F` is `Var.F`, and `*this` is Var. A bare `this` has no value: marked, and refused if it is lowered. */
+        const Json Receiver = *Obj;
+        std::function<void(Json&)> Bind = [&](Json& X) {
+            if (!X.is_structured()) return;
+            if (X.is_object() && X.contains("inner") && !X["inner"].empty() && Kind(X["inner"][0]) == "CXXThisExpr")
+            {
+                if (Kind(X) == "MemberExpr") { X["isArrow"] = false; X["inner"][0] = Receiver; }
+                else if (Kind(X) == "UnaryOperator" && X.value("opcode", std::string()) == "*") { X = Receiver; return; }
+            }
+            if (X.is_object() && Kind(X) == "CXXThisExpr") X["plainThis"] = true;
+            for (Json& C : X) Bind(C);
+        };
+        for (Json& C : Def["inner"]) if (Kind(C) == "CompoundStmt") Bind(C);
+        NormalizePointers(Def);
+        if (!MethodOwner.count(M->first)) ExpandLocalAliases(Def, {});     // a record's methods have theirs already
+        FoldConstObjects(Def);
+    }
+    Json Fn = { {"kind", "DeclRefExpr"}, {"type", Callee->value("type", Json::object())},
+                {"referencedDecl", { {"id", Key}, {"kind", "FunctionDecl"}, {"name", Name(*Callee)} }} };
+    N["inner"][0] = std::move(Fn);
     N["kind"] = "CallExpr";
 }
 
@@ -25077,6 +25224,31 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         for (const auto& M : Entry.second.Methods) NormalizePointers(const_cast<Json&>(*M.second));
         for (const auto& M : Entry.second.MethodDefs) NormalizePointers(const_cast<Json&>(*M.second));
         for (const auto& M : Entry.second.Inlines) NormalizePointers(const_cast<Json&>(*M.second));
+    }
+    /* Constants of plain structs, in every body and initializer a value can come from, before the lambdas: a method
+       bound to a constant is one more inline function whose lambdas are found below. */
+    IndexPlain(Doc, false, false);
+    if (!PlainFields.empty() || !PlainMethods.empty())
+    {
+        std::vector<Json*> Bodies;
+        std::set<const Json*> Seen;
+        auto Add = [&](const Json* B) { if (B && Seen.insert(B).second) Bodies.push_back(const_cast<Json*>(B)); };
+        for (const FChain* C : ChainOrder) Add(C->Def);
+        for (const auto& M : MemberTemplates) Add(M.second);
+        for (const auto& M : PlainMethods) Add(M.second);
+        for (const auto& V : ConstVars) Add(V.second);
+        for (const auto& Entry : Records)
+        {
+            const FRecord& R = Entry.second;
+            if (!R.IsGenerated() && !R.IsModStruct() && !R.bIsPatch) continue;
+            for (const Json* M : R.AllMethods) Add(M);
+            for (const auto& M : R.MethodDefs) Add(M.second);
+            for (const auto& M : R.Inlines) Add(M.second);
+            for (const Json* F : R.Fields) Add(F);
+            for (const Json* C : R.Ctors) Add(C);
+            Add(R.Defaults);
+        }
+        for (Json* B : Bodies) FoldConstObjects(*B);
     }
     /* Lambdas, in every body a call can reach or a function is compiled from: first each closure's operator() is
        registered as an inline function, then each call of one is rewritten into a call of that (RewriteLambdaCalls). */
