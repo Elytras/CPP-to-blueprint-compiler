@@ -3677,6 +3677,37 @@ def native_struct_values():
     print('ok  a PerPlatformFloat value is refused, as a default and as a UE_STRUCT member')
 
 
+SOFT_PATHS_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/SoftPaths");
+struct FSoftHolder {
+  UE_STRUCT;
+  FSoftObjectPath Ref = FSoftObjectPath("/Game/A/B.B", "Sub");
+  FSoftClassPath Cls = FSoftClassPath("/Game/C/D.D_C", "");
+};
+class ASoftBox : public AActor {
+public:
+  FSoftObjectPath Path = FSoftObjectPath("/Game/E/F.F", "");
+  FSoftHolder Held;
+};
+'''
+
+
+def soft_path_values():
+    """FSoftObjectPath / FSoftClassPath as a default and as a UE_STRUCT member: written in their own binary form,
+    AssetPathName's FName then SubPathString's FString (FSoftObjectPath::Serialize), as the cook of a game asset has them."""
+    import dumpexp, struct
+    tmp, out, _ = compile_to(SOFT_PATHS_SRC, 'SoftPaths')
+    proves('struct-defaults.ref-fsoftobjectpath-game-a-b')
+    base = os.path.join(out, 'ASoftBox')
+    cdo = dump('dumptags.py', base, exports_of(base).index('Default__ASoftBox_C'))
+    names = dumpexp.load(base)[3]
+    m = re.search(r'Path \[0\] StructProperty size=12 struct=SoftObjectPath: ([0-9a-f]+)', cdo)
+    assert m, cdo
+    raw = bytes.fromhex(m.group(1))
+    assert names[struct.unpack_from('<i', raw, 0)[0]] == '/Game/E/F.F' and struct.unpack_from('<i', raw, 8)[0] == 0, (raw, cdo)
+    shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  a SoftObjectPath default is written in its own form (name, then sub-path)')
+
+
 def string_behaviour():
     import runscript
     check('StringTest', 'MakeKey', lambda Prefix, Index: Prefix + '_' + str(Index),
@@ -3979,6 +4010,7 @@ constants()
 types_behaviour()
 types_defaults()
 native_struct_values()
+soft_path_values()
 string_behaviour()
 struct_behaviour()
 check('StructTest', 'MakeNative', lambda D: D + 0.5, [dict(D=d) for d in (0.0, 4.0)])

@@ -1245,6 +1245,7 @@ void ZeroAll() {
 | <a id="struct-defaults.ffloatinterval-delay"></a>`FFloatInterval Delay = FFloatInterval(1, 5);` | A constructor call as a member default. It is written into Class Defaults. | Yes |
 | <a id="struct-defaults.fterrainplacementbox-min-max"></a>`FTerrainPlacementBox(Min, Max, ETerrainPlacementBoxType::Terrain, UE_KEEP)` | `UE_KEEP` for a constructor argument leaves that member unwritten, so it holds what the engine's constructor sets, as braces leave out a member of a struct with no constructor. Only where the value starts fresh: a container's element, a class's own default. bpdecomp writes it for a member the cooked value leaves out. | Yes |
 | <a id="struct-defaults.gameplaytags"></a>`GameplayTags = FGameplayTagContainer({FGameplayTag("Enemy.Type.Regular")}, {});` | Written in the container's own form, its tags' FNames (FGameplayTagContainer::Serialize); ParentTags is rebuilt by the engine at load. | Yes |
+| <a id="struct-defaults.ref-fsoftobjectpath-game-a-b"></a>`Ref = FSoftObjectPath("/Game/A/B.B", "Sub");`, `FSoftClassPath Cls = FSoftClassPath("/Game/C/D.D_C", "");` | A soft path as a class default or a UE_STRUCT member, written in its own form: AssetPathName's name, then SubPathString's string (FSoftObjectPath::Serialize), as the cook of a game asset has them. | Yes |
 | <a id="struct-defaults.fx-overrideparameters"></a>`Fx->OverrideParameters.SortedParameterOffsets = {FNiagaraVariableWithOffset("User.Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), 0)};` | A Niagara component's parameter store, as the cook writes it: each FNiagaraVariable / FNiagaraVariableWithOffset in its own form (the Name, the type definition, then VarData or the Offset), and `UserParameterRedirects` a TMap of them. A handle is given as the FNiagaraTypeDefinition it names; `StaticStructOf<T>()` is the struct of its values. | Yes |
 | <a id="struct-defaults.classstructorenum-staticstructof"></a>`.ClassStructOrEnum = StaticStructOf<FNiagaraFloat>()`, `UObject *S = StaticStructOf<FLinearColor>();` | A struct's UScriptStruct as an object: the engine struct's `/Script` one, or a UE_STRUCT's asset. | Yes |
 | <a id="struct-defaults.fvector-offset-0-0-50"></a>`FVector Offset = {0, 0, 50};` | Positional braces as a default. | Yes |
@@ -6653,8 +6654,8 @@ and where the feature is described. In each group, the messages you are most lik
   constructor that takes every member, so clang usually refuses the call first. Fix: designated braces, as the message
   shows, `FHitResult H = { .Time = 0.5f };`. Members you leave out keep the struct's defaults. See [Structs](#structs).
 - `<Member>: the engine reads a <Struct> value in its own binary form, which AssetGen does not write yet; leave the value out`:
-  a default of an engine struct with a native serializer whose form AssetGen does not know (SoftObjectPath, PerPlatformFloat,
-  RichCurveKey and the like). GameplayTagContainer and the Niagara variables are written. Fix: leave the value out.
+  a default of an engine struct with a native serializer whose form AssetGen does not know (PerPlatformFloat, the material inputs
+  and the like). GameplayTagContainer, the soft paths and the Niagara variables are written. Fix: leave the value out.
 - `<Struct> literal must give every field (<N>)`, `<Struct> takes one value per member (<N>), in declaration order:
   <Member>` and `<Type> has no member for value <N>`: rare. A struct value is built with a constructor call or braces
   that give a different number of values than the struct has members. Fix: designated braces that name the members you

@@ -1030,7 +1030,18 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     else if (Ty == "StructProperty")
     {
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
-        if (const int32 Native = NativeStructSize(T.StructName))
+        if (T.StructName == "SoftObjectPath" || T.StructName == "SoftClassPath")      // AssetPathName, SubPathString
+        {
+            FPropertyDef& Asset = Members->emplace_back();
+            Asset.Type = "NameProperty"; Asset.Name = "AssetPathName";
+            Asset.Default.K = FDefaultValue::Str; Asset.Default.S = P.NameOf(R.Name());
+            FPropertyDef& Sub = Members->emplace_back();
+            Sub.Type = "StrProperty"; Sub.Name = "SubPathString";
+            Sub.Default.K = FDefaultValue::Str;
+            if (!ReadEncodedString(R, Sub.Default.S, Why)) return false;
+            if (Asset.Default.S == "None") Asset.Default.S.clear();
+        }
+        else if (const int32 Native = NativeStructSize(T.StructName))
         {
             /* The struct's bytes as they are: 4-byte chunks, then single bytes, which WriteValue writes back raw. */
             for (int32 At = 0; At < Native;)
