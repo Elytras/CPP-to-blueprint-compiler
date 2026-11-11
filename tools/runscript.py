@@ -410,6 +410,11 @@ MATH = {
     'FClamp': lambda v, lo, hi: min(max(v, lo), hi), 'Percent_FloatFloat': lambda a, b: math.fmod(a, b) if b else 0.0,
     'SelectInt': lambda a, b, pick: a if pick else b,
 }
+# S40: UE5's real is a double: KismetMathLibrary names the arithmetic X_DoubleDouble, and a native float meets it through
+# Conv_FloatToDouble / Conv_DoubleToFloat (the narrowing rounds to the 4 bytes a float holds).
+for _k in [k for k in MATH if k.endswith('_FloatFloat')]: MATH[_k[:-len('_FloatFloat')] + '_DoubleDouble'] = MATH[_k]
+MATH.update({'Conv_IntToDouble': float, 'Conv_FloatToDouble': float,
+             'Conv_DoubleToFloat': lambda a: struct.unpack('<f', struct.pack('<f', a))[0]})
 CALLS = []     # every library call run, as (name, args): a test can see an impure or kept call happen
 # The process memory a raw pointer reads and writes, address -> byte (unset bytes read 0). A deref is an
 # ArrayGetByRef of a view struct's TArray field over the FDeref scratch; the field decides the element's size
