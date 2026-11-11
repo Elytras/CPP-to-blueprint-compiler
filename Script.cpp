@@ -281,7 +281,7 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
     if (S != "GameplayTagContainer" && S != "NiagaraTypeDefinitionHandle" && S != "NiagaraVariableBase"
         && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset" && S != "SoftObjectPath" && S != "SoftClassPath"
         && S != "PerPlatformFloat" && S != "PerPlatformInt" && S != "PerPlatformBool" && S != "MovieSceneFrameRange"
-        && S != "MovieSceneFloatChannel")
+        && S != "MovieSceneFloatChannel" && S != "SkeletalMeshSamplingLODBuiltData" && S != "NiagaraDataInterfaceGPUParamInfo")
         return false;
     const auto& Members = D.Members ? D.Members : P.Members;
     auto Member = [&](const char* Name) -> const FPropertyDef* {
@@ -297,6 +297,43 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         const std::string Rest = Sub && Sub->Default.K == FDefaultValue::Str ? Sub->Default.S : std::string();
         if (IsUE5()) WriteSoftPath(V, Rest.empty() ? Path : Path + ":" + Rest);
         else { V.Name(Path); WriteFStringValue(V, Rest); }
+        return true;
+    }
+    if (S == "SkeletalMeshSamplingLODBuiltData")
+    {
+        /* Written for the value gate (Cooked.cpp's reader says the layout): Prob and Alias, each a count and its words, then
+           TotalWeight. */
+        for (const char* Name : { "Prob", "Alias" })
+        {
+            const FPropertyDef* M = Member(Name);
+            V.I32(M ? int32(M->Default.Items.size()) : 0);
+            if (M) for (const FDefaultValue& W : M->Default.Items) V.U32(uint32(W.I));
+        }
+        const FPropertyDef* Total = Member("TotalWeight");
+        V.U32(Total ? uint32(Total->Default.I) : 0);
+        return true;
+    }
+    if (S == "NiagaraDataInterfaceGPUParamInfo")
+    {
+        /* Written for the value gate: the symbol and class name, then each generated function's definition name, instance
+           name and specifier pairs. */
+        const auto Text = [&](const char* Name) { const FPropertyDef* M = Member(Name); WriteFStringValue(V, M ? M->Default.S : std::string()); };
+        Text("DataInterfaceHLSLSymbol"); Text("DIClassName");
+        const FPropertyDef* Functions = Member("GeneratedFunctions");
+        V.I32(Functions ? int32(Functions->Default.Items.size()) : 0);
+        if (Functions)
+            for (const FDefaultValue& F : Functions->Default.Items)
+            {
+                const auto Part = [&](const char* Name) -> const FPropertyDef* {
+                    if (F.Members) for (const FPropertyDef& M : *F.Members) if (M.Name == Name) return &M;
+                    return nullptr;
+                };
+                const FPropertyDef *Def = Part("DefinitionName"), *Instance = Part("InstanceName"), *Spec = Part("Specifiers");
+                V.Name(Def && !Def->Default.S.empty() ? Def->Default.S : std::string("None"));
+                WriteFStringValue(V, Instance ? Instance->Default.S : std::string());
+                V.I32(Spec ? int32(Spec->Default.Items.size() / 2) : 0);
+                if (Spec) for (const FDefaultValue& N : Spec->Default.Items) V.Name(N.S.empty() ? std::string("None") : N.S);
+            }
         return true;
     }
     if (S == "MovieSceneFrameRange" || S == "MovieSceneFloatChannel")

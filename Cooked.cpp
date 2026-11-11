@@ -1082,6 +1082,52 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
             if (T.StructName == "PerPlatformFloat") { Def.Type = "FloatProperty"; Def.Default.K = FDefaultValue::Float; Def.Default.F = R.Get<float>(); }
             else { Def.Type = T.StructName == "PerPlatformInt" ? "IntProperty" : "BoolProperty"; Def.Default.K = FDefaultValue::Int; Def.Default.I = R.U32(); }
         }
+        else if (T.StructName == "SkeletalMeshSamplingLODBuiltData")
+        {
+            /* FWeightedRandomSampler's three: Prob (floats) and Alias (ints), each a count then the words, then TotalWeight. */
+            for (const char* Name : { "Prob", "Alias" })
+            {
+                const int32 Count = R.I32();
+                if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / 4) { Why = std::string("a sampler's ") + Name + " past its value"; return false; }
+                FPropertyDef& M = Members->emplace_back();
+                M.Name = Name; M.Type = "ArrayProperty"; M.Default.K = FDefaultValue::Array;
+                for (int32 I = 0; I < Count; ++I) { FDefaultValue& W = M.Default.Items.emplace_back(); W.K = FDefaultValue::Int; W.I = R.I32(); }
+            }
+            FPropertyDef& Total = Members->emplace_back();
+            Total.Name = "TotalWeight"; Total.Type = "IntProperty"; Total.Default.K = FDefaultValue::Int; Total.Default.I = R.I32();
+        }
+        else if (T.StructName == "NiagaraDataInterfaceGPUParamInfo")
+        {
+            /* The HLSL symbol and the class name (strings), then the generated functions: each a definition name (a name), an
+               instance name (a string) and its specifiers (a count, then a pair of names each). */
+            auto Str = [&](const char* Name) {
+                FPropertyDef& M = Members->emplace_back();
+                M.Name = Name; M.Type = "StrProperty"; M.Default.K = FDefaultValue::Str;
+                return ReadEncodedString(R, M.Default.S, Why);
+            };
+            if (!Str("DataInterfaceHLSLSymbol") || !Str("DIClassName")) return false;
+            const int32 Count = R.I32();
+            if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / 12) { Why = "a GPU param info's functions past its value"; return false; }
+            FPropertyDef& Functions = Members->emplace_back();
+            Functions.Name = "GeneratedFunctions"; Functions.Type = "ArrayProperty"; Functions.Default.K = FDefaultValue::Array;
+            for (int32 I = 0; I < Count; ++I)
+            {
+                FDefaultValue& Item = Functions.Default.Items.emplace_back();
+                Item.K = FDefaultValue::Struct;
+                Item.Members = std::make_shared<std::vector<FPropertyDef>>();
+                FPropertyDef& Def = Item.Members->emplace_back();
+                Def.Name = "DefinitionName"; Def.Type = "NameProperty"; Def.Default.K = FDefaultValue::Str; Def.Default.S = P.NameOf(R.Name());
+                FPropertyDef& Instance = Item.Members->emplace_back();
+                Instance.Name = "InstanceName"; Instance.Type = "StrProperty"; Instance.Default.K = FDefaultValue::Str;
+                if (!ReadEncodedString(R, Instance.Default.S, Why)) return false;
+                const int32 Specifiers = R.I32();
+                if (Specifiers < 0 || R.bBad || size_t(Specifiers) > R.B.size() / 16) { Why = "a GPU function's specifiers past its value"; return false; }
+                FPropertyDef& Spec = Item.Members->emplace_back();
+                Spec.Name = "Specifiers"; Spec.Type = "ArrayProperty"; Spec.Default.K = FDefaultValue::Array;
+                for (int32 S = 0; S < Specifiers * 2; ++S)
+                { FDefaultValue& N = Spec.Default.Items.emplace_back(); N.K = FDefaultValue::Str; N.S = P.NameOf(R.Name()); }
+            }
+        }
         else if (T.StructName == "MovieSceneFrameRange")
         {
             /* TRange<FFrameNumber>: the lower bound's type and value, then the upper's (a byte and an int each). */
