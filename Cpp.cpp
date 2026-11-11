@@ -19150,7 +19150,8 @@ bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::s
         const Json* Init = Strip(Nth(List, I++));
         if (!Init || IsUnsetInit(*Init)) continue;
         FPropertyDef PD;
-        if (!TypeToProperty(TypeOf(*F), UeNameOf(&Rec, Name(*F)), 0, Where + "." + Name(*F), BP, &PD, Err)) return false;
+        if (!TypeToProperty(TypeOf(*F), UeNameOf(&Rec, Name(*F)), 0,
+                            NativeMemberWhere(&Rec, TypeOf(*F), Name(*F), Where + "." + Name(*F)), BP, &PD, Err)) return false;
         struct FRestore { bool& Flag; const Json*& Init; const FRecord*& Of; bool WasFlag; const Json* WasInit; const FRecord* WasOf;
                           ~FRestore() { Flag = WasFlag; Init = WasInit; Of = WasOf; } }
             Restore{ bParentFresh, ParentInit, ParentInitOf, bParentFresh, ParentInit, ParentInitOf };

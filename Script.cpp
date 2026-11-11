@@ -251,16 +251,35 @@ namespace
 void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D);
 void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P);
 
+/* An FSoftObjectPath, `/Game/A/B.B:Sub` or `None`: 4.27 writes the path's FName, then the SubPathString (empty here). */
+void WriteSoftPath(FArc& V, const std::string& Path)
+{
+    if (!IsUE5()) { V.Name(Path); V.I32(0); return; }
+    /* 5.6 (FSOFTOBJECTPATH_REMOVE_ASSET_PATH_FNAMES): an FTopLevelAssetPath, the package and the asset as two
+       FNames, then the SubPathString: `/Game/A/B.B:Sub` is `/Game/A/B`, `B`, `Sub`; a path with no `.` names
+       the asset by its package's last segment; none is `None`, `None`, empty. */
+    const size_t Colon = Path.find(':');
+    const std::string Top = Path.substr(0, Colon);
+    size_t Dot = Top.find('.');
+    const bool bPath = Path != "None";
+    const std::string Package = !bPath ? Path : Top.substr(0, Dot);
+    const std::string Asset = !bPath ? Path : Dot != std::string::npos ? Top.substr(Dot + 1) : Top.substr(Top.rfind('/') + 1);
+    V.Name(Package);
+    V.Name(Asset);
+    WriteFStringValue(V, Colon == std::string::npos ? std::string() : Path.substr(Colon + 1));
+}
+
 /* A struct the engine serializes in a form of its own (WithSerializer), not as tags, whose form AssetGen knows; false for
    any other. FGameplayTagContainer::Serialize writes its tags, each tag its FName; FNiagaraTypeDefinitionHandle the
    definition it names, as tags; FNiagaraVariableBase its Name, then its handle, and FNiagaraVariable its VarData after
-   that, FNiagaraVariableWithOffset its Offset (each measured on EEE's cooked cloud stores). A member the value does not
+   that, FNiagaraVariableWithOffset its Offset (each measured on EEE's cooked cloud stores); FSoftObjectPath and
+   FSoftClassPath their AssetPathName and SubPathString. A member the value does not
    give is its zero. */
 bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
 {
     const std::string& S = P.StructName;
     if (S != "GameplayTagContainer" && S != "NiagaraTypeDefinitionHandle" && S != "NiagaraVariableBase"
-        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset")
+        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset" && S != "SoftObjectPath" && S != "SoftClassPath")
         return false;
     const auto& Members = D.Members ? D.Members : P.Members;
     auto Member = [&](const char* Name) -> const FPropertyDef* {
@@ -268,6 +287,16 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
             for (const FPropertyDef& M : *Members) if (M.Name == Name) return &M;
         return nullptr;
     };
+    if (S == "SoftObjectPath" || S == "SoftClassPath")
+    {
+        /* AssetPathName, then SubPathString (FSoftObjectPath::Serialize); a member the value does not give is empty. */
+        const FPropertyDef *Asset = Member("AssetPathName"), *Sub = Member("SubPathString");
+        const std::string Path = Asset && Asset->Default.K == FDefaultValue::Str && !Asset->Default.S.empty() ? Asset->Default.S : "None";
+        const std::string Rest = Sub && Sub->Default.K == FDefaultValue::Str ? Sub->Default.S : std::string();
+        if (IsUE5()) WriteSoftPath(V, Rest.empty() ? Path : Path + ":" + Rest);
+        else { V.Name(Path); WriteFStringValue(V, Rest); }
+        return true;
+    }
     if (S == "GameplayTagContainer")
     {
         const FPropertyDef* Tags = Member("GameplayTags");
@@ -316,7 +345,8 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         else if (P.Type == "FloatProperty") { const float F = float(D.F); V.Raw(&F, 4); }
         else if (P.Type == "DoubleProperty") V.Raw(&D.F, 8);
         else if (P.Type == "Int64Property") V.I64(D.I);
-        else if (P.Type == "UInt16Property") V.U16(uint16(D.I));
+        else if (P.Type == "UInt16Property" || P.Type == "Int16Property") V.U16(uint16(D.I));
+        else if (P.Type == "UInt64Property") V.I64(D.I);
         else if (P.Type == "UInt32Property") V.U32(uint32(D.I));
         else if (P.Type == "EnumProperty") V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero);
         else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(uint8(D.I)); else V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero); }   // an enum byte is its enumerator's name
@@ -337,25 +367,7 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         else if (P.Type == "DelegateProperty")      // FScriptDelegate: the object, the function's name (ScriptDelegates.h
         { V.Idx(Null()); V.Name("None"); }           // 138-142); a default is unbound, as a bound one is refused
         else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty")    // FSoftObjectPath: AssetPathName, SubPathString
-        {
-            const std::string Path = D.K == FDefaultValue::Str && !D.S.empty() ? D.S : std::string("None");
-            if (!IsUE5()) { V.Name(Path); V.I32(0); }
-            else
-            {
-                /* 5.6 (FSOFTOBJECTPATH_REMOVE_ASSET_PATH_FNAMES): an FTopLevelAssetPath, the package and the asset as two
-                   FNames, then the SubPathString: `/Game/A/B.B:Sub` is `/Game/A/B`, `B`, `Sub`; a path with no `.` names
-                   the asset by its package's last segment; none is `None`, `None`, empty. */
-                const size_t Colon = Path.find(':');
-                const std::string Top = Path.substr(0, Colon);
-                size_t Dot = Top.find('.');
-                const bool bPath = Path != "None";
-                const std::string Package = !bPath ? Path : Top.substr(0, Dot);
-                const std::string Asset = !bPath ? Path : Dot != std::string::npos ? Top.substr(Dot + 1) : Top.substr(Top.rfind('/') + 1);
-                V.Name(Package);
-                V.Name(Asset);
-                WriteFStringValue(V, Colon == std::string::npos ? std::string() : Path.substr(Colon + 1));
-            }
-        }
+            WriteSoftPath(V, D.K == FDefaultValue::Str && !D.S.empty() ? D.S : std::string("None"));
         else if (P.Type == "SetProperty" || P.Type == "MapProperty")
         {
             /* The removed elements (a map's keys), then the count and the elements; a map's Items alternate key, value.
@@ -478,7 +490,7 @@ bool NativeUnwritten(const std::string& StructName)
 {
     // ponytail: the census's list; a native struct the pak holds no value of is not in it
     static const char* const Unwritten[] = {
-        "SoftObjectPath", "SoftClassPath", "PerPlatformFloat", "PerPlatformInt",
+        "PerPlatformFloat", "PerPlatformInt",
         "KeyHandleMap", "FontData", "FontCharacter", "ColorMaterialInput", "ScalarMaterialInput", "VectorMaterialInput",
         "MaterialAttributesInput",
         "MovieSceneFloatChannel", "MovieSceneFrameRange", "MovieSceneEvaluationFieldEntityTree",
@@ -493,8 +505,8 @@ int32 FixedValueSize(const FPropertyDef& P)
     if (T == "IntProperty" || T == "FloatProperty" || T == "ObjectProperty" || T == "ClassProperty" || T == "InterfaceProperty"
         || T == "UInt32Property")
         return 4;
-    if (T == "UInt16Property") return 2;
-    if (T == "Int64Property" || T == "DoubleProperty" || T == "EnumProperty" || T == "NameProperty") return 8;
+    if (T == "UInt16Property" || T == "Int16Property") return 2;
+    if (T == "Int64Property" || T == "UInt64Property" || T == "DoubleProperty" || T == "EnumProperty" || T == "NameProperty") return 8;
     if (T == "ByteProperty") return P.StructName.empty() ? 1 : 8;
     if (T == "StructProperty") return NativeStructSize(P.StructName);
     return 0;

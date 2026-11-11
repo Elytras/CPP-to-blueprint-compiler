@@ -984,6 +984,8 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     else if (Ty == "Int64Property") { D.K = FDefaultValue::Int; D.I = R.I64(); }
     else if (Ty == "UInt32Property") { D.K = FDefaultValue::Int; D.I = R.Get<uint32>(); }     // WriteValue: V.U32(uint32(D.I))
     else if (Ty == "UInt16Property") { D.K = FDefaultValue::Int; D.I = R.Get<uint16>(); }
+    else if (Ty == "Int16Property") { D.K = FDefaultValue::Int; D.I = R.Get<int16>(); }
+    else if (Ty == "UInt64Property") { D.K = FDefaultValue::Int; D.I = int64(R.Get<uint64>()); }     // its bits: Int64Property's writer
     else if (Ty == "DelegateProperty")                      // FScriptDelegate: the object, the function's name; the encoder writes it unbound
     {
         const int32 Object = R.I32();
@@ -1028,7 +1030,18 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     else if (Ty == "StructProperty")
     {
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
-        if (const int32 Native = NativeStructSize(T.StructName))
+        if (T.StructName == "SoftObjectPath" || T.StructName == "SoftClassPath")      // AssetPathName, SubPathString
+        {
+            FPropertyDef& Asset = Members->emplace_back();
+            Asset.Type = "NameProperty"; Asset.Name = "AssetPathName";
+            Asset.Default.K = FDefaultValue::Str; Asset.Default.S = P.NameOf(R.Name());
+            FPropertyDef& Sub = Members->emplace_back();
+            Sub.Type = "StrProperty"; Sub.Name = "SubPathString";
+            Sub.Default.K = FDefaultValue::Str;
+            if (!ReadEncodedString(R, Sub.Default.S, Why)) return false;
+            if (Asset.Default.S == "None") Asset.Default.S.clear();
+        }
+        else if (const int32 Native = NativeStructSize(T.StructName))
         {
             /* The struct's bytes as they are: 4-byte chunks, then single bytes, which WriteValue writes back raw. */
             for (int32 At = 0; At < Native;)
