@@ -1030,7 +1030,16 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     else if (Ty == "StructProperty")
     {
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
-        if (T.StructName == "SoftObjectPath" || T.StructName == "SoftClassPath")      // AssetPathName, SubPathString
+        if (T.StructName == "PerPlatformFloat" || T.StructName == "PerPlatformInt" || T.StructName == "PerPlatformBool")
+        {
+            /* bCooked, then Default (WriteNativeForm): a value with bCooked unset would hold a per-platform map after it. */
+            if (R.U32() != 1) { Why = "a " + T.StructName + " with bCooked unset (the encoder writes it set)"; return false; }
+            FPropertyDef& Def = Members->emplace_back();
+            Def.Name = "Default";
+            if (T.StructName == "PerPlatformFloat") { Def.Type = "FloatProperty"; Def.Default.K = FDefaultValue::Float; Def.Default.F = R.Get<float>(); }
+            else { Def.Type = T.StructName == "PerPlatformInt" ? "IntProperty" : "BoolProperty"; Def.Default.K = FDefaultValue::Int; Def.Default.I = R.U32(); }
+        }
+        else if (T.StructName == "SoftObjectPath" || T.StructName == "SoftClassPath")      // AssetPathName, SubPathString
         {
             FPropertyDef& Asset = Members->emplace_back();
             Asset.Type = "NameProperty"; Asset.Name = "AssetPathName";

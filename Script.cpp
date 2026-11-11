@@ -279,7 +279,8 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
 {
     const std::string& S = P.StructName;
     if (S != "GameplayTagContainer" && S != "NiagaraTypeDefinitionHandle" && S != "NiagaraVariableBase"
-        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset" && S != "SoftObjectPath" && S != "SoftClassPath")
+        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset" && S != "SoftObjectPath" && S != "SoftClassPath"
+        && S != "PerPlatformFloat" && S != "PerPlatformInt" && S != "PerPlatformBool")
         return false;
     const auto& Members = D.Members ? D.Members : P.Members;
     auto Member = [&](const char* Name) -> const FPropertyDef* {
@@ -295,6 +296,16 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         const std::string Rest = Sub && Sub->Default.K == FDefaultValue::Str ? Sub->Default.S : std::string();
         if (IsUE5()) WriteSoftPath(V, Rest.empty() ? Path : Path + ":" + Rest);
         else { V.Name(Path); WriteFStringValue(V, Rest); }
+        return true;
+    }
+    if (S == "PerPlatformFloat" || S == "PerPlatformInt" || S == "PerPlatformBool")
+    {
+        /* A bool bCooked (4 bytes: a bool in an archive is a uint32), then Default alone, which is all a game reads; a
+           cooked value always has bCooked set (FPerPlatformFloat's operator<<, PerPlatformProperties.h). */
+        const FPropertyDef* Default = Member("Default");
+        V.U32(1);
+        if (S == "PerPlatformFloat") { const float F = Default ? float(Default->Default.F) : 0.0f; V.Raw(&F, 4); }
+        else V.U32(Default ? uint32(Default->Default.I) : 0);
         return true;
     }
     if (S == "GameplayTagContainer")
@@ -490,7 +501,7 @@ bool NativeUnwritten(const std::string& StructName)
 {
     // ponytail: the census's list; a native struct the pak holds no value of is not in it
     static const char* const Unwritten[] = {
-        "PerPlatformFloat", "PerPlatformInt",
+        
         "KeyHandleMap", "FontData", "FontCharacter", "ColorMaterialInput", "ScalarMaterialInput", "VectorMaterialInput",
         "MaterialAttributesInput",
         "MovieSceneFloatChannel", "MovieSceneFrameRange", "MovieSceneEvaluationFieldEntityTree",
