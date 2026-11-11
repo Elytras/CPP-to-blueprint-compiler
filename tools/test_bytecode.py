@@ -17433,6 +17433,36 @@ def const_objects():
 const_objects()
 
 
+# ---- Two leftovers of the bug-class audit: warnings about constants come in the order the source writes them, and the
+# one int64 division with no int64 quotient is left for the game to run instead of trapping in the compiler.
+
+def audit_leftovers():
+    import tempfile
+    names = ['Zed', 'Alpha', 'Mid', 'Beta', 'Yaw', 'Cee', 'Xi', 'Dee']
+    head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'KeyOrder.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(head % 'KeyOrder' + ''.join('const FKey k%s = FKey{"LeftShfit"};\n' % n for n in names)
+                    + 'class KeyOrder : public AActor {\npublic:\n  int32 F() { return 1; }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout
+        assert re.findall(r'warning: k(\w+): FKey\{"LeftShfit"\}', proc.stdout) == names, proc.stdout
+        src = os.path.join(tmp, 'LowestOverMinusOne.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(head % 'LowestOverMinusOne' + 'class LowestOverMinusOne : public AActor {\npublic:\n'
+                    '  int64 Quot() { return (-9223372036854775807LL - 1) / -1; }\n'
+                    '  int64 Near() { return (-9223372036854775807LL) / -1; }\n};\n')       # folds: the largest int64
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, (proc.returncode, proc.stdout)
+        assert run(os.path.join(tmp, 'LowestOverMinusOne'), 'Near')[0] == 2**63 - 1
+    print('ok  AuditLeftovers: FKey warnings of constants come in source order; the lowest int64 over -1 compiles, unfolded')
+
+
+audit_leftovers()
+
+
+
 # ---- Rows that said "refused" and are not: tests/RowStd.cpp. std::min is built into the source's function library, a
 # whole TArray is copied out through a pointer, and a goto in a TMap loop whose value is no container leaves after the
 # write has reached the map.

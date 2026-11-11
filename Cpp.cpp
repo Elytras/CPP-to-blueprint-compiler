@@ -17333,6 +17333,8 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     if (Op == "+") Out.I = L.I + R.I;
     else if (Op == "-") Out.I = L.I - R.I;
     else if (Op == "*") Out.I = L.I * R.I;
+    /* The lowest int64 over -1 has no int64 quotient and traps here as it would in game: left unfolded. */
+    else if ((Op == "/" || Op == "%") && !bU64 && R.I == -1 && L.I == INT64_MIN) return false;
     else if (Op == "/" && R.I != 0) Out.I = bU64 ? int64(uint64(L.I) / uint64(R.I)) : L.I / R.I;
     else if (Op == "%" && R.I != 0) Out.I = bU64 ? int64(uint64(L.I) % uint64(R.I)) : L.I % R.I;
     else if (Op == "&") Out.I = L.I & R.I;
@@ -25023,11 +25025,12 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     GAg.Mark("LoadTables");
     if (!Collect(Err)) { GAg.Mark("Collect (failed)"); return false; }
     GAg.Mark("Collect");
+    std::vector<const Json*> ConstVarOrder;     // ConstVars as the sources write them: its key is a clang id, an address
     std::function<void(const Json&, bool)> IndexConsts = [&](const Json& N, bool bInClass) {
         const std::string K = Kind(N);
         if (K == "VarDecl" && N.contains("init") && N.contains("id")
             && (N.value("constexpr", false) || TypeOf(N).compare(0, 6, "const ") == 0))
-            ConstVars[N.value("id", std::string())] = &N;
+        { ConstVars[N.value("id", std::string())] = &N; ConstVarOrder.push_back(&N); }
         else if (K == "VarDecl" && N.contains("id") && bInClass)
             MutableStatics[N.value("id", std::string())] = &N;
         if (K == "TranslationUnitDecl" || K == "NamespaceDecl" || K == "CXXRecordDecl" || K == "LinkageSpecDecl")
@@ -25152,7 +25155,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             for (const Json* F : R.Fields) WarnKeyLiterals(*F, Cpp + "::" + Name(*F));
             if (R.Defaults) WarnKeyLiterals(*R.Defaults, Cpp + "::UE_DEFAULTS");
         }
-    for (const auto& [Id, Var] : ConstVars) WarnKeyLiterals(*Var, Name(*Var));
+    for (const Json* Var : ConstVarOrder) WarnKeyLiterals(*Var, Name(*Var));
     for (const FChain* C : ChainOrder) if (C->Def) WarnKeyLiterals(*C->Def, Name(*C->Def));
     /* A local or a parameter named None, in any case, is NAME_None: the bytecode names a local by its FName and
        FindFProperty returns null for None, so every read and write of it would be dead in game. The editor never keeps
