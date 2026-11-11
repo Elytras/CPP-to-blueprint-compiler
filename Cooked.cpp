@@ -1082,6 +1082,22 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
             if (T.StructName == "PerPlatformFloat") { Def.Type = "FloatProperty"; Def.Default.K = FDefaultValue::Float; Def.Default.F = R.Get<float>(); }
             else { Def.Type = T.StructName == "PerPlatformInt" ? "IntProperty" : "BoolProperty"; Def.Default.K = FDefaultValue::Int; Def.Default.I = R.U32(); }
         }
+        else if (T.StructName == "GameplayTagContainer")
+        {
+            /* FGameplayTagContainer::Serialize: a count, then each tag's name (WriteNativeForm). */
+            const int32 Count = R.I32();
+            if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / 8) { Why = "a tag container's count past its value"; return false; }
+            FPropertyDef& Tags = Members->emplace_back();
+            Tags.Name = "GameplayTags"; Tags.Type = "ArrayProperty"; Tags.Default.K = FDefaultValue::Array;
+            for (int32 I = 0; I < Count; ++I)
+            {
+                FDefaultValue& Tag = Tags.Default.Items.emplace_back();
+                Tag.K = FDefaultValue::Struct;
+                Tag.Members = std::make_shared<std::vector<FPropertyDef>>();
+                FPropertyDef& Name = Tag.Members->emplace_back();
+                Name.Name = "TagName"; Name.Type = "NameProperty"; Name.Default.K = FDefaultValue::Str; Name.Default.S = P.NameOf(R.Name());
+            }
+        }
         else if (T.StructName == "SkeletalMeshSamplingLODBuiltData")
         {
             /* FWeightedRandomSampler's three: Prob (floats) and Alias (ints), each a count then the words, then TotalWeight. */
