@@ -11,7 +11,7 @@ As a module: Package(base) is one cooked package read into tables, check(pkg) ->
 import glob, json, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import uasset_io
-from uasset import W
+from uasset import W, W5
 from uasset_io import R as Rd
 
 
@@ -47,7 +47,7 @@ class Walk(W):
     def expr(s):
         n = Node(s.b[s.o], s.mem, s.o)
         s.stack[-1].kids.append(n); s.stack.append(n)
-        try: op = W.expr(s)
+        try: op = super().expr()
         finally: s.stack.pop()
         n.size = s.mem - n.mem
         return op
@@ -67,6 +67,11 @@ class Walk(W):
             segs.append(s.names[i] + ('_%d' % (num - 1) if num else ''))
         s.stack[-1].ops.append(('prop', segs, struct.unpack_from('<i', s.b, o)[0]))
         return W.fieldpath(s)
+
+
+class Walk5(Walk, W5):
+    """Walk over uasset.W5's 5.6 operands (doubles, EX_Vector3fConst, EX_BitFieldConst): a node of those has no
+    operands or kids listed, and no rule reads one."""
 
 
 class Struct:
@@ -101,6 +106,7 @@ class Package:
                                          'not_always_loaded', 'is_asset'))
             e['deps'] = deps[k]                                 # serBeforeSer, createBeforeSer, serBeforeCreate, createBeforeCreate
             s.exports.append(e)
+        s.ue5, s.unversioned_props = sm['ue5'], bool(sm['ue5'] and s.package_flags & uasset_io.UNVERSIONED_PROPERTIES)
         s._structs, s._tags = {}, {}
 
     def _name(s, r):
@@ -165,8 +171,66 @@ class Package:
 
     def tags(s, i, start=0):
         """The export's FPropertyTags from `start` to None, as dicts (PropertyTag.cpp): name, type, size, index,
-        struct / enum / inner / key / value type names, bool, the value's bytes. The end offset in .end of the list."""
+        struct / enum / inner / key / value type names, bool, the value's bytes. The end offset in .end of the list.
+        A UE5 package is read as 5.6 writes it (_tags5); an unversioned one has no tags to list (_unversioned)."""
         if (i, start) in s._tags: return s._tags[i, start]
+        if getattr(s, 'unversioned_props', False): out = s._unversioned(i, start)
+        elif getattr(s, 'ue5', False): out = s._tags5(i, start)
+        else: out = s._tags4(i, start)
+        s._tags[i, start] = out
+        return out
+
+    def _unversioned(s, i, start):
+        """RogueCore's own packages hold unversioned properties (PKG_UnversionedProperties): a header of u16 fragments
+        (skip 7 bits, has-zeroes 0x80, last 0x100, value count 7 bits) and a zero mask, then the values in the class's
+        property order, which only the class's schema tells apart. So no tag list: .end is past the header, and a
+        header that counts values leaves .end None (the payload is opaque past it). A UClass or UFunction export counts
+        none (a UClass skips its 13 properties, all default)."""
+        r, values, zeroes = Rd(s.blob(i), start), 0, False
+        while True:
+            f = r.u16()
+            values += f >> 9
+            zeroes = zeroes or bool(f & 0x80)
+            if f & 0x100: break
+        if zeroes: r.o += 1 if values <= 8 else 2 if values <= 16 else 4 * ((values + 31) // 32)
+        out = TagList()
+        out.header_end = r.o
+        out.end = None if values else r.o
+        return out
+
+    def _tags5(s, i, start):
+        """The 5.4+ tagged grammar: a control byte before an object's list, then per tag the name, the type as a
+        pre-order list of (FName, inner count) nodes, the size and a flags byte (HasArrayIndex 1, HasPropertyGuid 2,
+        HasPropertyExtensions 4, BoolTrue 0x10), then the index / guid / extensions if flagged."""
+        b, out = s.blob(i), TagList()
+        r = Rd(b, start)
+        if start == 0: r.u8()                               # SerializationControlExtensions
+        def node():
+            name = s._name(r)
+            return name, [node() for _ in range(r.i32())]
+        while True:
+            name = s._name(r)
+            if name == 'None': break
+            (kind, kids), t = node(), dict(name=name)
+            t['type'] = kind
+            t['size'] = r.i32()
+            flags = r.u8()
+            t['index'] = r.i32() if flags & 1 else 0
+            if kind == 'StructProperty' and kids: t['struct'] = kids[0][0]; t['struct_guid'] = b''
+            elif kind == 'BoolProperty': t['bool'] = 1 if flags & 0x10 else 0
+            elif kind in ('ByteProperty', 'EnumProperty') and kids: t['enum'] = kids[0][0]
+            elif kind in ('ArrayProperty', 'SetProperty') and kids:
+                t['inner'] = kids[0][0]
+                if kids[0][1]: t['enum' if kids[0][0] in ('EnumProperty', 'ByteProperty') else 'struct'] = kids[0][1][0][0]
+            elif kind == 'MapProperty' and len(kids) == 2: t['inner'], t['value_type'] = kids[0][0], kids[1][0]
+            if flags & 2: r.o += 16                         # property guid
+            if flags & 4: r.o += 1                          # extensions: a flags byte, 0 for what AssetGen writes
+            t['at'] = r.o; t['value'] = b[r.o:r.o + t['size']]; r.o += t['size']
+            out.append(t)
+        out.end = r.o
+        return out
+
+    def _tags4(s, i, start):
         b, r, out = s.blob(i), None, TagList()
         r = Rd(b, start)
         while True:
@@ -183,7 +247,6 @@ class Package:
             t['at'] = r.o; t['value'] = b[r.o:r.o + t['size']]; r.o += t['size']
             out.append(t)
         out.end = r.o
-        s._tags[i, start] = out
         return out
 
     def tag(s, i, name):
@@ -201,12 +264,35 @@ class Package:
         st.kind = s.class_of(i + 1)
         tl = s.tags(i)
         st.tags = tl
-        r = Rd(b, tl.end)
+        st.size = len(b)
+        if tl.end is not None: s._struct_body(i, st, Rd(b, tl.end))
+        else:
+            # An unversioned class whose header counts values (BlueprintGeneratedClass's NumReplicatedProperties ...):
+            # their layout is the class's schema, which no table here holds. The body that follows starts with the lazy
+            # guid bool, and is the one start from which it reads to exactly the export's end.
+            for c in range(tl.header_end, min(len(b) - 8, tl.header_end + UNVERSIONED_SEARCH)):
+                if b[c:c + 4] != bytes(4): continue
+                try: s._struct_body(i, st, Rd(b, c))
+                except (IndexError, ValueError, struct.error, MemoryError, OverflowError): continue
+                if st.end == st.size: break
+            else: raise ValueError('export %d: no struct body found past its unversioned header' % i)
+        s._structs[i] = st
+        return st
+
+    def _struct_body(s, i, st, r):
+        """The UStruct body from the lazy-guid bool on, into st; ValueError where it is no struct body."""
+        b = r.b
         if r.i32(): r.o += 16                               # FLazyObjectPtr::PossiblySerializeObjectGuid
         st.super = r.i32()
-        st.children = [r.i32() for _ in range(r.i32())]
-        st.props = [s._prop(r, s._name(r)) for _ in range(r.i32())]
+        if abs(st.super) > len(s.imports) + len(s.exports): raise ValueError('super')
+        n = r.i32()
+        if not 0 <= n <= len(s.exports): raise ValueError('children')
+        st.children = [r.i32() for _ in range(n)]
+        n = r.i32()
+        if not 0 <= n <= 4096: raise ValueError('props')
+        st.props = [s._prop(r, s._name(r)) for _ in range(n)]
         st.script_mem, st.script_disk = r.i32(), r.i32()
+        if not 0 <= st.script_disk <= len(b) - r.o: raise ValueError('script')
         st.script_at = r.o
         r.o += st.script_disk
         if st.kind in s.FUNCTION_CLASSES:
@@ -217,7 +303,8 @@ class Package:
         elif st.kind in ('UserDefinedStruct', 'ScriptStruct'):
             st.struct_flags = r.u32()
             status = s.tag(i, 'Status')
-            if st.kind == 'UserDefinedStruct' and (not status or s.names[struct.unpack_from('<i', status['value'])[0]]
+            if s.unversioned_props: st.defaults, r.o = None, len(b)     # the default instance is unversioned too: opaque
+            elif st.kind == 'UserDefinedStruct' and (not status or s.names[struct.unpack_from('<i', status['value'])[0]]
                                                    .endswith('UDSS_UpToDate')):
                 st.defaults = s.tags(i, r.o)                # the default instance, UUserDefinedStruct::Serialize
                 r.o = st.defaults.end
@@ -227,13 +314,14 @@ class Package:
             st.generated_by = r.i32()
             st.interfaces = [(r.i32(), r.i32(), r.i32()) for _ in range(r.i32())]   # Class, PointerOffset, bImplementedByK2
             st.force_script_order, st.dummy, st.cooked, st.cdo = r.i32(), s._name(r), r.i32(), r.i32()
+            if s.ue5 and s.package_flags & uasset_io.FILTER_EDITOR_ONLY:
+                # UBlueprintGeneratedClass::Serialize's CookedEditorTags, a TMap<FName, FString> (the runtime's is empty)
+                st.cooked_editor_tags = [(s._name(r), r.fstr()) for _ in range(r.i32())]
         st.end = r.o
-        st.size = len(b)
-        s._structs[i] = st
-        return st
 
     def _prop(s, r, ftype):
         p = Prop()
+        if not ftype.endswith('Property'): raise ValueError('field class %r' % ftype)
         p.type, p.name, p.objflags = ftype, s._name(r), r.u32()
         p.dim, p.elem_size, p.flags, p.rep_index = r.i32(), r.i32(), r.u64(), r.u16()
         p.notify, p.cond = s._name(r), r.u8()
@@ -259,7 +347,7 @@ class Package:
         """Export i's bytecode as a list of top-level statements (Nodes); [] for a struct without script."""
         st = s.struct(i)
         if not st or not st.script_disk: return []
-        w = Walk(s.blob(i), st.script_at, s)
+        w = (Walk5 if s.ue5 else Walk)(s.blob(i), st.script_at, s)
         end = st.script_at + st.script_disk
         while w.o < end: w.expr()
         st.walked_mem, st.walked_end = w.mem, w.o
@@ -268,8 +356,10 @@ class Package:
 
 class TagList(list):
     end = 0
+    header_end = 0
 
 
+UNVERSIONED_SEARCH = 1 << 16        # how far past an unversioned header Package.struct looks for a struct body
 GAME_CONTENT = []           # the game's own FSD/Content folders, where Package.resolve looks for a /Game import last
 # What the rules know of the engine's own classes, which no cooked package carries: the mod API headers (UeApi) and a
 # Dumper-7 dump of the game (its SDK/SDK and GObjects-Dump-WithProperties.txt). Read at import, from the environment

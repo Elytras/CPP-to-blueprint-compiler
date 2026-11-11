@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 
 DECL = re.compile(r"^\t(static\s+)?([A-Za-z_][\w:<>,\s\*&]*?)\s+(\w+)\((.*)\)(\s*const)?;\s*$")
@@ -399,6 +400,10 @@ def game_structs(own, content):
             ex = [i for i in range(len(p.exports)) if p.class_of(i + 1) == "UserDefinedStruct"] if p else []
             if not ex:
                 why = "no package"
+            elif p.struct(ex[0]).defaults is None:
+                # ponytail: an unversioned package's default instance is values in the struct's property order, which the
+                # dump does not record (S40); decoding it is the "unversioned" follow-up.
+                why = "unversioned defaults"
             else:
                 by_real = dict((r, n) for n, r in st.real.items())
                 types = dict((n, t) for t, n in st.fields)
@@ -475,15 +480,33 @@ def cooked_enum_names(content, path):
     ex = [i for i in range(len(p.exports)) if p.class_of(i + 1) == "UserDefinedEnum"] if p else []
     if not ex:
         return None
-    # UEnum::Serialize after the tags: an object-GUID flag, then int32 count x (FName, int64) (Enum.cpp 33-90).
-    r = invariants.Rd(p.blob(ex[0]), p.tags(ex[0]).end)
-    if r.i32():
-        r.o += 16
-    out = {}
-    for _ in range(r.i32()):
-        name = p._name(r).split("::")[-1]
-        out[r.i64()] = name
-    return out
+    # UEnum::Serialize after the tags: an object-GUID flag, then int32 count x (FName, int64) (Enum.cpp 33-90). An
+    # unversioned package (RogueCore's) has no tag list, and a header counting values (the UserDescribedNames map) leaves
+    # no known start: the one from which a count and that many `Enum::Name` FNames read is it.
+    blob, tags = p.blob(ex[0]), p.tags(ex[0])
+
+    def read(at):
+        r = invariants.Rd(blob, at)
+        if r.i32():
+            r.o += 16
+        out = {}
+        for _ in range(r.i32()):
+            full = p._name(r)
+            if "::" not in full and tags.end is None:
+                raise ValueError("no enumerator")
+            out[r.i64()] = full.split("::")[-1]
+        return out
+    if tags.end is not None:
+        return read(tags.end)
+    for at in range(tags.header_end, len(blob) - 12):
+        if blob[at:at + 4] == bytes(4):
+            try:
+                found = read(at)
+            except (ValueError, IndexError, struct.error):
+                continue
+            if found:
+                return found
+    return None
 
 
 def game_enum_types(own, content):
