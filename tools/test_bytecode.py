@@ -6617,7 +6617,7 @@ def template_instances():
            'templates.template-class-t-inline-t')
     assert fns == ['Count__', 'Count__int32_float_bool', 'Fact__int32', 'Max2__float', 'Max2__int32', 'ModeOf__Angry',
                    'ModeOf__Calm', 'Pick__false', 'Pick__true', 'Times__3', 'Times__m2', 'Util__Twice__int32',
-                   'Width__float'], fns     # no Min2
+                   'ValueOf__Angry', 'ValueOf__Calm', 'Width__float'], fns     # no Min2, no InlineIs
     assert runscript.params_of(lib, 'Count__int32_float_bool') == ['V_0', 'V_1', 'V_2', 'WorldContextObject']
     proves('templates.static-member-template')
     assert sorted(e for e in exports_of(til) if not e.endswith('_C')) == ['Get__float', 'Get__int32']
@@ -6638,6 +6638,9 @@ def template_instances():
            vm.call('UsePick'), vm.call('UseCount'), vm.call('UseTwice', 4), vm.call('UseMin', 3, 9),
            vm.call('UseBox', 1.5, 4.0), vm.call('UseIntBox', 6), vm.call('UseGet', 5), vm.call('UseMode')]
     assert got == [9, 2.5, 120, 7 * 3 * 100 - 14, 12, 30, 8, 3, 2.5, 6, 15, 21], got
+    # An enum value parameter used as a value (`M == ETiMode::Angry`), in a function per instantiation and expanded inline.
+    proves('templates.template-emood-m-int32-valueof')
+    assert vm.call('UseModeValue') == 173, vm.call('UseModeValue')
     assert til_vm.call('Get__float', 1.5) == 4.5
     h = VM(holder, Value=4)
     h.call('ReceiveBeginPlay')
@@ -14448,7 +14451,18 @@ def widget_animation():
     assert cp.names[struct.unpack_from('<i', bytes(hal['value']))[0]].endswith('HAlign_Center'), hal
     proves('widget-layouts.cast-uoverlayslot-box-addchild-a')
 
-    widgets = '  UE_WIDGET(UCanvasPanel, Root);\n  UE_WIDGET(UTextBlock, Title);\n  UE_ANIMATION(Pop);\n'
+    # An inline helper called in the constructor reads as its statements, each parameter its argument.
+    hp, _ = class_pkg(os.path.join(ROOT, 'WidgetTree', 'FSD', 'Content', '_ElytrasMods', 'WidgetTree', 'UWtHelper'))
+    padded = {}
+    for i in range(len(hp.exports)):
+        if hp.class_of(i + 1) != 'OverlaySlot': continue
+        child = [t for t in hp.tags(i) if t['name'] == 'Content'][0]
+        top, = [struct.unpack('<f', bytes(t['value']))[0] for t in hp.tags(i, hp.tag(i, 'Padding')['at'])]
+        padded[hp.path(struct.unpack('<i', bytes(child['value'])[:4])[0]).split(':')[-1]] = top
+    assert padded == {'Left': 6.0, 'Right': 2.0}, padded
+    proves('widget-layouts.put-left-6-0f')
+
+    widgets ='  UE_WIDGET(UCanvasPanel, Root);\n  UE_WIDGET(UTextBlock, Title);\n  UE_ANIMATION(Pop);\n'
     proves('widget-layouts.ue-keys')
     refused('WaNoKeys', widgets + '  WaNoKeys() { Root->AddChildToCanvas(Title); }\n', 'keys nothing and has no length',
             base='UUserWidget')
@@ -15609,11 +15623,18 @@ def struct_slices():
                              'class StructSlice : public AActor {\npublic:\n'
                              '  bool Native(const FPointerEvent &E) { return UKismetInputLibrary::InputEvent_IsControlDown(E); }\n'
                              '  bool Sugar(const FPointerEvent &E) { return E.InputEvent_IsControlDown(); }\n'
-                             '  void Take(FInputEvent In) {}\n  void ByValue(const FKeyEvent &K) { Take(K); }\n};\n', 'StructSlice')
+                             '  void Take(FInputEvent In) {}\n  void ByValue(const FKeyEvent &K) { Take(K); }\n'
+                             '  FInputEvent Held;\n'
+                             '  FInputEvent Returned(const FPointerEvent &M) { return M; }\n'
+                             '  void Assigned(const FPointerEvent &M) { Held = M; }\n'
+                             '  void Initialised(const FPointerEvent &M) { FInputEvent E = M; Take(E); }\n};\n', 'StructSlice')
     base = os.path.join(out, 'StructSlice')
     for fn, conv, arg, callee in (('Native', 'GetInputEventFromPointerEvent', 'E', "Function'InputEvent_IsControlDown'"),
                                   ('Sugar', 'GetInputEventFromPointerEvent', 'E', "Function'InputEvent_IsControlDown'"),
-                                  ('ByValue', 'GetInputEventFromKeyEvent', 'K', r'LocalVirtualFunction\s+Take')):
+                                  ('ByValue', 'GetInputEventFromKeyEvent', 'K', r'LocalVirtualFunction\s+Take'),
+                                  ('Returned', 'GetInputEventFromPointerEvent', 'M', r'Return'),
+                                  ('Assigned', 'GetInputEventFromPointerEvent', 'M', r'Let'),
+                                  ('Initialised', 'GetInputEventFromPointerEvent', 'M', r'Let')):
         text = dump('walkscript.py', base, export_index(base, fn))
         assert re.search(r"Function'%s'\s*\n.*LocalOutVariable\s+%s@" % (conv, arg), text), (fn, text)
         assert not re.search(r"%s\s*\n.*Local\w*Variable\s+%s@" % (callee, arg), text), (fn, text)
@@ -15621,6 +15642,10 @@ def struct_slices():
     proves('struct-conversions.take-motion')
     refused('SliceNoConv', '  void Take(const FInputEvent &E) {}\n  void F(const FMotionEvent &M) { Take(M); }\n',
             'Take argument 1 is an FMotionEvent where an FInputEvent is wanted', top='#include "UeApi/SlateCore.h"\n')
+    for mod, body in (('SliceRet', '  FInputEvent F(const FMotionEvent &M) { return M; }\n'),
+                      ('SliceSet', '  FInputEvent H;\n  void F(const FMotionEvent &M) { H = M; }\n'),
+                      ('SliceInit', '  void F(const FMotionEvent &M) { FInputEvent E = M; }\n')):
+        refused(mod, body, 'this copy is an FMotionEvent where an FInputEvent is wanted', top='#include "UeApi/SlateCore.h"\n')
 
 
 def input_key_names():

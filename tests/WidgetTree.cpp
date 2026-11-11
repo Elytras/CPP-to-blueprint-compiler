@@ -92,3 +92,17 @@ public:
     Box->AddChildToOverlay(Right)->HorizontalAlignment = EHorizontalAlignment::HAlign_Center;
   }
 };
+
+/* An inline helper in the constructor: its statements are read where it is called, each parameter as its argument. */
+class UWtHelper : public UUserWidget {
+public:
+  UE_WIDGET(UOverlay, Box);
+  UE_WIDGET(UBorder, Left);
+  UE_WIDGET(UBorder, Right);
+
+  inline void Put(UBorder *Child, float Top) { Cast<UOverlaySlot>(Box->AddChild(Child))->Padding.Top = Top; }
+  UWtHelper() {
+    Put(Left, 6.0f);
+    Put(Right, 2.0f);
+  }
+};

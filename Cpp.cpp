@@ -2178,6 +2178,15 @@ private:
        stand in for every read (ParmConst), so neither the property nor its store is compiled. */
     bool ReadOnlyLocal(const std::string& DeclId) const;
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
+    /* A child struct for its parent struct (StructUpcastBelow's cast): the parent's name, the child's, the child's own
+       conversion `Get<Parent>From<Child>` as a call on it (null with none), and whether the layouts agree so that no
+       slice is needed. */
+    struct FStructSlice { std::string Parent, Child, Conv; bool bSame = false; Json Call; };
+    FStructSlice SliceOf(const Json& Up) const;
+    /* The child structs a body copies into a parent struct outside a call (`return M;`, `Held = M;`, `FInputEvent E = M;`),
+       each sliced through its conversion in *Fixed, a copy of Body made on the first. The count of them; -1 and *Err for
+       one with no conversion. */
+    int SliceStructCopies(const Json& Body, Json* Fixed, std::string* Err) const;
     bool LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                        std::vector<FPropertyDef>& Locals, std::string* Err);
     bool SameContainer(const Json& A, const Json& B) const;
@@ -4464,8 +4473,53 @@ bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
     });
     Json Moved = Json::array();
     bool bOk = true;
-    ForEach(*Body, [&](const Json& S) {
+    /* `AddRow(Box, Label);` with AddRow an inline method of this class (or one it derives from) whose body is itself
+       constructor statements: the statements, with each parameter replaced by the argument it was called with, read in
+       the call's place. No object but `this`, no return value; a helper's own helper calls expand the same way. */
+    std::deque<Json> Expansions;
+    int32 HelperDepth = 0;
+    auto ExpandHelper = [&](const Json& S) -> const Json* {
+        const Json* Call = Strip(&S);
+        const Json* Callee = Call && Kind(*Call) == "CXXMemberCallExpr" ? Strip(First(*Call)) : nullptr;
+        const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
+        if (!Obj || Kind(*Obj) != "CXXThisExpr" || HelperDepth > 16) return nullptr;
+        const std::string Id = Callee->value("referencedMemberDecl", std::string());
+        const auto Owner = MethodOwner.find(Id);
+        const FRecord* OwnerR = Owner == MethodOwner.end() ? nullptr : Find(Owner->second);
+        if (!OwnerR || OwnerR->IsNative() || !OwnerR->Inlines.count(Id)) return nullptr;
+        const Json* Code = nullptr;
+        std::map<std::string, const Json*> Args;
+        size_t At = 1;
+        ForEach(*OwnerR->Inlines.at(Id), [&](const Json& C) {
+            if (Kind(C) == "CompoundStmt") Code = &C;
+            else if (Kind(C) == "ParmVarDecl") Args[C.value("id", std::string())] = Nth(*Call, At++);
+        });
+        if (!Code) return nullptr;
+        for (const auto& A : Args) if (!A.second) return nullptr;
+        Json& Out = Expansions.emplace_back(*Code);
+        std::function<void(Json&)> Subst = [&](Json& N) {
+            if (!N.is_object()) return;
+            if (Kind(N) == "DeclRefExpr")
+                if (const auto P = Args.find(N["referencedDecl"].value("id", std::string())); P != Args.end())
+                {
+                    N = *P->second;
+                    return;
+                }
+            if (const auto In = N.find("inner"); In != N.end() && In->is_array()) for (Json& C : *In) Subst(C);
+        };
+        Subst(Out);
+        return &Out;
+    };
+    std::function<void(const Json&)> Statement;
+    Statement = [&](const Json& S) {
         if (!bOk || Kind(S) == "NullStmt") return;
+        if (const Json* Expanded = ExpandHelper(S))
+        {
+            ++HelperDepth;
+            ForEach(*Expanded, Statement);
+            --HelperDepth;
+            return;
+        }
         const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
         const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
         std::vector<const Json*> Part;
@@ -4497,7 +4551,8 @@ bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
         }
         Moved.push_back(S);
         Moved.back()["ueWhere"] = Where;
-    });
+    };
+    ForEach(*Body, Statement);
     if (!bOk || Moved.empty()) return bOk;
     Json Block = { { "kind", "CompoundStmt" }, { "inner", Json::array() } };
     if (R.Defaults)
@@ -8210,7 +8265,17 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     if (K == "CompoundAssignOperator") return LowerUpdateValue(*N, BP, Out, Err);
     /* `__is_same(A, B)`, `sizeof...(V)` and a template's value parameter are constants C++ knows here. */
     if (K == "TypeTraitExpr" || K == "SizeOfPackExpr" || K == "SubstNonTypeTemplateParmExpr")
-        if (FConstVal V; FoldConst(*N, V) && (ConstToArg(V, OuterType, Out) || ConstToArg(V, TypeOf(*N), Out))) return true;
+    {
+        FConstVal V;
+        if (FoldConst(*N, V))
+        {
+            if (ConstToArg(V, OuterType, Out) || ConstToArg(V, TypeOf(*N), Out)) return true;
+            /* An enum value parameter (`template <EMood M>`): clang casts the number to the enum, a type with no kind
+               here unless UE_ENUM names it, so the number's own type (uint8, int) is the width, as an enumerator's is. */
+            const Json* Number = K == "SubstNonTypeTemplateParmExpr" ? Strip(Nth(*N, 1)) : nullptr;
+            if (Number && ConstToArg(V, TypeOf(*Number), Out)) return true;
+        }
+    }
 
     *Err = "TODO: unimplemented argument " + K;
     return false;
@@ -9296,6 +9361,111 @@ static const Json* StructUpcastBelow(const Json& N)
     return nullptr;
 }
 
+FCompiler::FStructSlice FCompiler::SliceOf(const Json& Up) const
+{
+    FStructSlice S;
+    S.Parent = StripTypeKeywords(TypeOf(Up));
+    S.Child = StripTypeKeywords(TypeOf(*First(Up)));
+    /* The editor's TheSameLayout, by Types.json: the parent's size, and no reflected member of the child's own. */
+    const auto PS = Structs.find(S.Parent), CS = Structs.find(S.Child);
+    if (PS != Structs.end() && CS != Structs.end() && PS->second.Size > 0 && PS->second.Size == CS->second.Size
+        && PS->second.Fields.size() == CS->second.Fields.size())
+    {
+        S.bSame = true;
+        return S;
+    }
+    S.Conv = "Get" + S.Parent.substr(1) + "From" + S.Child.substr(1);
+    const FRecord* CR = Find(S.Child);
+    // ponytail: one step only; FAnalogInputEvent to FInputEvent (via GetKeyEventFromAnalogInputEvent) is refused.
+    const Json* ConvDecl = nullptr;
+    if (CR)
+        if (const auto M = CR->Methods.find(S.Conv); M != CR->Methods.end()) ConvDecl = M->second;
+    if (ConvDecl)
+        S.Call = { {"kind", "CXXMemberCallExpr"}, {"type", {{"qualType", S.Parent}}}, {"valueCategory", "prvalue"},
+                   {"inner", Json::array({ { {"kind", "MemberExpr"}, {"name", S.Conv}, {"isArrow", false},
+                       {"type", {{"qualType", "<bound member function type>"}}},
+                       {"referencedMemberDecl", ConvDecl->value("id", std::string())},
+                       {"inner", Json::array({ *First(Up) })} } })} };
+    return S;
+}
+
+/* One struct copy found by StructCopiesIn: the path of "inner" indices from the body to the cast, and the cast. */
+struct FStructCopy { std::vector<size_t> Path; const Json* Up; };
+
+/* The casts of a child struct for its parent that a copy makes: a copy constructor's argument (`return M;`,
+   `FInputEvent E = M;`) and the right side of `operator=`. A call's own arguments and object are LowerCall's, which
+   slices them (Handled); the base of `M.Member` and a reference bound to the child are no copy and stay. */
+static void StructCopiesIn(const Json& N, std::vector<size_t>& Path, std::set<const Json*>& Handled, std::vector<FStructCopy>& Out)
+{
+    const std::string K = Kind(N);
+    auto Found = [&](const Json& From, std::vector<size_t> P) {
+        const Json* Up = StructUpcastBelow(From);
+        if (!Up || Handled.count(Up)) return;
+        for (const Json* X = &From; X != Up; X = First(*X)) P.push_back(0);
+        Out.push_back({ std::move(P), Up });
+    };
+    if (K == "CallExpr" || K == "CXXMemberCallExpr")
+    {
+        const Json* Callee = Strip(First(N));
+        for (size_t I = 0; const Json* A = Nth(N, I); ++I)
+        {
+            const Json* Of = I > 0 ? A : K == "CXXMemberCallExpr" && Callee ? First(*Callee) : nullptr;
+            if (const Json* Up = Of ? StructUpcastBelow(*Of) : nullptr) Handled.insert(Up);
+        }
+    }
+    else if (K == "CXXConstructExpr")
+    {
+        if (const auto In = N.find("inner"); In != N.end() && In->size() == 1) Found(N, Path);
+    }
+    else if (K == "CXXOperatorCallExpr")
+    {
+        const Json* Op = Strip(First(N));
+        if (Op && Kind(*Op) == "DeclRefExpr" && Name((*Op)["referencedDecl"]) == "operator=")
+            for (size_t I = 1; const Json* A = Nth(N, I); ++I)
+            {
+                std::vector<size_t> P = Path;
+                P.push_back(I);
+                Found(*A, std::move(P));
+            }
+    }
+    if (const auto In = N.find("inner"); In != N.end())
+        for (size_t I = 0; I < In->size(); ++I)
+        {
+            Path.push_back(I);
+            StructCopiesIn((*In)[I], Path, Handled, Out);
+            Path.pop_back();
+        }
+}
+
+int FCompiler::SliceStructCopies(const Json& Body, Json* Fixed, std::string* Err) const
+{
+    std::vector<size_t> Path;
+    std::set<const Json*> Handled;
+    std::vector<FStructCopy> Found;
+    StructCopiesIn(Body, Path, Handled, Found);
+    int Done = 0;
+    /* Deepest last in the walk, so deepest first here: a slice replaces a node whose children a later one may sit in. */
+    for (auto It = Found.rbegin(); It != Found.rend(); ++It)
+    {
+        const FStructSlice S = SliceOf(*It->Up);
+        if (S.bSame) continue;
+        if (S.Call.is_null())
+        {
+            *Err = "this copy is an " + S.Child + " where an " + S.Parent + " is wanted: Blueprint copies only the exact "
+                   "struct (the editor disallows a derived one), a copy made past the " + S.Parent + "'s end would overwrite "
+                   "what follows it, and UeApi declares no " + S.Child + "::" + S.Conv + " to make the slice; convert it "
+                   "to an " + S.Parent + " first";
+            return -1;
+        }
+        if (!Done) *Fixed = Body;
+        Json* At = Fixed;
+        for (size_t I : It->Path) At = &(*At)["inner"][I];
+        *At = S.Call;
+        ++Done;
+    }
+    return Done;
+}
+
 bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
 {
     const std::string K = Kind(CallExprNode);
@@ -9337,39 +9507,24 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         const Json* Of = I > 0 ? A : K == "CXXMemberCallExpr" ? First(*Callee) : nullptr;
         const Json* Up = Of ? StructUpcastBelow(*Of) : nullptr;
         if (!Up) continue;
-        const std::string Parent = StripTypeKeywords(TypeOf(*Up)), Child = StripTypeKeywords(TypeOf(*First(*Up)));
-        /* The editor's TheSameLayout, by Types.json: the parent's size, and no reflected member of the child's own. */
-        const auto PS = Structs.find(Parent), CS = Structs.find(Child);
-        if (PS != Structs.end() && CS != Structs.end() && PS->second.Size > 0 && PS->second.Size == CS->second.Size
-            && PS->second.Fields.size() == CS->second.Fields.size())
-            continue;
-        const std::string Conv = "Get" + Parent.substr(1) + "From" + Child.substr(1);
-        const FRecord* CR = Find(Child);
-        // ponytail: one step only; FAnalogInputEvent to FInputEvent (via GetKeyEventFromAnalogInputEvent) is refused.
-        const Json* ConvDecl = nullptr;
-        if (CR)
-            if (const auto M = CR->Methods.find(Conv); M != CR->Methods.end()) ConvDecl = M->second;
-        if (ConvDecl)
+        const FStructSlice S = SliceOf(*Up);
+        if (S.bSame) continue;
+        if (!S.Call.is_null())
         {
-            const Json Sliced = { {"kind", "CXXMemberCallExpr"}, {"type", {{"qualType", Parent}}}, {"valueCategory", "prvalue"},
-                                  {"inner", Json::array({ { {"kind", "MemberExpr"}, {"name", Conv}, {"isArrow", false},
-                                      {"type", {{"qualType", "<bound member function type>"}}},
-                                      {"referencedMemberDecl", ConvDecl->value("id", std::string())},
-                                      {"inner", Json::array({ *First(*Up) })} } })} };
             Json Call = CallExprNode;
-            if (I > 0) Call["inner"][I] = Sliced;
+            if (I > 0) Call["inner"][I] = S.Call;
             else
             {
                 Json Member = *Callee;
-                Member["inner"][0] = Sliced;
+                Member["inner"][0] = S.Call;
                 Call["inner"][0] = std::move(Member);
             }
             return LowerCall(Call, BP, Out, Err);
         }
-        *Err = MethodName + (I == 0 ? "'s object" : " argument " + std::to_string(I)) + " is an " + Child
-             + " where an " + Parent + " is wanted: Blueprint passes only the exact struct (the editor disallows a derived "
-             "one), the VM would copy the whole " + Child + " into an " + Parent + "-sized slot, past its end, and UeApi "
-             "declares no " + Child + "::" + Conv + " to make the slice; convert it to an " + Parent + " first";
+        *Err = MethodName + (I == 0 ? "'s object" : " argument " + std::to_string(I)) + " is an " + S.Child
+             + " where an " + S.Parent + " is wanted: Blueprint passes only the exact struct (the editor disallows a derived "
+             "one), the VM would copy the whole " + S.Child + " into an " + S.Parent + "-sized slot, past its end, and UeApi "
+             "declares no " + S.Child + "::" + S.Conv + " to make the slice; convert it to an " + S.Parent + " first";
         return false;
     }
     /* SpawnActor returns None while a construction script runs (bIsRunningConstructionScript, LevelActor.cpp), and the
@@ -14389,7 +14544,11 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     const bool bSavedHasGoto = bBodyHasGoto;
     bBodyHasGoto = HasGoto(*Body);
     bFnHasGoto |= bBodyHasGoto;
-    const bool bOk = LowerBody(*Body, BP, *B.Body, Locals, Err);
+    Json SlicedBody;
+    const Json* BodyNode = Body;
+    const int Sliced = SliceStructCopies(*Body, &SlicedBody, Err);
+    if (Sliced > 0) BodyNode = &SlicedBody;
+    const bool bOk = Sliced >= 0 && LowerBody(*BodyNode, BP, *B.Body, Locals, Err);
     for (const FSavedBinding& S : SavedCaps)
     {
         auto Put = [&](auto& Map, const auto& Saved) {
@@ -16462,7 +16621,14 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     if (K == "ParenExpr" || K == "ConstantExpr" || K == "ExprWithCleanups")
         return First(E) && FoldConst(*First(E), Out);
     /* A template's value parameter, `template <int32 S>`: its declaration, then the argument it stands for. */
-    if (K == "SubstNonTypeTemplateParmExpr") return Nth(E, 1) && FoldConst(*Nth(E, 1), Out) && Fit(Out);
+    if (K == "SubstNonTypeTemplateParmExpr")
+    {
+        if (Nth(E, 1) && FoldConst(*Nth(E, 1), Out) && Fit(Out)) return true;
+        /* `template <EMood M>`: clang casts the number to the enum, whose type Fit knows only when UE_ENUM names it; the
+           number under the cast is the value, as an enumerator's is. */
+        const Json* Number = Strip(Nth(E, 1));
+        return Number && FoldConst(*Number, Out) && !Out.bFloat;
+    }
     /* `TEnumMask<E> M = 0x21;`, `{}`: the int32 it converts, or none. */
     if (K == "CXXConstructExpr" && IsTEnumType(TypeOf(E), "TEnumMask") && !Nth(E, 1))
     {
@@ -22799,7 +22965,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                       : (!RetType.empty() && RetType != "void") || bWritableRef
                           ? "a function that resumes later returns nothing and takes no non-const reference parameters"
                       : "";
-        if (Fn.Body && !LowerBody(*Fn.Body, BP, Stmts, Locals, Err))
+        Json SlicedBody;
+        const Json* BodyNode = Fn.Body;
+        if (BodyNode)
+        {
+            const int Sliced = SliceStructCopies(*BodyNode, &SlicedBody, Err);
+            if (Sliced < 0) { *Err = R.CppName + "::" + Fn.Name + ": " + *Err; return false; }
+            if (Sliced > 0) BodyNode = &SlicedBody;
+        }
+        if (BodyNode && !LowerBody(*BodyNode, BP, Stmts, Locals, Err))
         {
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
             return false;
