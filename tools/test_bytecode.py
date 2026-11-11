@@ -5937,11 +5937,14 @@ def edits():
     a, b = game('ED_AssetTest'), edited('ED_AssetTest')
     before, after = tags(a, 0), tags(b, 0)
     proves('ue-asset-at.changing-a-game-data-asset', 'editing-a-game.ue-asset-edit-ed-spider')
-    assert list(after) == list(before) + ['EnemySignificance'], (list(before), list(after))     # replaced in place, one appended
+    assert list(after) == list(before) + ['EnemySignificance', 'CreatureSize'], (list(before), list(after))     # replaced in place, two appended
     proves('editing-a-game.canbeusedforconstantpressure')
     assert after['SpawnSpread'].endswith(': 800.0') and 'value=0' in after['CanBeUsedForConstantPressure'], after
     # EEnemySignificance is an enum class: UEnemyDescriptor's member is an EnumProperty, and so is the tag (PropEnumClass)
     assert after['EnemySignificance'] == 'EnumProperty size=8 enum=EEnemySignificance: EEnemySignificance::Critical', after
+    # ECreatureSize is `: uint32`, no enum a variable can be, but a native member of one is an edit: the same tag
+    proves('editing-a-game.creaturesize-ecreaturesize-large')
+    assert after['CreatureSize'] == 'EnumProperty size=8 enum=ECreatureSize: ECreatureSize::Large', after
     for same in ('EnemyClass', 'IdealSpawnSize'):
         assert after[same] == before[same], (same, before[same], after[same])
     la, lb = dumpexp.load(a), dumpexp.load(b)

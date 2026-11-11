@@ -984,6 +984,8 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     else if (Ty == "Int64Property") { D.K = FDefaultValue::Int; D.I = R.I64(); }
     else if (Ty == "UInt32Property") { D.K = FDefaultValue::Int; D.I = R.Get<uint32>(); }     // WriteValue: V.U32(uint32(D.I))
     else if (Ty == "UInt16Property") { D.K = FDefaultValue::Int; D.I = R.Get<uint16>(); }
+    else if (Ty == "Int16Property") { D.K = FDefaultValue::Int; D.I = R.Get<int16>(); }
+    else if (Ty == "UInt64Property") { D.K = FDefaultValue::Int; D.I = int64(R.Get<uint64>()); }     // its bits: Int64Property's writer
     else if (Ty == "DelegateProperty")                      // FScriptDelegate: the object, the function's name; the encoder writes it unbound
     {
         const int32 Object = R.I32();

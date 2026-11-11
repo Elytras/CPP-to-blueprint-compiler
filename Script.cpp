@@ -316,7 +316,8 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         else if (P.Type == "FloatProperty") { const float F = float(D.F); V.Raw(&F, 4); }
         else if (P.Type == "DoubleProperty") V.Raw(&D.F, 8);
         else if (P.Type == "Int64Property") V.I64(D.I);
-        else if (P.Type == "UInt16Property") V.U16(uint16(D.I));
+        else if (P.Type == "UInt16Property" || P.Type == "Int16Property") V.U16(uint16(D.I));
+        else if (P.Type == "UInt64Property") V.I64(D.I);
         else if (P.Type == "UInt32Property") V.U32(uint32(D.I));
         else if (P.Type == "EnumProperty") V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero);
         else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(uint8(D.I)); else V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero); }   // an enum byte is its enumerator's name
@@ -493,8 +494,8 @@ int32 FixedValueSize(const FPropertyDef& P)
     if (T == "IntProperty" || T == "FloatProperty" || T == "ObjectProperty" || T == "ClassProperty" || T == "InterfaceProperty"
         || T == "UInt32Property")
         return 4;
-    if (T == "UInt16Property") return 2;
-    if (T == "Int64Property" || T == "DoubleProperty" || T == "EnumProperty" || T == "NameProperty") return 8;
+    if (T == "UInt16Property" || T == "Int16Property") return 2;
+    if (T == "Int64Property" || T == "UInt64Property" || T == "DoubleProperty" || T == "EnumProperty" || T == "NameProperty") return 8;
     if (T == "ByteProperty") return P.StructName.empty() ? 1 : 8;
     if (T == "StructProperty") return NativeStructSize(P.StructName);
     return 0;
