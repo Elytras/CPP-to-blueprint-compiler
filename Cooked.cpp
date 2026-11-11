@@ -1025,6 +1025,15 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
         if (Object != 0 || Fn != "None") { Why = "a bound delegate (the encoder writes it unbound)"; return false; }
         D.K = FDefaultValue::None;
     }
+    else if (Ty == "FieldPathProperty")
+    {
+        /* FFieldPath: the path's names (a count, then each name), then the owner's package index (WriteValue). */
+        const int32 Count = R.I32();
+        if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / 8) { Why = "a field path's count past its value"; return false; }
+        for (int32 I = 0; I < Count; ++I) { FDefaultValue& N = D.Items.emplace_back(); N.K = FDefaultValue::Str; N.S = P.NameOf(R.Name()); }
+        D.Object = FIndex{ R.I32() };
+        D.K = FDefaultValue::Array;
+    }
     else if (Ty == "MulticastInlineDelegateProperty" || Ty == "MulticastSparseDelegateProperty")
     {
         /* FMulticastScriptDelegate: a count of FScriptDelegates, each its object then its function's name (WriteValue). */

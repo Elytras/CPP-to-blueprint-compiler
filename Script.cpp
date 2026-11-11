@@ -453,6 +453,12 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         }
         else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
         else if (P.Type == "InterfaceProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
+        else if (P.Type == "FieldPathProperty")
+        {
+            V.I32(int32(D.Items.size()));
+            for (const FDefaultValue& N : D.Items) V.Name(N.S.empty() ? std::string("None") : N.S);
+            V.Idx(D.Object);
+        }
         else if (P.Type == "MulticastInlineDelegateProperty" || P.Type == "MulticastSparseDelegateProperty")
         {
             V.I32(int32(D.Items.size()));
@@ -569,7 +575,9 @@ int32 NativeStructSize(const std::string& StructName)
         { "Box2D", 17 }, { "FrameNumber", 4 },
         /* RichCurveKey: Interp, TangentMode, TangentWeightMode, then Time, Value and the four tangent floats (RichCurve.cpp,
            FRichCurveKey::Serialize); all zeros is FRichCurveKey()'s default. */
-        { "RichCurveKey", 27 } };
+        { "RichCurveKey", 27 },
+        /* FMovieSceneSequenceID: its uint32 Value, 0 the root sequence, which is its default. */
+        { "MovieSceneSequenceID", 4 } };
     /* UE5's large world coordinates make the math structs' components doubles (S40): the rest keep their 4.27 size. */
     static const std::map<std::string, int32> Lwc = {
         { "Vector", 24 }, { "Vector2D", 16 }, { "Vector4", 32 }, { "Rotator", 24 }, { "Quat", 32 },
