@@ -1186,6 +1186,7 @@ struct FRecord
     std::string FinalAs;        // UE_FINAL_AS(this, Leaf): Leaf's CppName - compiled as final, cooked Abstract
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bClassIn = false;      // UE_CLASS_IN: a mod's own class, cooked by the mod it names from this header
+    std::string InOwner;        // the mod package a UE_CLASS_IN / UE_STRUCT_IN or a header's folder gives the type: its owner's, imported
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
     bool bIsPatch = false;      // UE_PATCH: not a class of its own; its UE_DEFAULTS edit its parent's, in the parent's package
@@ -2600,6 +2601,8 @@ private:
     std::set<std::string> WarnedNoWorld;        // Class::Function that passed self as a world context without a world
     std::set<std::string> UcsReached;           // the class's functions UserConstructionScript runs, itself included
     std::set<std::string> WarnedUcsSpawn;
+    bool bWarnedReadText = false;                   // this compile said __ReadText__ needs the ReadProperty mod's pak
+    std::set<std::string> WarnedForeignInstance;     // another mod's static member template instantiation a call named
     std::set<std::string> WarnedRotationEq;     // Class::Function that compared FRotators or FQuats with ==
     std::set<std::string> WarnedMakes;          // Class::Function what: a spawn or construct the engine will not make
     std::map<std::string, const FRecord*> LocalClass;   // an inline parameter's local -> the X::StaticClass() it holds
@@ -3782,6 +3785,7 @@ bool FCompiler::Collect(std::string* Err)
                     R.UePackage = PathIn(Owner, R.CppName);
                     R.UeName = LeafOf(R.CppName) + "_C";
                     R.bClassIn = true;
+                    R.InOwner = Owner;
                 }
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeInterfaceMeta")
@@ -3839,6 +3843,7 @@ bool FCompiler::Collect(std::string* Err)
                 {
                     R.UePackage = PathIn(Owner, R.CppName);
                     R.UeName = LeafOf(R.CppName);
+                    R.InOwner = Owner;
                 }
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeFinalAsLeaf")
@@ -4310,6 +4315,8 @@ bool FCompiler::Collect(std::string* Err)
         if (R.UePackage.empty() || R.bCooked) continue;          // a UE_COOKED class is imported, as another mod's is
         /* UeApi's Game::_ModHub::IHubMod is at the path its namespace and name give, as a mod's class there would be. */
         if (R.bUeApi) continue;
+        /* Another mod's, by UE_CLASS_IN or by its header's folder: a `Game::` namespace gives the same path whoever's it is. */
+        if (!R.InOwner.empty() && Lower(R.InOwner) != Lower(ModPackage.substr(0, ModPackage.find_last_not_of('/') + 1))) continue;
         if (const std::string Own = PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName); R.UePackage != Own)
         {
             /* A path under this mod's own root that is not the one the class would get is an import of another package,
@@ -8638,6 +8645,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
                 R.UePackage = PathIn(O, R.CppName);
                 R.UeName = LeafOf(R.CppName) + "_C";
                 R.bClassIn = true;
+                R.InOwner = O;
             }
 
     /* So is a UE_STRUCT or UE_ENUM there, as UE_STRUCT_IN / UE_ENUM_IN would say: its owner cooks it, and a copy cooked
@@ -8648,6 +8656,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
             {
                 R.UePackage = PathIn(O, R.CppName);
                 R.UeName = LeafOf(R.CppName);
+                R.InOwner = O;
             }
     for (auto& [Enum, Owner] : EnumMarks)
         if (const std::string O = OwnerOf(LeafOf(Enum)); Owner.empty() && !O.empty() && O != Mine)
@@ -8733,6 +8742,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
                         {
                             R->UePackage = PathIn(O, R->CppName);
                             R->UeName = Leaf;
+                            R->InOwner = O;
                         }
                     }
     }
@@ -9498,6 +9508,13 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     }
     /* A static member template's instantiation is its class's function under the name its arguments give it. */
     if (const auto Inst = InstanceNames.find(DeclId); Inst != InstanceNames.end()) MethodName = Inst->second;
+    /* The instantiation is the owner's function only if a source of the owner's mod instantiated it. */
+    if (const auto Inst = InstanceNames.find(DeclId); Inst != InstanceNames.end())
+        if (const auto Owner = MethodOwner.find(DeclId); Owner != MethodOwner.end())
+            if (const FRecord* OwnerR = Find(Owner->second); OwnerR && OwnerR->IsNative() && WarnedForeignInstance.insert(OwnerR->CppName + "::" + Inst->second).second)
+                printf("  warning: %s::%s calls %s::%s, which is in %s's package only if a source of that mod instantiates it "
+                       "(by calling it, or with `template ...;`)\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(),
+                       OwnerR->CppName.c_str(), Inst->second.c_str(), OwnerR->UePackage.c_str());
     /* A child struct for its parent, as an argument or as the object of the parent's method (StructUpcastBelow). The
        slice C++ makes is the child's own conversion, where UeApi declares one: `E.GetInputEventFromPointerEvent()`, the
        editor's To Input Event node, a native that copies out the parent. The call is lowered with it in the child's
@@ -16058,6 +16075,15 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
        an already-materialised inner temp. */
     if (!HoistCallArgs(*A.Sub, BP, Locals, OutPre, Err)) return false;
 
+    /* A read's view struct that only the ReadProperty mod cooks (FDerefTextView) is imported from its package. */
+    if (const FReadViewSpec* V = FindReadView(A.Sub->Intrinsic); V && !bWarnedReadText
+        && std::string(V->ViewStructPkg).rfind("/Game/_ElytrasMods/ReadProperty/", 0) == 0
+        && Lower(ModPackage).rfind("/game/_elytrasmods/readproperty", 0) != 0)
+    {
+        bWarnedReadText = true;
+        printf("  warning: %s uses %s, whose view struct %s is cooked only in the ReadProperty mod: without that pak mounted "
+               "the read imports a missing struct and crashes\n", CurFnName.c_str(), V->Intrinsic, V->ViewStructName);
+    }
     if (const FReadViewSpec* V = A.Sub->Intrinsic == "__ReadStruct__" ? ViewFor(A.InnerType) : FindReadView(A.Sub->Intrinsic))
         return HoistReadCall(A, *V, BP, Locals, OutPre, Err);
     if (A.Sub->Intrinsic == "__RefAt__")
@@ -22781,6 +22807,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        there as in the script itself (LowerCall). */
     UcsReached.clear();
     WarnedUcsSpawn.clear();
+    WarnedForeignInstance.clear();
+    bWarnedReadText = false;
     for (std::vector<std::string> Todo = { "UserConstructionScript" }; !Todo.empty();)
     {
         const std::string Fn = Todo.back();

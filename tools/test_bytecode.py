@@ -17322,11 +17322,52 @@ def silent_drops():
     warned = built('Moved', ROW_HEAD % 'Moved' + real + moved % '/Game/_ElytrasMods/Moved/Sub/Moved')
     assert any('UE_CLASS' in l and "this mod's own" in l and '/Game/_ElytrasMods/Moved/Moved' in l for l in warned), warned
     assert not built('Moved', ROW_HEAD % 'Moved' + real + moved % '/Game/_ElytrasMods/OtherMod/Moved')
+    # Another mod's static member template: its instantiation is that package's function only if its own mod made it.
+    proves('templates.static-member-template')
+    lib = ('class StTplLib : public UBlueprintFunctionLibrary {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/StTplOwner/StTplLib", "StTplLib_C");\n'
+           '  template <class T> static T Get(T V) { return V + V; }\n};\n')
+    user = 'class StTplUser : public AActor {\npublic:\n  int32 F() { return StTplLib::Get<int32>(3); }\n};\n'
+    warned = built('StTplUser', ROW_HEAD % 'StTplUser' + lib + user)
+    assert any('StTplLib::Get__int32' in l and 'only if a source of that mod instantiates it' in l for l in warned), warned
+    # A text read imports a struct only the ReadProperty mod cooks.
+    proves('helper-code-you.ftext-addr')
+    warned = built('ReadTextMod', ROW_HEAD % 'ReadTextMod' + ROW_INTRIN
+                   + 'class ReadTextMod : public AActor {\npublic:\n  FText F(int64 A) { return __ReadText__(A); }\n};\n')
+    assert any('__ReadText__' in l and 'cooked only in the ReadProperty mod' in l for l in warned), warned
     print('ok  a method no compiled source defines, and a UE_CLASS path under the mod\'s own root that is not the class\'s, are warned about')
 
 
 proves('blueprint-classes.int32-helper-int32-x', 'sharing-a-class.ue-class-game-mymods-turrets-4')
 silent_drops()
+
+
+def foreign_game_namespace():
+    """A class in an absolute `Game::` namespace, in a header of another mod's folder, is that mod's: imported at the path
+    its namespace gives, never cooked into the mod that includes the header (the path is the same whoever cooks it, so
+    it used to read as this mod's own). The owner's own compile still cooks it."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        for d in ('ModA', 'ModB'): os.makedirs(os.path.join(tmp, d))
+        head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\n'
+        a_cls = ('namespace Game::_ElytrasMods::ModA_lib {\nclass UOtherThing : public UObject {\npublic:\n  int32 Count;\n'
+                 '  int32 Bump(int32 N) { return N + Count; }\n};\n}\n')
+        files = {'ModA/A.h': '#pragma once\n' + head + a_cls,
+                 'ModA/A.cpp': '#include "A.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ModA");\n'
+                               'class AModA : public AActor {\npublic:\n  int32 G(Game::_ElytrasMods::ModA_lib::UOtherThing *T) { return T->Bump(1); }\n};\n',
+                 'ModB/B.cpp': head + '#include "../ModA/A.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ModB");\n'
+                               'class AModB : public AActor {\npublic:\n  int32 F(Game::_ElytrasMods::ModA_lib::UOtherThing *T) { return T->Bump(2); }\n};\n'}
+        for rel, text in files.items():
+            with open(os.path.join(tmp, rel), 'w', encoding='utf-8') as f: f.write(text)
+        for mod, cooks in (('ModB', False), ('ModA', True)):
+            out = os.path.join(tmp, 'out' + mod, 'FSD', 'Content', '_ElytrasMods', mod)
+            os.makedirs(out)
+            proc = assetgen_compile([os.path.join(tmp, mod, mod[-1] + '.cpp'), UEAPI, out])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            assert ('Game::_ElytrasMods::ModA_lib::UOtherThing ->' in proc.stdout) == cooks, (mod, proc.stdout)
+    proves('sharing-a-class.include-turrets-turrets-h')
+
+
+foreign_game_namespace()
 
 
 PREFETCH.finish()

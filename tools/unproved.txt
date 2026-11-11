@@ -178,7 +178,6 @@ objects-and-addresses.aactor-addr
 objects-and-addresses.aactor-0
 the-fderef-scratch.struct-fderef-ue-struct-int64
 helper-code-you.obj-member
-helper-code-you.ftext-addr
 helper-code-you.classof-x
 reading-memory.readobject-a
 reading-memory.readname-a
