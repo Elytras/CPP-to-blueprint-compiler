@@ -17462,6 +17462,34 @@ def audit_leftovers():
 audit_leftovers()
 
 
+# ---- MapArrays: a store to an element of an array a map holds reaches the map (REFERENCE.md, Assignment and updates)
+
+def map_arrays():
+    proves('assignment-and-updates.lists-k-0-7')
+    check('MapArrays', 'Store', lambda V: V * 1000 + 20 + 300000, [dict(V=v) for v in (7, 0, -4)])
+    check('MapArrays', 'StoreMember', lambda V: V * 100 + 10 + 300000, [dict(V=v) for v in (7, -1)])
+    check('MapArrays', 'Update', lambda V: (20 + V) * 10000 + 31 * 100 + 4, [dict(V=v) for v in (1, 5, 0)])
+    check('MapArrays', 'Bound', lambda V: 10 + V, [dict(V=v) for v in (1, 90)])
+    check('MapArrays', 'Pairs', lambda V: V * 100 + 2 * V, [dict(V=v) for v in (3, 41)])
+    check('MapArrays', 'Others', lambda V: 5 * 10000 + 10 * 100 + 30, [dict(V=v) for v in (9, 77)])
+    check('MapArrays', 'KeyOnce', lambda V: V * 10 + 1, [dict(V=v) for v in (6, 2)])
+    assert "Grow's reference parameter V is bound to an element of a map element's array" in LOGS['MapArrays'], LOGS['MapArrays']
+    proves('range-for-over.for-int32-x-lists-k')
+    check('MapArrays', 'Walk', lambda V: wrap(60 * V), [dict(V=v) for v in (7, 0, -2)])
+    check('MapArrays', 'WalkMember', lambda V: (10 + V) * 10000 + (20 + V) * 100 + 30 + V, [dict(V=v) for v in (7, 1)])
+    check('MapArrays', 'WalkReturn', lambda V: V, [dict(V=v) for v in (7, 99)])
+    check('MapArrays', 'WalkBreak', lambda V: (10 + V) * 100 + 20, [dict(V=v) for v in (7, 3)])
+    assert run(asset('MapArrays'), 'WalkRead')[0] == 65
+    refused('MapWalkGoto', '  TMap<int32, TArray<int32>> Lists;\n'
+            '  void F() {\n    for (int32 &X : Lists[1]) {\n      X = 1;\n      if (X == 1) goto Out;\n    }\n  Out:\n    return;\n  }\n',
+            'a copy stored back when the loop is left')
+    print('ok  MapArrays: a store, an update, a T& bound to an element of an array under a map value, and a range-for by '
+          'reference over one, change the map: the value is copied out, changed and stored back under its key, found once')
+
+
+map_arrays()
+
+
 
 # ---- Rows that said "refused" and are not: tests/RowStd.cpp. std::min is built into the source's function library, a
 # whole TArray is copied out through a pointer, and a goto in a TMap loop whose value is no container leaves after the

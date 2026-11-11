@@ -2559,6 +2559,12 @@ private:
             Out["inner"][0] = Unalias(N["inner"][0]);
             return Out;
         }
+        if (K == "CXXOperatorCallExpr" && N["inner"].size() == 3)      // `L[0]`, L an `auto& L = Map[K]`: the container's root
+        {
+            Json Out = N;
+            Out["inner"][1] = Unalias(N["inner"][1]);
+            return Out;
+        }
         if (K == "DeclRefExpr")
             if (auto A = RefAlias.find(N["referencedDecl"].value("id", std::string())); A != RefAlias.end()) return Unalias(A->second);
         return N;
@@ -6217,12 +6223,18 @@ bool IsTMapElement(const Json& N)
         && Map && TemplateArg(TypeOf(*Map), "TMap", &Inner);
 }
 
-/* The map element a place stands on: `Map[Key]` itself, or a member chain on it (`Map[Key].A.B`). Map_Find copies
-   the value out, so a store or a reference through it would change the copy. */
+/* The map element a place stands on: `Map[Key]` itself, or members and array elements taken of it (`Map[Key].A.B`,
+   `Map[Key][0]`, `Map[Key].Items[I].X`). Map_Find copies the value out, so a store or a reference through it would
+   change the copy. */
 const Json* MapElementUnder(const Json& N)
 {
     const Json* P = PeelLvalue(&N);
-    while (P && Kind(*P) == "MemberExpr" && !P->value("isArrow", false) && First(*P)) P = PeelLvalue(First(*P));
+    for (;;)
+    {
+        if (P && Kind(*P) == "MemberExpr" && !P->value("isArrow", false) && First(*P)) P = PeelLvalue(First(*P));
+        else if (P && IsTArrayElement(*P) && (*P)["inner"].size() == 3) P = PeelLvalue(&(*P)["inner"][1]);
+        else break;
+    }
     return P && IsTMapElement(*P) ? P : nullptr;
 }
 
@@ -9379,7 +9391,9 @@ bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<cons
         Slot = Copy["inner"][0];      // the local itself, which the call takes by reference
         if (bReceiver) continue;
         const Json Seen = Unalias(Bare);
-        const std::string What = IsTMapElement(*PeelLvalue(&Seen)) ? "a map element" : MapElementUnder(Seen) ? "a map element's member"
+        const std::string What = IsTMapElement(*PeelLvalue(&Seen)) ? "a map element"
+                               : MapElementUnder(Seen) ? Kind(*PeelLvalue(&Seen)) == "MemberExpr" ? "a map element's member"
+                                                                                                  : "an element of a map element's array"
                                : bSel ? "`C ? X : Y`" : "that expression";
         char Line[512];
         snprintf(Line, sizeof(Line), "  warning: %s::%s: %s's reference parameter %s is bound to %s: Blueprint has no reference "
@@ -11960,7 +11974,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 Rhs = &Parked;
             }
             const std::string LK = Kind(*Lhs);
-            const Json Rooted = LK == "MemberExpr" ? Unalias(*Lhs) : Json();
+            const bool bInArray = LK == "CXXOperatorCallExpr" && IsTArrayElement(*Lhs);
+            const Json Rooted = LK == "MemberExpr" || bInArray ? Unalias(*Lhs) : Json();
             if (IsDerefLvalue(*Lhs))
             {
                 FArgIR Addr;
@@ -11977,10 +11992,11 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         Value = First(*Value);
                 bOk = bOk && LowerArg(*Value, BP, St.Value, Err);
             }
-            else if (const Json* Elem = LK == "MemberExpr" ? MapElementUnder(Rooted) : nullptr)
+            else if (const Json* Elem = LK == "MemberExpr" || bInArray ? MapElementUnder(Rooted) : nullptr)
             {
-                /* `Map[Key].A.B = v` (or `V.A.B = v`, V an `auto& [K, V]`): Map_Find copies the value out, so the store
-                   is `T E = Map[Key]; E.A.B = v; Map[Key] = E;`, v first as C++17 sequences it, and the key once. */
+                /* `Map[Key].A.B = v` (or `V.A.B = v`, V an `auto& [K, V]`), `Map[Key][I] = v`, `Map[Key].Items[I] = v`:
+                   Map_Find copies the value out, so the store is `T E = Map[Key]; E.A.B = v; Map[Key] = E;`, v first as
+                   C++17 sequences it, and the key once. */
                 Json Pre = Json::array();
                 const Json Value = HoistExpr(*Rhs, Pre);
                 const Json Place = StabilizeLvalue(*Elem, Pre);
@@ -11988,7 +12004,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 std::function<Json(const Json&)> Reroot = [&](const Json& N) {
                     if (&N == Elem) return Json(E["inner"][0]);
                     Json Up = N;
-                    Up["inner"][0] = Reroot(N["inner"][0]);
+                    const size_t At = N["inner"].size() == 3 ? 1 : 0;      // an element's array; a member's or a wrapper's base
+                    Up["inner"][At] = Reroot(N["inner"][At]);
                     return Up;
                 };
                 Pre.push_back(AssignOf(Reroot(Rooted), Value));
@@ -15990,6 +16007,66 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         /* `for (Init; T E : Range)`: the init-statement runs once, before the loop. */
         Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ *Init })} };
         if (!LowerBody(Wrap, BP, Out, Locals, Err)) return false;
+    }
+    /* `for (int32& X : Lists[K])`, `for (auto& S : Table[K].Items)`: Map_Find copies the map's value out, so a body
+       that writes through X would change the copy. The value goes into a local, the walk is over that, and it is stored
+       back under its key where the loop is left: at its end, a break, or a return in the body. A body that only reads
+       X walks the copy as before. */
+    if (const Json Seen = Unalias(*RangeExpr); const Json* Elem = IsMutableRef(TypeOf(*LoopDecl)) ? MapElementUnder(Seen) : nullptr)
+    {
+        std::set<std::string> Ids = { LoopDecl->value("id", std::string()) };
+        ForEach(*LoopDecl, [&](const Json& B) { if (Kind(B) == "BindingDecl") Ids.insert(B.value("id", std::string())); });
+        /* A use of X that is not read on the spot (assigned, updated, passed on, a method called on it) may write. */
+        std::function<bool(const Json&, bool)> Writes = [&](const Json& N, bool bRead) {
+            const std::string K = Kind(N);
+            if (K == "DeclRefExpr")
+                return !bRead && N.contains("referencedDecl") && Ids.count(N["referencedDecl"].value("id", std::string())) != 0;
+            const std::string Cast = K == "ImplicitCastExpr" ? N.value("castKind", std::string()) : std::string();
+            const bool bReads = Cast == "LValueToRValue" || (Cast == "NoOp" && TypeOf(N).compare(0, 6, "const ") == 0);
+            const bool bPass = K == "ParenExpr" || (K == "MemberExpr" && !N.value("isArrow", false));
+            bool bAny = false;
+            ForEach(N, [&](const Json& C) { bAny = bAny || Writes(C, bReads || (bPass && bRead)); });
+            return bAny;
+        };
+        if (Writes(*Body, false))
+        {
+            // ponytail: a goto has no one place it leaves by; give it the store when a mod needs one.
+            if (HasGoto(*Body))
+            { *Err = "a goto in a range-for that writes, by reference, the elements of an array a map holds: the array is "
+                     "a copy stored back when the loop is left; walk a local (`TArray<T> L = Map[K]; ...; Map[K] = L;`)"; return false; }
+            Json Pre = Json::array();
+            const Json Place = StabilizeLvalue(*Elem, Pre);
+            const Json E = SynthLocal(StripTypeKeywords(TypeOf(*Elem)), ReadOf(Place), Pre);
+            const Json Store = AssignOf(Place, E);
+            std::function<Json(const Json&)> Reroot = [&](const Json& N) {
+                if (&N == Elem) return Json(E["inner"][0]);
+                Json Up = N;
+                const size_t At = N["inner"].size() == 3 ? 1 : 0;      // an element's array; a member's or a wrapper's base
+                Up["inner"][At] = Reroot(N["inner"][At]);
+                return Up;
+            };
+            Json Loop = ForNode;
+            Loop["inner"][0] = Json::object();                          // the init-statement has run
+            std::function<bool(const Json&, Json&)> Swap = [&](const Json& From, Json& To) {
+                if (&From == RangeExpr) { To = Reroot(Seen); return true; }
+                if (!From.is_structured()) return false;
+                auto B = To.begin();
+                for (auto A = From.begin(); A != From.end(); ++A, ++B) if (Swap(*A, *B)) return true;
+                return false;
+            };
+            if (!Swap(ForNode["inner"][1], Loop["inner"][1])) { *Err = "internal: a range-for's range is not in its statement"; return false; }
+            std::function<void(Json&)> Leave = [&](Json& N) {           // a return in the body stores first
+                if (!N.is_structured() || (N.is_object() && Kind(N) == "LambdaExpr")) return;
+                if (N.is_object() && Kind(N) == "ReturnStmt")
+                { N = Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ Store, N })} }; return; }
+                for (Json& C : N) Leave(C);
+            };
+            Leave(Loop["inner"][7]);
+            Pre.push_back(std::move(Loop));
+            Pre.push_back(Store);
+            const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+            return LowerBody(Wrap, BP, Out, Locals, Err);
+        }
     }
     const Json Walked = Unalias(*RangeExpr);            // the container as the body names it, for WarnIteratedMutation
 
