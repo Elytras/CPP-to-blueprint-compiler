@@ -279,7 +279,8 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
 {
     const std::string& S = P.StructName;
     if (S != "GameplayTagContainer" && S != "NiagaraTypeDefinitionHandle" && S != "NiagaraVariableBase"
-        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset" && S != "SoftObjectPath" && S != "SoftClassPath")
+        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset" && S != "SoftObjectPath" && S != "SoftClassPath"
+        && S != "PerPlatformFloat" && S != "PerPlatformInt" && S != "PerPlatformBool")
         return false;
     const auto& Members = D.Members ? D.Members : P.Members;
     auto Member = [&](const char* Name) -> const FPropertyDef* {
@@ -295,6 +296,16 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         const std::string Rest = Sub && Sub->Default.K == FDefaultValue::Str ? Sub->Default.S : std::string();
         if (IsUE5()) WriteSoftPath(V, Rest.empty() ? Path : Path + ":" + Rest);
         else { V.Name(Path); WriteFStringValue(V, Rest); }
+        return true;
+    }
+    if (S == "PerPlatformFloat" || S == "PerPlatformInt" || S == "PerPlatformBool")
+    {
+        /* A bool bCooked (4 bytes: a bool in an archive is a uint32), then Default alone, which is all a game reads; a
+           cooked value always has bCooked set (FPerPlatformFloat's operator<<, PerPlatformProperties.h). */
+        const FPropertyDef* Default = Member("Default");
+        V.U32(1);
+        if (S == "PerPlatformFloat") { const float F = Default ? float(Default->Default.F) : 0.0f; V.Raw(&F, 4); }
+        else V.U32(Default ? uint32(Default->Default.I) : 0);
         return true;
     }
     if (S == "GameplayTagContainer")
@@ -357,13 +368,31 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
             /* A literal is a culture-invariant text, like EX_TextConst's LiteralString: Flags,
                ETextHistoryType::None, bHasCultureInvariantString, the string. */
             const bool bText = bSet && !D.S.empty();
-            V.U32(bText ? 2 : 0);           // ETextFlag::CultureInvariant
-            V.U8(0xFF);
-            V.I32(bText ? 1 : 0);
-            if (bText) WriteFStringValue(V, D.S);
+            if (D.TextHistory == 0 && D.Items.size() == 2)          // a localized text: namespace, key, source (FTextHistory_Base)
+            {
+                V.U32(uint32(D.I)); V.U8(0);
+                WriteFStringValue(V, D.Items[0].S); WriteFStringValue(V, D.Items[1].S); WriteFStringValue(V, D.S);
+            }
+            else if (D.TextHistory == 11 && D.Items.size() == 2)    // a string table entry: the table's id, the key
+            {
+                V.U32(uint32(D.I)); V.U8(11);
+                V.Name(D.Items[0].S); WriteFStringValue(V, D.Items[1].S);
+            }
+            else
+            {
+                V.U32(bText ? 2 : 0);           // ETextFlag::CultureInvariant
+                V.U8(0xFF);
+                V.I32(bText ? 1 : 0);
+                if (bText) WriteFStringValue(V, D.S);
+            }
         }
         else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
-        else if (P.Type == "InterfaceProperty") V.I32(0);
+        else if (P.Type == "InterfaceProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
+        else if (P.Type == "MulticastInlineDelegateProperty" || P.Type == "MulticastSparseDelegateProperty")
+        {
+            V.I32(int32(D.Items.size()));
+            for (const FDefaultValue& Bound : D.Items) { V.Idx(Bound.Object); V.Name(Bound.S.empty() ? std::string("None") : Bound.S); }
+        }
         else if (P.Type == "DelegateProperty")      // FScriptDelegate: the object, the function's name (ScriptDelegates.h
         { V.Idx(Null()); V.Name("None"); }           // 138-142); a default is unbound, as a bound one is refused
         else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty")    // FSoftObjectPath: AssetPathName, SubPathString
@@ -490,7 +519,7 @@ bool NativeUnwritten(const std::string& StructName)
 {
     // ponytail: the census's list; a native struct the pak holds no value of is not in it
     static const char* const Unwritten[] = {
-        "PerPlatformFloat", "PerPlatformInt",
+        
         "KeyHandleMap", "FontData", "FontCharacter", "ColorMaterialInput", "ScalarMaterialInput", "VectorMaterialInput",
         "MaterialAttributesInput",
         "MovieSceneFloatChannel", "MovieSceneFrameRange", "MovieSceneEvaluationFieldEntityTree",

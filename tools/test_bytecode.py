@@ -3671,10 +3671,10 @@ def types_defaults():
 def native_struct_values():
     """A struct the engine reads in its own binary form, which WriteValue does not write (it writes tags), gets no
     value: not as a default, and not as a UE_STRUCT member, whose default instance holds every member's."""
-    refused('NativeDefault', '  FPerPlatformFloat Scale = {};\n', 'PerPlatformFloat value in its own binary form')
+    refused('NativeDefault', '  FColorMaterialInput Tint = {};\n', 'ColorMaterialInput value in its own binary form')
     refused('NativeMember', '  int32 X = 0;\n', "a UE_STRUCT's defaults hold every member's",
-            top='struct FScaleHolder {\n  UE_STRUCT;\n  FPerPlatformFloat Scale;\n};\n')
-    print('ok  a PerPlatformFloat value is refused, as a default and as a UE_STRUCT member')
+            top='struct FTintHolder {\n  UE_STRUCT;\n  FColorMaterialInput Tint;\n};\n')
+    print('ok  a ColorMaterialInput value is refused, as a default and as a UE_STRUCT member')
 
 
 SOFT_PATHS_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/SoftPaths");
@@ -3687,6 +3687,9 @@ class ASoftBox : public AActor {
 public:
   FSoftObjectPath Path = FSoftObjectPath("/Game/E/F.F", "");
   FSoftHolder Held;
+  FPerPlatformFloat Scale = FPerPlatformFloat(2.5f);
+  FPerPlatformInt Count = FPerPlatformInt(7);
+  FPerPlatformBool On = FPerPlatformBool(true);
 };
 '''
 
@@ -3704,8 +3707,13 @@ def soft_path_values():
     assert m, cdo
     raw = bytes.fromhex(m.group(1))
     assert names[struct.unpack_from('<i', raw, 0)[0]] == '/Game/E/F.F' and struct.unpack_from('<i', raw, 8)[0] == 0, (raw, cdo)
+    # A PerPlatform value: bCooked set (a bool in an archive is 4 bytes), then its Default alone.
+    proves('struct-defaults.scale-fperplatformfloat-2-5f')
+    for tag, want in (('Scale', struct.pack('<If', 1, 2.5)), ('Count', struct.pack('<Ii', 1, 7)), ('On', struct.pack('<II', 1, 1))):
+        m = re.search(tag + r' \[0\] StructProperty size=8 struct=PerPlatform\w+: ([0-9a-f]+)', cdo)
+        assert m and bytes.fromhex(m.group(1)) == want, (tag, m and m.group(1), cdo)
     shutil.rmtree(tmp, ignore_errors=True)
-    print('ok  a SoftObjectPath default is written in its own form (name, then sub-path)')
+    print('ok  a SoftObjectPath default is written in its own form (name, then sub-path), and a PerPlatform value as bCooked + Default')
 
 
 def string_behaviour():

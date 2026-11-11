@@ -961,12 +961,32 @@ bool ReadEncodedString(FReader& R, std::string& Out, std::string& Why)
 }
 
 /* An FText in a form the encoder writes: culture-invariant (flags 2, no history, the string), or empty (all 0). */
-bool ReadEncodedText(FReader& R, std::string& Out, std::string& Why)
+bool ReadEncodedText(const FCookedPackage& P, FReader& R, FDefaultValue& D, std::string& Why)
 {
+    std::string& Out = D.S;
     const uint32 Flags = R.U32();
     const int8 History = R.Get<int8>();
+    if (History == 0 || History == 11)       // a localized text (namespace, key, source) or a string table entry (table, key)
+    {
+        D.TextHistory = History;
+        D.I = Flags;
+        D.Items.resize(2);
+        for (FDefaultValue& Part : D.Items) Part.K = FDefaultValue::Str;
+        Out.clear();
+        if (History == 0)
+        {
+            if (!ReadEncodedString(R, D.Items[0].S, Why) || !ReadEncodedString(R, D.Items[1].S, Why) || !ReadEncodedString(R, Out, Why))
+                return false;
+        }
+        else
+        {
+            D.Items[0].S = P.NameOf(R.Name());
+            if (!ReadEncodedString(R, D.Items[1].S, Why)) return false;
+        }
+        return !R.bBad;
+    }
     if (History != -1)
-    { Why = "a text of history " + std::to_string(History) + " (the encoder writes culture-invariant literals)"; return false; }
+    { Why = "a text of history " + std::to_string(History) + " (the encoder writes culture-invariant literals and history 0 and 11)"; return false; }
     const int32 bInvariant = R.I32();
     Out.clear();
     if (bInvariant && !ReadEncodedString(R, Out, Why)) return false;
@@ -993,6 +1013,20 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
         if (Object != 0 || Fn != "None") { Why = "a bound delegate (the encoder writes it unbound)"; return false; }
         D.K = FDefaultValue::None;
     }
+    else if (Ty == "MulticastInlineDelegateProperty" || Ty == "MulticastSparseDelegateProperty")
+    {
+        /* FMulticastScriptDelegate: a count of FScriptDelegates, each its object then its function's name (WriteValue). */
+        const int32 Count = R.I32();
+        if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / 12) { Why = "a delegate list past its value"; return false; }
+        for (int32 I = 0; I < Count; ++I)
+        {
+            FDefaultValue& Bound = D.Items.emplace_back();
+            Bound.K = FDefaultValue::Str;
+            Bound.Object = FIndex{ R.I32() };
+            Bound.S = P.NameOf(R.Name());
+        }
+        D.K = FDefaultValue::Array;
+    }
     else if (Ty == "FloatProperty") { D.K = FDefaultValue::Float; D.F = R.Get<float>(); }
     else if (Ty == "DoubleProperty") { D.K = FDefaultValue::Float; D.F = R.Get<double>(); }     // a UE5 real (S40)
     else if (Ty == "BoolProperty")
@@ -1004,10 +1038,7 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     else if (Ty == "ByteProperty" && T.StructName.empty()) { D.K = FDefaultValue::Int; D.I = R.Get<uint8>(); }
     else if (Ty == "ByteProperty" || Ty == "EnumProperty" || Ty == "NameProperty") { D.K = FDefaultValue::Str; D.S = P.NameOf(R.Name()); }
     else if (Ty == "ObjectProperty") { D.K = FDefaultValue::Obj; D.Object = FIndex{ R.I32() }; }
-    else if (Ty == "InterfaceProperty")
-    {
-        if (R.I32() != 0) { Why = "an interface value that is not null (the encoder writes null)"; return false; }
-    }
+    else if (Ty == "InterfaceProperty") { D.K = FDefaultValue::Obj; D.Object = FIndex{ R.I32() }; }     // the object alone, as an ObjectProperty
     else if (Ty == "StrProperty")
     {
         if (!ReadEncodedString(R, D.S, Why)) return false;
@@ -1015,7 +1046,7 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     }
     else if (Ty == "TextProperty")
     {
-        if (!ReadEncodedText(R, D.S, Why)) return false;
+        if (!ReadEncodedText(P, R, D, Why)) return false;
         D.K = FDefaultValue::Str;
     }
     else if (Ty == "SoftObjectProperty")                           // FSoftObjectPath: AssetPathName, SubPathString
@@ -1030,7 +1061,41 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     else if (Ty == "StructProperty")
     {
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
-        if (T.StructName == "SoftObjectPath" || T.StructName == "SoftClassPath")      // AssetPathName, SubPathString
+        if (T.StructName == "PerPlatformFloat" || T.StructName == "PerPlatformInt" || T.StructName == "PerPlatformBool")
+        {
+            /* bCooked, then Default (WriteNativeForm): a value with bCooked unset would hold a per-platform map after it. */
+            if (R.U32() != 1) { Why = "a " + T.StructName + " with bCooked unset (the encoder writes it set)"; return false; }
+            FPropertyDef& Def = Members->emplace_back();
+            Def.Name = "Default";
+            if (T.StructName == "PerPlatformFloat") { Def.Type = "FloatProperty"; Def.Default.K = FDefaultValue::Float; Def.Default.F = R.Get<float>(); }
+            else { Def.Type = T.StructName == "PerPlatformInt" ? "IntProperty" : "BoolProperty"; Def.Default.K = FDefaultValue::Int; Def.Default.I = R.U32(); }
+        }
+        else if (T.StructName == "NiagaraVariableBase" || T.StructName == "NiagaraVariable" || T.StructName == "NiagaraVariableWithOffset")
+        {
+            /* The Name, the type definition's handle (tags), then VarData's bytes or the Offset (WriteNativeForm). */
+            FPropertyDef& Name = Members->emplace_back();
+            Name.Type = "NameProperty"; Name.Name = "Name";
+            Name.Default.K = FDefaultValue::Str; Name.Default.S = P.NameOf(R.Name());
+            FPropertyDef& Handle = Members->emplace_back();
+            Handle.Type = "StructProperty"; Handle.Name = "TypeDefHandle"; Handle.StructName = "NiagaraTypeDefinitionHandle";
+            if (!ReadValueOf(P, R, Handle, Handle.Default, Why)) return false;
+            if (T.StructName == "NiagaraVariable")
+            {
+                const int32 Count = R.I32();
+                if (Count < 0 || size_t(Count) > R.B.size() - std::min(R.P, R.B.size())) { Why = "a NiagaraVariable's VarData past its value"; return false; }
+                FPropertyDef& Data = Members->emplace_back();
+                Data.Type = "ArrayProperty"; Data.Name = "VarData";
+                Data.Default.K = FDefaultValue::Array;
+                for (int32 I = 0; I < Count; ++I) { FDefaultValue& B = Data.Default.Items.emplace_back(); B.K = FDefaultValue::Int; B.I = R.Get<uint8>(); }
+            }
+            else if (T.StructName == "NiagaraVariableWithOffset")
+            {
+                FPropertyDef& Offset = Members->emplace_back();
+                Offset.Type = "IntProperty"; Offset.Name = "Offset";
+                Offset.Default.K = FDefaultValue::Int; Offset.Default.I = R.I32();
+            }
+        }
+        else if (T.StructName == "SoftObjectPath" || T.StructName == "SoftClassPath")      // AssetPathName, SubPathString
         {
             FPropertyDef& Asset = Members->emplace_back();
             Asset.Type = "NameProperty"; Asset.Name = "AssetPathName";
@@ -1066,7 +1131,6 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
             for (const FTag& M : Tags)
             {
                 /* The encoder writes a member's tag with index 0 and no guids: anything else changes the struct's bytes. */
-                if (M.ArrayIndex) { Why = "a struct member of a C array (the encoder writes each at index 0)"; return false; }
                 if (M.HasPropertyGuid) { Why = "a struct member with a property guid"; return false; }
                 if (std::any_of(std::begin(M.StructGuid), std::end(M.StructGuid), [](uint32 G) { return G != 0; }))
                 { Why = "a struct member of a struct with a guid (a user-defined struct)"; return false; }
@@ -1155,6 +1219,7 @@ bool ReadTagValue(const FCookedPackage& P, const FTag& Tag, FPropertyDef& Out, s
     Out = FPropertyDef{};
     Out.Name = P.NameOf(Tag.Name);
     Out.Type = P.NameOf(Tag.Type);
+    Out.ArrayIndex = Tag.ArrayIndex;        // a C array's element is its own tag, written at its index
     const std::string& Ty = Out.Type;
     if (Ty == "StructProperty") Out.StructName = P.NameOf(Tag.StructName);
     else if (Ty == "ByteProperty" || Ty == "EnumProperty")
@@ -1177,6 +1242,7 @@ bool ReadTagValue(const FCookedPackage& P, const FTag& Tag, FPropertyDef& Out, s
     {
         Out.Default.K = FDefaultValue::Bool;
         Out.Default.I = Tag.BoolVal;
+        if (Tag.ArrayIndex) { *Why = "a bool element of a C array (a bool's tag carries no index here)"; return false; }
         if (Tag.Value.empty() && Tag.BoolVal <= 1) return true;
         *Why = "a bool tag with a value, or other than 0 or 1";
         return false;
