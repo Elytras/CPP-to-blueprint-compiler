@@ -8284,12 +8284,15 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             if (!LowerArg(*LhsRaw, BP, LA, Err)) return false;
             const std::string LhsBare = StripTypeKeywords(LhsTy);
             const bool bSigned = LhsBare.find("unsigned") == std::string::npos && LhsBare.compare(0, 4, "uint") != 0;
-            if (Op == ">>" && bSigned && N > 0)
+            if (Op == ">>" && N > 0)
             {
                 /* Signed >> floors, Divide truncates toward zero (-3 >> 1 is -2, -3 / 2 is -1): clearing the low
                    N bits first makes the division exact. At N = width-1 the divisor wraps to MIN, which negates. */
                 Out = Math("Divide_", Math("And_", std::move(LA), Const(~((1LL << N) - 1))), Const(1LL << N));
                 if (N == (bWide ? 63 : 31)) Out = Math("Multiply_", std::move(Out), Const(-1));
+                /* An unsigned >> shifts zeros in, and Kismet's integers are signed: the same floor, then the N copies
+                   of the top bit cleared. */
+                if (!bSigned) Out = Math("And_", std::move(Out), Const(int64((1ULL << ((bWide ? 64 : 32) - N)) - 1)));
                 return true;
             }
             Out = Math(Op == "<<" ? "Multiply_" : "Divide_", std::move(LA), Const(1LL << N));
@@ -8327,6 +8330,30 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         FArgIR LA, RA;
         if (!LowerArg(*LhsRaw, BP, LA, Err)) return false;
         if (!LowerArg(*RhsRaw, BP, RA, Err)) return false;
+        /* Kismet's int64 is signed, and a uint64 is its bits (`*P` of a `uint64*`, `uint64(X)`). Unsigned order is the
+           signed order of both sides with the top bit flipped. An unsigned division has no such form: it runs signed,
+           right while neither side is past INT64_MAX, and says so. */
+        if (Flavour == "Int64Int64" && (IsUnsigned64Type(StripTypeKeywords(LhsTy)) || IsUnsigned64Type(StripTypeKeywords(RhsTy))))
+        {
+            if (Op == "<" || Op == ">" || Op == "<=" || Op == ">=")
+                for (FArgIR* Side : { &LA, &RA })
+                {
+                    FArgIR Top, Flip;
+                    Top.K = FArgIR::Int64;
+                    Top.I64 = INT64_MIN;
+                    if (Side->K == FArgIR::Int64) { Side->I64 ^= INT64_MIN; continue; }
+                    Flip.K = FArgIR::Call;
+                    Flip.Sub = std::make_shared<FCallIR>();
+                    Flip.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Xor_Int64Int64");
+                    Flip.Sub->bScript = false;
+                    Flip.Sub->bPure = true;
+                    Flip.Sub->Args = { std::move(*Side), std::move(Top) };
+                    *Side = std::move(Flip);
+                }
+            else if (Op == "/")
+                printf("  warning: %s::%s: an unsigned 64-bit `/` runs as a signed division (Blueprint has no unsigned "
+                       "integer): wrong when a side is past INT64_MAX\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str());
+        }
         Out.Sub->Args.push_back(LA);
         Out.Sub->Args.push_back(RA);
         return true;

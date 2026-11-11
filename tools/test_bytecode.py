@@ -17490,6 +17490,35 @@ def map_arrays():
 map_arrays()
 
 
+# ---- Unsigned64: a uint64 value shifts right and orders as unsigned (REFERENCE.md, Bitwise operators and shifts)
+
+def unsigned64():
+    u = lambda x: x % 2**64
+    s = lambda x: (x + 2**63) % 2**64 - 2**63
+    vals = (0, 1, 5, 6, 16, 2**62, 2**63 - 1, -1, -2, -16, -2**63, -2**62)
+    pairs = [dict(A=a, B=b) for a in vals for b in vals]
+    proves('bitwise-operators-and.uint64-x-4')
+    check('Unsigned64', 'Shr', lambda X: s(u(X) >> 4), [dict(X=x) for x in vals])
+    check('Unsigned64', 'Top', lambda X: u(X) >> 63, [dict(X=x) for x in vals])
+    check('Unsigned64', 'Shr0', lambda X: X, [dict(X=x) for x in vals])
+    check('Unsigned64', 'Signed', lambda X: X >> 4, [dict(X=x) for x in vals])
+    proves('bitwise-operators-and.uint64-a-uint64-b')
+    check('Unsigned64', 'Less', lambda A, B: u(A) < u(B), pairs)
+    check('Unsigned64', 'Greater', lambda A, B: u(A) > u(B), pairs)
+    check('Unsigned64', 'LessEq', lambda A, B: u(A) <= u(B), pairs)
+    check('Unsigned64', 'GreaterEq', lambda A, B: u(A) >= u(B), pairs)
+    check('Unsigned64', 'Same', lambda A, B: A == B, pairs)
+    check('Unsigned64', 'Past', lambda A: u(A) > 5, [dict(A=a) for a in vals])
+    proves('bitwise-operators-and.uint64-a-3')
+    check('Unsigned64', 'Div', lambda A: A // 3, [dict(A=a) for a in (0, 9, 10, 2**62)])
+    assert 'Unsigned64::Div: an unsigned 64-bit `/` runs as a signed division' in LOGS['Unsigned64'], LOGS['Unsigned64']
+    print('ok  Unsigned64: a uint64 value shifts zeros in from the top and orders above every smaller one, past INT64_MAX '
+          'too; its division runs signed and says so')
+
+
+unsigned64()
+
+
 
 # ---- Rows that said "refused" and are not: tests/RowStd.cpp. std::min is built into the source's function library, a
 # whole TArray is copied out through a pointer, and a goto in a TMap loop whose value is no container leaves after the
