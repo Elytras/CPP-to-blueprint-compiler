@@ -368,10 +368,23 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
             /* A literal is a culture-invariant text, like EX_TextConst's LiteralString: Flags,
                ETextHistoryType::None, bHasCultureInvariantString, the string. */
             const bool bText = bSet && !D.S.empty();
-            V.U32(bText ? 2 : 0);           // ETextFlag::CultureInvariant
-            V.U8(0xFF);
-            V.I32(bText ? 1 : 0);
-            if (bText) WriteFStringValue(V, D.S);
+            if (D.TextHistory == 0 && D.Items.size() == 2)          // a localized text: namespace, key, source (FTextHistory_Base)
+            {
+                V.U32(uint32(D.I)); V.U8(0);
+                WriteFStringValue(V, D.Items[0].S); WriteFStringValue(V, D.Items[1].S); WriteFStringValue(V, D.S);
+            }
+            else if (D.TextHistory == 11 && D.Items.size() == 2)    // a string table entry: the table's id, the key
+            {
+                V.U32(uint32(D.I)); V.U8(11);
+                V.Name(D.Items[0].S); WriteFStringValue(V, D.Items[1].S);
+            }
+            else
+            {
+                V.U32(bText ? 2 : 0);           // ETextFlag::CultureInvariant
+                V.U8(0xFF);
+                V.I32(bText ? 1 : 0);
+                if (bText) WriteFStringValue(V, D.S);
+            }
         }
         else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
         else if (P.Type == "InterfaceProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());

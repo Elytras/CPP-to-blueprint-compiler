@@ -961,12 +961,32 @@ bool ReadEncodedString(FReader& R, std::string& Out, std::string& Why)
 }
 
 /* An FText in a form the encoder writes: culture-invariant (flags 2, no history, the string), or empty (all 0). */
-bool ReadEncodedText(FReader& R, std::string& Out, std::string& Why)
+bool ReadEncodedText(const FCookedPackage& P, FReader& R, FDefaultValue& D, std::string& Why)
 {
+    std::string& Out = D.S;
     const uint32 Flags = R.U32();
     const int8 History = R.Get<int8>();
+    if (History == 0 || History == 11)       // a localized text (namespace, key, source) or a string table entry (table, key)
+    {
+        D.TextHistory = History;
+        D.I = Flags;
+        D.Items.resize(2);
+        for (FDefaultValue& Part : D.Items) Part.K = FDefaultValue::Str;
+        Out.clear();
+        if (History == 0)
+        {
+            if (!ReadEncodedString(R, D.Items[0].S, Why) || !ReadEncodedString(R, D.Items[1].S, Why) || !ReadEncodedString(R, Out, Why))
+                return false;
+        }
+        else
+        {
+            D.Items[0].S = P.NameOf(R.Name());
+            if (!ReadEncodedString(R, D.Items[1].S, Why)) return false;
+        }
+        return !R.bBad;
+    }
     if (History != -1)
-    { Why = "a text of history " + std::to_string(History) + " (the encoder writes culture-invariant literals)"; return false; }
+    { Why = "a text of history " + std::to_string(History) + " (the encoder writes culture-invariant literals and history 0 and 11)"; return false; }
     const int32 bInvariant = R.I32();
     Out.clear();
     if (bInvariant && !ReadEncodedString(R, Out, Why)) return false;
@@ -1026,7 +1046,7 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     }
     else if (Ty == "TextProperty")
     {
-        if (!ReadEncodedText(R, D.S, Why)) return false;
+        if (!ReadEncodedText(P, R, D, Why)) return false;
         D.K = FDefaultValue::Str;
     }
     else if (Ty == "SoftObjectProperty")                           // FSoftObjectPath: AssetPathName, SubPathString
