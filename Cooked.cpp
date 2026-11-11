@@ -960,6 +960,17 @@ bool ReadEncodedString(FReader& R, std::string& Out, std::string& Why)
     return true;
 }
 
+/* A string of a localized text: an empty one may be written as a lone terminator (length 1), which the text form keeps in
+   Terminator (1: the next four bytes are 1 and 0), as the engine saves an FString it never filled. */
+bool ReadTextString(FReader& R, std::string& Out, double& Terminator, std::string& Why)
+{
+    const size_t At = R.P;
+    if (R.I32() == 1 && R.Get<uint8>() == 0 && !R.bBad) { Out.clear(); Terminator = 1; return true; }
+    R.P = At;
+    Terminator = 0;
+    return ReadEncodedString(R, Out, Why);
+}
+
 /* An FText in a form the encoder writes: culture-invariant (flags 2, no history, the string), or empty (all 0). */
 bool ReadEncodedText(const FCookedPackage& P, FReader& R, FDefaultValue& D, std::string& Why)
 {
@@ -975,13 +986,14 @@ bool ReadEncodedText(const FCookedPackage& P, FReader& R, FDefaultValue& D, std:
         Out.clear();
         if (History == 0)
         {
-            if (!ReadEncodedString(R, D.Items[0].S, Why) || !ReadEncodedString(R, D.Items[1].S, Why) || !ReadEncodedString(R, Out, Why))
+            if (!ReadTextString(R, D.Items[0].S, D.Items[0].F, Why) || !ReadTextString(R, D.Items[1].S, D.Items[1].F, Why)
+                || !ReadTextString(R, Out, D.F, Why))
                 return false;
         }
         else
         {
             D.Items[0].S = P.NameOf(R.Name());
-            if (!ReadEncodedString(R, D.Items[1].S, Why)) return false;
+            if (!ReadTextString(R, D.Items[1].S, D.Items[1].F, Why)) return false;
         }
         return !R.bBad;
     }
@@ -1069,6 +1081,42 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
             Def.Name = "Default";
             if (T.StructName == "PerPlatformFloat") { Def.Type = "FloatProperty"; Def.Default.K = FDefaultValue::Float; Def.Default.F = R.Get<float>(); }
             else { Def.Type = T.StructName == "PerPlatformInt" ? "IntProperty" : "BoolProperty"; Def.Default.K = FDefaultValue::Int; Def.Default.I = R.U32(); }
+        }
+        else if (T.StructName == "MovieSceneFrameRange")
+        {
+            /* TRange<FFrameNumber>: the lower bound's type and value, then the upper's (a byte and an int each). */
+            for (const char* Part : { "LowerType", "LowerValue", "UpperType", "UpperValue" })
+            {
+                FPropertyDef& M = Members->emplace_back();
+                M.Name = Part;
+                M.Default.K = FDefaultValue::Int;
+                if (std::string(Part).find("Type") != std::string::npos) { M.Type = "ByteProperty"; M.Default.I = R.Get<uint8>(); }
+                else { M.Type = "IntProperty"; M.Default.I = R.I32(); }
+            }
+        }
+        else if (T.StructName == "MovieSceneFloatChannel")
+        {
+            /* FMovieSceneFloatChannel::Serialize: the two extrapolation bytes, the times (a bulk array of 4-byte frames:
+               element size, count, the frames), the values (28 bytes each, kept as 7 words), the default value, whether it
+               is set (a 4-byte bool) and the tick resolution (two ints). */
+            auto Word = [&](const char* Name, bool bByte) {
+                FPropertyDef& M = Members->emplace_back();
+                M.Name = Name; M.Type = bByte ? "ByteProperty" : "IntProperty";
+                M.Default.K = FDefaultValue::Int; M.Default.I = bByte ? R.Get<uint8>() : R.I32();
+            };
+            auto Bulk = [&](const char* Name, int32 Size, int32 Words) {
+                if (R.I32() != Size) { Why = std::string("a MovieSceneFloatChannel's ") + Name + " element size other than the encoder's"; return false; }
+                const int32 Count = R.I32();
+                if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / size_t(Size)) { Why = std::string("a MovieSceneFloatChannel's ") + Name + " past its value"; return false; }
+                FPropertyDef& M = Members->emplace_back();
+                M.Name = Name; M.Type = "ArrayProperty";
+                M.Default.K = FDefaultValue::Array;
+                for (int32 I = 0; I < Count * Words; ++I) { FDefaultValue& W = M.Default.Items.emplace_back(); W.K = FDefaultValue::Int; W.I = R.I32(); }
+                return true;
+            };
+            Word("PreInfinityExtrap", true); Word("PostInfinityExtrap", true);
+            if (!Bulk("Times", 4, 1) || !Bulk("Values", 28, 7)) return false;
+            Word("DefaultValue", false); Word("bHasDefaultValue", false); Word("TickNumerator", false); Word("TickDenominator", false);
         }
         else if (T.StructName == "NiagaraVariableBase" || T.StructName == "NiagaraVariable" || T.StructName == "NiagaraVariableWithOffset")
         {

@@ -280,7 +280,8 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
     const std::string& S = P.StructName;
     if (S != "GameplayTagContainer" && S != "NiagaraTypeDefinitionHandle" && S != "NiagaraVariableBase"
         && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset" && S != "SoftObjectPath" && S != "SoftClassPath"
-        && S != "PerPlatformFloat" && S != "PerPlatformInt" && S != "PerPlatformBool")
+        && S != "PerPlatformFloat" && S != "PerPlatformInt" && S != "PerPlatformBool" && S != "MovieSceneFrameRange"
+        && S != "MovieSceneFloatChannel")
         return false;
     const auto& Members = D.Members ? D.Members : P.Members;
     auto Member = [&](const char* Name) -> const FPropertyDef* {
@@ -296,6 +297,28 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         const std::string Rest = Sub && Sub->Default.K == FDefaultValue::Str ? Sub->Default.S : std::string();
         if (IsUE5()) WriteSoftPath(V, Rest.empty() ? Path : Path + ":" + Rest);
         else { V.Name(Path); WriteFStringValue(V, Rest); }
+        return true;
+    }
+    if (S == "MovieSceneFrameRange" || S == "MovieSceneFloatChannel")
+    {
+        /* Written for the value gate, which proves the forms; NativeUnwritten still refuses a mod's own value of either, as
+           their defaults are not measured. Each member is written in order: bytes for the two Type / Extrapolation ones,
+           ints for the rest, the bulk arrays behind their element size and count (Cooked.cpp's reader says the layout). */
+        auto Word = [&](const char* Name, bool bByte) {
+            const FPropertyDef* M = Member(Name);
+            const uint32 W = M ? uint32(M->Default.I) : 0;
+            if (bByte) V.U8(uint8(W)); else V.U32(W);
+        };
+        if (S == "MovieSceneFrameRange") { Word("LowerType", true); Word("LowerValue", false); Word("UpperType", true); Word("UpperValue", false); return true; }
+        auto Bulk = [&](const char* Name, int32 Size, int32 Words) {
+            const FPropertyDef* M = Member(Name);
+            V.I32(Size);
+            V.I32(M ? int32(M->Default.Items.size()) / Words : 0);
+            if (M) for (const FDefaultValue& W : M->Default.Items) V.U32(uint32(W.I));
+        };
+        Word("PreInfinityExtrap", true); Word("PostInfinityExtrap", true);
+        Bulk("Times", 4, 1); Bulk("Values", 28, 7);
+        Word("DefaultValue", false); Word("bHasDefaultValue", false); Word("TickNumerator", false); Word("TickDenominator", false);
         return true;
     }
     if (S == "PerPlatformFloat" || S == "PerPlatformInt" || S == "PerPlatformBool")
@@ -370,13 +393,18 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
             const bool bText = bSet && !D.S.empty();
             if (D.TextHistory == 0 && D.Items.size() == 2)          // a localized text: namespace, key, source (FTextHistory_Base)
             {
+                /* An empty string flagged in F (Cooked.cpp's ReadTextString) is a lone terminator, as the engine saves one. */
+                const auto Part = [&](const std::string& S, double Terminator) {
+                    if (S.empty() && Terminator != 0) { V.I32(1); V.U8(0); } else WriteFStringValue(V, S);
+                };
                 V.U32(uint32(D.I)); V.U8(0);
-                WriteFStringValue(V, D.Items[0].S); WriteFStringValue(V, D.Items[1].S); WriteFStringValue(V, D.S);
+                Part(D.Items[0].S, D.Items[0].F); Part(D.Items[1].S, D.Items[1].F); Part(D.S, D.F);
             }
             else if (D.TextHistory == 11 && D.Items.size() == 2)    // a string table entry: the table's id, the key
             {
                 V.U32(uint32(D.I)); V.U8(11);
-                V.Name(D.Items[0].S); WriteFStringValue(V, D.Items[1].S);
+                V.Name(D.Items[0].S);
+                if (D.Items[1].S.empty() && D.Items[1].F != 0) { V.I32(1); V.U8(0); } else WriteFStringValue(V, D.Items[1].S);
             }
             else
             {
