@@ -82,6 +82,17 @@ class RcPackagesTests(unittest.TestCase):
         pkg = invariants.Package(RC + '/GameElements/Objectives/Excavation/Struct_WeigtedActor')
         self.assertIsNone(pkg.struct(0).defaults)                # a UserDefinedStruct's unversioned default is opaque
 
+    def test_uasset_tags_and_struct_read_a_5_6_package(self):
+        import contextlib, io, uasset
+        base = RC + '/AI/Decorators/DEC_CanGrabTarget'
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            uasset.main(['tags', base, '0'])
+            uasset.main(['struct', base, '2'])
+        self.assertIn('unversioned properties', out.getvalue())
+        self.assertIn('SuperStruct', out.getvalue())
+        self.assertIn('consumed', out.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()
