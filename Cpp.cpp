@@ -1186,6 +1186,7 @@ struct FRecord
     std::string FinalAs;        // UE_FINAL_AS(this, Leaf): Leaf's CppName - compiled as final, cooked Abstract
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bClassIn = false;      // UE_CLASS_IN: a mod's own class, cooked by the mod it names from this header
+    std::string InOwner;        // the mod package a UE_CLASS_IN / UE_STRUCT_IN or a header's folder gives the type: its owner's, imported
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
     bool bIsPatch = false;      // UE_PATCH: not a class of its own; its UE_DEFAULTS edit its parent's, in the parent's package
@@ -2512,6 +2513,9 @@ private:
     bool HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                        std::vector<FStmtIR>& OutPre, std::string* Err);
     bool HasDerefStruct(std::string* Err) const;
+    /* A read's view struct as an import: FDerefTextView is the mod's own, made on first use like FDeref (HasTextViewStruct). */
+    FIndex ViewStruct(const FReadViewSpec& V, FBlueprintClass& BP);
+    void HasTextViewStruct() const;
     bool LowerPtrCastSource(const Json& Call, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     std::map<std::string, std::string> RefAddr;     // VarDecl id -> pointee: `T& R = *P` keeps the address in an int64 local R
     std::map<std::string, std::string> ArrayView;   // such an R's local -> the FDeref scratch its declaration points at a TArray
@@ -2600,6 +2604,7 @@ private:
     std::set<std::string> WarnedNoWorld;        // Class::Function that passed self as a world context without a world
     std::set<std::string> UcsReached;           // the class's functions UserConstructionScript runs, itself included
     std::set<std::string> WarnedUcsSpawn;
+    std::set<std::string> WarnedForeignInstance;     // another mod's static member template instantiation a call named
     std::set<std::string> WarnedRotationEq;     // Class::Function that compared FRotators or FQuats with ==
     std::set<std::string> WarnedMakes;          // Class::Function what: a spawn or construct the engine will not make
     std::map<std::string, const FRecord*> LocalClass;   // an inline parameter's local -> the X::StaticClass() it holds
@@ -2902,6 +2907,9 @@ private:
     mutable Json    DerefAst;        // owns the three FieldDecl nodes SynthDeref.Fields point into
     mutable FRecord SynthDeref;
     mutable bool    bSynthDeref = false;
+    mutable Json    TextViewAst;     // the one FieldDecl SynthTextView's Data points at
+    mutable FRecord SynthTextView;
+    mutable bool    bSynthTextView = false;
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::pair<std::string, std::string>> GameClassKinds;   // FBlueprintClass's, filled by Run
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
@@ -3782,6 +3790,7 @@ bool FCompiler::Collect(std::string* Err)
                     R.UePackage = PathIn(Owner, R.CppName);
                     R.UeName = LeafOf(R.CppName) + "_C";
                     R.bClassIn = true;
+                    R.InOwner = Owner;
                 }
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeInterfaceMeta")
@@ -3839,6 +3848,7 @@ bool FCompiler::Collect(std::string* Err)
                 {
                     R.UePackage = PathIn(Owner, R.CppName);
                     R.UeName = LeafOf(R.CppName);
+                    R.InOwner = Owner;
                 }
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeFinalAsLeaf")
@@ -4310,6 +4320,8 @@ bool FCompiler::Collect(std::string* Err)
         if (R.UePackage.empty() || R.bCooked) continue;          // a UE_COOKED class is imported, as another mod's is
         /* UeApi's Game::_ModHub::IHubMod is at the path its namespace and name give, as a mod's class there would be. */
         if (R.bUeApi) continue;
+        /* Another mod's, by UE_CLASS_IN or by its header's folder: a `Game::` namespace gives the same path whoever's it is. */
+        if (!R.InOwner.empty() && Lower(R.InOwner) != Lower(ModPackage.substr(0, ModPackage.find_last_not_of('/') + 1))) continue;
         if (const std::string Own = PathIn(ModPackage, R.bIsStruct ? CookedQual(R.CppName) : R.CppName); R.UePackage != Own)
         {
             /* A path under this mod's own root that is not the one the class would get is an import of another package,
@@ -6482,6 +6494,35 @@ bool FCompiler::HasDerefStruct(std::string* Err) const
     return true;
 }
 
+/* `struct FDerefTextView { TArray<FText> Data; }`, the view __ReadText__ reads an FText through: no engine struct has a
+   TArray<FText> at offset 0. Made here, in the mod's own package, as FDeref is, so a mod that reads a text needs no other
+   mod's pak; one that declares its own (the ReadProperty mod does) wins, Find seeing it first. */
+void FCompiler::HasTextViewStruct() const
+{
+    const FRecord* D = Find("FDerefTextView");
+    if ((D && D->bIsStruct && !D->IsNative()) || bSynthTextView) return;
+    TextViewAst = Json::array();
+    TextViewAst.push_back(Json{ { "kind", "FieldDecl" }, { "name", "Data" }, { "type", Json{ { "qualType", "TArray<FText>" } } } });
+    SynthTextView = FRecord();
+    SynthTextView.CppName   = "FDerefTextView";
+    SynthTextView.UeName    = "FDerefTextView";
+    SynthTextView.UePackage = ModPackage + "/FDerefTextView";
+    SynthTextView.bIsStruct = true;
+    SynthTextView.bIsLocal  = true;
+    for (const Json& F : TextViewAst) SynthTextView.Fields.push_back(&F);
+    bSynthTextView = true;
+}
+
+FIndex FCompiler::ViewStruct(const FReadViewSpec& V, FBlueprintClass& BP)
+{
+    const bool bText = std::strcmp(V.ViewStructName, "FDerefTextView") == 0;
+    if (bText) HasTextViewStruct();
+    const std::string Pkg = bText ? ModPackage + "/FDerefTextView" : std::string(V.ViewStructPkg);
+    const FIndex S = BP.ScriptStruct(Pkg, V.ViewStructName);
+    if (Pkg.compare(0, 6, "/Game/") == 0) KeepStructLoaded(S, V.ViewStructName, 16);     // ponytail: a mod-owned view is { TArray<T> Data; }, 16 bytes
+    return S;
+}
+
 /* FScriptMap and FScriptSet start with their sparse array's element array, and an element is TSetElement<TPair<K, V>>
    or TSetElement<T>: the pair or the element, then HashNextId and HashIndex (TScriptSet::GetScriptLayout). The same
    members laid out by UStruct::Link give the same offsets and stride, while no member is aligned past 8
@@ -6785,15 +6826,14 @@ bool FCompiler::ArrayThrough(FArgIR Addr, const std::string& Pointee, FBlueprint
         Place.InnerType = "int64";
         Place.Sub = std::make_shared<FCallIR>();
         Place.Sub->Intrinsic = "__RefAtInline__";
-        Place.Sub->Extra = BP.ScriptStruct(I64->ViewStructPkg, I64->ViewStructName);
+        Place.Sub->Extra = ViewStruct(*I64, BP);
         Place.Sub->View = ViewFieldOf(I64->DerefIntrinsic);
     }
     else if (!RefThrough(std::move(Addr), "int64", BP, Place, Err)) return false;
     Out = FArgIR();
     Out.K = FArgIR::Member;
     Out.S = V->ViewField ? V->ViewField : ViewFieldOf(V->DerefIntrinsic);
-    Out.Owner = BP.ScriptStruct(V->ViewStructPkg, V->ViewStructName);
-    if (std::strncmp(V->ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(Out.Owner, V->ViewStructName, 16);
+    Out.Owner = ViewStruct(*V, BP);
     Out.LetOp = LetOpFor(P);
     Out.InnerType = P;
     Out.Base = std::make_shared<FArgIR>(std::move(Place));
@@ -8638,6 +8678,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
                 R.UePackage = PathIn(O, R.CppName);
                 R.UeName = LeafOf(R.CppName) + "_C";
                 R.bClassIn = true;
+                R.InOwner = O;
             }
 
     /* So is a UE_STRUCT or UE_ENUM there, as UE_STRUCT_IN / UE_ENUM_IN would say: its owner cooks it, and a copy cooked
@@ -8648,6 +8689,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
             {
                 R.UePackage = PathIn(O, R.CppName);
                 R.UeName = LeafOf(R.CppName);
+                R.InOwner = O;
             }
     for (auto& [Enum, Owner] : EnumMarks)
         if (const std::string O = OwnerOf(LeafOf(Enum)); Owner.empty() && !O.empty() && O != Mine)
@@ -8733,6 +8775,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
                         {
                             R->UePackage = PathIn(O, R->CppName);
                             R->UeName = Leaf;
+                            R->InOwner = O;
                         }
                     }
     }
@@ -9498,6 +9541,13 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     }
     /* A static member template's instantiation is its class's function under the name its arguments give it. */
     if (const auto Inst = InstanceNames.find(DeclId); Inst != InstanceNames.end()) MethodName = Inst->second;
+    /* The instantiation is the owner's function only if a source of the owner's mod instantiated it. */
+    if (const auto Inst = InstanceNames.find(DeclId); Inst != InstanceNames.end())
+        if (const auto Owner = MethodOwner.find(DeclId); Owner != MethodOwner.end())
+            if (const FRecord* OwnerR = Find(Owner->second); OwnerR && OwnerR->IsNative() && WarnedForeignInstance.insert(OwnerR->CppName + "::" + Inst->second).second)
+                printf("  warning: %s::%s calls %s::%s, which is in %s's package only if a source of that mod instantiates it "
+                       "(by calling it, or with `template ...;`)\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(),
+                       OwnerR->CppName.c_str(), Inst->second.c_str(), OwnerR->UePackage.c_str());
     /* A child struct for its parent, as an argument or as the object of the parent's method (StructUpcastBelow). The
        slice C++ makes is the child's own conversion, where UeApi declares one: `E.GetInputEventFromPointerEvent()`, the
        editor's To Input Event node, a native that copies out the parent. The call is lowered with it in the child's
@@ -15999,9 +16049,7 @@ bool FCompiler::HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass
     ReadTmp.Value.S = "__DerefScratch__";      // the scratch it reads, renamed with the locals in a waiting function
     ReadTmp.Value.Sub->Intrinsic = V.DerefIntrinsic;
     ReadTmp.Value.Sub->View = V.ViewField ? V.ViewField : ViewFieldOf(V.DerefIntrinsic);
-    ReadTmp.Value.Sub->Extra = BP.ScriptStruct(V.ViewStructPkg, V.ViewStructName);
-    /* ponytail: a mod-owned view is { TArray<T> Data; }, 16 bytes. */
-    if (std::strncmp(V.ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(ReadTmp.Value.Sub->Extra, V.ViewStructName, 16);
+    ReadTmp.Value.Sub->Extra = ViewStruct(V, BP);
     OutPre.push_back(ReadTmp);
 
     /* Replace the original read expression with LocalVariable(__DerefTmpN__). */
@@ -16202,9 +16250,8 @@ bool FCompiler::HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FProperty
     A.InnerType = InnerType;
     A.Sub = std::make_shared<FCallIR>();
     A.Sub->Intrinsic = "__RefAtInline__";
-    A.Sub->Extra = BP.ScriptStruct(V->ViewStructPkg, V->ViewStructName);
+    A.Sub->Extra = ViewStruct(*V, BP);
     A.Sub->View = V->ViewField ? V->ViewField : ViewFieldOf(V->DerefIntrinsic);
-    if (std::strncmp(V->ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(A.Sub->Extra, V->ViewStructName, 16);
     return true;
 }
 
@@ -22787,6 +22834,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        there as in the script itself (LowerCall). */
     UcsReached.clear();
     WarnedUcsSpawn.clear();
+    WarnedForeignInstance.clear();
     for (std::vector<std::string> Todo = { "UserConstructionScript" }; !Todo.empty();)
     {
         const std::string Fn = Todo.back();
@@ -24788,6 +24836,11 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (bSynthDeref)
     {
         if (!GenerateStruct(SynthDeref, OutDir, Err)) return false;
+        ++Generated;
+    }
+    if (bSynthTextView)
+    {
+        if (!GenerateStruct(SynthTextView, OutDir, Err)) return false;
         ++Generated;
     }
     for (const auto& Entry : SlotStructs)       // the TMap / TSet walks lowering made; see SlotView

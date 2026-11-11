@@ -187,7 +187,7 @@ Notes:
 | <a id="sharing-a-class.ue-class-game-mymods-turrets-4"></a>`UE_CLASS("/Game/_MyMods/Turrets/Sub/UTurretDef", "UTurretDef_C");` in a mod whose `UE_MOD_PACKAGE` is `/Game/_MyMods/Turrets`, on a class outside that namespace | Warns: "UE_CLASS names ... under this mod's own ..., but the class here would be at ...". A path under the mod's own root that is not the one the class would get makes the class an import of another package, cooked nowhere. Write the path it gets, or `UE_CLASS_IN`. A path under another mod's root is the usual import and does not warn. | Warns |
 | <a id="sharing-a-class.ue-class-script-engine"></a>`UE_CLASS("/Script/Engine", "KismetSystemLibrary");` | Names an engine class: a `/Script` package and the native name, with no `_C`. The class is imported, never cooked, and needs no base. The SDK headers declare every class this way. Write one by hand for an engine class or function the SDK leaves out. | Yes |
 | <a id="sharing-a-class.ue-struct-in-game-mymods"></a>`UE_STRUCT_IN("/Game/_MyMods/Turrets");`, `UE_ENUM_IN(EMood, "/Game/_MyMods/Turrets");` | The same one-owner rule for a struct and an enum. These name the owning mod's `UE_MOD_PACKAGE`, not the type's own package. See [Structs](#structs) and [Enums](#enums). | Yes |
-| <a id="sharing-a-class.include-turrets-turrets-h"></a>A class, struct or enum with no marker in a header of another mod's folder: `#include "../Turrets/Turrets.h"` | That mod's, as `UE_CLASS_IN` / `UE_STRUCT_IN` / `UE_ENUM_IN` with its package would say: imported from `<its UE_MOD_PACKAGE>/<namespaces>/<Name>`, never cooked here. A file's mod is the one whose `UE_MOD_PACKAGE` the file holds, else the one of the nearest folder above it whose sources hold one, when they all name the same package. The owner cooks a struct or enum only where its own sources use it (see [Mod structs](#mod-structs-ue.struct-fstats-int32-kills-float)); `UE_STRUCT_IN` cooks one they do not. | Yes |
+| <a id="sharing-a-class.include-turrets-turrets-h"></a>A class, struct or enum with no marker in a header of another mod's folder: `#include "../Turrets/Turrets.h"` | That mod's, as `UE_CLASS_IN` / `UE_STRUCT_IN` / `UE_ENUM_IN` with its package would say: imported from `<its UE_MOD_PACKAGE>/<namespaces>/<Name>` (a class in an absolute `Game::` namespace at the path that namespace gives), never cooked here. A file's mod is the one whose `UE_MOD_PACKAGE` the file holds, else the one of the nearest folder above it whose sources hold one, when they all name the same package. The owner cooks a struct or enum only where its own sources use it (see [Mod structs](#mod-structs-ue.struct-fstats-int32-kills-float)); `UE_STRUCT_IN` cooks one they do not. | Yes |
 | <a id="sharing-a-class.include-marked"></a>A `UE_STRUCT` or `UE_ENUM` in a header of another mod's folder | That mod's too, as `UE_STRUCT_IN` / `UE_ENUM_IN` would say: imported from its package, never cooked here again, so a value of it is the type the owner's own functions and saves hold. | Yes |
 | <a id="sharing-a-class.a-header-in-a-folder"></a>A header in a folder of several mods' sources (BpMods/ itself, the tests' folder), or in no mod's folder | Nobody's by location: an unmarked class in it is cooked by every mod that includes it, as before, and a struct or enum needs `UE_STRUCT_IN` / `UE_ENUM_IN` to be shared, or a plain `UE_STRUCT` / `UE_ENUM` to be cooked by each. | Yes |
 | <a id="sharing-a-class.t-fire-2"></a>`T->Fire(2);`, `T->OnFired.Add(this, &Gunner::OnHeard);` on a `Turret *T`, where a shared header declares `class Turret : public AActor { public: UE_CLASS("/Game/_MyMods/Turrets/Turret", "Turret_C"); int32 Shots = 0; int32 Fire(int32 N); UE_DISPATCHER(OnFired, int32 Total); };` | Calls and binds another mod's actor class. The header declares the methods, the owner's source defines them (`int32 Turret::Fire(int32 N) { ... }`), and a user finds an instance as it would a game actor, for example with `UGameplayStatics::GetAllActorsOfClass(Turret::StaticClass(), Found)`, then `Cast<Turret>`. Compiled, not run in game. | Yes |
@@ -2870,7 +2870,7 @@ Notes:
 | <a id="templates.instance-name-clash"></a>`Id<AActor>()` beside `Id<AActor *>()`, or `FTag<AActor>` beside `FTag<AActor *>` | Refused (`would be cooked as`, `would both be cooked as`): two instantiations whose arguments spell one name. Use only one of them, or make the function template `inline`. | Refused |
 | <a id="templates.pack-instance"></a>`template <class... T> int32 Count(T... V)` without `inline`, called as `Count(1, 2.0f, true)` | Count__int32_float_bool, with one parameter per argument, V_0, V_1 and V_2; `sizeof...(V)` is 3 in it. `Count()` calls Count__. | Yes |
 | <a id="templates.lambda-argument"></a>`Apply(5, [&](int32 A) { ... })`, where `Apply` is a template without `inline` | Expanded at the call, as an inline template is: a lambda's type has no name to give an instantiation, and a lambda is no value a function can take; see [Lambdas](#lambdas). | Yes |
-| <a id="templates.static-member-template"></a>`template <class T> static T Get(T V)` in a class of the mod's own, without `inline` | A static of the class per instantiation, `Get__int32`, called as any static of it is. A call from another mod names that function in the class's package, which has it only if a source of the class's own mod instantiates it: by calling it, or with an explicit instantiation such as `template float UMyLib::Get<float>(float);`, which makes Get__float with no call. A static member template of a UE_STRUCT or of an engine or game class is still expanded at the call. | Yes |
+| <a id="templates.static-member-template"></a>`template <class T> static T Get(T V)` in a class of the mod's own, without `inline` | A static of the class per instantiation, `Get__int32`, called as any static of it is. A call from another mod names that function in the class's package, which has it only if a source of the class's own mod instantiates it: by calling it, or with an explicit instantiation such as `template float UMyLib::Get<float>(float);`, which makes Get__float with no call. A call from another mod's header warns that the function is there only if that mod instantiated it. A static member template of a UE_STRUCT or of an engine or game class is still expanded at the call. | Yes |
 | <a id="templates.struct-template"></a>`template <class T> struct FRange { UE_STRUCT; T Lo; T Hi; };` used as `FRange<float>` | One cooked struct per instantiation the source uses, FRange__float, in the mod's package as any UE_STRUCT, with its members under the same rules. Every spelling of the type is that struct: `FRange<int32>` and `FRange<int>`, `const FRange<float> &`, an alias of it, `TArray<FRange<float>>`, a member of another template's instantiation. | Yes |
 | <a id="templates.class-template"></a>`template <class T> class ATurret : public AActor { ... };` with `template class ATurret<float>;` | One cooked class per instantiation, ATurret__float_C, its methods Blueprint functions and its overrides events, as any class's are. The explicit instantiation makes C++ compile every method. | Yes |
 | <a id="templates.class-template-not-instantiated"></a>`ATurret<float>` used without `template class ATurret<float>;` | Refused where a method of the template has no body in the instantiation (`is not instantiated`): C++ compiles a class template's method only where the source calls it, while the engine calls an event such as ReceiveBeginPlay by name. Cooked without it, the class would run the parent's. The message gives the line to add. | Refused |
@@ -5794,7 +5794,7 @@ Notes:
 | <a id="reading-and-writing.int8-addr"></a>`*(int8 *)Addr`, `*(signed char *)Addr` | Reads one byte, sign-extended: 0x80 to 0xFF read as negative ints, as in C++. | Yes |
 | <a id="reading-and-writing.uint8-addr"></a>`*(uint8 *)Addr`, `*(bool *)Addr` | Reads one byte as 0 to 255. A bool read is `byte != 0`. | Yes |
 | <a id="reading-and-writing.fstring-s-fstring-addr"></a>`FString S = *(FString *)Addr;` | Copies the string out. The function owns its copy, which is freed when it returns. | Yes |
-| <a id="reading-and-writing.ftext-t-ftext-addr"></a>`FText T = *(FText *)Addr;`, `*(FText *)Addr = T;` | Copies the text with the engine's FText copy, which shares the text data by reference count. Needs the FDerefTextView helper struct (see Helper code you supply, below). | Yes |
+| <a id="reading-and-writing.ftext-t-ftext-addr"></a>`FText T = *(FText *)Addr;`, `*(FText *)Addr = T;` | Copies the text with the engine's FText copy, which shares the text data by reference count. Through an `FDerefTextView` the compiler makes in the mod's package (see Helper code you supply, below). | Yes |
 | <a id="reading-and-writing.uobject-addr"></a>`*(UObject **)Addr`, `*(UClass **)Addr` | Reads 8 bytes as an object or class reference. | Yes |
 | <a id="reading-and-writing.int64-void-addr"></a>`(int64)*(void **)Addr` | A pointer to a raw pointer reads a plain int64 address. | Yes |
 | <a id="reading-and-writing.int64-v-uint32-addr"></a>`int64 V = *(uint32 *)Addr;` | Not built: Kismet has no unsigned 32-bit integer, and an int32 read would make 0xFFFFFFFF compare as -1. Refused with "reading a uint32 through a pointer". Read an int32 and mask it, as below. | Not yet |
@@ -6020,8 +6020,8 @@ Notes:
 - The class imports FDeref.uasset, so it is part of the mod's output: ship it with the class.
 - The layout of a declared FDeref is not checked. Another shape compiles without a warning, and every pointer access
   in the mod then names members the struct does not have. Do not declare one unless you have a reason.
-- The FText view is separate: its path is fixed (see the next section), and an FDerefTextView declared in an ordinary
-  mod is cooked under that mod's package and never used.
+- The FText view, FDerefTextView, is made the same way, in the mod's own package, the first time a text is read through a
+  pointer. One you declare yourself (`UE_STRUCT`) is used instead.
 
 ### Helper code you supply
 
@@ -6031,10 +6031,10 @@ that the compiler does not generate, so you supply it:
 | You write | What it does | Status |
 |---|---|---|
 | <a id="helper-code-you.obj-member"></a>`&Obj->Member` | Calls the Blueprint function `GetPropertyAddress` on the class named ReadProperty that the source can see. | Yes |
-| <a id="helper-code-you.ftext-addr"></a>`*(FText *)Addr`, `__ReadText__(Addr)` | Imports the struct `/Game/_ElytrasMods/ReadProperty/FDerefTextView`, a path the compiler hard-codes. | Yes |
+| <a id="helper-code-you.ftext-addr"></a>`*(FText *)Addr`, `__ReadText__(Addr)` | Reads through `FDerefTextView { TArray<FText> Data; }`, which the compiler makes in the mod's own package the first time a text is read, as it makes FDeref: no other mod's pak is needed. A mod that declares its own `FDerefTextView` (the ReadProperty mod does) uses that. | Yes |
 | <a id="helper-code-you.classof-x"></a>`__ClassOf__(x)` | Calls GetParmClassName on the class that uses it: see [Intrinsics](#intrinsics). | Yes |
 
-One small helper mod covers the first two. It cooks FDerefTextView at the fixed path, and a ReadProperty class that
+One small helper mod covers the first two. It cooks a ReadProperty class that
 exports a real GetPropertyAddress. The function walks the object's class and its super classes for a property with
 that name, and returns the object's address plus the property's offset, or 0 when the object is null or has no such
 property.
@@ -6057,8 +6057,6 @@ public:
 // ReadProperty.cpp: the helper mod's only source
 #include "ReadProperty.h"
 UE_MOD_PACKAGE("/Game/_ElytrasMods/ReadProperty");
-
-struct FDerefTextView { UE_STRUCT; TArray<FText> Data; };   // the view every FText pointer access uses
 
 int64 ReadProperty::GetPropertyAddress(class UObject *Target, FName PropName, class UObject *WorldContextObject) {
   if (Target == nullptr) return 0;
@@ -6092,8 +6090,6 @@ Notes:
 - The package must be exactly `/Game/_ElytrasMods/ReadProperty` for the FText view, because the compiler hard-codes
   that path. A helper that only serves `&Obj->Member` can live in any package, as long as the class is named
   ReadProperty and its UE_CLASS path is `<its UE_MOD_PACKAGE>/ReadProperty`.
-- Keep FDerefTextView in the .cpp, not in the header. A UE_STRUCT is cooked under the package of the mod that
-  declares it, and FText access only ever uses the copy at the fixed path.
 - GetPropertyAddress must not be `inline`, and must keep its three parameters. An inline method gets no function of
   its own, and the call always passes three arguments. Neither mistake is caught at build time.
 - The name match compares only the FName's comparison index, not its number suffix.
@@ -6125,7 +6121,7 @@ intrinsic".
 | <a id="reading-memory.readobject-a"></a>`__ReadObject__(A)`, `__ReadClass__(A)` | Reads 8 bytes as a UObject* or a UClass*. `__ReadClass__` assigns to a UClass* variable without a cast. | Yes |
 | <a id="reading-memory.readname-a"></a>`__ReadName__(A)` | Reads 8 bytes as an FName. | Yes |
 | <a id="reading-memory.readstring-a"></a>`__ReadString__(A)` | Copies the 16-byte FString at A. | Yes |
-| <a id="reading-memory.readtext-a"></a>`__ReadText__(A)` | Copies the 24-byte FText at A. Needs the FDerefTextView helper struct: see [Pointers and memory](#pointers-and-memory). | Yes |
+| <a id="reading-memory.readtext-a"></a>`__ReadText__(A)` | Copies the 24-byte FText at A, through an `FDerefTextView` the compiler makes in the mod's package: see [Pointers and memory](#pointers-and-memory). | Yes |
 | <a id="reading-memory.read32-p"></a>`__Read32__(P)` with `int32 *P` | Every read also takes a pointer, and reads at the address it holds. | Yes |
 | <a id="reading-memory.addrof-obj"></a>`__AddrOf__(Obj)` | The object's address as an int64, the same as `(int64)Obj`. | Yes |
 | <a id="reading-memory.nameindex-name"></a>`__NameIndex__(Name)` | The FName's comparison index, its first 4 bytes, as an int32. A cheap identity to compare with a name read from memory. It ignores the name's number suffix. | Yes |
@@ -6295,7 +6291,7 @@ listed here is refused with "unimplemented intrinsic".
 | Event override, `void ReceiveBeginPlay()` | Overrides that event, as adding its node in the editor does. Copy the SDK's parameter list: nothing checks it. | [Overrides and parent calls](#overrides-and-parent-calls) |
 | `ExecuteUbergraph_<Class>` | The name of the event graph that holds the methods that wait. A method named so is refused. | [Latent calls](#latent-calls) |
 | `FDeref` | The scratch struct that every read and write through a pointer goes through. AssetGen creates it when the mod declares none. | [Pointers and memory](#pointers-and-memory) |
-| `FDerefTextView` | The struct that an FText read or write through a pointer imports, from a path the compiler fixes. A helper mod you supply cooks it. | [Pointers and memory](#pointers-and-memory) |
+| `FDerefTextView` | The struct that an FText read or write through a pointer imports: made in the mod's own package when a text is read, or the one you declare. | [Pointers and memory](#pointers-and-memory) |
 | `final` | On a class or a virtual method: no subclass has a version of its own. The functions are cooked Final, and calls to them are direct and, on `this`, copied in. | [Calling your own functions](#calling-your-own-functions) |
 | `FinishComponent(Owner, Component)` | Registers a component that AddComponentDeferred held back. | [Components](#components) |
 | `FinishSpawning(Actor, Transform)` | Finishes an actor that SpawnActorDeferred began: its construction script and BeginPlay run. | [Creating objects](#creating-objects) |
@@ -6347,7 +6343,7 @@ listed here is refused with "unimplemented intrinsic".
 | `__ReadObject__(Addr)` | Reads 8 bytes at an address or pointer as a `UObject *`. | [Intrinsics](#intrinsics) |
 | `ReadProperty::GetPropertyAddress` | The function that `&Obj->Member` calls. A helper mod you supply exports it. | [Pointers and memory](#pointers-and-memory) |
 | `__ReadString__(Addr)` | Copies the FString at an address or pointer. | [Intrinsics](#intrinsics) |
-| `__ReadText__(Addr)` | Copies the FText at an address or pointer. Needs the FDerefTextView helper struct. | [Intrinsics](#intrinsics) |
+| `__ReadText__(Addr)` | Copies the FText at an address or pointer, through an `FDerefTextView` made in the mod's package. | [Intrinsics](#intrinsics) |
 | `__RefAt__(Addr)` | Passes the memory at Addr by reference, for an engine function's wildcard parameter. | [Intrinsics](#intrinsics) |
 | Respelled SDK member, `Name_0`, `Index_0` | Write the SDK spelling. Everything AssetGen cooks uses the real name. | [Classes and variables](#classes-and-variables) |
 | `Comp->SetupAttachment(Parent)` | In UE_DEFAULTS, places a component under another, its own class's or an inherited one, as a constructor does. In a function, attaches at once, keeping the relative transform. | [Components](#components) |
