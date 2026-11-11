@@ -993,6 +993,20 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
         if (Object != 0 || Fn != "None") { Why = "a bound delegate (the encoder writes it unbound)"; return false; }
         D.K = FDefaultValue::None;
     }
+    else if (Ty == "MulticastInlineDelegateProperty" || Ty == "MulticastSparseDelegateProperty")
+    {
+        /* FMulticastScriptDelegate: a count of FScriptDelegates, each its object then its function's name (WriteValue). */
+        const int32 Count = R.I32();
+        if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / 12) { Why = "a delegate list past its value"; return false; }
+        for (int32 I = 0; I < Count; ++I)
+        {
+            FDefaultValue& Bound = D.Items.emplace_back();
+            Bound.K = FDefaultValue::Str;
+            Bound.Object = FIndex{ R.I32() };
+            Bound.S = P.NameOf(R.Name());
+        }
+        D.K = FDefaultValue::Array;
+    }
     else if (Ty == "FloatProperty") { D.K = FDefaultValue::Float; D.F = R.Get<float>(); }
     else if (Ty == "DoubleProperty") { D.K = FDefaultValue::Float; D.F = R.Get<double>(); }     // a UE5 real (S40)
     else if (Ty == "BoolProperty")
@@ -1004,10 +1018,7 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     else if (Ty == "ByteProperty" && T.StructName.empty()) { D.K = FDefaultValue::Int; D.I = R.Get<uint8>(); }
     else if (Ty == "ByteProperty" || Ty == "EnumProperty" || Ty == "NameProperty") { D.K = FDefaultValue::Str; D.S = P.NameOf(R.Name()); }
     else if (Ty == "ObjectProperty") { D.K = FDefaultValue::Obj; D.Object = FIndex{ R.I32() }; }
-    else if (Ty == "InterfaceProperty")
-    {
-        if (R.I32() != 0) { Why = "an interface value that is not null (the encoder writes null)"; return false; }
-    }
+    else if (Ty == "InterfaceProperty") { D.K = FDefaultValue::Obj; D.Object = FIndex{ R.I32() }; }     // the object alone, as an ObjectProperty
     else if (Ty == "StrProperty")
     {
         if (!ReadEncodedString(R, D.S, Why)) return false;
@@ -1038,6 +1049,31 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
             Def.Name = "Default";
             if (T.StructName == "PerPlatformFloat") { Def.Type = "FloatProperty"; Def.Default.K = FDefaultValue::Float; Def.Default.F = R.Get<float>(); }
             else { Def.Type = T.StructName == "PerPlatformInt" ? "IntProperty" : "BoolProperty"; Def.Default.K = FDefaultValue::Int; Def.Default.I = R.U32(); }
+        }
+        else if (T.StructName == "NiagaraVariableBase" || T.StructName == "NiagaraVariable" || T.StructName == "NiagaraVariableWithOffset")
+        {
+            /* The Name, the type definition's handle (tags), then VarData's bytes or the Offset (WriteNativeForm). */
+            FPropertyDef& Name = Members->emplace_back();
+            Name.Type = "NameProperty"; Name.Name = "Name";
+            Name.Default.K = FDefaultValue::Str; Name.Default.S = P.NameOf(R.Name());
+            FPropertyDef& Handle = Members->emplace_back();
+            Handle.Type = "StructProperty"; Handle.Name = "TypeDefHandle"; Handle.StructName = "NiagaraTypeDefinitionHandle";
+            if (!ReadValueOf(P, R, Handle, Handle.Default, Why)) return false;
+            if (T.StructName == "NiagaraVariable")
+            {
+                const int32 Count = R.I32();
+                if (Count < 0 || size_t(Count) > R.B.size() - std::min(R.P, R.B.size())) { Why = "a NiagaraVariable's VarData past its value"; return false; }
+                FPropertyDef& Data = Members->emplace_back();
+                Data.Type = "ArrayProperty"; Data.Name = "VarData";
+                Data.Default.K = FDefaultValue::Array;
+                for (int32 I = 0; I < Count; ++I) { FDefaultValue& B = Data.Default.Items.emplace_back(); B.K = FDefaultValue::Int; B.I = R.Get<uint8>(); }
+            }
+            else if (T.StructName == "NiagaraVariableWithOffset")
+            {
+                FPropertyDef& Offset = Members->emplace_back();
+                Offset.Type = "IntProperty"; Offset.Name = "Offset";
+                Offset.Default.K = FDefaultValue::Int; Offset.Default.I = R.I32();
+            }
         }
         else if (T.StructName == "SoftObjectPath" || T.StructName == "SoftClassPath")      // AssetPathName, SubPathString
         {
