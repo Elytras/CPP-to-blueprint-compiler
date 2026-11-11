@@ -1291,6 +1291,18 @@ bool IsContainerType(const std::string& T)
     return S.compare(0, 7, "TArray<") == 0 || S.compare(0, 5, "TSet<") == 0 || S.compare(0, 5, "TMap<") == 0;
 }
 
+/* UE5: a native container whose elements are 4-byte floats (TArray<float>, TMap<FName, float>). Its element property is a
+   FloatProperty where the mod's float is a double, and the VM copies the property's own size, so it is refused, not
+   converted (S40). */
+bool HoldsNativeSingle(const std::string& Type)
+{
+    const std::string T = StripTypeKeywords(Type);
+    if (!IsContainerType(T)) return false;
+    for (size_t At = T.find("float"); At != std::string::npos; At = T.find("float", At + 1))
+        if (At > 0 && std::strchr("<, ", T[At - 1]) && At + 5 < T.size() && std::strchr(">, ", T[At + 5])) return true;
+    return false;
+}
+
 /* "K, V" -> {"K", "V"} at top-level commas. */
 std::vector<std::string> SplitTemplateArgs(const std::string& S)
 {
@@ -2178,6 +2190,7 @@ private:
        stand in for every read (ParmConst), so neither the property nor its store is compiled. */
     bool ReadOnlyLocal(const std::string& DeclId) const;
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
+    bool LowerCallBody(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     /* A child struct for its parent struct (StructUpcastBelow's cast): the parent's name, the child's, the child's own
        conversion `Get<Parent>From<Child>` as a call on it (null with none), and whether the layouts agree so that no
        slice is needed. */
@@ -2913,6 +2926,8 @@ private:
     const FRecord* Cur = nullptr;                     // record Generate is working on
     std::set<std::string> CurrentOutParms;            // T& parm names of the function being lowered
     std::set<std::string> SingleParms;                // UE5: its parameters a native parent makes 4-byte floats (S40)
+    struct FSingleOut { FArgIR Var; std::string Tmp; };
+    std::vector<FSingleOut> SingleOuts;               // UE5: the call being lowered's `float&` arguments and the 4-byte temps standing for them
     bool bCurNet = false;                             // the function being lowered is an RPC
     bool bCurNoOpt = false;                           // ... is UE_NO_OPTIMIZE: no drops, no && / || fold
     const Json* CurBody = nullptr;                    // the body LowerBody is walking: scope of the locals it declares
@@ -5321,9 +5336,25 @@ bool FCompiler::SingleArg(const std::string& ParmType, const std::string& Fn, FB
     if (StripTypeKeywords(T) != "float") return true;
     if (bRef && T.compare(0, 6, "const ") != 0)
     {
-        *Err = Fn + ": TODO: a native float& parameter on UE5, where the mod's float is a double (S40); pass a struct "
-               "or call a function that returns the value";
-        return false;
+        /* The native writes four bytes through the address, which a double local would take as its low half: the call
+           gets a 4-byte temp holding the local's value, and the local is set from it after the call (LowerCall). */
+        if (A.K != FArgIR::Local || !CurLocals)
+        {
+            *Err = Fn + ": a native float& parameter on UE5 takes a local variable (the mod's float is a double, so a "
+                   "4-byte temp stands in for it); pass a local, or call a function that returns the value";
+            return false;
+        }
+        const std::string Tmp = "__Single" + std::to_string(ReadTmpCounter++) + "__";
+        FPropertyDef PD = SingleParam(Tmp);
+        PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+        CurLocals->push_back(PD);
+        SingleOuts.push_back({ A, Tmp });
+        A = FArgIR();
+        A.K = FArgIR::Local;
+        A.S = Tmp;
+        A.InnerType = "float";
+        A.bSingle = true;
+        return true;
     }
     ToSingle(A, BP);
     return true;
@@ -5701,6 +5732,8 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
         Out.Owner = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
         Out.LetOp = LetOpFor(TypeOf(MemberNode));
         Out.bSingle = IsSingleNative(*R) && StripTypeKeywords(TypeOf(MemberNode)) == "float";
+        if (IsSingleNative(*R) && HoldsNativeSingle(TypeOf(MemberNode)))
+        { *Err = Name(MemberNode) + ": a native " + StripTypeKeywords(TypeOf(MemberNode)) + " on UE5 holds 4-byte floats, which the mod's float (a double) cannot stand for (S40)"; return false; }
         Out.Base = std::make_shared<FArgIR>();
         /* `P->X` and `(*P).X`: StructMember offsets into the memory P points at. The base is only offset into,
            never copied, so the int64 view serves a struct of any size. */
@@ -5742,6 +5775,8 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
     Out.Owner = !R->IsNative() && R == Cur ? BP.ClassIndex() : BP.PropertyOwner(PackageOf(*R), ClassOf(*R));
     Out.LetOp = LetOpFor(TypeOf(MemberNode));
     Out.bSingle = IsSingleNative(*R) && StripTypeKeywords(TypeOf(MemberNode)) == "float";
+    if (IsSingleNative(*R) && HoldsNativeSingle(TypeOf(MemberNode)))
+    { *Err = Name(MemberNode) + ": a native " + StripTypeKeywords(TypeOf(MemberNode)) + " on UE5 holds 4-byte floats, which the mod's float (a double) cannot stand for (S40)"; return false; }
     const Json* Obj = Strip(ObjRaw);
     if (!Obj) { *Err = "property access with no object: " + Name(MemberNode); return false; }
     if (Kind(*Obj) == "CXXThisExpr") return true;
@@ -6650,7 +6685,7 @@ const FReadViewSpec* FCompiler::ViewFor(const std::string& PointeeType)
              : StripTypeKeywords(P.substr(0, P.size() - 1)) == "UClass" ? "__ReadClass__" : "__ReadObject__";
     else if (P == "int64" || P == "uint64" || P == "long long" || P == "unsigned long long") Read = "__Read64__";
     else if (P == "int" || P == "int32" || P == "uint32" || P == "unsigned int") Read = "__Read32__";
-    else if (P == "float" && !IsUE5()) Read = "__ReadFloat__";     // S40: no UE5 real view yet
+    else if (P == "float") Read = "__ReadFloat__";     // UE5: the 4-byte view, its local single and read through ToReal (HoistReadCall)
     else if (P == "uint8" || P == "int8" || P == "unsigned char" || P == "signed char" || P == "char" || P == "bool")
         Read = "__ReadByte__";
     else if (auto E = Enums.find(P); E != Enums.end())
@@ -6743,6 +6778,9 @@ bool FCompiler::ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintC
 /* The memory at Addr as an lvalue: a __RefAt__, whose hoist types its view by the Pointee. */
 bool FCompiler::RefThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
+    if (IsUE5() && StripTypeKeywords(Pointee) == "float")
+    { *Err = "TODO: a float written or bound through a pointer on UE5, where the mod's float is a double and the address "
+             "holds four bytes (S40); read it with *(float*)P, or write it as an int32 bit pattern"; return false; }
     if (StripTypeKeywords(Pointee).compare(0, 7, "TArray<") == 0) return ArrayThrough(std::move(Addr), Pointee, BP, Out, Err);
     if (!IsWideScalar(StripTypeKeywords(Pointee)) && !ViewFor(Pointee))
     { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
@@ -6770,6 +6808,8 @@ bool FCompiler::ArrayThrough(FArgIR Addr, const std::string& Pointee, FBlueprint
     for (const auto& [Alias, Canon] : { std::pair{ "long long", "int64" }, std::pair{ "int", "int32" },
                                         std::pair{ "unsigned char", "uint8" } })
         if (Elem == Alias) Elem = Canon;
+    if (IsUE5() && Elem == "float")
+    { *Err = "TODO: a " + P + " through a pointer on UE5: its elements are four bytes, the mod's float a double (S40)"; return false; }
     const FReadViewSpec* V = ViewFor(Elem);
     /* Object pointers, FName and UClass* share the int64 view, whose elements are int64: no view holds them. */
     if (!V || StripTypeKeywords(V->ResultType) != Elem
@@ -6980,7 +7020,9 @@ bool FCompiler::HoistOperand(FArgIR& Operand, FBlueprintClass& BP, std::vector<F
                            : Operand.K == FArgIR::Self ? std::string("class UObject *") : Operand.InnerType;
     const std::string Tmp = "__PtrTmp" + std::to_string(ReadTmpCounter++) + "__";
     FPropertyDef PD;
-    if (!TypeToProperty(Type, Tmp, 0, Tmp, BP, &PD, Err)) return false;
+    /* UE5: a native's `const float&` argument (ToSingle) lives in a 4-byte local, as the parameter it binds is. */
+    if (IsUE5() && Operand.bSingle && StripTypeKeywords(Type) == "float") PD = SingleParam(Tmp);
+    else if (!TypeToProperty(Type, Tmp, 0, Tmp, BP, &PD, Err)) return false;
     PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
     Locals.push_back(PD);
 
@@ -9466,7 +9508,61 @@ int FCompiler::SliceStructCopies(const Json& Body, Json* Fixed, std::string* Err
     return Done;
 }
 
+/* A call, and on UE5 what a native `float&` argument needs (SingleArg): each such local goes in a 4-byte temp the call
+   fills, and the local is set from it after: `{ T = (float)L; call(T); L = (double)T; }` as one inline block. */
 bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
+{
+    std::vector<FSingleOut> Outer;
+    Outer.swap(SingleOuts);
+    const bool bOk = LowerCallBody(CallExprNode, BP, Out, Err);
+    std::vector<FSingleOut> Mine;
+    Mine.swap(SingleOuts);
+    SingleOuts.swap(Outer);
+    if (!bOk || Mine.empty()) return bOk;
+    const std::string ResultType = StripTypeKeywords(TypeOf(CallExprNode));
+    if (ResultType != "void")
+    { *Err = "a native call with a float& parameter and a result: call it as a statement, or take the result separately"; return false; }
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    auto Set = [&](const FArgIR& Var, FArgIR Value) {
+        FStmtIR& St = Body->emplace_back();
+        St.K = FStmtIR::Assign;
+        St.Var = Var;
+        St.Var.LetOp = LetOpFor("float");
+        St.bAssignLocal = true;
+        St.Value = std::move(Value);
+    };
+    for (const FSingleOut& O : Mine)
+    {
+        FArgIR Tmp;
+        Tmp.K = FArgIR::Local;
+        Tmp.S = O.Tmp;
+        Tmp.InnerType = "float";
+        FArgIR In = O.Var;
+        ToSingle(In, BP);
+        Set(Tmp, std::move(In));
+    }
+    Body->emplace_back().K = FStmtIR::StaticCall;
+    Body->back().Call = Out;
+    for (const FSingleOut& O : Mine)
+    {
+        FArgIR Read;
+        Read.K = FArgIR::Local;
+        Read.S = O.Tmp;
+        Read.InnerType = "float";
+        SingleParms.insert(O.Tmp);
+        ToReal(Read, BP);
+        Set(O.Var, std::move(Read));
+    }
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out = FCallIR();
+    Out.Intrinsic = "__Inline__";
+    Out.Inline = Block;
+    return true;
+}
+
+bool FCompiler::LowerCallBody(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
 {
     const std::string K = Kind(CallExprNode);
     const Json* Callee = Strip(First(CallExprNode));
@@ -15948,7 +16044,10 @@ bool FCompiler::HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass
 
     FPropertyDef TmpPD;
     std::string PErr;
-    if (!TypeToProperty(V.ResultType, TmpName, 0, TmpName, BP, &TmpPD, &PErr))
+    /* UE5: a float read stays four bytes in a FloatProperty local, which the read's value then widens from. */
+    const bool bSingleRead = IsUE5() && std::strcmp(V.ResultType, "float") == 0;
+    if (bSingleRead) TmpPD = SingleParam(TmpName);
+    else if (!TypeToProperty(V.ResultType, TmpName, 0, TmpName, BP, &TmpPD, &PErr))
     {
         *Err = "hoisting " + std::string(V.Intrinsic) + ": " + PErr;
         return false;
@@ -16009,6 +16108,12 @@ bool FCompiler::HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass
     A.K = FArgIR::Local;
     A.S = TmpName;
     A.LetOp = LetOpFor(V.ResultType);
+    if (bSingleRead)
+    {
+        A.InnerType = "float";
+        SingleParms.insert(TmpName);
+        ToReal(A, BP);
+    }
     return true;
 }
 
