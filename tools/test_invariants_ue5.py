@@ -59,6 +59,15 @@ class Tag5Tests(unittest.TestCase):
         self.assertEqual((list(tags), tags.end), ([], 2))
 
 
+class RunscriptMathTests(unittest.TestCase):
+    def test_runscript_evaluates_ue5_double_math(self):
+        import runscript
+        m = runscript.MATH
+        self.assertEqual((m['Add_DoubleDouble'](1.5, 2.0), m['Percent_DoubleDouble'](5.0, 3.0)), (3.5, 2.0))
+        self.assertEqual(m['Conv_DoubleToFloat'](0.1), 0.10000000149011612)      # the narrowing keeps a float's 24 bits
+        self.assertEqual(m['Conv_FloatToDouble'](2), 2.0)
+
+
 RC = os.environ.get('RC_CONTENT', 'D:/tmp/s40rc/content/RogueCore/Content')
 
 
@@ -81,6 +90,17 @@ class RcPackagesTests(unittest.TestCase):
         self.assertGreaterEqual(len(names), 4)
         pkg = invariants.Package(RC + '/GameElements/Objectives/Excavation/Struct_WeigtedActor')
         self.assertIsNone(pkg.struct(0).defaults)                # a UserDefinedStruct's unversioned default is opaque
+
+    def test_uasset_tags_and_struct_read_a_5_6_package(self):
+        import contextlib, io, uasset
+        base = RC + '/AI/Decorators/DEC_CanGrabTarget'
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            uasset.main(['tags', base, '0'])
+            uasset.main(['struct', base, '2'])
+        self.assertIn('unversioned properties', out.getvalue())
+        self.assertIn('SuperStruct', out.getvalue())
+        self.assertIn('consumed', out.getvalue())
 
 
 if __name__ == '__main__':
