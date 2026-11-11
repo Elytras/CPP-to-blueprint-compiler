@@ -982,6 +982,15 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     const std::string& Ty = T.Type;
     if (Ty == "IntProperty") { D.K = FDefaultValue::Int; D.I = R.I32(); }
     else if (Ty == "Int64Property") { D.K = FDefaultValue::Int; D.I = R.I64(); }
+    else if (Ty == "UInt32Property") { D.K = FDefaultValue::Int; D.I = R.Get<uint32>(); }     // WriteValue: V.U32(uint32(D.I))
+    else if (Ty == "UInt16Property") { D.K = FDefaultValue::Int; D.I = R.Get<uint16>(); }
+    else if (Ty == "DelegateProperty")                      // FScriptDelegate: the object, the function's name; the encoder writes it unbound
+    {
+        const int32 Object = R.I32();
+        const std::string Fn = P.NameOf(R.Name());
+        if (Object != 0 || Fn != "None") { Why = "a bound delegate (the encoder writes it unbound)"; return false; }
+        D.K = FDefaultValue::None;
+    }
     else if (Ty == "FloatProperty") { D.K = FDefaultValue::Float; D.F = R.Get<float>(); }
     else if (Ty == "DoubleProperty") { D.K = FDefaultValue::Float; D.F = R.Get<double>(); }     // a UE5 real (S40)
     else if (Ty == "BoolProperty")
