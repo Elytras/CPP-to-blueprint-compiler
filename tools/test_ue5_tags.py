@@ -34,6 +34,13 @@ class TagTreeTests(unittest.TestCase):
         cdo = cls.pkg.find('Default__TagsRc_C') or cls.pkg.find('Default__TagsRc')
         cls.tags = {t['name']: t for t in cls.pkg.tags(cdo)}
 
+    def test_the_structural_rules_hold_on_a_5_6_package(self):
+        # the table, EDL, flag, opcode and body rules read 5.x headers and rows (the SDK-bound rules need --sdk)
+        only = ['table_bounds', 'names_split', 'import_chains', 'import_unique', 'export_rows', 'export_outer_within',
+                'export_name_unique', 'payload_exact', 'cdo_body_exact', 'edl_preload_arcs', 'package_flags',
+                'typing_opcodes_known', 'struct_body_exact']
+        self.assertEqual(invariants.check(self.pkg, only), [])
+
     def test_array_of_structs_names_its_struct_and_has_no_inner_tag(self):
         self.assertEqual(self.tags['Points']['inner'], 'StructProperty')
         # the count and two FVectors of three doubles: 5.6 writes no inner tag between them
