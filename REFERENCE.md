@@ -5794,7 +5794,7 @@ Notes:
 | <a id="reading-and-writing.int8-addr"></a>`*(int8 *)Addr`, `*(signed char *)Addr` | Reads one byte, sign-extended: 0x80 to 0xFF read as negative ints, as in C++. | Yes |
 | <a id="reading-and-writing.uint8-addr"></a>`*(uint8 *)Addr`, `*(bool *)Addr` | Reads one byte as 0 to 255. A bool read is `byte != 0`. | Yes |
 | <a id="reading-and-writing.fstring-s-fstring-addr"></a>`FString S = *(FString *)Addr;` | Copies the string out. The function owns its copy, which is freed when it returns. | Yes |
-| <a id="reading-and-writing.ftext-t-ftext-addr"></a>`FText T = *(FText *)Addr;`, `*(FText *)Addr = T;` | Copies the text with the engine's FText copy, which shares the text data by reference count. Needs the FDerefTextView helper struct (see Helper code you supply, below). | Yes |
+| <a id="reading-and-writing.ftext-t-ftext-addr"></a>`FText T = *(FText *)Addr;`, `*(FText *)Addr = T;` | Copies the text with the engine's FText copy, which shares the text data by reference count. Through an `FDerefTextView` the compiler makes in the mod's package (see Helper code you supply, below). | Yes |
 | <a id="reading-and-writing.uobject-addr"></a>`*(UObject **)Addr`, `*(UClass **)Addr` | Reads 8 bytes as an object or class reference. | Yes |
 | <a id="reading-and-writing.int64-void-addr"></a>`(int64)*(void **)Addr` | A pointer to a raw pointer reads a plain int64 address. | Yes |
 | <a id="reading-and-writing.int64-v-uint32-addr"></a>`int64 V = *(uint32 *)Addr;` | Not built: Kismet has no unsigned 32-bit integer, and an int32 read would make 0xFFFFFFFF compare as -1. Refused with "reading a uint32 through a pointer". Read an int32 and mask it, as below. | Not yet |
@@ -6020,8 +6020,8 @@ Notes:
 - The class imports FDeref.uasset, so it is part of the mod's output: ship it with the class.
 - The layout of a declared FDeref is not checked. Another shape compiles without a warning, and every pointer access
   in the mod then names members the struct does not have. Do not declare one unless you have a reason.
-- The FText view is separate: its path is fixed (see the next section), and an FDerefTextView declared in an ordinary
-  mod is cooked under that mod's package and never used.
+- The FText view, FDerefTextView, is made the same way, in the mod's own package, the first time a text is read through a
+  pointer. One you declare yourself (`UE_STRUCT`) is used instead.
 
 ### Helper code you supply
 
@@ -6031,10 +6031,10 @@ that the compiler does not generate, so you supply it:
 | You write | What it does | Status |
 |---|---|---|
 | <a id="helper-code-you.obj-member"></a>`&Obj->Member` | Calls the Blueprint function `GetPropertyAddress` on the class named ReadProperty that the source can see. | Yes |
-| <a id="helper-code-you.ftext-addr"></a>`*(FText *)Addr`, `__ReadText__(Addr)` | Imports the struct `/Game/_ElytrasMods/ReadProperty/FDerefTextView`, a path the compiler hard-codes, cooked only in the ReadProperty mod: any other mod that reads a text warns, since the read crashes where that pak is not mounted. | Yes |
+| <a id="helper-code-you.ftext-addr"></a>`*(FText *)Addr`, `__ReadText__(Addr)` | Reads through `FDerefTextView { TArray<FText> Data; }`, which the compiler makes in the mod's own package the first time a text is read, as it makes FDeref: no other mod's pak is needed. A mod that declares its own `FDerefTextView` (the ReadProperty mod does) uses that. | Yes |
 | <a id="helper-code-you.classof-x"></a>`__ClassOf__(x)` | Calls GetParmClassName on the class that uses it: see [Intrinsics](#intrinsics). | Yes |
 
-One small helper mod covers the first two. It cooks FDerefTextView at the fixed path, and a ReadProperty class that
+One small helper mod covers the first two. It cooks a ReadProperty class that
 exports a real GetPropertyAddress. The function walks the object's class and its super classes for a property with
 that name, and returns the object's address plus the property's offset, or 0 when the object is null or has no such
 property.
@@ -6057,8 +6057,6 @@ public:
 // ReadProperty.cpp: the helper mod's only source
 #include "ReadProperty.h"
 UE_MOD_PACKAGE("/Game/_ElytrasMods/ReadProperty");
-
-struct FDerefTextView { UE_STRUCT; TArray<FText> Data; };   // the view every FText pointer access uses
 
 int64 ReadProperty::GetPropertyAddress(class UObject *Target, FName PropName, class UObject *WorldContextObject) {
   if (Target == nullptr) return 0;
@@ -6092,8 +6090,6 @@ Notes:
 - The package must be exactly `/Game/_ElytrasMods/ReadProperty` for the FText view, because the compiler hard-codes
   that path. A helper that only serves `&Obj->Member` can live in any package, as long as the class is named
   ReadProperty and its UE_CLASS path is `<its UE_MOD_PACKAGE>/ReadProperty`.
-- Keep FDerefTextView in the .cpp, not in the header. A UE_STRUCT is cooked under the package of the mod that
-  declares it, and FText access only ever uses the copy at the fixed path.
 - GetPropertyAddress must not be `inline`, and must keep its three parameters. An inline method gets no function of
   its own, and the call always passes three arguments. Neither mistake is caught at build time.
 - The name match compares only the FName's comparison index, not its number suffix.
@@ -6125,7 +6121,7 @@ intrinsic".
 | <a id="reading-memory.readobject-a"></a>`__ReadObject__(A)`, `__ReadClass__(A)` | Reads 8 bytes as a UObject* or a UClass*. `__ReadClass__` assigns to a UClass* variable without a cast. | Yes |
 | <a id="reading-memory.readname-a"></a>`__ReadName__(A)` | Reads 8 bytes as an FName. | Yes |
 | <a id="reading-memory.readstring-a"></a>`__ReadString__(A)` | Copies the 16-byte FString at A. | Yes |
-| <a id="reading-memory.readtext-a"></a>`__ReadText__(A)` | Copies the 24-byte FText at A. Needs the FDerefTextView helper struct: see [Pointers and memory](#pointers-and-memory). | Yes |
+| <a id="reading-memory.readtext-a"></a>`__ReadText__(A)` | Copies the 24-byte FText at A, through an `FDerefTextView` the compiler makes in the mod's package: see [Pointers and memory](#pointers-and-memory). | Yes |
 | <a id="reading-memory.read32-p"></a>`__Read32__(P)` with `int32 *P` | Every read also takes a pointer, and reads at the address it holds. | Yes |
 | <a id="reading-memory.addrof-obj"></a>`__AddrOf__(Obj)` | The object's address as an int64, the same as `(int64)Obj`. | Yes |
 | <a id="reading-memory.nameindex-name"></a>`__NameIndex__(Name)` | The FName's comparison index, its first 4 bytes, as an int32. A cheap identity to compare with a name read from memory. It ignores the name's number suffix. | Yes |
@@ -6295,7 +6291,7 @@ listed here is refused with "unimplemented intrinsic".
 | Event override, `void ReceiveBeginPlay()` | Overrides that event, as adding its node in the editor does. Copy the SDK's parameter list: nothing checks it. | [Overrides and parent calls](#overrides-and-parent-calls) |
 | `ExecuteUbergraph_<Class>` | The name of the event graph that holds the methods that wait. A method named so is refused. | [Latent calls](#latent-calls) |
 | `FDeref` | The scratch struct that every read and write through a pointer goes through. AssetGen creates it when the mod declares none. | [Pointers and memory](#pointers-and-memory) |
-| `FDerefTextView` | The struct that an FText read or write through a pointer imports, from a path the compiler fixes. A helper mod you supply cooks it. | [Pointers and memory](#pointers-and-memory) |
+| `FDerefTextView` | The struct that an FText read or write through a pointer imports: made in the mod's own package when a text is read, or the one you declare. | [Pointers and memory](#pointers-and-memory) |
 | `final` | On a class or a virtual method: no subclass has a version of its own. The functions are cooked Final, and calls to them are direct and, on `this`, copied in. | [Calling your own functions](#calling-your-own-functions) |
 | `FinishComponent(Owner, Component)` | Registers a component that AddComponentDeferred held back. | [Components](#components) |
 | `FinishSpawning(Actor, Transform)` | Finishes an actor that SpawnActorDeferred began: its construction script and BeginPlay run. | [Creating objects](#creating-objects) |
@@ -6347,7 +6343,7 @@ listed here is refused with "unimplemented intrinsic".
 | `__ReadObject__(Addr)` | Reads 8 bytes at an address or pointer as a `UObject *`. | [Intrinsics](#intrinsics) |
 | `ReadProperty::GetPropertyAddress` | The function that `&Obj->Member` calls. A helper mod you supply exports it. | [Pointers and memory](#pointers-and-memory) |
 | `__ReadString__(Addr)` | Copies the FString at an address or pointer. | [Intrinsics](#intrinsics) |
-| `__ReadText__(Addr)` | Copies the FText at an address or pointer. Needs the FDerefTextView helper struct. | [Intrinsics](#intrinsics) |
+| `__ReadText__(Addr)` | Copies the FText at an address or pointer, through an `FDerefTextView` made in the mod's package. | [Intrinsics](#intrinsics) |
 | `__RefAt__(Addr)` | Passes the memory at Addr by reference, for an engine function's wildcard parameter. | [Intrinsics](#intrinsics) |
 | Respelled SDK member, `Name_0`, `Index_0` | Write the SDK spelling. Everything AssetGen cooks uses the real name. | [Classes and variables](#classes-and-variables) |
 | `Comp->SetupAttachment(Parent)` | In UE_DEFAULTS, places a component under another, its own class's or an inherited one, as a constructor does. In a function, attaches at once, keeping the relative transform. | [Components](#components) |

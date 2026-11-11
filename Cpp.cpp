@@ -2513,6 +2513,9 @@ private:
     bool HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                        std::vector<FStmtIR>& OutPre, std::string* Err);
     bool HasDerefStruct(std::string* Err) const;
+    /* A read's view struct as an import: FDerefTextView is the mod's own, made on first use like FDeref (HasTextViewStruct). */
+    FIndex ViewStruct(const FReadViewSpec& V, FBlueprintClass& BP);
+    void HasTextViewStruct() const;
     bool LowerPtrCastSource(const Json& Call, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     std::map<std::string, std::string> RefAddr;     // VarDecl id -> pointee: `T& R = *P` keeps the address in an int64 local R
     std::map<std::string, std::string> ArrayView;   // such an R's local -> the FDeref scratch its declaration points at a TArray
@@ -2601,7 +2604,6 @@ private:
     std::set<std::string> WarnedNoWorld;        // Class::Function that passed self as a world context without a world
     std::set<std::string> UcsReached;           // the class's functions UserConstructionScript runs, itself included
     std::set<std::string> WarnedUcsSpawn;
-    bool bWarnedReadText = false;                   // this compile said __ReadText__ needs the ReadProperty mod's pak
     std::set<std::string> WarnedForeignInstance;     // another mod's static member template instantiation a call named
     std::set<std::string> WarnedRotationEq;     // Class::Function that compared FRotators or FQuats with ==
     std::set<std::string> WarnedMakes;          // Class::Function what: a spawn or construct the engine will not make
@@ -2905,6 +2907,9 @@ private:
     mutable Json    DerefAst;        // owns the three FieldDecl nodes SynthDeref.Fields point into
     mutable FRecord SynthDeref;
     mutable bool    bSynthDeref = false;
+    mutable Json    TextViewAst;     // the one FieldDecl SynthTextView's Data points at
+    mutable FRecord SynthTextView;
+    mutable bool    bSynthTextView = false;
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::pair<std::string, std::string>> GameClassKinds;   // FBlueprintClass's, filled by Run
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
@@ -6489,6 +6494,35 @@ bool FCompiler::HasDerefStruct(std::string* Err) const
     return true;
 }
 
+/* `struct FDerefTextView { TArray<FText> Data; }`, the view __ReadText__ reads an FText through: no engine struct has a
+   TArray<FText> at offset 0. Made here, in the mod's own package, as FDeref is, so a mod that reads a text needs no other
+   mod's pak; one that declares its own (the ReadProperty mod does) wins, Find seeing it first. */
+void FCompiler::HasTextViewStruct() const
+{
+    const FRecord* D = Find("FDerefTextView");
+    if ((D && D->bIsStruct && !D->IsNative()) || bSynthTextView) return;
+    TextViewAst = Json::array();
+    TextViewAst.push_back(Json{ { "kind", "FieldDecl" }, { "name", "Data" }, { "type", Json{ { "qualType", "TArray<FText>" } } } });
+    SynthTextView = FRecord();
+    SynthTextView.CppName   = "FDerefTextView";
+    SynthTextView.UeName    = "FDerefTextView";
+    SynthTextView.UePackage = ModPackage + "/FDerefTextView";
+    SynthTextView.bIsStruct = true;
+    SynthTextView.bIsLocal  = true;
+    for (const Json& F : TextViewAst) SynthTextView.Fields.push_back(&F);
+    bSynthTextView = true;
+}
+
+FIndex FCompiler::ViewStruct(const FReadViewSpec& V, FBlueprintClass& BP)
+{
+    const bool bText = std::strcmp(V.ViewStructName, "FDerefTextView") == 0;
+    if (bText) HasTextViewStruct();
+    const std::string Pkg = bText ? ModPackage + "/FDerefTextView" : std::string(V.ViewStructPkg);
+    const FIndex S = BP.ScriptStruct(Pkg, V.ViewStructName);
+    if (Pkg.compare(0, 6, "/Game/") == 0) KeepStructLoaded(S, V.ViewStructName, 16);     // ponytail: a mod-owned view is { TArray<T> Data; }, 16 bytes
+    return S;
+}
+
 /* FScriptMap and FScriptSet start with their sparse array's element array, and an element is TSetElement<TPair<K, V>>
    or TSetElement<T>: the pair or the element, then HashNextId and HashIndex (TScriptSet::GetScriptLayout). The same
    members laid out by UStruct::Link give the same offsets and stride, while no member is aligned past 8
@@ -6792,15 +6826,14 @@ bool FCompiler::ArrayThrough(FArgIR Addr, const std::string& Pointee, FBlueprint
         Place.InnerType = "int64";
         Place.Sub = std::make_shared<FCallIR>();
         Place.Sub->Intrinsic = "__RefAtInline__";
-        Place.Sub->Extra = BP.ScriptStruct(I64->ViewStructPkg, I64->ViewStructName);
+        Place.Sub->Extra = ViewStruct(*I64, BP);
         Place.Sub->View = ViewFieldOf(I64->DerefIntrinsic);
     }
     else if (!RefThrough(std::move(Addr), "int64", BP, Place, Err)) return false;
     Out = FArgIR();
     Out.K = FArgIR::Member;
     Out.S = V->ViewField ? V->ViewField : ViewFieldOf(V->DerefIntrinsic);
-    Out.Owner = BP.ScriptStruct(V->ViewStructPkg, V->ViewStructName);
-    if (std::strncmp(V->ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(Out.Owner, V->ViewStructName, 16);
+    Out.Owner = ViewStruct(*V, BP);
     Out.LetOp = LetOpFor(P);
     Out.InnerType = P;
     Out.Base = std::make_shared<FArgIR>(std::move(Place));
@@ -16016,9 +16049,7 @@ bool FCompiler::HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass
     ReadTmp.Value.S = "__DerefScratch__";      // the scratch it reads, renamed with the locals in a waiting function
     ReadTmp.Value.Sub->Intrinsic = V.DerefIntrinsic;
     ReadTmp.Value.Sub->View = V.ViewField ? V.ViewField : ViewFieldOf(V.DerefIntrinsic);
-    ReadTmp.Value.Sub->Extra = BP.ScriptStruct(V.ViewStructPkg, V.ViewStructName);
-    /* ponytail: a mod-owned view is { TArray<T> Data; }, 16 bytes. */
-    if (std::strncmp(V.ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(ReadTmp.Value.Sub->Extra, V.ViewStructName, 16);
+    ReadTmp.Value.Sub->Extra = ViewStruct(V, BP);
     OutPre.push_back(ReadTmp);
 
     /* Replace the original read expression with LocalVariable(__DerefTmpN__). */
@@ -16075,15 +16106,6 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
        an already-materialised inner temp. */
     if (!HoistCallArgs(*A.Sub, BP, Locals, OutPre, Err)) return false;
 
-    /* A read's view struct that only the ReadProperty mod cooks (FDerefTextView) is imported from its package. */
-    if (const FReadViewSpec* V = FindReadView(A.Sub->Intrinsic); V && !bWarnedReadText
-        && std::string(V->ViewStructPkg).rfind("/Game/_ElytrasMods/ReadProperty/", 0) == 0
-        && Lower(ModPackage).rfind("/game/_elytrasmods/readproperty", 0) != 0)
-    {
-        bWarnedReadText = true;
-        printf("  warning: %s uses %s, whose view struct %s is cooked only in the ReadProperty mod: without that pak mounted "
-               "the read imports a missing struct and crashes\n", CurFnName.c_str(), V->Intrinsic, V->ViewStructName);
-    }
     if (const FReadViewSpec* V = A.Sub->Intrinsic == "__ReadStruct__" ? ViewFor(A.InnerType) : FindReadView(A.Sub->Intrinsic))
         return HoistReadCall(A, *V, BP, Locals, OutPre, Err);
     if (A.Sub->Intrinsic == "__RefAt__")
@@ -16228,9 +16250,8 @@ bool FCompiler::HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FProperty
     A.InnerType = InnerType;
     A.Sub = std::make_shared<FCallIR>();
     A.Sub->Intrinsic = "__RefAtInline__";
-    A.Sub->Extra = BP.ScriptStruct(V->ViewStructPkg, V->ViewStructName);
+    A.Sub->Extra = ViewStruct(*V, BP);
     A.Sub->View = V->ViewField ? V->ViewField : ViewFieldOf(V->DerefIntrinsic);
-    if (std::strncmp(V->ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(A.Sub->Extra, V->ViewStructName, 16);
     return true;
 }
 
@@ -22808,7 +22829,6 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     UcsReached.clear();
     WarnedUcsSpawn.clear();
     WarnedForeignInstance.clear();
-    bWarnedReadText = false;
     for (std::vector<std::string> Todo = { "UserConstructionScript" }; !Todo.empty();)
     {
         const std::string Fn = Todo.back();
@@ -24810,6 +24830,11 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (bSynthDeref)
     {
         if (!GenerateStruct(SynthDeref, OutDir, Err)) return false;
+        ++Generated;
+    }
+    if (bSynthTextView)
+    {
+        if (!GenerateStruct(SynthTextView, OutDir, Err)) return false;
         ++Generated;
     }
     for (const auto& Entry : SlotStructs)       // the TMap / TSet walks lowering made; see SlotView

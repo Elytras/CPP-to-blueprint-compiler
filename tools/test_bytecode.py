@@ -605,6 +605,9 @@ def build():
     # value is read into the model and encoded again, which must give the same bytes.
     proc = subprocess.run([ASSETGEN, 'roundtrip', ROOT], capture_output=True, encoding='utf-8')
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    # The encoder's gaps that are closed: a UInt16 / UInt32 value, an unbound delegate, a RichCurveKey (27 native bytes).
+    for gap in ('UInt16Property value', 'UInt32Property value', 'DelegateProperty value', 'RichCurveKey written natively'):
+        assert gap not in proc.stdout, gap + ' is read into the model again:\n' + proc.stdout
     print('ok  every package reads back and writes out byte for byte, and every tag value re-encodes (assetgen roundtrip)')
 
 
@@ -17329,11 +17332,12 @@ def silent_drops():
     user = 'class StTplUser : public AActor {\npublic:\n  int32 F() { return StTplLib::Get<int32>(3); }\n};\n'
     warned = built('StTplUser', ROW_HEAD % 'StTplUser' + lib + user)
     assert any('StTplLib::Get__int32' in l and 'only if a source of that mod instantiates it' in l for l in warned), warned
-    # A text read imports a struct only the ReadProperty mod cooks.
+    # A text read's view struct is made in the mod's own package, as FDeref is: no warning, no other mod's pak.
     proves('helper-code-you.ftext-addr')
-    warned = built('ReadTextMod', ROW_HEAD % 'ReadTextMod' + ROW_INTRIN
-                   + 'class ReadTextMod : public AActor {\npublic:\n  FText F(int64 A) { return __ReadText__(A); }\n};\n')
-    assert any('__ReadText__' in l and 'cooked only in the ReadProperty mod' in l for l in warned), warned
+    proc = row_compile('ReadTextMod', ROW_HEAD % 'ReadTextMod' + ROW_INTRIN
+                       + 'class ReadTextMod : public AActor {\npublic:\n  FText F(int64 A) { return __ReadText__(A); }\n};\n')
+    assert proc.returncode == 0 and 'FDerefTextView' in proc.stdout and 'warning:' not in proc.stdout, proc.stdout
+    assert 'ReadProperty/FDerefTextView' not in proc.stdout, proc.stdout
     print('ok  a method no compiled source defines, and a UE_CLASS path under the mod\'s own root that is not the class\'s, are warned about')
 
 

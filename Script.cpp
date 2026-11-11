@@ -425,7 +425,10 @@ int32 NativeStructSize(const std::string& StructName)
         { "Vector", 12 }, { "Vector2D", 8 }, { "Vector4", 16 }, { "Rotator", 12 }, { "Quat", 16 },
         { "Plane", 16 }, { "Matrix", 64 }, { "Color", 4 }, { "LinearColor", 16 }, { "IntPoint", 8 },
         { "IntVector", 12 }, { "Guid", 16 }, { "DateTime", 8 }, { "Timespan", 8 }, { "Box", 25 },
-        { "Box2D", 17 }, { "FrameNumber", 4 } };
+        { "Box2D", 17 }, { "FrameNumber", 4 },
+        /* RichCurveKey: Interp, TangentMode, TangentWeightMode, then Time, Value and the four tangent floats (RichCurve.cpp,
+           FRichCurveKey::Serialize); all zeros is FRichCurveKey()'s default. */
+        { "RichCurveKey", 27 } };
     /* UE5's large world coordinates make the math structs' components doubles (S40): the rest keep their 4.27 size. */
     static const std::map<std::string, int32> Lwc = {
         { "Vector", 24 }, { "Vector2D", 16 }, { "Vector4", 32 }, { "Rotator", 24 }, { "Quat", 32 },
@@ -440,7 +443,7 @@ bool NativeUnwritten(const std::string& StructName)
 {
     // ponytail: the census's list; a native struct the pak holds no value of is not in it
     static const char* const Unwritten[] = {
-        "SoftObjectPath", "SoftClassPath", "PerPlatformFloat", "PerPlatformInt", "RichCurveKey",
+        "SoftObjectPath", "SoftClassPath", "PerPlatformFloat", "PerPlatformInt",
         "KeyHandleMap", "FontData", "FontCharacter", "ColorMaterialInput", "ScalarMaterialInput", "VectorMaterialInput",
         "MaterialAttributesInput",
         "MovieSceneFloatChannel", "MovieSceneFrameRange", "MovieSceneEvaluationFieldEntityTree",
@@ -452,8 +455,10 @@ int32 FixedValueSize(const FPropertyDef& P)
 {
     const std::string& T = P.Type;
     if (T == "BoolProperty") return 1;
-    if (T == "IntProperty" || T == "FloatProperty" || T == "ObjectProperty" || T == "ClassProperty" || T == "InterfaceProperty")
+    if (T == "IntProperty" || T == "FloatProperty" || T == "ObjectProperty" || T == "ClassProperty" || T == "InterfaceProperty"
+        || T == "UInt32Property")
         return 4;
+    if (T == "UInt16Property") return 2;
     if (T == "Int64Property" || T == "DoubleProperty" || T == "EnumProperty" || T == "NameProperty") return 8;
     if (T == "ByteProperty") return P.StructName.empty() ? 1 : 8;
     if (T == "StructProperty") return NativeStructSize(P.StructName);
