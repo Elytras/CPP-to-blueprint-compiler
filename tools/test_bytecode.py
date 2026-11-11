@@ -2802,6 +2802,88 @@ opt_raw()
 opt_flags()
 
 
+# ---- TailCalls: a self-call that is a function's last act is a loop (REFERENCE.md, Tail calls)
+
+def entered(base, fn, self_vars=None, **parms):
+    """fn's value, and how many times a function of the mod was entered to get it: 1 when nothing was called."""
+    real, count = runscript.run, [0]
+
+    def counted(*a, **kw):
+        count[0] += 1
+        return real(*a, **kw)
+    runscript.run = counted     # a script call inside runscript.run looks the name up again
+    try:
+        return counted(base, fn, self_vars, **parms)[0], count[0]
+    finally:
+        runscript.run = real
+
+
+def tail_steps(n, acc):
+    while True:
+        if n % 3 == 0:
+            if n == 0: return acc
+            n, acc = n - 3, acc + 1
+        elif n % 3 == 1: n, acc = n - 1, acc + 10
+        else: n, acc = n - 2, acc + 100
+
+
+def tail_calls():
+    import math
+    base = asset('TailCalls')
+    tri = lambda n: n * (n + 1) // 2
+    # One frame however deep: 5000 steps of a call would be 5000 frames.
+    proves('tail-calls.return-sum-n-1-acc-n')
+    for fn in ('Sum', 'StaticSum'):
+        for n in (0, 1, 7, 5000):
+            assert entered(base, fn, N=n, Acc=3) == (3 + tri(n), 1), (fn, n, entered(base, fn, N=n, Acc=3))
+    assert entered(base, 'Count', N=4000, Acc=1) == (8001, 1), entered(base, 'Count', N=4000, Acc=1)
+    assert entered(base, 'UseStatic', N=5000) == (tri(5000), 1)
+    got, frames = entered(base, 'UseFree', N=5000)      # the library's function is called once, and loops
+    assert got == tri(5000) and frames <= 2, (got, frames)
+    for n in (0, 3, 4, 5, 3002):
+        assert entered(base, 'Steps', N=n, Acc=7) == (tail_steps(n, 7), 1), n
+    proves('tail-calls.fill-n-1')
+    for fn, n, want in (('Fill', 4, [4, 3, 2, 1]), ('Fill', 0, []), ('FillEarly', 5, [5, 3, 1, 0]), ('FillEarly', 0, [0])):
+        me = dict(Seen=[])
+        assert entered(base, fn, me, N=n) == (None, 1) and me['Seen'] == want, (fn, n, me)
+    proves('tail-calls.return-b-0-a-gcd', 'tail-calls.inline-int32-sum-int32-n')
+    for n in (0, 1, 30, 5000):
+        want = tri(n) + math.gcd(n, 36) * 1000000 + math.gcd(n, 48) * 10000000
+        assert entered(base, 'UseInline', N=n) == (want, 1), (n, entered(base, 'UseInline', N=n), want)
+    refused('TailInlMid', '  inline int32 Loop(int32 X) { if (X > 0) { Loop(X - 1); Seen += 1; } return X; }\n  int32 Seen;\n'
+            '  int32 F(int32 X) { return Loop(X); }\n', 'calls itself')
+    proves('tail-calls.int32-step-tarray-int32-mine')
+    for n in (0, 1, 6):
+        assert entered(base, 'Fresh', N=n, Acc=2) == (2 + tri(n), 1), n
+    proves('tail-calls.return-longest-s-ab-limits')
+    for n in (0, 1, 40):
+        me = dict(Kept='', Pad=0)
+        got, frames = entered(base, 'CallLongest', me, N=n)
+        assert got == (1 + 2 * n + 3) * 100 + 1 and me['Kept'] == 'x' and frames <= 2, (n, got, me, frames)
+    proves('tail-calls.collect-out-n-1')
+    for n in (0, 1, 30):
+        got, frames = entered(base, 'CallCollect', N=n)
+        assert got == n * 1000 + (1 if n else 0) and frames <= 2, (n, got, frames)
+    # Still calls, one frame a step, and right.
+    proves('tail-calls.return-n-factorial-n-1')
+    assert entered(base, 'Factorial', N=5) == (120, 5)
+    proves('tail-calls.halve-other-n-1')
+    me = dict(Calls=0)
+    got, frames = entered(base, 'CallHalve', me, V=40, N=3)
+    assert got == 20 and me['Calls'] == 3 and frames >= 3, (got, me, frames)
+    proves('tail-calls.for-return-down-n-1')
+    assert entered(base, 'Down', N=2) == (2, 1) and entered(base, 'Down', N=6) == (2, 5), entered(base, 'Down', N=6)
+    refused('TailInlLoop', '  inline int32 Down(int32 N) { for (int32 I = 0; I < N; ++I) if (I == 2) return Down(N - 1); return N; }\n'
+            '  int32 F(int32 N) { return Down(N); }\n', 'calls itself')
+    proves('tail-calls.return-sum-n-1-acc-n-2')
+    assert entered(os.path.join(os.path.dirname(base), 'TailOpen'), 'Sum', N=5, Acc=0) == (15, 6)
+    print('ok  TailCalls: a self-call that is the last act is a loop, in one frame however deep; one that is not, one a '
+          'subclass could replace, one under a loop or re-binding a reference stays a call')
+
+
+tail_calls()
+
+
 # ---- FinalTest
 
 def calls_in(base, fn):
@@ -16982,7 +17064,7 @@ ROW_REFUSALS = [
     ('lambdas-function.inline-fpairx-operator-fpairx-l', 'OpOver', '  FPairX F(FPairX A, FPairX B) { return A + B; }\n', 'unimplemented operator overload',
      'struct FPairX {\n  UE_STRUCT;\n  int32 A;\n  int32 B;\n};\ninline FPairX operator+(FPairX L, FPairX R) { return {L.A + R.A, L.B + R.B}; }\n'),
     ('math-and-utility.fmath-clamp-v-0-10', 'FMathUse', '  int32 F(int32 V) { return FMath::Clamp(V, 0, 10); }\n', "use of undeclared identifier 'FMath'", ''),
-    ('inline-functions.an-inline-function-that-calls', 'InlRec', '  inline int32 Loop(int32 X) { return X > 0 ? Loop(X - 1) : 0; }\n  int32 F(int32 X) { return Loop(X); }\n',
+    ('inline-functions.an-inline-function-that-calls', 'InlRec', '  inline int32 Loop(int32 X) { return X > 0 ? 1 + Loop(X - 1) : 0; }\n  int32 F(int32 X) { return Loop(X); }\n',
      'calls itself', ''),
     ('inline-functions.inline-int32-nope-int32-x', 'InlNoBody', '  inline int32 Nope(int32 X);\n  int32 F(int32 X) { return Nope(X); }\n', 'has no body', ''),
     ('inline-functions.other-twice-3', 'InlOther', '  inline int32 Twice(int32 X) { return X * 2; }\n  int32 F(InlOther *Other) { return Other->Twice(3); }\n',
@@ -17314,7 +17396,6 @@ def row_defaults():
 proves('soft-references.tsoftclassptr-aactor-kind-game-a', 'soft-references.tarray-tsoftclassptr-aactor',
        'container-variables.tarray-tsoftclassptr-aactor', 'struct-defaults.ffloatinterval-delay')
 row_defaults()
-
 
 
 # ---- Rows that said "refused" and are not: tests/RowStd.cpp. std::min is built into the source's function library, a

@@ -2229,7 +2229,7 @@ public:
   int32 N;
   int32 Bump(int32 By) { N += By; return N; }
   int32 Twice(int32 By) { return Bump(By) + Bump(By); }         // both copied in
-  int32 Fact(int32 V) { return V <= 1 ? 1 : V * Fact(V - 1); }  // stays a call
+  int32 Fact(int32 V) { return V <= 1 ? 1 : V * Fact(V - 1); }  // stays a call: not its last act
   [[gnu::noinline]] int32 Kept(int32 V) { return V + 1; }
   int32 UseKept(int32 V) { return Kept(V); }                    // stays a call
 };
@@ -2246,10 +2246,10 @@ Notes:
   [Calling engine and game functions](#calling-engine-and-game-functions)).
 - A Shipping build of the engine has no script recursion guard, so unbounded recursion overflows the native stack and
   crashes the game.
-- Recursion through `inline` functions is refused; see
+- Recursion through `inline` functions is refused, a [tail call](#tail-calls) aside; see
   [Inline functions and templates](#inline-functions-and-templates).
-- A function is never copied into itself, so a recursive call stays a call. In mutual recursion one copy is made, and
-  its call back stays a call.
+- A function is never copied into itself, so a recursive call stays a call, unless it is the function's last act
+  ([Tail calls](#tail-calls)). In mutual recursion one copy is made, and its call back stays a call.
 - These are never copied in: a function that waits (Delay, UE_AWAIT) or contains a goto; an RPC, an authority-only or
   cosmetic function; an override of an engine function; UE_NO_OPTIMIZE on the function or on the caller; a class
   another mod cooks (UE_CLASS); a function whose body calls a parent's function that is not copied in, such as
@@ -2264,6 +2264,45 @@ Notes:
   own WorldContextObject parameter, as it would in the static's own function. A static without that parameter gets
   the caller's context instead of the class default object, so such a call works in the copy where the function's own
   would find no world.
+
+### Tail calls
+
+A function whose last act is to call itself does not call: the arguments become the parameters' new values and the
+body starts again, a loop. No frame is made per step, so how deep the recursion goes no longer depends on the native
+stack, which a Shipping build does not guard.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="tail-calls.return-sum-n-1-acc-n"></a>`return Sum(N - 1, Acc + N);` inside `Sum`, in a `final` class, a `final` method, a static or a free function | A jump back to the top of the body. Every argument is evaluated first, each from the parameters as they were, then the parameters take them: `return Gcd(B, A % B);` swaps. Nothing about the function changes for its other callers. | Yes |
+| <a id="tail-calls.fill-n-1"></a>`Fill(N - 1);` as the last statement of a void function, or right before a bare `return;` | The same. The call may sit under `if` / `else`, a block, or a `switch`. | Yes |
+| <a id="tail-calls.return-b-0-a-gcd"></a>`return B == 0 ? A : Gcd(B, A % B);` | The same: a `?:` whose arm is the call is read as `if (B == 0) return A; return Gcd(B, A % B);`. | Yes |
+| <a id="tail-calls.inline-int32-sum-int32-n"></a>`inline int32 Sum(int32 N, int32 Acc) { ...; return Sum(N - 1, Acc + N); }` | An inline function, a member template or a free inline function may call itself this way: once the call is a loop there is nothing left to expand. Any other self-call in one is refused, as before. | Yes |
+| <a id="tail-calls.int32-step-tarray-int32-mine"></a>`int32 Step; TArray<int32> Mine;` declared in such a body | Start as zero and empty on every round, as each call's did. | Yes |
+| <a id="tail-calls.return-longest-s-ab-limits"></a>`return Longest(S + "ab", Limits, N - 1);` where `S` is a `const FString&` | A const reference parameter that gets another value is read through a local, which starts as a copy of it; the caller's variable is never written. One handed on as it came (`Limits`) stays the caller's variable, with no copy. | Yes |
+| <a id="tail-calls.collect-out-n-1"></a>`Collect(Out, N - 1);` where `Out` is a `TArray<int32>&` | A `T&` parameter handed on as it came is the same variable on every round. | Yes |
+| <a id="tail-calls.halve-other-n-1"></a>`Halve(Other, N - 1);` where the parameter is `int32&` and `Other` is another variable | Stays a call: a reference is bound once, and a loop cannot bind it again. | Yes |
+| <a id="tail-calls.return-n-factorial-n-1"></a>`return N * Factorial(N - 1);` | Stays a call: the multiplication comes after it. | Yes |
+| <a id="tail-calls.for-return-down-n-1"></a>`for (...) if (...) return Down(N - 1);` | Stays a call under a loop of the body, though it is a tail call. In an inline function it is refused (`calls itself`). | Not yet |
+| <a id="tail-calls.return-sum-n-1-acc-n-2"></a>`return Sum(N - 1, Acc + N);` in a class a subclass may follow, without `final` | Stays a call by name: a subclass's `Sum` must run when the object is one. | Yes |
+
+```cpp
+class Counter final : public AActor {
+public:
+  int32 Sum(int32 N, int32 Acc) {
+    if (N <= 0)
+      return Acc;
+    return Sum(N - 1, Acc + N);   // Acc += N; N -= 1; back to the top
+  }
+};
+```
+
+Notes:
+
+- Also left a call: in an RPC, an authority-only or cosmetic function and an override of an engine function, which
+  the engine routes; in a function that waits (Delay, UE_AWAIT) or contains a goto; under UE_NO_OPTIMIZE; and, when a
+  `const T&` parameter gets another value, in a body that holds a lambda.
+- `Peer->Sum(...)` and `Base::Sum(...)` are calls to another object's or another class's function, never a loop.
+- General recursion, a call that is not the last act, keeps one frame per step.
 
 ### Parameters and return values
 
@@ -2803,7 +2842,7 @@ rule to remember: an inline method expands only on `this`. For a helper that tak
 | <a id="inline-functions.static-inline-int32-addone-int32"></a>`static inline int32 AddOne(int32 V)` in a library class | Expanded at the call, from its own class or from any class that includes the header, in any mod. The library does not export it. | Yes |
 | <a id="inline-functions.bump-by"></a>`Bump(By)` inside an inline body or a member template that a subclass expands | A call on `this` goes by name, so the object's most derived method runs, including an override compiled later or one in a class between. | Yes |
 | <a id="inline-functions.other-twice-3"></a>`Other->Twice(3)` where `Twice` is an inline method | Refused: `called on another object (only this)`, because `this` in the body stays the caller's self. Make the method non-inline, or write a free function that takes the object. | Not yet |
-| <a id="inline-functions.an-inline-function-that-calls"></a>An inline function that calls itself, directly or through another inline | Refused (`calls itself`): the expansion would never end. Make it non-inline; a Blueprint function may recurse. One overload calling another is fine. | Refused |
+| <a id="inline-functions.an-inline-function-that-calls"></a>An inline function that calls itself, directly or through another inline, anywhere but as its last act (`return 1 + Loop(X - 1);`) | Refused (`calls itself`): the expansion would never end. Make it non-inline; a Blueprint function may recurse. One overload calling another is fine, and so is a [tail call](#tail-calls), which is a loop. | Refused |
 | <a id="inline-functions.inline-int32-nope-int32-x"></a>`inline int32 Nope(int32 X);` with no body | Refused at the call (`has no body`). clang also warns with `-Wundefined-inline`. | Refused |
 | <a id="inline-functions.onhit-add-this-amine-handle"></a>`OnHit.Add(this, &AMine::Handle)` where `Handle` is inline | Refused: a delegate binds a function by name, and an inline function is none. Drop `inline`; see [Event dispatchers](#event-dispatchers). | Refused |
 | <a id="inline-functions.static-int32-count-0"></a>`static int32 Count = 0;` inside an inline function | Refused: each expansion would keep its own. Use a member variable; see [Latent calls](#latent-calls). | Refused |
@@ -6888,8 +6927,9 @@ and where the feature is described. In each group, the messages you are most lik
   an ancestor's static of the same signature. Each call runs the one it names, as in C++; the editor would refuse the
   name. Fix: rename one of them to make no Blueprint the editor could not.
 - `inline function <Class>::<Method> calls itself`: recursion through inline functions, direct or through another
-  inline function. Each call copies the body in, so the copying never ends. One overload calling another is fine. Fix:
-  drop `inline`, because a Blueprint function can call itself, or write a loop. See
+  inline function. Each call copies the body in, so the copying never ends. One overload calling another is fine, and
+  so is a self-call that is the function's last act, which becomes a loop ([Tail calls](#tail-calls)). Fix: drop
+  `inline`, because a Blueprint function can call itself, or write a loop. See
   [Inline functions and templates](#inline-functions-and-templates).
 - `inline function <Class>::<Method> has no body`: an inline function declared and never defined,
   `inline int32 Nope(int32 X);`. clang warns about it too. Fix: define it in the source or in a header the source

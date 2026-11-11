@@ -2268,6 +2268,9 @@ private:
     bool ListsDefaultRootOf(const FRecord& R) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                       FCallIR& Out, std::string* Err, const Json* Receiver = nullptr, bool bStaticCall = false);
+    /* Def's body with each self-call in tail position turned into a jump back to its top, or false when it has none
+       that can be. See the definition. */
+    bool TailCallsToLoop(const Json& Def, const Json& Body, Json* Out);
     /* `final`: the class holding the version of Method a call by name reaches on every object of class Of or below,
        the nearest declaration from Of up that is a Blueprint function, when no subclass can bring its own: Of is
        final, or that declaration is. Null when one could. */
@@ -14394,6 +14397,252 @@ bool FCompiler::ResolveLambda(const Json& Operand, FBlueprintClass& BP, std::vec
     return true;
 }
 
+/*
+A self-call in tail position is a jump back to the top of the body (REFERENCE.md#tail-calls). The body is wrapped in
+`while (true) { ...; break; }`, and `return F(A, B);` - or `F(A, B);` where a void function ends, or right before a bare
+`return;` - becomes
+    T0 __Upd0__ = A;  T1 __Upd1__ = B;      every argument first: each may read any parameter
+    P0 = __Upd0__;    P1 = __Upd1__;
+    continue;
+so the loop is an ordinary one to everything after: a local the body declares starts fresh each round, as each call's
+did. A shipping build compiles the VM's recursion guard out (DO_BLUEPRINT_GUARD, CoreMisc.h 265), so depth that comes
+from data ends in a native stack overflow; and an inline function has no self-call left to refuse.
+
+Only a call that always runs this body: an inline function's, a static's, or on `this` to a function no subclass can
+replace (FinalOwner) that the engine does not route (an RPC, authority only, cosmetic). Left a call: one under a loop of
+the body, whose `continue` would be that loop's; one that passes a `T&` parameter anything but the parameter itself,
+since a reference is bound once; any in a function that waits (its locals are the ubergraph frame's, one set per
+object) or holds a goto. A `const T&` parameter that gets another value is read through a local, which starts as a
+copy of it: the parameter may be the caller's own variable, never to be written.
+*/
+bool FCompiler::TailCallsToLoop(const Json& Def, const Json& Body, Json* Out)
+{
+    const std::string DefId = Def.value("id", std::string()), PrevId = Def.value("previousDecl", std::string());
+    if (bCurNoOpt || IsNoOptDecl(Def) || LambdaOps.count(DefId)) return false;
+    auto IsSelf = [&](const Json& Call) {
+        const std::string K = Kind(Call);
+        const Json* Callee = K == "CallExpr" || K == "CXXMemberCallExpr" ? Strip(First(Call)) : nullptr;
+        if (!Callee) return false;
+        std::string Id;
+        if (K == "CXXMemberCallExpr")
+        {
+            const Json* Obj = Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
+            if (Obj && Kind(*Obj) == "CXXThisExpr") Id = Callee->value("referencedMemberDecl", std::string());
+        }
+        else if (Kind(*Callee) == "DeclRefExpr" && Callee->contains("referencedDecl"))
+            Id = (*Callee)["referencedDecl"].value("id", std::string());
+        if (Id.empty()) return false;
+        if (Id == DefId || Id == PrevId) return true;
+        if (auto F = FreeInlines.find(Id); F != FreeInlines.end()) return F->second == &Def;
+        if (auto T = MemberTemplates.find(Id); T != MemberTemplates.end()) return T->second == &Def;
+        if (auto F = FreeFns.find(Id); F != FreeFns.end()) return F->second.Def == &Def;
+        if (auto O = MethodOwner.find(Id); O != MethodOwner.end())
+            if (const FRecord* R = Find(O->second))
+                if (auto I = R->Inlines.find(Id); I != R->Inlines.end()) return I->second == &Def;
+        return false;
+    };
+    /* Most bodies stop here. */
+    std::function<bool(const Json&)> CallsSelf = [&](const Json& N) {
+        bool bFound = IsSelf(N);
+        ForEach(N, [&](const Json& C) { bFound = bFound || CallsSelf(C); });
+        return bFound;
+    };
+    if (!CallsSelf(Body)) return false;
+    /* N under what clang wraps a whole expression in, and a copy of a value to its own type; never a conversion, whose
+       result is not what it converts. bRead: under the read of a variable too. */
+    auto Peel = [](const Json* N, bool bRead) {
+        for (;;)
+        {
+            const std::string K = Kind(*N), Cast = N->value("castKind", std::string());
+            const Json* In = First(*N);
+            const bool bWrap = K == "ParenExpr" || K == "ExprWithCleanups" || K == "CXXBindTemporaryExpr" || K == "MaterializeTemporaryExpr"
+                            || (K == "ImplicitCastExpr" && (Cast == "NoOp" || (bRead && Cast == "LValueToRValue")))
+                            || (K == "CXXConstructExpr" && In && (*N)["inner"].size() == 1
+                                && StripTypeKeywords(TypeOf(*N)) == StripTypeKeywords(TypeOf(*In)));
+            if (!bWrap || !In) return N;
+            N = In;
+        }
+    };
+    /* The self-call a statement or a returned value is. */
+    auto SelfCallIn = [&](const Json& S) -> const Json* {
+        const Json* N = Peel(&S, false);
+        return IsSelf(*N) ? N : nullptr;
+    };
+    /* Not the world context FreeLibrary gives a free function: no call passes it, and it stays what it was. */
+    std::vector<const Json*> Parms;
+    ForEach(Def, [&](const Json& C) { if (Kind(C) == "ParmVarDecl" && !C.value("isImplicit", false)) Parms.push_back(&C); });
+    auto ArgsOf = [&](const Json& Call) {
+        std::vector<const Json*> Args;
+        bool bFirst = true;
+        ForEach(Call, [&](const Json& C) { if (bFirst) bFirst = false; else Args.push_back(&C); });
+        return Args;
+    };
+    /* Whether argument A hands parameter I on as it came: the parameter itself (Named: the declaration its reads name),
+       or a world context left to its default, which is the caller's (ExpandInline, LowerCall). */
+    auto PassesOn = [&](const Json& A, size_t I, const std::string& Named) {
+        if (Kind(A) == "CXXDefaultArgExpr" && IsWcoName(Name(*Parms[I]))) return true;
+        const Json* N = Peel(&A, true);
+        return Kind(*N) == "DeclRefExpr" && N->contains("referencedDecl") && (*N)["referencedDecl"].value("id", std::string()) == Named;
+    };
+
+    std::string RetType = ReturnPartOf(Def["type"].value("qualType", std::string()));
+    while (!RetType.empty() && RetType.back() == ' ') RetType.pop_back();
+    const bool bVoid = StripTypeKeywords(RetType) == "void";
+    /* Each site by its path from Body, an index into `inner` per level: the same path finds it in the copy. */
+    std::vector<std::vector<size_t>> Sites;
+    std::vector<bool> Shadowed(Parms.size());
+    std::vector<size_t> Path;
+    auto Site = [&](const Json* Call) {
+        if (!Call) return;
+        const std::vector<const Json*> Args = ArgsOf(*Call);
+        if (Args.size() != Parms.size()) return;
+        std::vector<bool> Shadows(Parms.size());
+        for (size_t I = 0; I < Parms.size(); ++I)
+        {
+            const std::string T = TypeOf(*Parms[I]);
+            if (PassesOn(*Args[I], I, Parms[I]->value("id", std::string()))) continue;
+            if (IsMutableRef(T) || IsClosureType(T) || IsClosureType(TypeOf(*Args[I]))) return;
+            Shadows[I] = !T.empty() && T.back() == '&';
+        }
+        for (size_t I = 0; I < Parms.size(); ++I) Shadowed[I] = Shadowed[I] || Shadows[I];
+        Sites.push_back(Path);
+    };
+    std::function<void(const Json&, bool)> Walk = [&](const Json& S, bool bTail) {
+        const std::string K = Kind(S);
+        const size_t N = S.contains("inner") ? S["inner"].size() : 0;
+        auto Kid = [&](size_t I, bool bKidTail) { Path.push_back(I); Walk(S["inner"][I], bKidTail); Path.pop_back(); };
+        if (K == "CompoundStmt")
+            for (size_t I = 0; I < N; ++I)
+            {
+                const Json* Next = I + 1 < N ? &S["inner"][I + 1] : nullptr;
+                Kid(I, Next ? Kind(*Next) == "ReturnStmt" && !First(*Next) : bTail);
+            }
+        else if (K == "IfStmt")     // [init, variable,] condition, then, else
+            for (size_t I = (S.value("hasInit", false) ? 1 : 0) + (S.value("hasVar", false) ? 1 : 0) + 1; I < N; ++I) Kid(I, bTail);
+        else if (K == "SwitchStmt") { if (N) Kid(N - 1, false); }   // the end of its body leaves the switch only
+        else if (K == "CaseStmt" || K == "DefaultStmt" || K == "LabelStmt" || K == "AttributedStmt") { if (N) Kid(N - 1, bTail); }
+        else if (K == "ReturnStmt") { if (const Json* V = First(S)) Site(SelfCallIn(*V)); }
+        else if (bTail && bVoid) Site(SelfCallIn(S));
+        /* ponytail: a loop's body is not walked. A goto would reach the top from there, and turns the optimizer off
+           for the function (bFnHasGoto); a labelled continue when a mod has the shape. */
+    };
+    /* `return C ? X : Y;` with a self-call for X or Y is `if (C) return X; else return Y;`. */
+    Json Loop = Body;
+    std::function<bool(const Json&)> IsArm = [&](const Json& A) {
+        const Json* P = Peel(&A, false);
+        return IsSelf(*P) || (Kind(*P) == "ConditionalOperator" && Nth(*P, 2) && (IsArm(*Nth(*P, 1)) || IsArm(*Nth(*P, 2))));
+    };
+    std::function<void(Json&)> Split = [&](Json& S) {
+        const std::string K = Kind(S);
+        if (K == "ReturnStmt" && First(S))
+        {
+            const Json* V = Peel(First(S), false);
+            if (Kind(*V) != "ConditionalOperator" || !IsArm(*V)) return;
+            auto Returns = [&](const Json& X) { Json R = S; R["inner"] = Json::array({ X }); return R; };
+            Json If = { {"kind", "IfStmt"}, {"inner", Json::array({ *Nth(*V, 0), Returns(*Nth(*V, 1)), Returns(*Nth(*V, 2)) })} };
+            S = std::move(If);
+        }
+        else if (K != "CompoundStmt" && K != "IfStmt" && K != "SwitchStmt" && K != "CaseStmt" && K != "DefaultStmt"
+                 && K != "LabelStmt" && K != "AttributedStmt")
+            return;
+        if (S.contains("inner")) for (Json& C : S["inner"]) Split(C);
+    };
+    Split(Loop);
+    Walk(Loop, true);
+    if (Sites.empty()) return false;
+
+    /* Whether a self-call always runs Def. */
+    const FRecord* R = nullptr;
+    std::string Method;
+    bool bInline = FreeInlines.count(DefId) || MemberTemplates.count(DefId);
+    if (auto F = FreeFns.find(DefId); F != FreeFns.end()) { R = &FreeLib; Method = Flatten(F->second.Qual); }
+    else if (auto O = MethodOwner.find(DefId); O != MethodOwner.end()) { R = Find(O->second); Method = Name(Def); }
+    else if (auto O = MethodOwner.find(PrevId); O != MethodOwner.end()) { R = Find(O->second); Method = Name(Def); }
+    bInline = bInline || (R && (R->Inlines.count(DefId) || R->Inlines.count(PrevId)));
+    if (!bInline)
+    {
+        if (!R) return false;
+        const auto M = R->Methods.find(Method);
+        if (M == R->Methods.end()) return false;
+        /* A free function is a static of the source's library, whatever its declaration says. */
+        if (R != &FreeLib && !IsStaticDecl(*M->second) && (!Cur || FinalOwner(Cur, Method) != R)) return false;
+        for (const FRecord* A = R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            auto AM = A->Methods.find(Method);
+            if (AM == A->Methods.end()) continue;
+            if (A->IsNative() || NetFlagsOf(*AM->second) || AccessFlagsOf(*AM->second)) return false;
+            if (auto D = A->MethodDefs.find(Method); D != A->MethodDefs.end() && (NetFlagsOf(*D->second) || AccessFlagsOf(*D->second)))
+                return false;
+        }
+    }
+    std::set<const Json*> Seen;
+    if (HasGoto(Body) || ResumesLater(Body, Seen)) return false;
+    /* ponytail: a lambda's capture names the parameter by its declaration, which the local below is not. */
+    const bool bShadows = std::find(Shadowed.begin(), Shadowed.end(), true) != Shadowed.end();
+    std::function<bool(const Json&)> HasLambda = [&](const Json& N) {
+        bool bFound = Kind(N) == "LambdaExpr";
+        ForEach(N, [&](const Json& C) { bFound = bFound || HasLambda(C); });
+        return bFound;
+    };
+    if (bShadows && HasLambda(Body)) return false;
+
+    /* What the body names each parameter by: itself, or the local read in a const reference's place. */
+    struct FTarget { Json Decl; std::string Type; };
+    std::vector<FTarget> Targets(Parms.size());
+    Json Top = Json::array();
+    for (size_t I = 0; I < Parms.size(); ++I)
+    {
+        const Json& P = *Parms[I];
+        std::string T = TypeOf(P);
+        while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+        T = StripTypeKeywords(T);
+        const std::string Id = P.value("id", std::string());
+        const Json OfParm = { {"id", Id}, {"kind", "ParmVarDecl"}, {"name", Name(P)}, {"type", P.value("type", Json::object())} };
+        Targets[I] = { OfParm, T };
+        if (!Shadowed[I]) continue;
+        const Json Type = { {"qualType", T} };
+        const std::string LocalId = "tail:" + Id, Local = "__Tail_" + Name(P);
+        const Json Read = ReadOf({ {"kind", "DeclRefExpr"}, {"type", Type}, {"valueCategory", "lvalue"}, {"referencedDecl", OfParm} });
+        Top.push_back({ {"kind", "DeclStmt"}, {"inner", Json::array({
+            { {"kind", "VarDecl"}, {"id", LocalId}, {"name", Local}, {"type", Type}, {"init", "c"}, {"inner", Json::array({ Read })} } })} });
+        Targets[I].Decl = { {"id", LocalId}, {"kind", "VarDecl"}, {"name", Local}, {"type", Type} };
+        std::function<void(Json&)> Rename = [&](Json& N) {
+            if (!N.is_structured()) return;
+            if (N.is_object())
+                if (const auto Ref = N.find("referencedDecl"); Ref != N.end() && Ref->is_object() && Ref->value("id", std::string()) == Id)
+                    *Ref = Targets[I].Decl;
+            for (Json& C : N) Rename(C);
+        };
+        Rename(Loop);
+    }
+    for (const std::vector<size_t>& Where : Sites)
+    {
+        Json* At = &Loop;
+        for (size_t I : Where) At = &(*At)["inner"][I];
+        const Json* Call = SelfCallIn(Kind(*At) == "ReturnStmt" ? *First(*At) : *At);
+        const std::vector<const Json*> Args = ArgsOf(*Call);
+        Json Seq = Json::array(), Sets = Json::array();
+        for (size_t I = 0; I < Parms.size(); ++I)
+        {
+            const std::string Named = Targets[I].Decl.value("id", std::string());
+            if (PassesOn(*Args[I], I, Named)) continue;
+            const Json To = { {"kind", "DeclRefExpr"}, {"type", { {"qualType", Targets[I].Type} }}, {"valueCategory", "lvalue"},
+                              {"referencedDecl", Targets[I].Decl} };
+            Sets.push_back(AssignOf(To, SynthLocal(Targets[I].Type, *DefaultedArg(*Args[I], Parms[I]), Seq)));
+        }
+        for (Json& S : Sets) Seq.push_back(std::move(S));
+        Seq.push_back(Json{ {"kind", "ContinueStmt"} });
+        *At = Json{ {"kind", "CompoundStmt"}, {"inner", std::move(Seq)} };
+    }
+    Json Round = Loop.contains("inner") ? Loop["inner"] : Json::array();
+    Round.push_back(Json{ {"kind", "BreakStmt"} });
+    const Json True = { {"kind", "CXXBoolLiteralExpr"}, {"type", { {"qualType", "bool"} }}, {"value", true} };
+    Top.push_back({ {"kind", "WhileStmt"},
+                    {"inner", Json::array({ True, Json{ {"kind", "CompoundStmt"}, {"inner", std::move(Round)} } })} });
+    *Out = { {"kind", "CompoundStmt"}, {"inner", std::move(Top)} };
+    return true;
+}
+
 /* The call becomes one Block statement in Out.Inline:
        <each by-value parameter> = <its argument>;
        <the body, locals renamed __Inl<N>_<name>, `return X` as `__Inl<N>_ReturnValue = X` + a jump to the end>
@@ -14431,6 +14680,17 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     const Json* Body = nullptr;
     ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
     if (!Body) { *Err = "inline function " + Method + " has no body"; return false; }
+    /* Its tail self-calls as a loop. ReadDef is Def with that body, for what reads how the body uses a parameter;
+       Def itself stays the expansion's identity (InlineStack). */
+    Json LoopBody, LoopDef;
+    const Json* ReadDef = &Def;
+    if (TailCallsToLoop(Def, *Body, &LoopBody))
+    {
+        LoopDef = Def;
+        for (Json& C : LoopDef["inner"]) if (Kind(C) == "CompoundStmt") C = LoopBody;
+        ReadDef = &LoopDef;
+        Body = &LoopBody;
+    }
 
     const std::string Prefix = "__Inl" + std::to_string(ReadTmpCounter++) + "_";
     std::vector<FPropertyDef>& Locals = *CurLocals;
@@ -14720,7 +14980,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
 
     /* A return that is the body's last statement already falls through to the end. */
     if (!B.Body->empty() && B.Body->back().K == FStmtIR::InlineReturn) B.Body->pop_back();
-    ArgumentsInPlace(*B.Body, Binds, Def, BindIds, Locals);
+    ArgumentsInPlace(*B.Body, Binds, *ReadDef, BindIds, Locals);
     Out.Intrinsic = "__Inline__";
     Out.Inline = Block;
     return true;
@@ -23125,8 +23385,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                       : (!RetType.empty() && RetType != "void") || bWritableRef
                           ? "a function that resumes later returns nothing and takes no non-const reference parameters"
                       : "";
-        Json SlicedBody;
+        Json SlicedBody, LoopBody;
         const Json* BodyNode = Fn.Body;
+        if (BodyNode && TailCallsToLoop(M, *BodyNode, &LoopBody)) CurFnBody = BodyNode = &LoopBody;
         if (BodyNode)
         {
             const int Sliced = SliceStructCopies(*BodyNode, &SlicedBody, Err);
