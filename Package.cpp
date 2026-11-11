@@ -251,11 +251,28 @@ void StructArray(FArc& V, const std::string& Name, const std::string& StructName
    a class or weak property too, and FSoftObjectProperty's is SoftObjectProperty for a soft class (4.27
    PropertyBaseObject.cpp, PropertySoftObjectPtr.cpp). A tag naming the class instead is skipped at load as a type
    mismatch, value and all. A container's inner types are GetID()s the same way. */
-static std::string TagId(const std::string& Type)
+std::string TagId(const std::string& Type)
 {
     if (Type == "ClassProperty" || Type == "WeakObjectProperty") return "ObjectProperty";
     if (Type == "SoftClassProperty") return "SoftObjectProperty";
     return Type;
+}
+
+void TagTree(FArc& Ar, const std::string& Name, const FTypeTree& Type,
+             const std::function<void(FArc&)>& Value, int32 ArrayIndex)
+{
+    FArc Scratch(Ar.Owner());
+    Value(Scratch);
+    Ar.Name(Name);
+    const std::function<void(const FTypeTree&)> Node = [&](const FTypeTree& T) {
+        TypeNode(Ar, T.Name, int32(T.Kids.size()));
+        for (const FTypeTree& Kid : T.Kids) Node(Kid);
+    };
+    Node(Type);
+    Ar.I32(int32(Scratch.B.size()));
+    Ar.U8(ArrayIndex ? kTagHasArrayIndex : 0);
+    if (ArrayIndex) Ar.I32(ArrayIndex);
+    Ar.Append(Scratch);
 }
 
 void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
@@ -266,26 +283,20 @@ void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
 
     if (IsUE5())
     {
-        Ar.Name(Name);
         const std::string Id = TagId(Type);
+        FTypeTree Tree{ Id, {} };
         if (Type == "StructProperty" || ((Type == "ByteProperty" || Type == "EnumProperty") && !StructName.empty()
                                          && StructName != "None"))
-        { TypeNode(Ar, Id, 1); TypeNode(Ar, StructName, 0); }
+            Tree.Kids.push_back({ StructName, {} });
         else if (Type == "ArrayProperty" || Type == "SetProperty")
-        { TypeNode(Ar, Id, 1); TypeNode(Ar, TagId(StructName), 0); }
+            Tree.Kids.push_back({ TagId(StructName), {} });
         else if (Type == "MapProperty")
         {
             const size_t Comma = StructName.find(',');
-            TypeNode(Ar, Id, 2);
-            TypeNode(Ar, TagId(StructName.substr(0, Comma)), 0);
-            TypeNode(Ar, TagId(StructName.substr(Comma + 1)), 0);
+            Tree.Kids.push_back({ TagId(StructName.substr(0, Comma)), {} });
+            Tree.Kids.push_back({ TagId(StructName.substr(Comma + 1)), {} });
         }
-        else
-            TypeNode(Ar, Id, 0);
-        Ar.I32(int32(Scratch.B.size()));
-        Ar.U8(ArrayIndex ? kTagHasArrayIndex : 0);
-        if (ArrayIndex) Ar.I32(ArrayIndex);
-        Ar.Append(Scratch);
+        TagTree(Ar, Name, Tree, Value, ArrayIndex);
         return;
     }
     Ar.Name(Name);

@@ -22229,7 +22229,13 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             auto Pair = [&](const std::string& N, const std::string& Path) -> std::optional<FPropertyDef> {
                 const auto X = S.Layout.find(Path + ".X"), Y = S.Layout.find(Path + ".Y");
                 if (X == S.Layout.end() || Y == S.Layout.end()) return std::nullopt;     // the setters set both
-                return Struct(N, "Vector2D", { Float("X", X->second), Float("Y", Y->second) });
+                /* UE5's FVector2D is two doubles (LWC), written raw into the 16 bytes the loader reads. */
+                auto Part = [&](const char* Axis, double V) {
+                    FPropertyDef P = Float(Axis, V);
+                    if (IsUE5()) P.Type = "DoubleProperty";
+                    return P;
+                };
+                return Struct(N, "Vector2D", { Part("X", X->second), Part("Y", Y->second) });
             };
             std::vector<FPropertyDef> Data, Offsets, Anchors;
             for (const char* Side : { "Left", "Top", "Right", "Bottom" })

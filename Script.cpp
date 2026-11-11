@@ -337,7 +337,25 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         else if (P.Type == "DelegateProperty")      // FScriptDelegate: the object, the function's name (ScriptDelegates.h
         { V.Idx(Null()); V.Name("None"); }           // 138-142); a default is unbound, as a bound one is refused
         else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty")    // FSoftObjectPath: AssetPathName, SubPathString
-        { V.Name(D.K == FDefaultValue::Str && !D.S.empty() ? D.S : std::string("None")); V.I32(0); }
+        {
+            const std::string Path = D.K == FDefaultValue::Str && !D.S.empty() ? D.S : std::string("None");
+            if (!IsUE5()) { V.Name(Path); V.I32(0); }
+            else
+            {
+                /* 5.6 (FSOFTOBJECTPATH_REMOVE_ASSET_PATH_FNAMES): an FTopLevelAssetPath, the package and the asset as two
+                   FNames, then the SubPathString: `/Game/A/B.B:Sub` is `/Game/A/B`, `B`, `Sub`; a path with no `.` names
+                   the asset by its package's last segment; none is `None`, `None`, empty. */
+                const size_t Colon = Path.find(':');
+                const std::string Top = Path.substr(0, Colon);
+                size_t Dot = Top.find('.');
+                const bool bPath = Path != "None";
+                const std::string Package = !bPath ? Path : Top.substr(0, Dot);
+                const std::string Asset = !bPath ? Path : Dot != std::string::npos ? Top.substr(Dot + 1) : Top.substr(Top.rfind('/') + 1);
+                V.Name(Package);
+                V.Name(Asset);
+                WriteFStringValue(V, Colon == std::string::npos ? std::string() : Path.substr(Colon + 1));
+            }
+        }
         else if (P.Type == "SetProperty" || P.Type == "MapProperty")
         {
             /* The removed elements (a map's keys), then the count and the elements; a map's Items alternate key, value.
@@ -359,7 +377,7 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
                Its Size is the elements' byte count, so they are measured first. */
             FArc Elements(V.Owner());
             if (P.Inner) for (const FDefaultValue& Item : D.Items) WriteValue(Elements, *P.Inner, Item);
-            if (P.Inner && P.Inner->Type == "StructProperty")
+            if (P.Inner && P.Inner->Type == "StructProperty" && !IsUE5())      // 5.6 has no inner tag: the type tree names the struct
             {
                 V.Name(P.Name); V.Name("StructProperty"); V.I32(int32(Elements.B.size())); V.I32(0);
                 V.Name(P.Inner->StructName);
@@ -396,20 +414,37 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
     }
 }
 
-void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P)
+/* UE5: P's type as a tag carries it (PROPERTY_TAG_COMPLETE_TYPE_NAME): its GetID, then a struct's or an enum's name, an
+   array's or set's element tree, a map's key and value trees. */
+FTypeTree TypeTreeOf(const FPropertyDef& P)
+{
+    FTypeTree T{ TagId(P.Type), {} };
+    if (P.Type == "StructProperty" || ((P.Type == "ByteProperty" || P.Type == "EnumProperty") && !P.StructName.empty()
+                                       && P.StructName != "None"))
+        T.Kids.push_back({ P.StructName, {} });
+    else if (P.Type == "ArrayProperty" || P.Type == "SetProperty" || P.Type == "MapProperty")
+        for (const std::shared_ptr<FPropertyDef>& Element : { P.Inner, P.Value })
+            if (Element) T.Kids.push_back(TypeTreeOf(*Element));
+    return T;
+}
+
+/* P's default as a tag: UE5 names a container's element types in full (a struct, an enum), 4.27's tag only their classes. */
+void WriteTag(FArc& Ar, const FPropertyDef& P)
 {
     const FDefaultValue& D = P.Default;
     if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
+    if (IsUE5() && P.Inner && (P.Type == "ArrayProperty" || P.Type == "SetProperty" || P.Type == "MapProperty"))
+    {
+        TagTree(Ar, P.Name, TypeTreeOf(P), [&](FArc& V) { WriteValue(V, P, D); }, P.ArrayIndex);
+        return;
+    }
     Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName, P.ArrayIndex);
 }
+
+void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P) { WriteTag(Ar, P); }
 }   // namespace
 
-void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
-{
-    const FDefaultValue& D = P.Default;
-    if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
-    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName, P.ArrayIndex);
-}
+void WriteDefaultTag(FArc& Ar, const FPropertyDef& P) { WriteTag(Ar, P); }
 
 void WriteDefaultValue(FArc& Ar, const FPropertyDef& P)
 {
