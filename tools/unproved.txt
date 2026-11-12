@@ -44,7 +44,6 @@ struct-conversions.fvector-v-flat
 struct-copies.weights-find-key-out
 mod-structs-ue.ue-struct-in-game-mymods
 container-variables.tmap-aplayercharacter-int32
-arithmetic.hits-shots
 evaluation-order.bump-100-bumpinline
 conditions.target-target-customtimedilation
 reference-locals.int32-r-other-score

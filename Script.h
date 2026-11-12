@@ -39,6 +39,10 @@ struct FDefaultValue
     std::vector<FDefaultValue> Items;   // Array (also a set / map): one value per element, typed by the property's Inner; a map alternates key, value
     std::shared_ptr<std::vector<struct FPropertyDef>> Members;  // Struct, as a container's element: its own members (a lone struct's are FPropertyDef::Members)
     std::vector<FDefaultValue> Removed; // a set / map read over the parent's value: its elements (a map's keys) taken out first
+    /* TextProperty only: -1 a culture-invariant literal (S, or none). 0 a localized text: S the source string, Items[0] its
+       namespace and Items[1] its key (as S), I its flags. 11 a string table entry: Items[0] the table id (a name, as S),
+       Items[1] the key, I its flags. */
+    int8 TextHistory = -1;
 };
 
 /* One ChildProperties entry. ElementSize must equal the type's runtime size; the engine lays the struct out from it. */

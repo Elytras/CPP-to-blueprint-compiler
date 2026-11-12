@@ -28,4 +28,10 @@ public:
         UPlayMontageCallbackProxy::CreateProxyObjectForPlayMontage(Mesh, Montage, 1.0f, 0.0f, FName());
     Proxy->OnCompleted.Add(this, &ProxyLocalHeld::Done);
   }
+
+  /* The proxy made in the middle of the statement: no local of the source holds it, so the compiler makes one. */
+  void PlayChained() {
+    UPlayMontageCallbackProxy::CreateProxyObjectForPlayMontage(Mesh, Montage, 1.0f, 0.0f, FName())
+        ->OnCompleted.Add(this, &ProxyLocalHeld::Done);
+  }
 };

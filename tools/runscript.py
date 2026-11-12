@@ -378,12 +378,15 @@ def native_refs(n):
 
 
 def i32(v): return (v + 2**31) % 2**32 - 2**31
-def idiv(a, b): q = abs(a) // abs(b); return q if (a < 0) == (b < 0) else -q
+def i64(v): return (v + 2**63) % 2**64 - 2**63
+def idiv(a, b):
+    if not b: return 0      # KismetMathLibrary: a zero divisor is a logged warning and 0, for / and % alike
+    q = abs(a) // abs(b); return q if (a < 0) == (b < 0) else -q
 
 MATH = {
     'Add_IntInt': lambda a, b: i32(a + b), 'Subtract_IntInt': lambda a, b: i32(a - b),
     'Multiply_IntInt': lambda a, b: i32(a * b), 'Divide_IntInt': idiv,
-    'Percent_IntInt': lambda a, b: a - idiv(a, b) * b,
+    'Percent_IntInt': lambda a, b: a - idiv(a, b) * b if b else 0,
     'Less_IntInt': lambda a, b: a < b, 'Greater_IntInt': lambda a, b: a > b,
     'LessEqual_IntInt': lambda a, b: a <= b, 'GreaterEqual_IntInt': lambda a, b: a >= b,
     'EqualEqual_ByteByte': lambda a, b: a == b, 'EqualEqual_IntInt': lambda a, b: a == b, 'NotEqual_IntInt': lambda a, b: a != b,
@@ -393,8 +396,8 @@ MATH = {
     'BooleanXOR': lambda a, b: bool(a) != bool(b),
     'Add_FloatFloat': lambda a, b: a + b, 'Multiply_FloatFloat': lambda a, b: a * b,
     'Conv_IntToFloat': float, 'Not_Int': lambda a: ~a, 'Not_Int64': lambda a: ~a,
-    'Subtract_FloatFloat': lambda a, b: a - b, 'Divide_FloatFloat': lambda a, b: a / b,
-    'Add_Int64Int64': lambda a, b: a + b, 'Subtract_Int64Int64': lambda a, b: a - b,
+    'Subtract_FloatFloat': lambda a, b: a - b, 'Divide_FloatFloat': lambda a, b: a / b if b else 0.0,
+    'Add_Int64Int64': lambda a, b: i64(a + b), 'Subtract_Int64Int64': lambda a, b: i64(a - b),
     'Less_FloatFloat': lambda a, b: a < b, 'Greater_FloatFloat': lambda a, b: a > b, 'NotEqual_FloatFloat': lambda a, b: a != b,
     'Conv_ByteToInt': lambda a: int(a) & 0xFF, 'NotEqual_ByteByte': lambda a, b: a != b,
     'Conv_IntToByte': lambda a: int(a) & 0xFF, 'Conv_Int64ToByte': lambda a: int(a) & 0xFF, 'Conv_BoolToByte': int,
@@ -402,8 +405,11 @@ MATH = {
     'EqualEqual_NameName': lambda a, b: str(a).lower() == str(b).lower(),
     'Or_IntInt': lambda a, b: int(a) | int(b), 'And_IntInt': lambda a, b: int(a) & int(b), 'Xor_IntInt': lambda a, b: int(a) ^ int(b),
     'Divide_Int64Int64': idiv, 'And_Int64Int64': lambda a, b: int(a) & int(b),
+    'Or_Int64Int64': lambda a, b: int(a) | int(b), 'Xor_Int64Int64': lambda a, b: int(a) ^ int(b),
+    'Less_Int64Int64': lambda a, b: a < b, 'Greater_Int64Int64': lambda a, b: a > b,
+    'LessEqual_Int64Int64': lambda a, b: a <= b, 'GreaterEqual_Int64Int64': lambda a, b: a >= b,
     'FTrunc': lambda a: i32(int(a)), 'FTrunc64': int,     # FMath::TruncToInt: toward zero, as C++ converts
-    'Conv_BoolToInt': int, 'Multiply_Int64Int64': lambda a, b: a * b, 'Conv_IntToInt64': int, 'Conv_Int64ToInt': lambda a: i32(a),
+    'Conv_BoolToInt': int, 'Multiply_Int64Int64': lambda a, b: i64(a * b), 'Conv_IntToInt64': int, 'Conv_Int64ToInt': lambda a: i32(a),
     'InRange_IntInt': lambda v, lo, hi, imin, imax: (v >= lo if imin else v > lo) and (v <= hi if imax else v < hi),
     'Abs_Int': lambda a: i32(abs(a)), 'RandomInteger': lambda a: 0,     # RandomInteger: a stand-in; CALLS shows it ran
     'Max': max, 'Min': min, 'FMax': max, 'FMin': min, 'Abs': abs, 'Clamp': lambda v, lo, hi: min(max(v, lo), hi),

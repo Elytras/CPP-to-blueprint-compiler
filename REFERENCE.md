@@ -189,6 +189,7 @@ Notes:
 | <a id="sharing-a-class.ue-struct-in-game-mymods"></a>`UE_STRUCT_IN("/Game/_MyMods/Turrets");`, `UE_ENUM_IN(EMood, "/Game/_MyMods/Turrets");` | The same one-owner rule for a struct and an enum. These name the owning mod's `UE_MOD_PACKAGE`, not the type's own package. See [Structs](#structs) and [Enums](#enums). | Yes |
 | <a id="sharing-a-class.include-turrets-turrets-h"></a>A class, struct or enum with no marker in a header of another mod's folder: `#include "../Turrets/Turrets.h"` | That mod's, as `UE_CLASS_IN` / `UE_STRUCT_IN` / `UE_ENUM_IN` with its package would say: imported from `<its UE_MOD_PACKAGE>/<namespaces>/<Name>` (a class in an absolute `Game::` namespace at the path that namespace gives), never cooked here. A file's mod is the one whose `UE_MOD_PACKAGE` the file holds, else the one of the nearest folder above it whose sources hold one, when they all name the same package. The owner cooks a struct or enum only where its own sources use it (see [Mod structs](#mod-structs-ue.struct-fstats-int32-kills-float)); `UE_STRUCT_IN` cooks one they do not. | Yes |
 | <a id="sharing-a-class.include-marked"></a>A `UE_STRUCT` or `UE_ENUM` in a header of another mod's folder | That mod's too, as `UE_STRUCT_IN` / `UE_ENUM_IN` would say: imported from its package, never cooked here again, so a value of it is the type the owner's own functions and saves hold. | Yes |
+| <a id="sharing-a-class.two-mods-one-name"></a>Two types of one name, each in its own namespace: `Core::Init` in another mod's header, `Spawn::Init` in this mod | Each is the mod's whose file defines it, found by its whole name: `Core::Init` is imported from its owner and `Spawn::Init` is cooked here. A class, a struct and an enum alike. Two files that define the same whole name leave it nobody's, as a header in a shared folder is. | Yes |
 | <a id="sharing-a-class.a-header-in-a-folder"></a>A header in a folder of several mods' sources (BpMods/ itself, the tests' folder), or in no mod's folder | Nobody's by location: an unmarked class in it is cooked by every mod that includes it, as before, and a struct or enum needs `UE_STRUCT_IN` / `UE_ENUM_IN` to be shared, or a plain `UE_STRUCT` / `UE_ENUM` to be cooked by each. | Yes |
 | <a id="sharing-a-class.t-fire-2"></a>`T->Fire(2);`, `T->OnFired.Add(this, &Gunner::OnHeard);` on a `Turret *T`, where a shared header declares `class Turret : public AActor { public: UE_CLASS("/Game/_MyMods/Turrets/Turret", "Turret_C"); int32 Shots = 0; int32 Fire(int32 N); UE_DISPATCHER(OnFired, int32 Total); };` | Calls and binds another mod's actor class. The header declares the methods, the owner's source defines them (`int32 Turret::Fire(int32 N) { ... }`), and a user finds an instance as it would a game actor, for example with `UGameplayStatics::GetAllActorsOfClass(Turret::StaticClass(), Found)`, then `Cast<Turret>`. Compiled, not run in game. | Yes |
 | <a id="sharing-a-class.otherdata"></a>`&OtherData`, where `OtherData` is another mod's asset of a class that a shared header declares without `UE_CLASS` | Refused: the reference would load as null. The message names the `UE_CLASS` line that fixes it. See [Game assets](#game-assets). | Refused |
@@ -884,6 +885,46 @@ is not run at build time.
 Notes:
 - How constant subexpressions fold inside a function body: [The optimizer](#the-optimizer).
 
+### Constant objects
+
+A `const` or `constexpr` variable of a plain C++ struct of the mod's own, one with no base and no `UE_STRUCT`, is
+written with braces and never stored. No Blueprint type stands for the struct and none is cooked: each use of a member
+is what the braces gave it, and a method called on the constant reads its members there. That makes a handle: a name
+and a default written once, and used through its methods.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="constant-objects.constexpr-ftable-ktable-5-2"></a>`constexpr FTable kTable = {5, 2.5f, {-3, 9}, "table"};` then `kTable.X`, `kTable.Range.Low` | Each use is the expression the braces gave that member: in code, in a default, in another constant (`constexpr int32 kTwice = kTable.X * 2;`), and where a constant is needed (`V << kTable.X`). | Yes |
+| <a id="constant-objects.static-constexpr-finthandle"></a>`static constexpr FIntHandle Lives{"Lives", 3};` in a class, then `Lives.Get(Stored)` | A method of the struct called on the constant is expanded at the call, as an inline function is, and every member its body reads is that constant's: `Default` is 3 there. A method may call another method of the same constant, and `(*this).Default` is the member too. | Yes |
+| <a id="constant-objects.static-constexpr-thandle-float"></a>`static constexpr THandle<float> Volume{"Audio.Volume", 0.5f};` then `Volume.Or(Stored, bHas)` | The same for a struct template: `THandle<float>` and `THandle<int32>` are two structs, and each constant has its own members. | Yes |
+| <a id="constant-objects.fname-key-const-return-name"></a>`FName Key() const { return Name; }` in such a struct, where `Name` is a `const char*` member | The string the braces gave, as the type the use asks for: an FName here, an FString or an FText elsewhere. | Yes |
+| <a id="constant-objects.method-below"></a>`int32 Late(int32 Stored) const;` in the struct and `inline int32 FIntHandle::Late(int32 Stored) const { ... }` below it | The same method: the definition below is the body that is expanded where the method is called on a constant, with that constant's members. | Yes |
+| <a id="constant-objects.this"></a>`this` as a value in such a method, `Register(this)` | Refused (`the constant has no address`): only the members' values exist. Pass the members. | Refused |
+
+```cpp
+template <class T> struct THandle {
+  const char *Name;
+  T Default;
+  T Or(T Stored, bool bHas) const { return bHas ? Stored : Default; }
+  FName Key() const { return Name; }
+};
+
+class Speaker : public AActor {
+public:
+  static constexpr THandle<float> Volume{"Audio.Volume", 0.5f};
+  float Loudness(float Stored, bool bHas) { return Volume.Or(Stored, bHas); }   // bHas ? Stored : 0.5
+};
+```
+
+Notes:
+
+- Only braces are read. A constant made by a constructor (`constexpr FTable kMade(5);`), or the constant itself
+  passed to a function, stored or returned, is refused as a value no Blueprint type holds.
+- A struct that derives from another, a `UE_STRUCT`, a struct UeApi declares (`FVector`) and a plain struct a
+  reflected position names (so it is cooked: [Mod structs](#mod-structs-ue_struct)) are Blueprint structs, read as
+  those are: a constant of one is a struct value built where it is used.
+- A method defined out of the struct is not expanded this way; write its body in the struct.
+
 ### consteval functions
 
 | You write | What it does | Status |
@@ -1246,6 +1287,7 @@ void ZeroAll() {
 | <a id="struct-defaults.fterrainplacementbox-min-max"></a>`FTerrainPlacementBox(Min, Max, ETerrainPlacementBoxType::Terrain, UE_KEEP)` | `UE_KEEP` for a constructor argument leaves that member unwritten, so it holds what the engine's constructor sets, as braces leave out a member of a struct with no constructor. Only where the value starts fresh: a container's element, a class's own default. bpdecomp writes it for a member the cooked value leaves out. | Yes |
 | <a id="struct-defaults.gameplaytags"></a>`GameplayTags = FGameplayTagContainer({FGameplayTag("Enemy.Type.Regular")}, {});` | Written in the container's own form, its tags' FNames (FGameplayTagContainer::Serialize); ParentTags is rebuilt by the engine at load. | Yes |
 | <a id="struct-defaults.ref-fsoftobjectpath-game-a-b"></a>`Ref = FSoftObjectPath("/Game/A/B.B", "Sub");`, `FSoftClassPath Cls = FSoftClassPath("/Game/C/D.D_C", "");` | A soft path as a class default or a UE_STRUCT member, written in its own form: AssetPathName's name, then SubPathString's string (FSoftObjectPath::Serialize), as the cook of a game asset has them. | Yes |
+| <a id="struct-defaults.scale-fperplatformfloat-2-5f"></a>`Scale = FPerPlatformFloat(2.5f);`, `FPerPlatformInt Count = FPerPlatformInt(7);`, `FPerPlatformBool On = FPerPlatformBool(true);` | A per-platform value as a class default or a UE_STRUCT member, written as a game reads it: `bCooked` set, then `Default` alone (the per-platform map is an editor-only part). | Yes |
 | <a id="struct-defaults.fx-overrideparameters"></a>`Fx->OverrideParameters.SortedParameterOffsets = {FNiagaraVariableWithOffset("User.Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), 0)};` | A Niagara component's parameter store, as the cook writes it: each FNiagaraVariable / FNiagaraVariableWithOffset in its own form (the Name, the type definition, then VarData or the Offset), and `UserParameterRedirects` a TMap of them. A handle is given as the FNiagaraTypeDefinition it names; `StaticStructOf<T>()` is the struct of its values. | Yes |
 | <a id="struct-defaults.classstructorenum-staticstructof"></a>`.ClassStructOrEnum = StaticStructOf<FNiagaraFloat>()`, `UObject *S = StaticStructOf<FLinearColor>();` | A struct's UScriptStruct as an object: the engine struct's `/Script` one, or a UE_STRUCT's asset. | Yes |
 | <a id="struct-defaults.fvector-offset-0-0-50"></a>`FVector Offset = {0, 0, 50};` | Positional braces as a default. | Yes |
@@ -1527,6 +1569,9 @@ Notes:
 | <a id="bitwise-operators-and.b-0xff"></a>`~B & 0xFF` | `~` is the Bitwise NOT node (Not_Int, Not_Int64). | Yes |
 | <a id="bitwise-operators-and.hi-16"></a>`Hi << 16` | Kismet has no shift node. `X << N` is a multiply by 2^N, which wraps as a shift does. | Yes |
 | <a id="bitwise-operators-and.x-1"></a>`X >> 1` | Clears the low N bits and then divides, so it floors as C++ does: -3 >> 1 is -2 and -7 >> 1 is -4. A uint8 is promoted to int first, so 255 >> 1 is 127. | Yes |
+| <a id="bitwise-operators-and.uint64-x-4"></a>`uint64(X) >> 4`, `*P >> 63` with a `uint64 *P` | Blueprint's int64 is signed and a uint64 value is its bits. An unsigned `>>` shifts zeros in: the same floor, then the copies of the top bit cleared, so `uint64(-1) >> 63` is 1. | Yes |
+| <a id="bitwise-operators-and.uint64-a-uint64-b"></a>`uint64(A) < uint64(B)`, `*P > 5` | `<` `>` `<=` `>=` with an unsigned 64-bit side compare as unsigned: both sides with the top bit flipped, then the signed node, so a value past INT64_MAX is above every smaller one. `==` and `!=` need nothing. | Yes |
+| <a id="bitwise-operators-and.uint64-a-3"></a>`uint64(A) / 3` | Warns (`runs as a signed division`): right while neither side is past INT64_MAX. `%` on 64 bits is refused, as for int64. | Warns |
 | <a id="bitwise-operators-and.x-3ll"></a>`X << 3LL`, `X << SHIFT` | The amount may be any integer literal, with any suffix, or a macro that expands to one. The width comes from the left side alone, so `int32 >> 1LL` is int32 math. | Yes |
 | <a id="bitwise-operators-and.x-kshift"></a>`X << kShift`, `X >> (2)` | The amount may be any constant C++ knows when it compiles: a constexpr or const variable, a const local, an enumerator, a cast such as `(int32)3`, `sizeof(...)`, a template's value parameter, and an inline function's parameter when the caller passes a constant. | Yes |
 | <a id="bitwise-operators-and.1-kshift"></a>`1 << kShift` | When both sides are constants the whole shift folds to a constant. | Yes |
@@ -1596,6 +1641,7 @@ Notes:
 | <a id="assignment-and-updates.slots-i-value"></a>`Slots[I] = Value;` | Set Array Elem. | Yes |
 | <a id="assignment-and-updates.scores-name-5"></a>`Scores[Name] = 5;` | The map Add node, which replaces an existing value. See [Containers](#containers). | Yes |
 | <a id="assignment-and-updates.spots-name-x-1"></a>`Spots[Name].X = 1;` | A store into a map value's member is copied out, changed and stored back, as `T E = Map[K]; E.X = 1; Map[K] = E;`, with the key evaluated once. | Yes |
+| <a id="assignment-and-updates.lists-k-0-7"></a>`Lists[K][0] = 7;`, `Table[K].Items[I] = V;`, where the map's value is an array or holds one | The same for an element of an array under a map value: the value is copied out, the element changed in the copy, and the whole value stored back under its key, found once. `+=`, `++` and `--` on such an element, a `T&` parameter bound to it (a copy, stored back, with the warning `bound to an element of a map element's array`) and `auto& L = Lists[K]; L[0] = 7;` take the same path. | Yes |
 | <a id="assignment-and-updates.acc-i"></a>`Acc += I;`, and `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | `X = X op Y`: a math node and a Set. X is located once, so `Slots[NextSlot()] += By` calls NextSlot a single time, and Y is evaluated first. It works on everything plain `=` works on, map values and their members included. `<<=`, `>>=` and int64 `%=` follow the rules of the plain operators. | Yes |
 | <a id="assignment-and-updates.int32-z-y-x-10"></a>`int32 Z = (Y += X) * 10;` | A compound assignment used as a value is X after the store. | Yes |
 | <a id="assignment-and-updates.incref-1-b-1"></a>`IncRef(1, B += 1)`, `Peek(SetB(), ++B)`, where the parameter is `int32&` or `const int32&` | Passed to a reference parameter, a compound assignment or a prefix `++` / `--` is the variable itself, as a plain `=` is: the update runs first, as a statement, and the callee reads, and for `T&` writes, B after every argument. Its left side must be a plain variable (`IncRef(1, L[Idx()] += 1)` is refused). The same holds in a loop condition (`while (IncRef(0, B += 1) < 20)`), on the right of `&&` / `\|\|` or in `?:`, and in a call on another object (`P->IncRef(1, B += 1)`). There the call runs as one block each time C++ runs it: the object first, then the update, then the call on B. Behind something its statement runs first, `{G(), IncRef(0, B += 1)}`, it is refused, since the update would run before G. | Yes |
@@ -1803,6 +1849,7 @@ a build a loop that never ends hangs the game instead of being stopped.
 |---|---|---|
 | <a id="range-for-over.for-int32-x-items"></a>`for (int32 X : Items)` | The editor's ForEachLoop: the array is walked by index, and X is a fresh copy on each pass, so assigning to X never changes the array. | Yes |
 | <a id="range-for-over.for-int32-x-items-2"></a>`for (int32 &X : Items)` | X is another name for `Items[Index]`, so writes land in the array. `const T&` and `auto&&` work the same way. ForEachLoop's element is a copy, so it has no equivalent. | Yes |
+| <a id="range-for-over.for-int32-x-lists-k"></a>`for (int32 &X : Lists[K])`, `for (auto &S : Table[K].Items)`, the array a map's value or in it | Blueprint has no reference to a map's value (Find copies it out), so when the body may write through X the value is copied into a local, walked there, and stored back under its key, found once, where the loop is left: at its end, at a `break`, and before a `return` in the body. A body that only reads X walks the copy. A `goto` in such a writing loop is refused (`a copy stored back when the loop is left`). | Yes |
 | <a id="range-for-over.for-auto-x-y-points"></a>`for (auto [X, Y] : Points)` | A structured binding over TArray or TSet elements is refused ("a structured binding over a TArray"). Bind the element, `for (const FIntPoint &P : Points)`, and read `P.X`. | Refused |
 | <a id="range-for-over.for-auto-item-index-items"></a>`for (auto &[Item, Index] : Items.Enumerate())` | The element and its index together, walked by index like `for (int32 &X : Items)`: Item is `Items[Index]` where it lives, so writes land in the array (a struct element's members too), and Index counts from 0. `const auto&` reads in place; `auto [Item, Index]` copies the element on each pass. A method, because `auto &[A, B] : Items` already means unpacking each element. TArray only. | Yes |
 | <a id="range-for-over.index-0"></a>`Index = 0;`, `++Index` in that loop; `Item = 0;` under `const auto &[Item, Index]` | Refused by clang: `cannot assign to variable 'Index' with const-qualified type 'const int32'`, and the same for a const Item. The index is the loop's own, so no form of the loop lets the body change it. | Refused |
@@ -1986,6 +2033,7 @@ int32 Names(int32 N) {
 |---|---|---|
 | <a id="reference-locals.int32-alias-count"></a>`int32 &Alias = Count;` | Another name for a local, a parameter or a member of this (`Score` or `this->Score`), or for a member of one of their structs (`float &Z = Spawn.Z;`). Reads and writes are that variable's own Get and Set. | Yes |
 | <a id="reference-locals.int32-slot-slots-i"></a>`int32 &Slot = Slots[I];` | A TArray element (of this object or another), `*P` or `P[I]`: the reference keeps the place's address in a hidden int64 local, and reads and writes go straight to that memory. | Yes |
+| <a id="reference-locals.auto-l-lists-k"></a>`auto &L = Lists[K];`, `FBag &B = Table[K];`, `int32 &R = Scores[K];`, `int32 &X = Lists[K][I];` on a TMap | Blueprint has no reference to a map's value (Find copies it out), so the reference is another name for the place: the key and any index are read once, where it is declared. A read through it finds the value again, so it sees later writes; a write through it (`L[0] = 7`, `B.Count += 1`, `L.Add(X)`, `R = 5`) copies the value out, changes it and stores it back under its key, as the place written in full does ([Assignment and updates](#assignment-and-updates)). | Yes |
 | <a id="reference-locals.const-fvector-home-k2"></a>`const FVector &Home = K2_GetActorLocation();` | A `const T&` bound to a temporary is a copy, which lives as long as the reference. | Yes |
 | <a id="reference-locals.int32-r-other-score"></a>`int32 &R = Other->Score;` | Another object's field has no Blueprint reference, so R keeps the field's address, found by name at run time as `&Other->Score` is. That needs the ReadProperty class you supply (see [Pointers and memory](#pointers-and-memory)); without one the build stops ("include ReadProperty.h"). The `const` and `auto &` forms, and `O->Score` through a local pointer, are the same. Without the helper, write to the field directly, or pass it to an inline function's `T&` parameter, which binds the field itself. | Yes |
 | <a id="reference-locals.float-x-other-loc-x"></a>`float &X = Other->Loc.X;` | X keeps the address of Loc, found by name at run time as `&Other->Loc` is, plus X's offset. That needs the ReadProperty class, as the row above does. | Yes |
@@ -2228,7 +2276,7 @@ public:
   int32 N;
   int32 Bump(int32 By) { N += By; return N; }
   int32 Twice(int32 By) { return Bump(By) + Bump(By); }         // both copied in
-  int32 Fact(int32 V) { return V <= 1 ? 1 : V * Fact(V - 1); }  // stays a call
+  int32 Fact(int32 V) { return V <= 1 ? 1 : V * Fact(V - 1); }  // stays a call: not its last act
   [[gnu::noinline]] int32 Kept(int32 V) { return V + 1; }
   int32 UseKept(int32 V) { return Kept(V); }                    // stays a call
 };
@@ -2245,10 +2293,10 @@ Notes:
   [Calling engine and game functions](#calling-engine-and-game-functions)).
 - A Shipping build of the engine has no script recursion guard, so unbounded recursion overflows the native stack and
   crashes the game.
-- Recursion through `inline` functions is refused; see
+- Recursion through `inline` functions is refused, a [tail call](#tail-calls) aside; see
   [Inline functions and templates](#inline-functions-and-templates).
-- A function is never copied into itself, so a recursive call stays a call. In mutual recursion one copy is made, and
-  its call back stays a call.
+- A function is never copied into itself, so a recursive call stays a call, unless it is the function's last act
+  ([Tail calls](#tail-calls)). In mutual recursion one copy is made, and its call back stays a call.
 - These are never copied in: a function that waits (Delay, UE_AWAIT) or contains a goto; an RPC, an authority-only or
   cosmetic function; an override of an engine function; UE_NO_OPTIMIZE on the function or on the caller; a class
   another mod cooks (UE_CLASS); a function whose body calls a parent's function that is not copied in, such as
@@ -2263,6 +2311,45 @@ Notes:
   own WorldContextObject parameter, as it would in the static's own function. A static without that parameter gets
   the caller's context instead of the class default object, so such a call works in the copy where the function's own
   would find no world.
+
+### Tail calls
+
+A function whose last act is to call itself does not call: the arguments become the parameters' new values and the
+body starts again, a loop. No frame is made per step, so how deep the recursion goes no longer depends on the native
+stack, which a Shipping build does not guard.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="tail-calls.return-sum-n-1-acc-n"></a>`return Sum(N - 1, Acc + N);` inside `Sum`, in a `final` class, a `final` method, a static or a free function | A jump back to the top of the body. Every argument is evaluated first, each from the parameters as they were, then the parameters take them: `return Gcd(B, A % B);` swaps. Nothing about the function changes for its other callers. | Yes |
+| <a id="tail-calls.fill-n-1"></a>`Fill(N - 1);` as the last statement of a void function, or right before a bare `return;` | The same. The call may sit under `if` / `else`, a block, or a `switch`. | Yes |
+| <a id="tail-calls.return-b-0-a-gcd"></a>`return B == 0 ? A : Gcd(B, A % B);` | The same: a `?:` whose arm is the call is read as `if (B == 0) return A; return Gcd(B, A % B);`. | Yes |
+| <a id="tail-calls.inline-int32-sum-int32-n"></a>`inline int32 Sum(int32 N, int32 Acc) { ...; return Sum(N - 1, Acc + N); }` | An inline function, a member template or a free inline function may call itself this way: once the call is a loop there is nothing left to expand. Any other self-call in one is refused, as before. | Yes |
+| <a id="tail-calls.int32-step-tarray-int32-mine"></a>`int32 Step; TArray<int32> Mine;` declared in such a body | Start as zero and empty on every round, as each call's did. | Yes |
+| <a id="tail-calls.return-longest-s-ab-limits"></a>`return Longest(S + "ab", Limits, N - 1);` where `S` is a `const FString&` | A const reference parameter that gets another value is read through a local, which starts as a copy of it; the caller's variable is never written. One handed on as it came (`Limits`) stays the caller's variable, with no copy. | Yes |
+| <a id="tail-calls.collect-out-n-1"></a>`Collect(Out, N - 1);` where `Out` is a `TArray<int32>&` | A `T&` parameter handed on as it came is the same variable on every round. | Yes |
+| <a id="tail-calls.halve-other-n-1"></a>`Halve(Other, N - 1);` where the parameter is `int32&` and `Other` is another variable | Stays a call: a reference is bound once, and a loop cannot bind it again. | Yes |
+| <a id="tail-calls.return-n-factorial-n-1"></a>`return N * Factorial(N - 1);` | Stays a call: the multiplication comes after it. | Yes |
+| <a id="tail-calls.for-return-down-n-1"></a>`for (...) if (...) return Down(N - 1);` | Stays a call under a loop of the body, though it is a tail call. In an inline function it is refused (`calls itself`). | Not yet |
+| <a id="tail-calls.return-sum-n-1-acc-n-2"></a>`return Sum(N - 1, Acc + N);` in a class a subclass may follow, without `final` | Stays a call by name: a subclass's `Sum` must run when the object is one. | Yes |
+
+```cpp
+class Counter final : public AActor {
+public:
+  int32 Sum(int32 N, int32 Acc) {
+    if (N <= 0)
+      return Acc;
+    return Sum(N - 1, Acc + N);   // Acc += N; N -= 1; back to the top
+  }
+};
+```
+
+Notes:
+
+- Also left a call: in an RPC, an authority-only or cosmetic function and an override of an engine function, which
+  the engine routes; in a function that waits (Delay, UE_AWAIT) or contains a goto; under UE_NO_OPTIMIZE; and, when a
+  `const T&` parameter gets another value, in a body that holds a lambda.
+- `Peer->Sum(...)` and `Base::Sum(...)` are calls to another object's or another class's function, never a loop.
+- General recursion, a call that is not the last act, keeps one frame per step.
 
 ### Parameters and return values
 
@@ -2482,6 +2569,7 @@ the body, as for an inline function.
 | <a id="lambdas-function.auto-l-x-int32-y"></a>`auto L = [=](int32 A) { return X + A; };` | A by-value capture (`[=]`, `[X]`) is X as it was where the lambda was declared. A local assigned after the declaration gets a snapshot local, stored there; a constant, or a variable nothing writes, is used in place and costs nothing. | Yes |
 | <a id="lambdas.c-int32-a-mutable-c"></a>`[C](int32 A) mutable { C += A; return C; }` | The copy is the lambda's own state, kept from call to call, as a snapshot local that the declaration assigns again each time it is reached; the variable is untouched. | Yes |
 | <a id="lambdas.z-x-1-int32-a"></a>`[Z = X + 1](int32 A) { return Z * A; }`, `[&R = X]` | An init-capture is a snapshot local made from the initialiser; `&R = X` is another name for the place X. The capture list is read off the mod's own sources, so a lambda written in a macro or in a header cannot have one. | Yes |
+| <a id="lambdas.g-l-int32-b"></a>`[G = L](int32 B) { return G(B) * 2; }`, `[G = [V](int32 A) { ... }]` | An init-capture that holds a lambda is that lambda under another name, as one captured by its own name is: `G(B)` expands its body. A mutable one copied this way is refused, as any copy of one is (`which would fork its state`). | Yes |
 | <a id="lambdas.this-int32-a-m-a"></a>`[this](int32 A) { M += A; return M; }`, members | `this` is the object. The body names what it names where it was written: the class, and a call's world context, are those of the lambda's own function, whichever function it is called from. | Yes |
 | <a id="lambdas.const-int32-r-return-v"></a>`const int32 R = [&] { return V * 2; }();` | A lambda called where it is written expands in place, and its value is the return. | Yes |
 | <a id="lambdas.apply-5-int32-a-x"></a>`Apply(5, [&](int32 A) { X += A; return X; })` | A lambda passed to an inline function or template binds its parameter, whatever `F`, `F&` or `const F&` it is: no local and no copy, and each call of the parameter expands the lambda. A lambda that captures by reference makes the call keep a caller's variable out of a parameter that only reads it, as a reference parameter does. | Yes |
@@ -2802,7 +2890,7 @@ rule to remember: an inline method expands only on `this`. For a helper that tak
 | <a id="inline-functions.static-inline-int32-addone-int32"></a>`static inline int32 AddOne(int32 V)` in a library class | Expanded at the call, from its own class or from any class that includes the header, in any mod. The library does not export it. | Yes |
 | <a id="inline-functions.bump-by"></a>`Bump(By)` inside an inline body or a member template that a subclass expands | A call on `this` goes by name, so the object's most derived method runs, including an override compiled later or one in a class between. | Yes |
 | <a id="inline-functions.other-twice-3"></a>`Other->Twice(3)` where `Twice` is an inline method | Refused: `called on another object (only this)`, because `this` in the body stays the caller's self. Make the method non-inline, or write a free function that takes the object. | Not yet |
-| <a id="inline-functions.an-inline-function-that-calls"></a>An inline function that calls itself, directly or through another inline | Refused (`calls itself`): the expansion would never end. Make it non-inline; a Blueprint function may recurse. One overload calling another is fine. | Refused |
+| <a id="inline-functions.an-inline-function-that-calls"></a>An inline function that calls itself, directly or through another inline, anywhere but as its last act (`return 1 + Loop(X - 1);`) | Refused (`calls itself`): the expansion would never end. Make it non-inline; a Blueprint function may recurse. One overload calling another is fine, and so is a [tail call](#tail-calls), which is a loop. | Refused |
 | <a id="inline-functions.inline-int32-nope-int32-x"></a>`inline int32 Nope(int32 X);` with no body | Refused at the call (`has no body`). clang also warns with `-Wundefined-inline`. | Refused |
 | <a id="inline-functions.onhit-add-this-amine-handle"></a>`OnHit.Add(this, &AMine::Handle)` where `Handle` is inline | Refused: a delegate binds a function by name, and an inline function is none. Drop `inline`; see [Event dispatchers](#event-dispatchers). | Refused |
 | <a id="inline-functions.static-int32-count-0"></a>`static int32 Count = 0;` inside an inline function | Refused: each expansion would keep its own. Use a member variable; see [Latent calls](#latent-calls). | Refused |
@@ -3202,6 +3290,7 @@ default constructor is read the same way, as C++ would leave the object: see [Co
 | <a id="ue-defaults.lamp-intensity-1500-0f"></a>`Lamp->Intensity = 1500.0f;` | A default on the template of a component this class declares, as editing the component in the details panel writes it. A zero or `false` is still written, because a template is compared with the component class's own defaults, where `bVisible` is true. | Yes |
 | <a id="ue-defaults.lamp-lightcolor-fcolor-255-128"></a>`Lamp->LightColor = FColor(255, 128, 0);`, `Lamp->LightColor = {255, 128, 0};` | A struct value, by constructor or by braces. Each argument goes to the member its parameter is named after, so `FColor` takes R, G, B, A as in C++, although it stores B, G, R, A. Braces on an SDK struct that has a constructor call that constructor. Only a struct with no constructor is filled by member position. | Yes |
 | <a id="ue-defaults.ids-2-3"></a>`Ids = {2, 3};`, `Score = {{"a", 5}, {"b", 2}};` on a TSet or TMap a parent declares | This class's whole value, as Class Defaults would set it. The default object loads a set or map over its parent's value, so the compiler writes what differs, as the editor saves it: the parent's elements (a map's keys) this value lacks, as removed, then the elements the parent lacks or maps to another value. The parent's value is known where a header gives it: an initializer, a `UE_DEFAULTS` or a `UE_STRUCT` member's default instance, in a class of this mod or of another mod's shared header (`UE_CLASS_IN`, or `UE_CLASS` where the header gives the member a value). Below an engine or game class, whose value no header says, the elements are added to that class's own, with a warning naming the member, and so below a class whose `UE_DEFAULTS` sets the member over one (its default object holds that class's elements too; the statement's own are still removed). The same holds for a TSet or TMap inside a UE_STRUCT a parent declares, when you assign the struct whole (`Held = {{2, 3}, 3};`). A key given twice holds the last value given, as in C++, and an FString key compares without case: `{{"a", 5}, {"A", 1}}` is `{"A": 1}`. | Yes |
+| <a id="ue-defaults.holder-ids-2-3"></a>`Holder->Ids = {2, 3};`, `Holder->Score = {{"a", 5}, {"b", 2}};` on a component's TSet or TMap | The component's whole value, written the same way against what its template loads over: the value the nearest class above gave that member of the component in its own `UE_DEFAULTS`, else the component class's default. So the template loads `{2, 3}`, not the union with the component class's `{1, 2}`. A set or map in a struct member of the component too. Over a component class whose value no header says (a native class's constructor), nothing can be removed and the same warning is printed. | Yes |
 | <a id="ue-defaults.mesh-staticmesh-sm-crate-b"></a>`Mesh->StaticMesh = &SM_Crate_B;` | Points an object property at an asset: a `UE_ASSET_AT`, a UeAssets name or an asset the mod cooks. The same as picking the asset in the details panel. | Yes |
 | <a id="ue-defaults.index-0-7"></a>`Index_0 = 7;`, for a member the SDK spells `Index_0` | Written under the engine's real name, `Index`. See [Classes and variables](#classes-and-variables). | Yes |
 | <a id="ue-defaults.button-widgetstyle-normal-drawas"></a>`Button->WidgetStyle.Normal.DrawAs = ESlateBrushDrawType::Box;`, `PrimaryActorTick.bStartWithTickEnabled = false;` | A part of a struct member, at any depth, written as the cook writes a struct that differs from its default in a few members: the tag holds only the parts set, and the rest keeps the archetype's value (the parent's, the component class's, the widget class's). Several statements on one member make one tag, a later one over an earlier. | Yes |
@@ -3528,6 +3617,7 @@ Notes:
 | <a id="staticclass-on-the.newobject-uenemycontext-this"></a>`NewObject<UEnemyContext>(this)` | A helper's default `T::StaticClass()` argument names `T`. | Yes |
 | <a id="staticclass-on-the.ukismetsystemlibrary"></a>`UKismetSystemLibrary::DoesImplementInterface(Obj, IAimable::StaticClass())`, on one of the mod's own interfaces | Names the interface's class (`IAimable_C`), as `ITargetable::StaticClass()` names a game interface's. `UE_INTERFACE` declares the `StaticClass`; it is no function of the interface asset. | Yes |
 | <a id="staticclass-on-the.weapons-rifle-staticclass"></a>`Weapons::Rifle::StaticClass()` | Names `Rifle_C`: the qualifier is read in as many parts as it is written with. So does an alias, `using RifleT = Weapons::Rifle;` then `RifleT::StaticClass()`, as [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp) does. | Yes |
+| <a id="staticclass-on-the.t-staticclass"></a>`T::StaticClass()` in a template's body, `template <class T> UClass *ClassOfT() { return T::StaticClass(); }` then `ClassOfT<Lexer>()` | Names the class the template was instantiated with (`Lexer_C`), though C++ finds the engine parent's `StaticClass` for every `T`: in a free function template, a member template, and a method of a class template, each parameter by its place (`Second<A, B>` names B's). A parameter pack's `Ts::StaticClass()...` is not read this way. | Yes |
 | <a id="staticclass-on-the.staticclassof-egg"></a>`StaticClassOf<Egg>()`, with `class Egg;` declared before | `Egg::StaticClass()` where Egg is only declared so far, as a value and as a default. Two classes whose defaults name each other's class (`Hen` holds `TSubclassOf<AActor> EggClass`, `Egg` holds Hen's class) cannot both have the other complete, and clang needs a class complete for `X::StaticClass()`; a template argument need only be declared. | Yes |
 
 ```cpp
@@ -4195,6 +4285,7 @@ path is not checked when the mod is built, so a wrong path compiles.
 |---|---|---|
 | <a id="ue-asset-at.ue-asset-at-uenemydescriptor-ed"></a>`UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");` | Names an asset in another package, so `&ED_Spider_Grunt` points at it in defaults and in function bodies. The object's name is the last segment of the path. Only an asset the source uses is imported. | Yes |
 | <a id="ue-asset-at.game-dir-package-object"></a>`"/Game/Dir/Package.Object"` | Names an object whose name is not its package's. In the game's content the difference is mostly letter case. | Yes |
+| <a id="ue-asset-at.two-spellings"></a>One asset named in two spellings: `"/Game/Enemies/Spider/Grunt/ED_Spider_Grunt"` and `"/game/enemies/spider/grunt/ed_spider_grunt"` | One import of the package and one of the object, the first spelling's: a name in a package is an FName, which compares without case. So for a class, a function, a struct or an enum reached under two spellings. | Yes |
 | <a id="ue-asset-at.ue-asset-at-uenemydescriptor"></a>`UE_ASSET_AT(UEnemyDescriptor, Spider, ...)` in two namespaces | Two different assets: an asset is keyed by its qualified name. | Yes |
 | <a id="ue-asset-at.ed-spider-grunt"></a>`(&ED_Spider_Grunt)->SpawnAmountModifier` | Reads the game asset's value when the game runs. | Yes |
 | <a id="ue-asset-at.ed-spider-grunt-spawnspread-2"></a>`ED_Spider_Grunt.SpawnSpread * 2`, `ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity` | A member read by value is the value the asset's package holds, read when the mod is built off the extracted game pak (`--game`; bpbuild: `game_content`), and a constant there: in code, and in a default. A number, a bool, an enum, a name or a string. A step is `.Member` or a `TArray`'s `[i]`, as in `UE_ASSET_EDITS`. A member the asset has no value of is its archetype's, its class's default object, followed through the game's packages; a Blueprint class's own variable that its default object leaves out is zero. The SDK carries no values, so none can go stale with it. The compile prints each value it reads, `value <- <package> (<path> = <value>, ...)`, and bpbuild rebuilds a mod when the game's copy of a package it read is newer, after a re-extract. | Yes |
@@ -4557,7 +4648,10 @@ Notes:
   `CreatePlayAnimationProxyObject`, `CreatePlayAnimationTimeRangeProxyObject`) are kept alive by nothing but the
   variable that holds them. Put in a local of a method that does not wait, the compiler also stores it into a hidden
   transient member of the class, `<Method>_<Local>`, so it outlives the call as the editor's event graph keeps it;
-  a later call of the method replaces it there.
+  a later call of the method replaces it there. One made in the middle of a statement
+  (`CreateProxyObjectForPlayMontage(...)->OnCompleted.Add(this, &AMine::Done);`, or the call straight into a `Cast` or
+  an argument) is given a local first and kept the same way; where the statement calls something else as well it is
+  refused (`put it in a local of its own first`), since the proxy's call would move in front of that one.
 - To continue a function when a dispatcher next fires, instead of binding a handler, use `UE_AWAIT`: see
   [Waiting on events](#waiting-on-events). [examples/AwaitEvents.cpp](examples/AwaitEvents.cpp) uses UE_AWAIT and
   contrasts it with the callback style in a comment.
@@ -4890,7 +4984,7 @@ lifts a light.
 | You write | What it does | Status |
 |---|---|---|
 | <a id="declaring-a-timeline.ue-timeline-fade-2-0f"></a>`UE_TIMELINE(Fade, 2.0f);` | A timeline 2 seconds long: the Timeline node's template. `Fade` is a `UTimelineComponent *` variable. The engine makes the component as the actor spawns, before the construction script and BeginPlay, and stores it there. | Yes |
-| <a id="declaring-a-timeline.ue-timeline-fade-2-0f-2"></a>`UE_TIMELINE(Fade, 2.0f, AutoPlay, Loop);` | Options after the length, the template's tick boxes: AutoPlay (plays from the start as the actor spawns), Loop, Replicated (the component replicates its play state), IgnoreTimeDilation, and LastKeyframe (the length is the time of the last key of any track, the editor's Use Last Keyframe). | Yes |
+| <a id="declaring-a-timeline.ue-timeline-fade-2-0f-2"></a>`UE_TIMELINE(Fade, 2.0f, AutoPlay, Loop);` | Options after the length, the template's tick boxes: AutoPlay (plays from the start as the actor spawns), Loop, Replicated (the component replicates its play state, and the actor's `bReplicates` is set, as a replicated variable sets it: a component replicates only with its actor), IgnoreTimeDilation, and LastKeyframe (the length is the time of the last key of any track, the editor's Use Last Keyframe). | Yes |
 | <a id="declaring-a-timeline.ue-float-track-fade-alpha"></a>`UE_FLOAT_TRACK(Fade, Alpha, (0, 0), (1, 1, Cubic), (2, 0));` | A float track of Fade and its curve. Each key is `(time, value)`, interpolated Linear to the next key unless Cubic or Constant follows the value, as the curve editor's key menu sets it. A Cubic key's tangents are the editor's Auto ones. The macro declares `float Alpha`, which the timeline sets every frame it plays. | Yes |
 | <a id="declaring-a-timeline.ue-vector-track-fade-lift"></a>`UE_VECTOR_TRACK(Fade, Lift, (0, 0, 0, 0), (2, 0, 0, 100));` | A vector track: each key is `(time, x, y, z)`. Declares `FVector Lift`. | Yes |
 | <a id="declaring-a-timeline.ue-color-track-fade-tint"></a>`UE_COLOR_TRACK(Fade, Tint, (0, 1, 1, 1, 1), (2, 1, 0, 0, 1));` | A linear color track: each key is `(time, r, g, b, a)`. Declares `FLinearColor Tint`. | Yes |
@@ -5292,6 +5386,7 @@ Notes:
 | <a id="replicated-variables-on.ue-replicated-using-int32-points"></a>`UE_REPLICATED_USING(int32, Points, OnRep_Points) = 0;` in a `UE_INTERFACE` | Each class that implements the interface gets `Points` as a replicated variable of its own, with the replication settings written on the interface. A write calls the RepNotify as usual. | Yes |
 | <a id="replicated-variables-on.void-onrep-points-seen-1"></a>`void OnRep_Points() { Seen += 1; }` in the implementing class | The RepNotify belongs to the implementing class. AssetGen looks for it on the class first, then on the interface. A class that leaves it out gets the interface's out-of-line body when there is one (`void IScored::OnRep_Points() { Mirror = Points; }`), otherwise an empty function, and every write still calls it. | Yes |
 | <a id="replicated-variables-on.an-onrep-declared-on-neither"></a>an OnRep declared on neither | Refused: the RepNotify "must be a method of the class taking no parameters". If the interface leaves the declaration out, every implementing class has to define it. | Refused |
+| <a id="replicated-variables-on.no-actor"></a>`class Tally : public UObject, public IScored`, a class that is no actor and no component implementing an interface with a replicated variable | Refused (`does nothing, since only an actor or an actor component replicates`), as the class's own replicated variable is: the property would be one the engine never sends. | Refused |
 
 ```cpp
 class IScored {
@@ -6654,8 +6749,8 @@ and where the feature is described. In each group, the messages you are most lik
   constructor that takes every member, so clang usually refuses the call first. Fix: designated braces, as the message
   shows, `FHitResult H = { .Time = 0.5f };`. Members you leave out keep the struct's defaults. See [Structs](#structs).
 - `<Member>: the engine reads a <Struct> value in its own binary form, which AssetGen does not write yet; leave the value out`:
-  a default of an engine struct with a native serializer whose form AssetGen does not know (PerPlatformFloat, the material inputs
-  and the like). GameplayTagContainer, the soft paths and the Niagara variables are written. Fix: leave the value out.
+  a default of an engine struct with a native serializer whose form AssetGen does not know (the material inputs, FontData
+  and the like). GameplayTagContainer, the soft paths, the per-platform values and the Niagara variables are written. Fix: leave the value out.
 - `<Struct> literal must give every field (<N>)`, `<Struct> takes one value per member (<N>), in declaration order:
   <Member>` and `<Type> has no member for value <N>`: rare. A struct value is built with a constructor call or braces
   that give a different number of values than the struct has members. Fix: designated braces that name the members you
@@ -6887,8 +6982,9 @@ and where the feature is described. In each group, the messages you are most lik
   an ancestor's static of the same signature. Each call runs the one it names, as in C++; the editor would refuse the
   name. Fix: rename one of them to make no Blueprint the editor could not.
 - `inline function <Class>::<Method> calls itself`: recursion through inline functions, direct or through another
-  inline function. Each call copies the body in, so the copying never ends. One overload calling another is fine. Fix:
-  drop `inline`, because a Blueprint function can call itself, or write a loop. See
+  inline function. Each call copies the body in, so the copying never ends. One overload calling another is fine, and
+  so is a self-call that is the function's last act, which becomes a loop ([Tail calls](#tail-calls)). Fix: drop
+  `inline`, because a Blueprint function can call itself, or write a loop. See
   [Inline functions and templates](#inline-functions-and-templates).
 - `inline function <Class>::<Method> has no body`: an inline function declared and never defined,
   `inline int32 Nope(int32 X);`. clang warns about it too. Fix: define it in the source or in a header the source
@@ -7648,7 +7744,7 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   inline or static class variable. A bare `&K` gives the address-of message above instead. Fix: use the value; a
   constant is its initializer at each use. See [Pointers and memory](#pointers-and-memory).
 - `reference <Name>: <Reason>`: a reference local, `T &R = X;`, whose initializer is neither a variable nor a member
-  reached with `.` from this or from a variable, so AssetGen needs an address it cannot take. `int32 &R = Scores[Name];`
+  reached with `.` from this or from a variable, so AssetGen needs an address it cannot take. `int32 &R = B ? X : Y;`
   gives the address-of message above as the reason. Fix: follow `<Reason>`, use the place directly, or copy it into a
   local and store it back. `T &R = LocalVar` and `T &R = MemberVar` work. See [Locals](#locals).
 - `__PtrCast__ of <Name>, a reference to a Blueprint variable, which has no address`: `__PtrCast__` of a reference

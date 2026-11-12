@@ -2802,6 +2802,88 @@ opt_raw()
 opt_flags()
 
 
+# ---- TailCalls: a self-call that is a function's last act is a loop (REFERENCE.md, Tail calls)
+
+def entered(base, fn, self_vars=None, **parms):
+    """fn's value, and how many times a function of the mod was entered to get it: 1 when nothing was called."""
+    real, count = runscript.run, [0]
+
+    def counted(*a, **kw):
+        count[0] += 1
+        return real(*a, **kw)
+    runscript.run = counted     # a script call inside runscript.run looks the name up again
+    try:
+        return counted(base, fn, self_vars, **parms)[0], count[0]
+    finally:
+        runscript.run = real
+
+
+def tail_steps(n, acc):
+    while True:
+        if n % 3 == 0:
+            if n == 0: return acc
+            n, acc = n - 3, acc + 1
+        elif n % 3 == 1: n, acc = n - 1, acc + 10
+        else: n, acc = n - 2, acc + 100
+
+
+def tail_calls():
+    import math
+    base = asset('TailCalls')
+    tri = lambda n: n * (n + 1) // 2
+    # One frame however deep: 5000 steps of a call would be 5000 frames.
+    proves('tail-calls.return-sum-n-1-acc-n')
+    for fn in ('Sum', 'StaticSum'):
+        for n in (0, 1, 7, 5000):
+            assert entered(base, fn, N=n, Acc=3) == (3 + tri(n), 1), (fn, n, entered(base, fn, N=n, Acc=3))
+    assert entered(base, 'Count', N=4000, Acc=1) == (8001, 1), entered(base, 'Count', N=4000, Acc=1)
+    assert entered(base, 'UseStatic', N=5000) == (tri(5000), 1)
+    got, frames = entered(base, 'UseFree', N=5000)      # the library's function is called once, and loops
+    assert got == tri(5000) and frames <= 2, (got, frames)
+    for n in (0, 3, 4, 5, 3002):
+        assert entered(base, 'Steps', N=n, Acc=7) == (tail_steps(n, 7), 1), n
+    proves('tail-calls.fill-n-1')
+    for fn, n, want in (('Fill', 4, [4, 3, 2, 1]), ('Fill', 0, []), ('FillEarly', 5, [5, 3, 1, 0]), ('FillEarly', 0, [0])):
+        me = dict(Seen=[])
+        assert entered(base, fn, me, N=n) == (None, 1) and me['Seen'] == want, (fn, n, me)
+    proves('tail-calls.return-b-0-a-gcd', 'tail-calls.inline-int32-sum-int32-n')
+    for n in (0, 1, 30, 5000):
+        want = tri(n) + math.gcd(n, 36) * 1000000 + math.gcd(n, 48) * 10000000
+        assert entered(base, 'UseInline', N=n) == (want, 1), (n, entered(base, 'UseInline', N=n), want)
+    refused('TailInlMid', '  inline int32 Loop(int32 X) { if (X > 0) { Loop(X - 1); Seen += 1; } return X; }\n  int32 Seen;\n'
+            '  int32 F(int32 X) { return Loop(X); }\n', 'calls itself')
+    proves('tail-calls.int32-step-tarray-int32-mine')
+    for n in (0, 1, 6):
+        assert entered(base, 'Fresh', N=n, Acc=2) == (2 + tri(n), 1), n
+    proves('tail-calls.return-longest-s-ab-limits')
+    for n in (0, 1, 40):
+        me = dict(Kept='', Pad=0)
+        got, frames = entered(base, 'CallLongest', me, N=n)
+        assert got == (1 + 2 * n + 3) * 100 + 1 and me['Kept'] == 'x' and frames <= 2, (n, got, me, frames)
+    proves('tail-calls.collect-out-n-1')
+    for n in (0, 1, 30):
+        got, frames = entered(base, 'CallCollect', N=n)
+        assert got == n * 1000 + (1 if n else 0) and frames <= 2, (n, got, frames)
+    # Still calls, one frame a step, and right.
+    proves('tail-calls.return-n-factorial-n-1')
+    assert entered(base, 'Factorial', N=5) == (120, 5)
+    proves('tail-calls.halve-other-n-1')
+    me = dict(Calls=0)
+    got, frames = entered(base, 'CallHalve', me, V=40, N=3)
+    assert got == 20 and me['Calls'] == 3 and frames >= 3, (got, me, frames)
+    proves('tail-calls.for-return-down-n-1')
+    assert entered(base, 'Down', N=2) == (2, 1) and entered(base, 'Down', N=6) == (2, 5), entered(base, 'Down', N=6)
+    refused('TailInlLoop', '  inline int32 Down(int32 N) { for (int32 I = 0; I < N; ++I) if (I == 2) return Down(N - 1); return N; }\n'
+            '  int32 F(int32 N) { return Down(N); }\n', 'calls itself')
+    proves('tail-calls.return-sum-n-1-acc-n-2')
+    assert entered(os.path.join(os.path.dirname(base), 'TailOpen'), 'Sum', N=5, Acc=0) == (15, 6)
+    print('ok  TailCalls: a self-call that is the last act is a loop, in one frame however deep; one that is not, one a '
+          'subclass could replace, one under a loop or re-binding a reference stays a call')
+
+
+tail_calls()
+
+
 # ---- FinalTest
 
 def calls_in(base, fn):
@@ -3671,10 +3753,10 @@ def types_defaults():
 def native_struct_values():
     """A struct the engine reads in its own binary form, which WriteValue does not write (it writes tags), gets no
     value: not as a default, and not as a UE_STRUCT member, whose default instance holds every member's."""
-    refused('NativeDefault', '  FPerPlatformFloat Scale = {};\n', 'PerPlatformFloat value in its own binary form')
+    refused('NativeDefault', '  FColorMaterialInput Tint = {};\n', 'ColorMaterialInput value in its own binary form')
     refused('NativeMember', '  int32 X = 0;\n', "a UE_STRUCT's defaults hold every member's",
-            top='struct FScaleHolder {\n  UE_STRUCT;\n  FPerPlatformFloat Scale;\n};\n')
-    print('ok  a PerPlatformFloat value is refused, as a default and as a UE_STRUCT member')
+            top='struct FTintHolder {\n  UE_STRUCT;\n  FColorMaterialInput Tint;\n};\n')
+    print('ok  a ColorMaterialInput value is refused, as a default and as a UE_STRUCT member')
 
 
 SOFT_PATHS_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/SoftPaths");
@@ -3687,6 +3769,9 @@ class ASoftBox : public AActor {
 public:
   FSoftObjectPath Path = FSoftObjectPath("/Game/E/F.F", "");
   FSoftHolder Held;
+  FPerPlatformFloat Scale = FPerPlatformFloat(2.5f);
+  FPerPlatformInt Count = FPerPlatformInt(7);
+  FPerPlatformBool On = FPerPlatformBool(true);
 };
 '''
 
@@ -3704,8 +3789,13 @@ def soft_path_values():
     assert m, cdo
     raw = bytes.fromhex(m.group(1))
     assert names[struct.unpack_from('<i', raw, 0)[0]] == '/Game/E/F.F' and struct.unpack_from('<i', raw, 8)[0] == 0, (raw, cdo)
+    # A PerPlatform value: bCooked set (a bool in an archive is 4 bytes), then its Default alone.
+    proves('struct-defaults.scale-fperplatformfloat-2-5f')
+    for tag, want in (('Scale', struct.pack('<If', 1, 2.5)), ('Count', struct.pack('<Ii', 1, 7)), ('On', struct.pack('<II', 1, 1))):
+        m = re.search(tag + r' \[0\] StructProperty size=8 struct=PerPlatform\w+: ([0-9a-f]+)', cdo)
+        assert m and bytes.fromhex(m.group(1)) == want, (tag, m and m.group(1), cdo)
     shutil.rmtree(tmp, ignore_errors=True)
-    print('ok  a SoftObjectPath default is written in its own form (name, then sub-path)')
+    print('ok  a SoftObjectPath default is written in its own form (name, then sub-path), and a PerPlatform value as bCooked + Default')
 
 
 def string_behaviour():
@@ -7240,6 +7330,19 @@ def uber_frames():
     print('ok  LatentTest / AsyncTest: each ubergraph is the class\'s UberGraphFunction and runs on the persistent frame')
 
 
+def repl_nowhere():
+    """A replicated variable on a class that is no actor and no component goes nowhere: refused, its own and one an
+    interface gives it."""
+    proves('replicated-variables-on.no-actor')
+    refused('ReplIfaceObject', '  int32 Read() { return Points; }\n', 'the replicated variable IReplScored::Points of an interface it '
+            'implements does nothing, since only an actor or an actor component replicates',
+            top='class IReplScored {\npublic:\n  UE_INTERFACE;\n  UE_REPLICATED(int32, Points) = 0;\n};\n',
+            base='UObject, public IReplScored')
+    refused('ReplOwnObject', '  UE_REPLICATED(int32, Points) = 0;\n',
+            'the replicated variable Points does nothing, since only an actor or an actor component replicates', base='UObject')
+    print('ok  ReplNowhere: a replicated variable on a class that is no actor or component is refused, an interface\'s too')
+
+
 def repl_defaults():
     """The actor replicates (CDO bReplicates, or no replicated variable ever leaves the server) and keeps Score's
     initializer; ReplKid inherits both rather than overriding them."""
@@ -7259,6 +7362,7 @@ def repl_defaults():
 
 
 replication()
+repl_nowhere()
 repl_defaults()
 repl_runs()
 rpc_routing()
@@ -8003,10 +8107,17 @@ def infer_meta():
         files = {
             'Owner/Shared.h': '#pragma once\n' + head + 'struct FShared { int32 A; };\nenum class EShared : uint8 { One, Two };\n'
                               'struct FMarked { UE_STRUCT; int32 B; };\nenum class EMarked : uint8 { X, Y };\nUE_ENUM(EMarked);\n'
-                              'class UShared : public UObject { public: FShared S; EShared E; FMarked M; EMarked K; };\n',
+                              'class UShared : public UObject { public: FShared S; EShared E; FMarked M; EMarked K; };\n'
+                              'namespace Core { class UInit : public UObject { public: int32 A; };\n'
+                              'struct FPair { int32 A; }; enum class EKind : uint8 { One, Two };\n'
+                              'class UCoreUser : public UObject { public: FPair P; EKind K; }; }\n',
             'Owner/Owner.cpp': '#include "Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Owner");\n',
             'User/User.cpp': '#include "../Owner/Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/User");\n'
-                             'class AUser : public AActor { FShared S; EShared E; FMarked M; EMarked K; UShared *D; };\n',
+                             'class AUser : public AActor { FShared S; EShared E; FMarked M; EMarked K; UShared *D; };\n'
+                             'namespace Spawn { class UInit : public UObject { public: int32 B; };\n'
+                             'struct FPair { int32 B; }; enum class EKind : uint8 { Three, Four }; }\n'
+                             'class ATwo : public AActor { Core::UInit *Theirs; Spawn::UInit *Mine; Core::FPair TP; Spawn::FPair MP;\n'
+                             '  Core::EKind TK; Spawn::EKind MK; };\n',
             'Mixed/Mixed.h': '#pragma once\n' + head + 'struct FMixed { int32 A; };\n',
             'Mixed/A.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixA");\nclass AMixA : public AActor { FMixed M; };\n',
             'Mixed/B.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixB");\nclass AMixB : public AActor {};\n'}
@@ -8020,13 +8131,22 @@ def infer_meta():
         proves('sharing-a-class.include-turrets-turrets-h')
         assert {'EShared.uasset', 'FShared.uasset', 'UShared.uasset', 'FMarked.uasset', 'EMarked.uasset'} \
             <= set(os.listdir(out('Owner'))), os.listdir(out('Owner'))
-        assert {f for f in os.listdir(out('User')) if f.endswith('.uasset')} == {'AUser.uasset'}, os.listdir(out('User'))
+        assert {f for f in os.listdir(out('User')) if f.endswith('.uasset')} == {'AUser.uasset', 'ATwo.uasset'}, os.listdir(out('User'))
         imports = set(import_paths(os.path.join(out('User'), 'AUser')))
         assert {'/Game/_ElytrasMods/Owner/FShared.FShared', '/Game/_ElytrasMods/Owner/EShared.EShared',
                 '/Game/_ElytrasMods/Owner/UShared.UShared_C'} <= imports, sorted(imports)
         # Its UE_STRUCT and UE_ENUM too, never cooked again here:
         proves('sharing-a-class.include-marked')
         assert {'/Game/_ElytrasMods/Owner/FMarked.FMarked', '/Game/_ElytrasMods/Owner/EMarked.EMarked'} <= imports, sorted(imports)
+        # Two mods' types of one name, each in its own namespace: each is its own file's mod's.
+        proves('sharing-a-class.two-mods-one-name')
+        made = lambda mod, ns: {f for f in os.listdir(os.path.join(out(mod), ns)) if f.endswith('.uasset')}
+        assert made('Owner', 'Core') >= {'UInit.uasset', 'FPair.uasset', 'EKind.uasset'}, made('Owner', 'Core')
+        assert made('User', 'Spawn') == {'UInit.uasset', 'FPair.uasset', 'EKind.uasset'}, made('User', 'Spawn')
+        assert not os.path.exists(os.path.join(out('User'), 'Core')), os.listdir(os.path.join(out('User'), 'Core'))
+        imports = set(import_paths(os.path.join(out('User'), 'ATwo')))
+        assert {'/Game/_ElytrasMods/%s/%s' % (mod, leaf) for mod in ('Owner/Core', 'User/Spawn')
+                for leaf in ('UInit.UInit_C', 'FPair.FPair', 'EKind.EKind')} <= imports, sorted(imports)
         proves('sharing-a-class.a-header-in-a-folder')
         proc = assetgen_compile([os.path.join(tmp, 'Mixed/A.cpp'), UEAPI, out('MixA')])
         assert proc.returncode != 0 and 'unimplemented property M: FMixed' in proc.stdout, proc.stdout
@@ -8304,6 +8424,24 @@ subobject_chain()
 print('ok  InstancedDefaults: an instanced object is an export under its outer, its tag that export, its archetype the '
       'outer archetype\'s object of its name or its class\'s CDO; %s' % instanced_defaults())
 self_ref_import()
+
+
+def import_case():
+    """ImportCase: a package's and an object's name is an FName, which compares without case, so one asset named in two
+    spellings is one package row and one object row; two would be two imports of one object."""
+    b = asset('ImportCase')
+    paths = [p.lower() for p in import_paths(b)]
+    proves('ue-asset-at.two-spellings')
+    assert len(paths) == len(set(paths)), sorted(p for p in set(paths) if paths.count(p) > 1)
+    assert '/game/enemies/spider/grunt/ed_spider_grunt.ed_spider_grunt' in paths, paths
+    mine = {}
+    run(b, 'Keep', self_vars=mine)
+    assert mine['A'] and mine['A'] == mine['B'], mine
+    keeps_invariants(b)
+    print('ok  ImportCase: an asset named in two spellings is one import of its package and one of the object')
+
+
+import_case()
 abstract_instances()
 proves('declaring-components.ue-component-ucharges-ammo')
 refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP)
@@ -12795,6 +12933,32 @@ def prop_set_delta():
           'parent\'s elements it drops as removed, and loads as its own value, not the union')
 
 
+def comp_set_delta():
+    """UE_DEFAULTS on a component's TSet / TMap is what the template loads: read as the loader reads each tag on top of
+    its archetype's loaded value (loaded_container), the component class's default object for a class's own component
+    and the parent's template for an inherited one. Any encoding that loads the value the source says passes."""
+    import invariants
+    folder = os.path.dirname(asset('CompSetDelta'))
+    part, base, kid = (invariants.Package(os.path.join(folder, n)) for n in ('UCsdHolder', 'CsdBase', 'CompSetDelta'))
+    cdo = part.find('Default__UCsdHolder_C')
+    cls = {('Ids',): loaded_container(part, cdo, 'Ids', 'set', set()), ('Score',): loaded_container(part, cdo, 'Score', 'map', {}),
+           ('Held', 'Ids'): loaded_container(part, cdo, ('Held', 'Ids'), 'set', set())}
+    assert cls == {('Ids',): {1, 2}, ('Score',): {'a': 1, 'c': 3}, ('Held', 'Ids'): {1, 2}}, cls
+    kinds = {('Ids',): 'set', ('Score',): 'map', ('Held', 'Ids'): 'set'}
+    over = lambda pkg, name, start: {k: loaded_container(pkg, pkg.find(name), k, kinds[k], start[k]) for k in kinds}
+    proves('ue-defaults.holder-ids-2-3')
+    holder = over(base, 'Holder_GEN_VARIABLE', cls)
+    assert holder == {('Ids',): {2, 3}, ('Score',): {'a': 5, 'b': 2}, ('Held', 'Ids'): {2, 4}}, 'CsdBase.Holder loads %s' % holder
+    assert over(base, 'Plain_GEN_VARIABLE', cls) == cls
+    kid_holder = over(kid, 'Holder_GEN_VARIABLE', holder)
+    assert kid_holder == {('Ids',): {3, 9}, ('Score',): {'a': 5, 'b': 2}, ('Held', 'Ids'): {2, 4}}, 'CompSetDelta.Holder loads %s' % kid_holder
+    kid_plain = over(kid, 'Plain_GEN_VARIABLE', cls)
+    assert kid_plain == {('Ids',): {7}, ('Score',): {'a': 1, 'c': 3}, ('Held', 'Ids'): {1, 2}}, 'CompSetDelta.Plain loads %s' % kid_plain
+    for n in ('UCsdHolder', 'CsdBase', 'CompSetDelta'): keeps_invariants(os.path.join(folder, n))
+    print('ok  CompSetDelta: a component\'s TSet / TMap default, the class\'s own component or an inherited one, lists its '
+          'archetype\'s elements it drops as removed, and loads as the braces say, not the union')
+
+
 def prop_enum_class():
     """A property of a native `enum class : uint8` is an EnumProperty over a ByteProperty, as the editor makes it
     (KismetCompilerMisc.cpp 1071-1094; every EnumProperty of the game's Blueprints is over a ByteProperty): a variable, a
@@ -12889,6 +13053,7 @@ prop_flag_predicates()
 prop_hash_keys()
 prop_enum_casts()
 prop_set_delta()
+comp_set_delta()
 prop_enum_class()
 
 
@@ -15447,17 +15612,26 @@ def proxy_frame_held():
         for n in invariants.statements(pkg, i)[0]:
             if n.op in (0x0F, 0x5F) and factory(n.kids[1]): held.append(holder(i, n.kids[0]))
             elif n.op == 0x64 and factory(n.kids[0]): held.append('the frame')
-    assert len(held) == 1, held
-    assert held[0] in ('a member', 'the frame'), 'the montage proxy is kept in %s' % held[0]
-    made = []
-    vm = VM(base, {'CreateProxyObjectForPlayMontage': lambda vm, ctx, *a: made.append(Obj('PlayMontageCallbackProxy')) or made[-1]},
-            Mesh='mesh', Montage='montage', Last='None')
-    vm.call('Play')
-    assert any(v is made[-1] for v in vm.self.vars.values()), 'nothing of the object holds the proxy: %s' % vm.self.vars
-    vm.broadcast(made[-1], 'OnCompleted', 'End')
-    assert vm.self.vars['Last'] == 'End', vm.self.vars
+    # Play's, and PlayChained's, which the source gives no local: `Create(...)->OnCompleted.Add(...)`.
+    assert len(held) == 2, held
+    assert all(h in ('a member', 'the frame') for h in held), 'the montage proxy is kept in %s' % held
+    for play in ('Play', 'PlayChained'):
+        made = []
+        vm = VM(base, {'CreateProxyObjectForPlayMontage': lambda vm, ctx, *a: made.append(Obj('PlayMontageCallbackProxy')) or made[-1]},
+                Mesh='mesh', Montage='montage', Last='None')
+        vm.call(play)
+        assert len(made) == 1 and any(v is made[-1] for v in vm.self.vars.values()), \
+            '%s: nothing of the object holds the proxy: %s' % (play, vm.self.vars)
+        vm.broadcast(made[-1], 'OnCompleted', 'End')
+        assert vm.self.vars['Last'] == 'End', (play, vm.self.vars)
     keeps_invariants(base)
-    print('ok  ProxyLocalHeld.Play: a callback proxy bound in a plain function is kept in a member, where the GC sees it')
+    # Beside another call of its statement the proxy's call cannot move in front: refused, saying what to write.
+    refused('ProxyBeside', '  USkeletalMeshComponent *Mesh;\n  UAnimMontage *Montage;\n  int32 N = 0;\n'
+            '  int32 Bump() { return ++N; }\n  void Take(int32 A, UObject *P) {}\n'
+            '  void F() { Take(Bump(), UPlayMontageCallbackProxy::CreateProxyObjectForPlayMontage(Mesh, Montage, 1.0f, 0.0f, FName())); }\n',
+            'put it in a local of its own first', top='#include "UeApi/AnimGraphRuntime.h"\n')
+    print('ok  ProxyLocalHeld.Play: a callback proxy bound in a plain function, held in a local or made in the middle of the '
+          'bind, is kept in a member, where the GC sees it')
 
 
 def deferred_left():
@@ -15853,10 +16027,17 @@ def timelines():
     assert [(props[n].type, props[n].flags) for n in ('Alpha', 'Lift', 'Tint', 'Beat')] == [
         ('FloatProperty', 0), ('StructProperty', 0), ('StructProperty', 0), ('FloatProperty', 0)]
 
+    lamp_base = os.path.join(ROOT, 'FadingLamp', 'FSD', 'Content', '_AssetGenExamples', 'FadingLamp', 'FadingLamp')
     kid = timelines_of(child)
     assert list(kid) == ['Spin'] and kid['Spin']['UpdateFunctionName'] == 'OnSpin' and 'FinishedFunctionName' not in kid['Spin'], kid
     assert timelines_of(plain) == {}
-    lamp = os.path.join(ROOT, 'FadingLamp', 'FSD', 'Content', '_AssetGenExamples', 'FadingLamp', 'FadingLamp')
+    # A replicated timeline's component replicates only with its actor: the class's CDO replicates, and a subclass inherits it.
+    cdo_of = lambda b: dump('dumptags.py', b, [e['name'] for e in dumpexp.load(b)[5]].index('Default__%s_C' % os.path.basename(b)))
+    proves('declaring-a-timeline.ue-timeline-fade-2-0f-2')
+    assert re.search(r'bReplicates \[0\] BoolProperty size=0 value=1', cdo_of(base)), cdo_of(base)
+    assert 'bReplicates' not in cdo_of(child) and 'bReplicates' not in cdo_of(plain)
+    assert 'bReplicates' not in cdo_of(lamp_base), cdo_of(lamp_base)      # no Replicated option: the actor is left as it was
+    lamp = lamp_base
     assert os.path.exists(lamp + '.uasset'), 'the examples are not built under ' + ROOT
     lit = timelines_of(lamp)
     assert list(lit) == ['Fade'] and (lit['Fade']['UpdateFunctionName'], lit['Fade']['FinishedFunctionName']) == ('OnFade', 'OnFaded'), lit
@@ -16778,6 +16959,8 @@ def lambdas():
         ('InitCapture', lambda V: (V + 1) * 7),
         ('InitCaptures', lambda V: ((V * 10 + V * 2) + (V + V * 2)) * 100 + V + 2),
         ('InitUnused', lambda V: V * 3 + 1),
+        ('InitLambda', lambda V: (3 + V) * 2 + (V + V) * 2),
+        ('InitLambdaInPlace', lambda V: 4 * V + 1),
         ('Immediate', lambda V: V * 5),
         ('ImmediateInCondition', lambda V: 1 if V > 3 else 0),
         ('ToTemplate', lambda V: (V + 5) * 2 + 1 + V + 5),
@@ -16805,7 +16988,7 @@ def lambdas():
     ]
     proves('other-declarations.auto-inc-int32-v-return', 'lambdas.auto-l-int32-a-x', 'lambdas-function.auto-l-x-int32-y',
            'lambdas.c-int32-a-mutable-c', 'lambdas.z-x-1-int32-a', 'lambdas.const-int32-r-return-v', 'lambdas.apply-5-int32-a-x',
-           'lambdas.auto-a-auto-b-return', 'lambdas.a-lambda-calling-or-capturing')
+           'lambdas.auto-a-auto-b-return', 'lambdas.a-lambda-calling-or-capturing', 'lambdas.g-l-int32-b')
     for fn, want in forms:
         for v in (-5, 0, 3, 8):
             got = run(base, fn, V=v)[0]
@@ -16855,6 +17038,8 @@ def lambda_refusals():
         ('LamPassMutable', 'template <class G> inline int32 Use(G Fn) { return Fn(1); }', 'int32 F(int32 V) { %s return Use(L); }' % src,
          'takes a mutable lambda by value, which copies its state'),
         ('LamCaptureMutable', '', 'int32 F(int32 V) { %s auto K = [=](int32 A) mutable { return L(A); }; return K(1); }' % src,
+         'which would fork its state: capture it by reference'),
+        ('LamInitMutable', '', 'int32 F(int32 V) { %s auto K = [G = L](int32 A) mutable { return G(A); }; return K(1); }' % src,
          'which would fork its state: capture it by reference'),
         ('LamStatic', '', 'int32 F(int32 V) { auto L = [](int32 A) { static int32 N = 0; N += A; return N; }; return L(V); }',
          "static N lives in the ubergraph's frame"),
@@ -16974,7 +17159,7 @@ ROW_REFUSALS = [
     ('lambdas-function.inline-fpairx-operator-fpairx-l', 'OpOver', '  FPairX F(FPairX A, FPairX B) { return A + B; }\n', 'unimplemented operator overload',
      'struct FPairX {\n  UE_STRUCT;\n  int32 A;\n  int32 B;\n};\ninline FPairX operator+(FPairX L, FPairX R) { return {L.A + R.A, L.B + R.B}; }\n'),
     ('math-and-utility.fmath-clamp-v-0-10', 'FMathUse', '  int32 F(int32 V) { return FMath::Clamp(V, 0, 10); }\n', "use of undeclared identifier 'FMath'", ''),
-    ('inline-functions.an-inline-function-that-calls', 'InlRec', '  inline int32 Loop(int32 X) { return X > 0 ? Loop(X - 1) : 0; }\n  int32 F(int32 X) { return Loop(X); }\n',
+    ('inline-functions.an-inline-function-that-calls', 'InlRec', '  inline int32 Loop(int32 X) { return X > 0 ? 1 + Loop(X - 1) : 0; }\n  int32 F(int32 X) { return Loop(X); }\n',
      'calls itself', ''),
     ('inline-functions.inline-int32-nope-int32-x', 'InlNoBody', '  inline int32 Nope(int32 X);\n  int32 F(int32 X) { return Nope(X); }\n', 'has no body', ''),
     ('inline-functions.other-twice-3', 'InlOther', '  inline int32 Twice(int32 X) { return X * 2; }\n  int32 F(InlOther *Other) { return Other->Twice(3); }\n',
@@ -17306,6 +17491,179 @@ def row_defaults():
 proves('soft-references.tsoftclassptr-aactor-kind-game-a', 'soft-references.tarray-tsoftclassptr-aactor',
        'container-variables.tarray-tsoftclassptr-aactor', 'struct-defaults.ffloatinterval-delay')
 row_defaults()
+
+
+# ---- ConstObjects: a constant of a plain C++ struct is its braces (REFERENCE.md, Constant objects)
+
+def const_objects():
+    base = asset('ConstObjects')
+    folder = os.path.dirname(base)
+    # No Blueprint struct stands for FTable or a handle: the class is all the mod cooks.
+    assert sorted(os.listdir(folder)) == ['ConstObjects.uasset', 'ConstObjects.uexp'], os.listdir(folder)
+    proves('constant-objects.constexpr-ftable-ktable-5-2')
+    assert run(base, 'Members')[0] == 5 * 100 - 3 + 9
+    for v in (0.0, 2.0, -1.5):
+        assert run(base, 'Real', V=v)[0] == f32(v * 2.5), v
+    assert run(base, 'Label')[0] == 'table'
+    check('ConstObjects', 'Shift', lambda V: wrap(V << 5), [dict(V=v) for v in (0, 1, -3, 2**27)])
+    assert global_default(folder, 'ConstObjects', 'Seed') == '18', global_default(folder, 'ConstObjects', 'Seed')
+    proves('constant-objects.static-constexpr-finthandle')
+    check('ConstObjects', 'Handle', lambda Stored: (Stored or 12) + (Stored or 12) * 2000, [dict(Stored=s) for s in (0, 1, 40)])
+    check('ConstObjects', 'Statics', lambda Stored: (Stored or 3) * 10 + 3 + 1100, [dict(Stored=s) for s in (0, 5)])
+    proves('constant-objects.method-below')
+    check('ConstObjects', 'Below', lambda Stored: (Stored or 12) * 2 + 12 + ((Stored or 3) * 2 + 3) * 1000,
+          [dict(Stored=s) for s in (0, 1, 40)])
+    proves('constant-objects.static-constexpr-thandle-float')
+    check('ConstObjects', 'Templated', lambda Stored, bHas: Stored if bHas else 7,
+          [dict(Stored=s, bHas=h) for s in (0, 9) for h in (False, True)])
+    check('ConstObjects', 'TemplatedReal', lambda Stored, bHas: Stored if bHas else 0.5,
+          [dict(Stored=s, bHas=h) for s in (0.0, 0.25) for h in (False, True)])
+    proves('constant-objects.fname-key-const-return-name')
+    check('ConstObjects', 'Keys', lambda Which: ('Waves.Max', 'Audio.Volume', 'Count')[Which], [dict(Which=w) for w in (0, 1, 2)])
+    proves('constant-objects.this')
+    refused('ConstThis', '  int32 F() { return kH.Reg(); }\n', 'the constant has no address',
+            top='inline int32 Take(const void *P) { return 1; }\n'
+                'struct FH {\n  int32 D;\n  int32 Reg() const { return Take(this) + D; }\n};\nconstexpr FH kH = {4};\n')
+    print('ok  ConstObjects: a member of a plain struct constant is what its braces gave it, in code, a default and '
+          "another constant; a method called on one reads that constant's members, a template's too; no struct is cooked")
+
+
+const_objects()
+
+
+# ---- Two leftovers of the bug-class audit: warnings about constants come in the order the source writes them, and the
+# one int64 division with no int64 quotient is left for the game to run instead of trapping in the compiler.
+
+def audit_leftovers():
+    import tempfile
+    names = ['Zed', 'Alpha', 'Mid', 'Beta', 'Yaw', 'Cee', 'Xi', 'Dee']
+    head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'KeyOrder.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(head % 'KeyOrder' + ''.join('const FKey k%s = FKey{"LeftShfit"};\n' % n for n in names)
+                    + 'class KeyOrder : public AActor {\npublic:\n  int32 F() { return 1; }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout
+        assert re.findall(r'warning: k(\w+): FKey\{"LeftShfit"\}', proc.stdout) == names, proc.stdout
+        src = os.path.join(tmp, 'LowestOverMinusOne.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(head % 'LowestOverMinusOne' + 'class LowestOverMinusOne : public AActor {\npublic:\n'
+                    '  int64 Quot() { return (-9223372036854775807LL - 1) / -1; }\n'
+                    '  int64 Near() { return (-9223372036854775807LL) / -1; }\n};\n')       # folds: the largest int64
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, (proc.returncode, proc.stdout)
+        assert run(os.path.join(tmp, 'LowestOverMinusOne'), 'Near')[0] == 2**63 - 1
+    print('ok  AuditLeftovers: FKey warnings of constants come in source order; the lowest int64 over -1 compiles, unfolded')
+
+
+audit_leftovers()
+
+
+# ---- MapArrays: a store to an element of an array a map holds reaches the map (REFERENCE.md, Assignment and updates)
+
+def map_arrays():
+    proves('assignment-and-updates.lists-k-0-7')
+    check('MapArrays', 'Store', lambda V: V * 1000 + 20 + 300000, [dict(V=v) for v in (7, 0, -4)])
+    check('MapArrays', 'StoreMember', lambda V: V * 100 + 10 + 300000, [dict(V=v) for v in (7, -1)])
+    check('MapArrays', 'Update', lambda V: (20 + V) * 10000 + 31 * 100 + 4, [dict(V=v) for v in (1, 5, 0)])
+    check('MapArrays', 'Bound', lambda V: 10 + V, [dict(V=v) for v in (1, 90)])
+    check('MapArrays', 'Pairs', lambda V: V * 100 + 2 * V, [dict(V=v) for v in (3, 41)])
+    check('MapArrays', 'Others', lambda V: 5 * 10000 + 10 * 100 + 30, [dict(V=v) for v in (9, 77)])
+    check('MapArrays', 'KeyOnce', lambda V: V * 10 + 1, [dict(V=v) for v in (6, 2)])
+    assert "Grow's reference parameter V is bound to an element of a map element's array" in LOGS['MapArrays'], LOGS['MapArrays']
+    proves('reference-locals.auto-l-lists-k')
+    check('MapArrays', 'Named', lambda V: V * 10000 + (V + 1) * 100 + V + 2 + 4000000, [dict(V=v) for v in (7, 40)])
+    check('MapArrays', 'NamedBag', lambda V: (3 + V) * 1000 + V, [dict(V=v) for v in (7, 0)])
+    check('MapArrays', 'NamedElem', lambda V: 30 + 2 * V, [dict(V=v) for v in (7, -3)])
+    check('MapArrays', 'NamedPinned', lambda V: V * 100 + 5, [dict(V=v) for v in (7, 12)])
+    check('MapArrays', 'NamedScore', lambda V: (10 + V) * 2, [dict(V=v) for v in (7, -10)])
+    check('MapArrays', 'NamedRead', lambda V: V, [dict(V=v) for v in (7, 99)])
+    check('MapArrays', 'NamedKeyOnce', lambda V: 1000 + 2 * V, [dict(V=v) for v in (7, 3)])
+    refused('RefPick', '  int32 X = 0, Y = 0;\n  void F(bool B) {\n    int32 &R = B ? X : Y;\n    R = 1;\n  }\n',
+            'reference R: TODO: the address of ConditionalOperator')
+    proves('range-for-over.for-int32-x-lists-k')
+    check('MapArrays', 'Walk', lambda V: wrap(60 * V), [dict(V=v) for v in (7, 0, -2)])
+    check('MapArrays', 'WalkMember', lambda V: (10 + V) * 10000 + (20 + V) * 100 + 30 + V, [dict(V=v) for v in (7, 1)])
+    check('MapArrays', 'WalkReturn', lambda V: V, [dict(V=v) for v in (7, 99)])
+    check('MapArrays', 'WalkBreak', lambda V: (10 + V) * 100 + 20, [dict(V=v) for v in (7, 3)])
+    assert run(asset('MapArrays'), 'WalkRead')[0] == 65
+    refused('MapWalkGoto', '  TMap<int32, TArray<int32>> Lists;\n'
+            '  void F() {\n    for (int32 &X : Lists[1]) {\n      X = 1;\n      if (X == 1) goto Out;\n    }\n  Out:\n    return;\n  }\n',
+            'a copy stored back when the loop is left')
+    print('ok  MapArrays: a store, an update, a T& bound to an element of an array under a map value, and a range-for by '
+          'reference over one, change the map: the value is copied out, changed and stored back under its key, found once')
+
+
+map_arrays()
+
+
+# ---- MathEdges: where Blueprint's arithmetic leaves C++ (REFERENCE.md, Arithmetic)
+
+def math_edges():
+    s = lambda x: (x + 2**63) % 2**64 - 2**63
+    ints = [dict(A=a, B=b) for a in (-7, 0, 7, 2**31 - 1, -2**31) for b in (0, 3, -2)]
+    proves('arithmetic.hits-shots')
+    check('MathEdges', 'Div', lambda A, B: cdiv(A, B) if B else 0, ints)
+    check('MathEdges', 'Mod', lambda A, B: cmod(A, B) if B else 0, ints)
+    check('MathEdges', 'Div64', lambda A, B: cdiv(A, B) if B else 0, ints + [dict(A=2**62, B=0), dict(A=-2**40, B=7)])
+    check('MathEdges', 'DivF', lambda A, B: A / B if B else 0.0, [dict(A=a, B=b) for a in (-1.5, 0.0, 8.0) for b in (0.0, 0.5, -4.0)])
+    check('MathEdges', 'Guarded', lambda A, B: 1 if B != 0 and cdiv(A, B) > 2 else 0, ints)
+    proves('arithmetic.x-1')
+    wide = [dict(A=a, B=b) for a in (2**63 - 1, -2**63, 2**62, -5, 3) for b in (1, -1, 2**62, 2**63 - 1, -2**63)]
+    check('MathEdges', 'Add64', lambda A, B: s(A + B), wide)
+    check('MathEdges', 'Sub64', lambda A, B: s(A - B), wide)
+    check('MathEdges', 'Mul64', lambda A, B: s(A * B), wide)
+
+
+math_edges()
+
+
+# ---- Unsigned64: a uint64 value shifts right and orders as unsigned (REFERENCE.md, Bitwise operators and shifts)
+
+def unsigned64():
+    u = lambda x: x % 2**64
+    s = lambda x: (x + 2**63) % 2**64 - 2**63
+    vals = (0, 1, 5, 6, 16, 2**62, 2**63 - 1, -1, -2, -16, -2**63, -2**62)
+    pairs = [dict(A=a, B=b) for a in vals for b in vals]
+    proves('bitwise-operators-and.uint64-x-4')
+    check('Unsigned64', 'Shr', lambda X: s(u(X) >> 4), [dict(X=x) for x in vals])
+    check('Unsigned64', 'Top', lambda X: u(X) >> 63, [dict(X=x) for x in vals])
+    check('Unsigned64', 'Shr0', lambda X: X, [dict(X=x) for x in vals])
+    check('Unsigned64', 'Signed', lambda X: X >> 4, [dict(X=x) for x in vals])
+    proves('bitwise-operators-and.uint64-a-uint64-b')
+    check('Unsigned64', 'Less', lambda A, B: u(A) < u(B), pairs)
+    check('Unsigned64', 'Greater', lambda A, B: u(A) > u(B), pairs)
+    check('Unsigned64', 'LessEq', lambda A, B: u(A) <= u(B), pairs)
+    check('Unsigned64', 'GreaterEq', lambda A, B: u(A) >= u(B), pairs)
+    check('Unsigned64', 'Same', lambda A, B: A == B, pairs)
+    check('Unsigned64', 'Past', lambda A: u(A) > 5, [dict(A=a) for a in vals])
+    proves('bitwise-operators-and.uint64-a-3')
+    check('Unsigned64', 'Div', lambda A: A // 3, [dict(A=a) for a in (0, 9, 10, 2**62)])
+    assert 'Unsigned64::Div: an unsigned 64-bit `/` runs as a signed division' in LOGS['Unsigned64'], LOGS['Unsigned64']
+    print('ok  Unsigned64: a uint64 value shifts zeros in from the top and orders above every smaller one, past INT64_MAX '
+          'too; its division runs signed and says so')
+
+
+unsigned64()
+
+
+# ---- TmplStaticClass: `T::StaticClass()` in a template names the class it was instantiated with (REFERENCE.md,
+# StaticClass on the mod's classes)
+
+def tmpl_static_class():
+    base = asset('TmplStaticClass')
+    proves('staticclass-on-the.t-staticclass')
+    for fn, want in (('Direct', 'Lexer_C'), ('Free', 'Lexer_C'), ('FreeOther', 'Parser_C'), ('Member', 'Lexer_C'),
+                     ('MemberOther', 'Parser_C'), ('Pair', 'Parser_C'), ('PairSwapped', 'Lexer_C'), ('OfStruct', 'Parser_C'),
+                     ('Engine', 'Actor')):
+        assert run(base, fn)[0] == want, (fn, run(base, fn)[0], want)
+    assert run(base, 'Nested', bFirst=True)[0] == 'Lexer_C' and run(base, 'Nested', bFirst=False)[0] == 'Parser_C'
+    print('ok  TmplStaticClass: T::StaticClass() in a free, a member and a class template names each instantiation\'s own '
+          'class, by the parameter\'s place, an inner template\'s too')
+
+
+tmpl_static_class()
 
 
 

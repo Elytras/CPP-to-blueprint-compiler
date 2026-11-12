@@ -2268,6 +2268,9 @@ private:
     bool ListsDefaultRootOf(const FRecord& R) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                       FCallIR& Out, std::string* Err, const Json* Receiver = nullptr, bool bStaticCall = false);
+    /* Def's body with each self-call in tail position turned into a jump back to its top, or false when it has none
+       that can be. See the definition. */
+    bool TailCallsToLoop(const Json& Def, const Json& Body, Json* Out);
     /* `final`: the class holding the version of Method a call by name reaches on every object of class Of or below,
        the nearest declaration from Of up that is a Blueprint function, when no subclass can bring its own: Of is
        final, or that declaration is. Null when one could. */
@@ -2426,6 +2429,18 @@ private:
     const Json* CurFnBody = nullptr;                                    // the body of the function being compiled
     void IndexLambdas(const Json& N);
     void RewriteLambdaCalls(Json& N);
+    /* Constants of the mod's own plain C++ aggregates, `constexpr FTable kTable = {5, 2.5f};`, which no Blueprint type
+       stands for (REFERENCE.md#constant-objects): a field's place in its struct's braces, each method with a body, and
+       the copies of those methods made for one constant each, which are free inline functions. See FoldConstObjects. */
+    std::map<std::string, size_t> PlainFields;          // FieldDecl id -> its index among the struct's fields
+    std::map<std::string, const Json*> PlainMethods;    // CXXMethodDecl id -> its definition
+    std::map<std::string, Json> BoundMethods;           // "<method id>@<variable id>" -> the method with that `this`
+    void IndexPlain(const Json& N, bool bApi, bool bInTemplate);
+    /* `T::StaticClass()` in a template's body: each such reference in an instantiation gets the arguments its
+       template's parameters stand for there ("templateArgs"), which NamedQualifier reads the written `T` through. */
+    void BindStaticClassParms(Json& N, const Json& Bound);
+    const Json* PlainConstInit(const Json& E, std::string* VarId = nullptr) const;
+    void FoldConstObjects(Json& N, bool bAddressed = false);
     bool CaptureNames(const Json& Lambda, const std::vector<const Json*>& Inits, std::vector<std::string>* Names,
                       std::vector<char>* Kinds, std::string* Err) const;
     bool DeclareLambda(const Json& LambdaExpr, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
@@ -2545,6 +2560,12 @@ private:
         {
             Json Out = N;
             Out["inner"][0] = Unalias(N["inner"][0]);
+            return Out;
+        }
+        if (K == "CXXOperatorCallExpr" && N["inner"].size() == 3)      // `L[0]`, L an `auto& L = Map[K]`: the container's root
+        {
+            Json Out = N;
+            Out["inner"][1] = Unalias(N["inner"][1]);
             return Out;
         }
         if (K == "DeclRefExpr")
@@ -6205,12 +6226,18 @@ bool IsTMapElement(const Json& N)
         && Map && TemplateArg(TypeOf(*Map), "TMap", &Inner);
 }
 
-/* The map element a place stands on: `Map[Key]` itself, or a member chain on it (`Map[Key].A.B`). Map_Find copies
-   the value out, so a store or a reference through it would change the copy. */
+/* The map element a place stands on: `Map[Key]` itself, or members and array elements taken of it (`Map[Key].A.B`,
+   `Map[Key][0]`, `Map[Key].Items[I].X`). Map_Find copies the value out, so a store or a reference through it would
+   change the copy. */
 const Json* MapElementUnder(const Json& N)
 {
     const Json* P = PeelLvalue(&N);
-    while (P && Kind(*P) == "MemberExpr" && !P->value("isArrow", false) && First(*P)) P = PeelLvalue(First(*P));
+    for (;;)
+    {
+        if (P && Kind(*P) == "MemberExpr" && !P->value("isArrow", false) && First(*P)) P = PeelLvalue(First(*P));
+        else if (P && IsTArrayElement(*P) && (*P)["inner"].size() == 3) P = PeelLvalue(&(*P)["inner"][1]);
+        else break;
+    }
     return P && IsTMapElement(*P) ? P : nullptr;
 }
 
@@ -7193,6 +7220,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         }
         return LowerField(*N, BP, Out, Err);
     }
+    if (K == "CXXThisExpr" && N->value("plainThis", false))
+    { *Err = "`this` in a method called on a constant of a plain struct: the constant has no address, only its members' values; name the members"; return false; }
     if (K == "CXXThisExpr") { Out.K = FArgIR::Self; return true; }
     if (K == "CXXNullPtrLiteralExpr") { Out.K = FArgIR::NullObj; return true; }
     if (!RefReturnOf(*N).empty())
@@ -8258,12 +8287,15 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             if (!LowerArg(*LhsRaw, BP, LA, Err)) return false;
             const std::string LhsBare = StripTypeKeywords(LhsTy);
             const bool bSigned = LhsBare.find("unsigned") == std::string::npos && LhsBare.compare(0, 4, "uint") != 0;
-            if (Op == ">>" && bSigned && N > 0)
+            if (Op == ">>" && N > 0)
             {
                 /* Signed >> floors, Divide truncates toward zero (-3 >> 1 is -2, -3 / 2 is -1): clearing the low
                    N bits first makes the division exact. At N = width-1 the divisor wraps to MIN, which negates. */
                 Out = Math("Divide_", Math("And_", std::move(LA), Const(~((1LL << N) - 1))), Const(1LL << N));
                 if (N == (bWide ? 63 : 31)) Out = Math("Multiply_", std::move(Out), Const(-1));
+                /* An unsigned >> shifts zeros in, and Kismet's integers are signed: the same floor, then the N copies
+                   of the top bit cleared. */
+                if (!bSigned) Out = Math("And_", std::move(Out), Const(int64((1ULL << ((bWide ? 64 : 32) - N)) - 1)));
                 return true;
             }
             Out = Math(Op == "<<" ? "Multiply_" : "Divide_", std::move(LA), Const(1LL << N));
@@ -8301,6 +8333,30 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         FArgIR LA, RA;
         if (!LowerArg(*LhsRaw, BP, LA, Err)) return false;
         if (!LowerArg(*RhsRaw, BP, RA, Err)) return false;
+        /* Kismet's int64 is signed, and a uint64 is its bits (`*P` of a `uint64*`, `uint64(X)`). Unsigned order is the
+           signed order of both sides with the top bit flipped. An unsigned division has no such form: it runs signed,
+           right while neither side is past INT64_MAX, and says so. */
+        if (Flavour == "Int64Int64" && (IsUnsigned64Type(StripTypeKeywords(LhsTy)) || IsUnsigned64Type(StripTypeKeywords(RhsTy))))
+        {
+            if (Op == "<" || Op == ">" || Op == "<=" || Op == ">=")
+                for (FArgIR* Side : { &LA, &RA })
+                {
+                    FArgIR Top, Flip;
+                    Top.K = FArgIR::Int64;
+                    Top.I64 = INT64_MIN;
+                    if (Side->K == FArgIR::Int64) { Side->I64 ^= INT64_MIN; continue; }
+                    Flip.K = FArgIR::Call;
+                    Flip.Sub = std::make_shared<FCallIR>();
+                    Flip.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Xor_Int64Int64");
+                    Flip.Sub->bScript = false;
+                    Flip.Sub->bPure = true;
+                    Flip.Sub->Args = { std::move(*Side), std::move(Top) };
+                    *Side = std::move(Flip);
+                }
+            else if (Op == "/")
+                printf("  warning: %s::%s: an unsigned 64-bit `/` runs as a signed division (Blueprint has no unsigned "
+                       "integer): wrong when a side is past INT64_MAX\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str());
+        }
         Out.Sub->Args.push_back(LA);
         Out.Sub->Args.push_back(RA);
         return true;
@@ -8610,8 +8666,11 @@ static std::string WithoutComments(std::string T)
     return T;
 }
 
-/* The names of the types T defines, comments gone: `struct X {`, `class X final : public Y {`, `enum class X : uint8 {`.
-   A forward declaration, a template's parameter (`class T>`) and an elaborated type (`class UObject *O;`) are none. */
+/* The types T defines, comments gone, each by its qualified name, the namespaces and types it is written in:
+   `struct X {`, `class X final : public Y {`, `enum class X : uint8 {`. A forward declaration, a template's parameter
+   (`class T>`) and an elaborated type (`class UObject *O;`) are none.
+   ponytail: the scopes are counted by braces, so a namespace a macro opens is not seen and a brace in a raw string
+   miscounts; the caller falls back to the last segment (InferFromSources' OwnerOf). */
 static std::vector<std::string> DefinedTypes(const std::string& T)
 {
     auto IsIdent = [](char C) { return isalnum(uint8(C)) || C == '_'; };
@@ -8621,12 +8680,30 @@ static std::vector<std::string> DefinedTypes(const std::string& T)
         while (At < T.size() && IsIdent(T[At])) ++At;
         return T.substr(Begin, At - Begin);
     };
-    std::vector<std::string> Out;
+    std::vector<std::string> Out, Scope;     // Scope: one per open brace, the name it is the body of or empty
+    std::string Opens;                       // what the `{` that comes next is the body of
     for (size_t At = 0; At < T.size(); ++At)
     {
+        if (const char C = T[At]; C == '"' || C == '\'')
+        {
+            for (++At; At < T.size() && T[At] != C && T[At] != '\n'; ++At) if (T[At] == '\\') ++At;
+            continue;
+        }
+        if (T[At] == '{') { Scope.push_back(Opens); Opens.clear(); continue; }
+        if (T[At] == '}') { if (!Scope.empty()) Scope.pop_back(); continue; }
         if (!IsIdent(T[At]) || (At > 0 && IsIdent(T[At - 1]))) continue;
         size_t P = At;
         std::string Key = Word(P);
+        if (Key == "namespace")
+        {
+            /* `namespace A::B {`; an alias (`namespace X = Y;`) and `using namespace X;` open nothing. */
+            std::string Name = Word(P);
+            while (T.compare(P, 2, "::") == 0) { P += 2; Name += "::" + Word(P); }
+            while (P < T.size() && isspace(uint8(T[P]))) ++P;
+            if (P < T.size() && T[P] == '{') Opens = Name;
+            At = P - 1;
+            continue;
+        }
         if (Key == "enum")
         {
             const size_t Q = P;
@@ -8638,7 +8715,13 @@ static std::vector<std::string> DefinedTypes(const std::string& T)
         if (Word(Q) == "final") P = Q;
         while (P < T.size() && isspace(uint8(T[P]))) ++P;
         if (P < T.size() && T[P] == ':' && T.compare(P, 2, "::") != 0) P = std::min(T.find_first_of("{;", P), T.size());
-        if (!Name.empty() && P < T.size() && T[P] == '{') Out.push_back(Name);
+        if (!Name.empty() && P < T.size() && T[P] == '{')
+        {
+            std::string Full;
+            for (const std::string& S : Scope) if (!S.empty()) Full += S + "::";
+            Out.push_back(Full + Name);
+            Opens = Name;
+        }
         At = P - 1;
     }
     return Out;
@@ -8665,13 +8748,14 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
     if (Mine.empty()) return;
 
     /* First the owners: each type the reached files define, by name, and each of those files' mod. */
-    std::map<std::string, std::string> TypeFile;        // name -> canonical file, empty when two files define it
-    std::map<std::string, std::string> FileText;
+    std::map<std::string, std::string> TypeFile, QualFile;      // a name's last segment, and the name whole -> canonical
+    std::map<std::string, std::string> FileText;                // file, empty when two files define it
     for (const auto& [Key, Entry] : ReachedByIncludes(fs::path(SourceFile)))
     {
         FileText[Key] = WithoutComments(Entry.second);
         for (const std::string& N : DefinedTypes(FileText[Key]))
-            if (auto [It, bNew] = TypeFile.emplace(N, Key); !bNew && It->second != Key) It->second.clear();
+            for (auto [Map, Name] : { std::pair(&QualFile, N), std::pair(&TypeFile, LeafOf(N)) })
+                if (auto [It, bNew] = Map->emplace(Name, Key); !bNew && It->second != Key) It->second.clear();
     }
     std::map<std::string, std::string> FileOwner, DirOwner;
     auto OwnerOfDir = [&](fs::path Dir) {
@@ -8699,9 +8783,12 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
         for (const std::string& K : Seen) DirOwner[K] = Owner;
         return Owner;
     };
-    auto OwnerOf = [&](const std::string& Leaf) -> std::string {
-        auto T = TypeFile.find(Leaf);
-        if (T == TypeFile.end() || T->second.empty()) return std::string();
+    /* By the whole name, so two mods' types of one name, each in its own namespace, have each their file; by the last
+       segment when the text's scopes do not spell that name (DefinedTypes). */
+    auto OwnerOf = [&](const std::string& Name) -> std::string {
+        auto T = QualFile.find(Name);
+        if (T == QualFile.end() && (T = TypeFile.find(LeafOf(Name))) == TypeFile.end()) return std::string();
+        if (T->second.empty()) return std::string();
         auto [It, bNew] = FileOwner.emplace(T->second, std::string());
         if (bNew)
         {
@@ -8715,7 +8802,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
     /* A class of another mod's folder is imported from it. */
     for (auto& [Key, R] : Records)
         if (R.UePackage.empty() && !R.bIsStruct && !R.bIsPatch && !R.bCooked && (!R.Base.empty() || R.bIsInterface))
-            if (const std::string O = OwnerOf(LeafOf(R.CppName)); !O.empty() && O != Mine)
+            if (const std::string O = OwnerOf(R.CppName); !O.empty() && O != Mine)
             {
                 R.UePackage = PathIn(O, R.CppName);
                 R.UeName = LeafOf(R.CppName) + "_C";
@@ -8727,14 +8814,14 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
        here would be another type, which the owner's saves and results do not hold. */
     for (auto& [Key, R] : Records)
         if (R.bIsStruct && R.UePackage.empty() && !R.bIsPatch && !R.bCooked)
-            if (const std::string O = OwnerOf(LeafOf(R.CppName)); !O.empty() && O != Mine)
+            if (const std::string O = OwnerOf(R.CppName); !O.empty() && O != Mine)
             {
                 R.UePackage = PathIn(O, R.CppName);
                 R.UeName = LeafOf(R.CppName);
                 R.InOwner = O;
             }
     for (auto& [Enum, Owner] : EnumMarks)
-        if (const std::string O = OwnerOf(LeafOf(Enum)); Owner.empty() && !O.empty() && O != Mine)
+        if (const std::string O = OwnerOf(Enum); Owner.empty() && !O.empty() && O != Mine)
             Owner = O;
 
     /* The candidates: a plain struct, its members values a struct holds (no text pointer, array or reference), and a
@@ -8743,7 +8830,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
     for (auto& [Key, R] : Records)
     {
         if (!R.UePackage.empty() || R.bIsStruct || R.bIsInterface || R.bIsPatch || R.bCooked || !R.Base.empty()
-            || R.Defaults || R.Fields.empty() || OwnerOf(LeafOf(R.CppName)).empty())
+            || R.Defaults || R.Fields.empty() || OwnerOf(R.CppName).empty())
             continue;
         if (std::none_of(R.Fields.begin(), R.Fields.end(), [](const Json* F) {
                 const std::string T = TypeOf(*F);
@@ -8756,7 +8843,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
     std::map<std::string, std::vector<std::string>> PlainEnums;     // by name, the last segment -> the C++ names
     for (const auto& [Enum, Values] : EnumDecls)
         if (auto U = EnumUnderlying.find(Enum); !Values.empty() && !Marked.count(Enum) && U != EnumUnderlying.end()
-            && U->second == "uint8" && !OwnerOf(LeafOf(Enum)).empty())
+            && U->second == "uint8" && !OwnerOf(Enum).empty())
             PlainEnums[LeafOf(Enum)].push_back(Enum);
     if (Plain.empty() && PlainEnums.empty()) return;
 
@@ -8788,7 +8875,9 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
         if (TypeFile.find(LeafOf(R.CppName)) == TypeFile.end()) continue;      // only C++ of the mods' own
         if (auto S = Plain.find(LeafOf(R.CppName)); S != Plain.end()
             && std::find(S->second.begin(), S->second.end(), &R) != S->second.end()) continue;
-        for (const Json* F : R.Fields) Names(TypeOf(*F));
+        /* A struct that is no candidate and no Blueprint type (`const char* Label;` in it) is C++'s alone, as a
+           constexpr variable is: its members are no properties, so they name nothing (REFERENCE.md#constant-objects). */
+        if (R.IsGenerated() || R.bIsPatch || R.IsNative()) for (const Json* F : R.Fields) Names(TypeOf(*F));
         for (const Json* M : R.AllMethods) { Names(TypeOf(*M)); Body(*M); }
         for (const auto& [Method, Def] : R.MethodDefs) Body(*Def);
         for (const Json* C : R.Ctors) Body(*C);
@@ -8813,7 +8902,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
                     {
                         R->bIsStruct = bMore = true;
                         for (const Json* F : R->Fields) Names(TypeOf(*F));
-                        if (const std::string O = OwnerOf(Leaf); O != Mine)
+                        if (const std::string O = OwnerOf(R->CppName); O != Mine)
                         {
                             R->UePackage = PathIn(O, R->CppName);
                             R->UeName = Leaf;
@@ -8824,7 +8913,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
     for (const auto& [Leaf, Of] : PlainEnums)
         if (Used.count(Leaf))
             for (const std::string& Enum : Of)
-                EnumMarks.push_back({ Enum, OwnerOf(Leaf) == Mine ? std::string() : OwnerOf(Leaf) });
+                EnumMarks.push_back({ Enum, OwnerOf(Enum) == Mine ? std::string() : OwnerOf(Enum) });
 }
 
 /* The AST keeps no file of a declaration (DroppedAstKey), and the leaf UE_FINAL_AS declares is spelled in UeMeta.h, so
@@ -8934,6 +9023,9 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
     if (End.is_null())
     {
         const std::string Q = QualifierBefore(*T, Off, Len, "StaticClass");
+        /* A template's parameter, in an instantiation: the class it stands for there (BindStaticClassParms). */
+        if (const auto B = Ref.find("templateArgs"); B != Ref.end() && B->contains(Q))
+            return Find(StripTypeKeywords((*B)[Q].get<std::string>()));
         return Q.empty() ? nullptr : Find(Q);
     }
     /* In a macro: its body has `::StaticClass` at End, and the qualifier is the whole identifier at Off. */
@@ -9363,7 +9455,9 @@ bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<cons
         Slot = Copy["inner"][0];      // the local itself, which the call takes by reference
         if (bReceiver) continue;
         const Json Seen = Unalias(Bare);
-        const std::string What = IsTMapElement(*PeelLvalue(&Seen)) ? "a map element" : MapElementUnder(Seen) ? "a map element's member"
+        const std::string What = IsTMapElement(*PeelLvalue(&Seen)) ? "a map element"
+                               : MapElementUnder(Seen) ? Kind(*PeelLvalue(&Seen)) == "MemberExpr" ? "a map element's member"
+                                                                                                  : "an element of a map element's array"
                                : bSel ? "`C ? X : Y`" : "that expression";
         char Line[512];
         snprintf(Line, sizeof(Line), "  warning: %s::%s: %s's reference parameter %s is bound to %s: Blueprint has no reference "
@@ -11639,6 +11733,22 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         RefAlias[D.value("id", std::string())] = *RefInit;
                         return;
                     }
+                    /* `auto& L = Map[K];`, `FBag& B = Table[K];`, `int32& X = Map[K].Items[I];`: Blueprint has no
+                       reference to a map's value, which Map_Find copies out. R is another name for the place, what
+                       locates it (the key, an index) found once, here; a read through R finds the value again, and a
+                       write through it stores the value back under its key (MapElementUnder). */
+                    if (const Json Seen = Unalias(*RefInit); MapElementUnder(Seen))
+                    {
+                        Json Pre = Json::array();
+                        Json Place = StabilizeLvalue(Seen, Pre, true);
+                        if (!Pre.empty())
+                        {
+                            const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
+                            if (!LowerBody(Wrap, BP, Out, Locals, Err)) { bOk = false; return; }
+                        }
+                        RefAlias[D.value("id", std::string())] = std::move(Place);
+                        return;
+                    }
                     std::string Pointee;
                     if (!LowerAddress(*RefInit, BP, Ds.Value, &Pointee, Err))
                     { *Err = "reference " + VarName + ": " + *Err; bOk = false; return; }
@@ -11944,7 +12054,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 Rhs = &Parked;
             }
             const std::string LK = Kind(*Lhs);
-            const Json Rooted = LK == "MemberExpr" ? Unalias(*Lhs) : Json();
+            const bool bInArray = LK == "CXXOperatorCallExpr" && IsTArrayElement(*Lhs);
+            const Json Rooted = LK == "MemberExpr" || bInArray ? Unalias(*Lhs) : Json();
             if (IsDerefLvalue(*Lhs))
             {
                 FArgIR Addr;
@@ -11961,10 +12072,11 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         Value = First(*Value);
                 bOk = bOk && LowerArg(*Value, BP, St.Value, Err);
             }
-            else if (const Json* Elem = LK == "MemberExpr" ? MapElementUnder(Rooted) : nullptr)
+            else if (const Json* Elem = LK == "MemberExpr" || bInArray ? MapElementUnder(Rooted) : nullptr)
             {
-                /* `Map[Key].A.B = v` (or `V.A.B = v`, V an `auto& [K, V]`): Map_Find copies the value out, so the store
-                   is `T E = Map[Key]; E.A.B = v; Map[Key] = E;`, v first as C++17 sequences it, and the key once. */
+                /* `Map[Key].A.B = v` (or `V.A.B = v`, V an `auto& [K, V]`), `Map[Key][I] = v`, `Map[Key].Items[I] = v`:
+                   Map_Find copies the value out, so the store is `T E = Map[Key]; E.A.B = v; Map[Key] = E;`, v first as
+                   C++17 sequences it, and the key once. */
                 Json Pre = Json::array();
                 const Json Value = HoistExpr(*Rhs, Pre);
                 const Json Place = StabilizeLvalue(*Elem, Pre);
@@ -11972,7 +12084,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 std::function<Json(const Json&)> Reroot = [&](const Json& N) {
                     if (&N == Elem) return Json(E["inner"][0]);
                     Json Up = N;
-                    Up["inner"][0] = Reroot(N["inner"][0]);
+                    const size_t At = N["inner"].size() == 3 ? 1 : 0;      // an element's array; a member's or a wrapper's base
+                    Up["inner"][At] = Reroot(N["inner"][At]);
                     return Up;
                 };
                 Pre.push_back(AssignOf(Reroot(Rooted), Value));
@@ -13331,7 +13444,7 @@ bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& B
         for (const std::string& O : TimelineItems(Bar < Spec.size() ? Spec.substr(Bar + 1) : std::string()))
             if (O == "AutoPlay") T.bAutoPlay = true;
             else if (O == "Loop") T.bLoop = true;
-            else if (O == "Replicated") T.bReplicated = true;
+            else if (O == "Replicated") { T.bReplicated = true; BP.SetReplicates(true); }      // a component replicates only with its actor
             else if (O == "IgnoreTimeDilation") T.bIgnoreTimeDilation = true;
             else if (O == "LastKeyframe") T.bLastKeyframe = true;
             else return Refuse("(" + Name_ + ") has an unknown option " + O + ": the options are AutoPlay, Loop, Replicated, "
@@ -14068,6 +14181,192 @@ void FCompiler::RewriteLambdaCalls(Json& N)
     N["kind"] = "CallExpr";
 }
 
+/* StaticClass is declared once, on a native class, so `T::StaticClass()` in a template names the declaring class in
+   every instantiation and only the source says more: `T`. Under each template, every instantiation's references to
+   StaticClass are given what the template's type parameters are there, by name; an inner template adds its own to its
+   outer's. Nothing else is walked: a pattern has no arguments, and code outside a template none to read. */
+void FCompiler::BindStaticClassParms(Json& N, const Json& Bound)
+{
+    if (!N.is_object()) return;
+    const std::string K = Kind(N);
+    if (K == "DeclRefExpr" && !Bound.empty() && N.contains("referencedDecl") && Name(N["referencedDecl"]) == "StaticClass")
+        N["templateArgs"] = Bound;
+    if (!N.contains("inner") || !N["inner"].is_array()) return;
+    if (K == "FunctionTemplateDecl" || K == "ClassTemplateDecl")
+    {
+        std::vector<std::string> Parms;
+        for (const Json& P : N["inner"])
+            if (const std::string PK = Kind(P); PK == "TemplateTypeParmDecl" || PK == "NonTypeTemplateParmDecl" || PK == "TemplateTemplateParmDecl")
+                Parms.push_back(PK == "TemplateTypeParmDecl" ? Name(P) : std::string());
+        for (Json& C : N["inner"])
+        {
+            Json Mine = Bound;
+            size_t At = 0;
+            bool bInstance = false;
+            if (C.is_object() && C.contains("inner") && C["inner"].is_array())
+                for (const Json& A : C["inner"])
+                {
+                    if (Kind(A) != "TemplateArgument") continue;
+                    bInstance = true;
+                    // ponytail: a pack's arguments are not bound; `Ts::StaticClass()...` stays the declaring class.
+                    if (At < Parms.size() && !Parms[At].empty() && A.contains("type") && !A.value("isPack", false))
+                        Mine[Parms[At]] = A["type"].value("qualType", std::string());
+                    ++At;
+                }
+            if (bInstance) BindStaticClassParms(C, Mine);
+            else if (!Bound.empty()) BindStaticClassParms(C, Bound);        // a member template's pattern in an instantiated class
+        }
+        return;
+    }
+    const bool bScope = K == "TranslationUnitDecl" || K == "NamespaceDecl" || K == "LinkageSpecDecl" || K == "CXXRecordDecl"
+                     || K == "ClassTemplateSpecializationDecl";
+    if (!bScope && Bound.empty()) return;
+    for (Json& C : N["inner"]) BindStaticClassParms(C, Bound);
+}
+
+/* Every struct of the mod's own sources with no base: its fields by their place, its methods that have a body, in the
+   struct or below it. A
+   template's instantiations are found under the template, whose pattern says where it is written (an instantiation
+   keeps no location). UeApi's types are never indexed, so nothing below touches a TEnum, a TArray or an FVector. */
+void FCompiler::IndexPlain(const Json& N, bool bApi, bool bInTemplate)
+{
+    const std::string K = Kind(N);
+    if (K == "ClassTemplateDecl")
+    {
+        bool bPatternApi = true;
+        ForEach(N, [&](const Json& P) { if (Kind(P) == "CXXRecordDecl") bPatternApi = InUeApi(P); });
+        ForEach(N, [&](const Json& C) { IndexPlain(C, bPatternApi, true); });
+        return;
+    }
+    const bool bInstance = K == "ClassTemplateSpecializationDecl";
+    if (K == "CXXRecordDecl" || bInstance)
+    {
+        if (bInstance ? bApi || !bInTemplate : InUeApi(N)) return;
+        size_t At = 0;
+        if (!N.contains("bases"))
+            ForEach(N, [&](const Json& C) {
+                bool bBody = false;
+                ForEach(C, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+                if (Kind(C) == "FieldDecl") PlainFields[C.value("id", std::string())] = At++;
+                else if (Kind(C) == "CXXMethodDecl" && !C.value("isImplicit", false))
+                    PlainMethods[C.value("id", std::string())] = bBody ? &C : nullptr;      // null until its body is met below
+            });
+        ForEach(N, [&](const Json& C) { IndexPlain(C, false, false); });
+        return;
+    }
+    if (K == "TranslationUnitDecl" || K == "NamespaceDecl" || K == "LinkageSpecDecl")
+        ForEach(N, [&](const Json& C) {
+            if (Kind(C) != "CXXMethodDecl") { IndexPlain(C, false, false); return; }
+            /* A method defined below its struct (`float FHandle::Get() const { ... }`) is its declaration's body. */
+            const auto Declared = PlainMethods.find(C.value("previousDecl", std::string()));
+            bool bBody = false;
+            ForEach(C, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+            if (Declared != PlainMethods.end() && !Declared->second && bBody)
+                Declared->second = PlainMethods[C.value("id", std::string())] = &C;
+        });
+}
+
+/* The braces E's value was written as, when E names a `const` or `constexpr` variable made from braces, or is such
+   braces already (a member FoldConstObjects put in its use's place): null for anything else. VarId gets the variable. */
+const Json* FCompiler::PlainConstInit(const Json& E, std::string* VarId) const
+{
+    auto Peel = [](const Json* N) {
+        for (;;)
+        {
+            const std::string K = Kind(*N);
+            const Json* In = First(*N);
+            const bool bWrap = K == "ParenExpr" || K == "ExprWithCleanups" || K == "MaterializeTemporaryExpr" || K == "CXXBindTemporaryExpr"
+                            || K == "CXXFunctionalCastExpr" || (K == "ImplicitCastExpr" && N->value("castKind", std::string()) == "NoOp")
+                            || (K == "CXXConstructExpr" && In && (*N)["inner"].size() == 1);     // a copy of the braces
+            if (!bWrap || !In) return N;
+            N = In;
+        }
+    };
+    const Json* N = Peel(&E);
+    if (Kind(*N) == "InitListExpr") return N;
+    std::string Id;
+    if (Kind(*N) == "DeclRefExpr" && N->contains("referencedDecl")) Id = (*N)["referencedDecl"].value("id", std::string());
+    else if (Kind(*N) == "MemberExpr") Id = N->value("referencedMemberDecl", std::string());    // `this->kTable`, a static
+    const auto V = ConstVars.find(Id);
+    const Json* Init = V == ConstVars.end() ? nullptr : First(*V->second);
+    if (Init) Init = Peel(Init);
+    if (!Init || Kind(*Init) != "InitListExpr") return nullptr;
+    if (VarId) *VarId = Id;
+    return Init;
+}
+
+/*
+A constant of a plain C++ struct has no Blueprint value: its uses are rewritten here, before anything is lowered, into
+what they come to (REFERENCE.md#constant-objects).
+    kTable.X                    the expression X was given in kTable's braces, as a constant's use is its initializer
+    Volume.Get(this)            a call of Get's body with `this->Name` and `this->Default` read off Volume's braces: a
+                                copy of the method per constant, registered as a free inline function, so the call
+                                expands like any other and the copy is the expansion's identity (a method that calls
+                                itself is still caught)
+A member of a struct UeApi declares or the mod cooks is left to LowerField, as before: IndexPlain has none of its
+fields. `&kTable.X` is left alone too, and refused where it was. Children first, so `kTable.Inner.X` reads the braces
+`kTable.Inner` became.
+*/
+void FCompiler::FoldConstObjects(Json& N, bool bAddressed)
+{
+    if (!N.is_structured()) return;
+    if (N.is_array()) { for (Json& C : N) FoldConstObjects(C, false); return; }
+    const std::string K = Kind(N);
+    if (auto In = N.find("inner"); In != N.end() && In->is_array())
+    {
+        const bool bAddress = K == "UnaryOperator" && N.value("opcode", std::string()) == "&";
+        for (Json& C : *In) FoldConstObjects(C, bAddress);
+    }
+    if (K == "MemberExpr" && !bAddressed && !N.value("isArrow", false))
+    {
+        const auto F = PlainFields.find(N.value("referencedMemberDecl", std::string()));
+        const Json* Obj = F == PlainFields.end() ? nullptr : First(N);
+        const Json* Init = Obj ? PlainConstInit(*Obj) : nullptr;
+        if (!Init || !Init->contains("inner") || F->second >= (*Init)["inner"].size()) return;
+        Json Value = (*Init)["inner"][F->second];
+        N = std::move(Value);
+        return;
+    }
+    if (K != "CXXMemberCallExpr" || !N.contains("inner") || N["inner"].empty()) return;
+    const Json* Callee = Strip(&N["inner"][0]);
+    const auto M = Callee && Kind(*Callee) == "MemberExpr" ? PlainMethods.find(Callee->value("referencedMemberDecl", std::string()))
+                                                          : PlainMethods.end();
+    const Json* Obj = M == PlainMethods.end() || !M->second ? nullptr : First(*Callee);
+    std::string Var;
+    if (!Obj || !PlainConstInit(*Obj, &Var) || Var.empty()) return;
+    const std::string Key = M->first + "@" + Var;
+    const auto [Bound, bNew] = BoundMethods.try_emplace(Key);
+    if (bNew)
+    {
+        Json& Def = Bound->second;
+        Def = *M->second;
+        Def["id"] = Key;
+        Def["inline"] = true;
+        Def.erase("previousDecl");
+        FreeInlines[Key] = &Def;        // before its body is read: it may call itself
+        /* `this->F` is `Var.F`, and `*this` is Var. A bare `this` has no value: marked, and refused if it is lowered. */
+        const Json Receiver = *Obj;
+        std::function<void(Json&)> Bind = [&](Json& X) {
+            if (!X.is_structured()) return;
+            if (X.is_object() && X.contains("inner") && !X["inner"].empty() && Kind(X["inner"][0]) == "CXXThisExpr")
+            {
+                if (Kind(X) == "MemberExpr") { X["isArrow"] = false; X["inner"][0] = Receiver; }
+                else if (Kind(X) == "UnaryOperator" && X.value("opcode", std::string()) == "*") { X = Receiver; return; }
+            }
+            if (X.is_object() && Kind(X) == "CXXThisExpr") X["plainThis"] = true;
+            for (Json& C : X) Bind(C);
+        };
+        for (Json& C : Def["inner"]) if (Kind(C) == "CompoundStmt") Bind(C);
+        NormalizePointers(Def);
+        if (!MethodOwner.count(M->first)) ExpandLocalAliases(Def, {});     // a record's methods have theirs already
+        FoldConstObjects(Def);
+    }
+    Json Fn = { {"kind", "DeclRefExpr"}, {"type", Callee->value("type", Json::object())},
+                {"referencedDecl", { {"id", Key}, {"kind", "FunctionDecl"}, {"name", Name(*Callee)} }} };
+    N["inner"][0] = std::move(Fn);
+    N["kind"] = "CallExpr";
+}
+
 /* The explicit captures of a lambda, by name, read off the capture list where it is written: clang's AST names a
    by-value capture by the variable it copies (the body's DeclRefExpr), but an init-capture's own variable is
    anonymous in it, and two of them cannot be told apart by anything but their order and spelling.
@@ -14249,6 +14548,7 @@ bool FCompiler::DeclareLambda(const Json& L, FBlueprintClass& BP, std::vector<FS
             if (RK == "VarDecl" || RK == "ParmVarDecl") Free[R.value("id", std::string())] = R.value("name", std::string());
         }
         ForEach(N, Walk);
+        if (auto Obj = N.find("lambdaObj"); Obj != N.end()) Walk(*Obj);      // the lambda a call is made on (RewriteLambdaCalls)
     };
     Walk(*Body);
     if (Op) ForEach(*Op, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Own.insert(C.value("id", std::string())); });
@@ -14310,6 +14610,21 @@ bool FCompiler::DeclareLambda(const Json& L, FBlueprintClass& BP, std::vector<FS
             if (Same.size() > 1)
             { *Err = Lam->Where + ": more than one variable named " + Names[I] + " in an init-capture's scope"; return false; }
             Cap.DeclId = Same.empty() ? std::string() : Same[0];
+            /* `[G = L]`, `[G = [](int32 A) { ... }]`: G is that lambda, as one captured by its own name is (below). */
+            if (IsClosureType(FT))
+            {
+                std::shared_ptr<FLambda> Held;
+                bool bCopy = false;
+                if (!ResolveLambda(*Inits[I], BP, &Out, &Held, &bCopy, Err)) return false;
+                if (Held)
+                {
+                    if (Held->bRefCapture) Lam->bRefCapture = true;
+                    if (Held->bMutable && bCopy && !bRefField)
+                    { *Err = Lam->Where + ": it copies the mutable lambda " + Held->Where + ", which would fork its state: capture it by reference"; return false; }
+                    if (!Cap.DeclId.empty()) LambdaOf[Cap.DeclId] = Held;
+                    continue;
+                }
+            }
         }
         else
         {
@@ -14394,6 +14709,252 @@ bool FCompiler::ResolveLambda(const Json& Operand, FBlueprintClass& BP, std::vec
     return true;
 }
 
+/*
+A self-call in tail position is a jump back to the top of the body (REFERENCE.md#tail-calls). The body is wrapped in
+`while (true) { ...; break; }`, and `return F(A, B);` - or `F(A, B);` where a void function ends, or right before a bare
+`return;` - becomes
+    T0 __Upd0__ = A;  T1 __Upd1__ = B;      every argument first: each may read any parameter
+    P0 = __Upd0__;    P1 = __Upd1__;
+    continue;
+so the loop is an ordinary one to everything after: a local the body declares starts fresh each round, as each call's
+did. A shipping build compiles the VM's recursion guard out (DO_BLUEPRINT_GUARD, CoreMisc.h 265), so depth that comes
+from data ends in a native stack overflow; and an inline function has no self-call left to refuse.
+
+Only a call that always runs this body: an inline function's, a static's, or on `this` to a function no subclass can
+replace (FinalOwner) that the engine does not route (an RPC, authority only, cosmetic). Left a call: one under a loop of
+the body, whose `continue` would be that loop's; one that passes a `T&` parameter anything but the parameter itself,
+since a reference is bound once; any in a function that waits (its locals are the ubergraph frame's, one set per
+object) or holds a goto. A `const T&` parameter that gets another value is read through a local, which starts as a
+copy of it: the parameter may be the caller's own variable, never to be written.
+*/
+bool FCompiler::TailCallsToLoop(const Json& Def, const Json& Body, Json* Out)
+{
+    const std::string DefId = Def.value("id", std::string()), PrevId = Def.value("previousDecl", std::string());
+    if (bCurNoOpt || IsNoOptDecl(Def) || LambdaOps.count(DefId)) return false;
+    auto IsSelf = [&](const Json& Call) {
+        const std::string K = Kind(Call);
+        const Json* Callee = K == "CallExpr" || K == "CXXMemberCallExpr" ? Strip(First(Call)) : nullptr;
+        if (!Callee) return false;
+        std::string Id;
+        if (K == "CXXMemberCallExpr")
+        {
+            const Json* Obj = Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
+            if (Obj && Kind(*Obj) == "CXXThisExpr") Id = Callee->value("referencedMemberDecl", std::string());
+        }
+        else if (Kind(*Callee) == "DeclRefExpr" && Callee->contains("referencedDecl"))
+            Id = (*Callee)["referencedDecl"].value("id", std::string());
+        if (Id.empty()) return false;
+        if (Id == DefId || Id == PrevId) return true;
+        if (auto F = FreeInlines.find(Id); F != FreeInlines.end()) return F->second == &Def;
+        if (auto T = MemberTemplates.find(Id); T != MemberTemplates.end()) return T->second == &Def;
+        if (auto F = FreeFns.find(Id); F != FreeFns.end()) return F->second.Def == &Def;
+        if (auto O = MethodOwner.find(Id); O != MethodOwner.end())
+            if (const FRecord* R = Find(O->second))
+                if (auto I = R->Inlines.find(Id); I != R->Inlines.end()) return I->second == &Def;
+        return false;
+    };
+    /* Most bodies stop here. */
+    std::function<bool(const Json&)> CallsSelf = [&](const Json& N) {
+        bool bFound = IsSelf(N);
+        ForEach(N, [&](const Json& C) { bFound = bFound || CallsSelf(C); });
+        return bFound;
+    };
+    if (!CallsSelf(Body)) return false;
+    /* N under what clang wraps a whole expression in, and a copy of a value to its own type; never a conversion, whose
+       result is not what it converts. bRead: under the read of a variable too. */
+    auto Peel = [](const Json* N, bool bRead) {
+        for (;;)
+        {
+            const std::string K = Kind(*N), Cast = N->value("castKind", std::string());
+            const Json* In = First(*N);
+            const bool bWrap = K == "ParenExpr" || K == "ExprWithCleanups" || K == "CXXBindTemporaryExpr" || K == "MaterializeTemporaryExpr"
+                            || (K == "ImplicitCastExpr" && (Cast == "NoOp" || (bRead && Cast == "LValueToRValue")))
+                            || (K == "CXXConstructExpr" && In && (*N)["inner"].size() == 1
+                                && StripTypeKeywords(TypeOf(*N)) == StripTypeKeywords(TypeOf(*In)));
+            if (!bWrap || !In) return N;
+            N = In;
+        }
+    };
+    /* The self-call a statement or a returned value is. */
+    auto SelfCallIn = [&](const Json& S) -> const Json* {
+        const Json* N = Peel(&S, false);
+        return IsSelf(*N) ? N : nullptr;
+    };
+    /* Not the world context FreeLibrary gives a free function: no call passes it, and it stays what it was. */
+    std::vector<const Json*> Parms;
+    ForEach(Def, [&](const Json& C) { if (Kind(C) == "ParmVarDecl" && !C.value("isImplicit", false)) Parms.push_back(&C); });
+    auto ArgsOf = [&](const Json& Call) {
+        std::vector<const Json*> Args;
+        bool bFirst = true;
+        ForEach(Call, [&](const Json& C) { if (bFirst) bFirst = false; else Args.push_back(&C); });
+        return Args;
+    };
+    /* Whether argument A hands parameter I on as it came: the parameter itself (Named: the declaration its reads name),
+       or a world context left to its default, which is the caller's (ExpandInline, LowerCall). */
+    auto PassesOn = [&](const Json& A, size_t I, const std::string& Named) {
+        if (Kind(A) == "CXXDefaultArgExpr" && IsWcoName(Name(*Parms[I]))) return true;
+        const Json* N = Peel(&A, true);
+        return Kind(*N) == "DeclRefExpr" && N->contains("referencedDecl") && (*N)["referencedDecl"].value("id", std::string()) == Named;
+    };
+
+    std::string RetType = ReturnPartOf(Def["type"].value("qualType", std::string()));
+    while (!RetType.empty() && RetType.back() == ' ') RetType.pop_back();
+    const bool bVoid = StripTypeKeywords(RetType) == "void";
+    /* Each site by its path from Body, an index into `inner` per level: the same path finds it in the copy. */
+    std::vector<std::vector<size_t>> Sites;
+    std::vector<bool> Shadowed(Parms.size());
+    std::vector<size_t> Path;
+    auto Site = [&](const Json* Call) {
+        if (!Call) return;
+        const std::vector<const Json*> Args = ArgsOf(*Call);
+        if (Args.size() != Parms.size()) return;
+        std::vector<bool> Shadows(Parms.size());
+        for (size_t I = 0; I < Parms.size(); ++I)
+        {
+            const std::string T = TypeOf(*Parms[I]);
+            if (PassesOn(*Args[I], I, Parms[I]->value("id", std::string()))) continue;
+            if (IsMutableRef(T) || IsClosureType(T) || IsClosureType(TypeOf(*Args[I]))) return;
+            Shadows[I] = !T.empty() && T.back() == '&';
+        }
+        for (size_t I = 0; I < Parms.size(); ++I) Shadowed[I] = Shadowed[I] || Shadows[I];
+        Sites.push_back(Path);
+    };
+    std::function<void(const Json&, bool)> Walk = [&](const Json& S, bool bTail) {
+        const std::string K = Kind(S);
+        const size_t N = S.contains("inner") ? S["inner"].size() : 0;
+        auto Kid = [&](size_t I, bool bKidTail) { Path.push_back(I); Walk(S["inner"][I], bKidTail); Path.pop_back(); };
+        if (K == "CompoundStmt")
+            for (size_t I = 0; I < N; ++I)
+            {
+                const Json* Next = I + 1 < N ? &S["inner"][I + 1] : nullptr;
+                Kid(I, Next ? Kind(*Next) == "ReturnStmt" && !First(*Next) : bTail);
+            }
+        else if (K == "IfStmt")     // [init, variable,] condition, then, else
+            for (size_t I = (S.value("hasInit", false) ? 1 : 0) + (S.value("hasVar", false) ? 1 : 0) + 1; I < N; ++I) Kid(I, bTail);
+        else if (K == "SwitchStmt") { if (N) Kid(N - 1, false); }   // the end of its body leaves the switch only
+        else if (K == "CaseStmt" || K == "DefaultStmt" || K == "LabelStmt" || K == "AttributedStmt") { if (N) Kid(N - 1, bTail); }
+        else if (K == "ReturnStmt") { if (const Json* V = First(S)) Site(SelfCallIn(*V)); }
+        else if (bTail && bVoid) Site(SelfCallIn(S));
+        /* ponytail: a loop's body is not walked. A goto would reach the top from there, and turns the optimizer off
+           for the function (bFnHasGoto); a labelled continue when a mod has the shape. */
+    };
+    /* `return C ? X : Y;` with a self-call for X or Y is `if (C) return X; else return Y;`. */
+    Json Loop = Body;
+    std::function<bool(const Json&)> IsArm = [&](const Json& A) {
+        const Json* P = Peel(&A, false);
+        return IsSelf(*P) || (Kind(*P) == "ConditionalOperator" && Nth(*P, 2) && (IsArm(*Nth(*P, 1)) || IsArm(*Nth(*P, 2))));
+    };
+    std::function<void(Json&)> Split = [&](Json& S) {
+        const std::string K = Kind(S);
+        if (K == "ReturnStmt" && First(S))
+        {
+            const Json* V = Peel(First(S), false);
+            if (Kind(*V) != "ConditionalOperator" || !IsArm(*V)) return;
+            auto Returns = [&](const Json& X) { Json R = S; R["inner"] = Json::array({ X }); return R; };
+            Json If = { {"kind", "IfStmt"}, {"inner", Json::array({ *Nth(*V, 0), Returns(*Nth(*V, 1)), Returns(*Nth(*V, 2)) })} };
+            S = std::move(If);
+        }
+        else if (K != "CompoundStmt" && K != "IfStmt" && K != "SwitchStmt" && K != "CaseStmt" && K != "DefaultStmt"
+                 && K != "LabelStmt" && K != "AttributedStmt")
+            return;
+        if (S.contains("inner")) for (Json& C : S["inner"]) Split(C);
+    };
+    Split(Loop);
+    Walk(Loop, true);
+    if (Sites.empty()) return false;
+
+    /* Whether a self-call always runs Def. */
+    const FRecord* R = nullptr;
+    std::string Method;
+    bool bInline = FreeInlines.count(DefId) || MemberTemplates.count(DefId);
+    if (auto F = FreeFns.find(DefId); F != FreeFns.end()) { R = &FreeLib; Method = Flatten(F->second.Qual); }
+    else if (auto O = MethodOwner.find(DefId); O != MethodOwner.end()) { R = Find(O->second); Method = Name(Def); }
+    else if (auto O = MethodOwner.find(PrevId); O != MethodOwner.end()) { R = Find(O->second); Method = Name(Def); }
+    bInline = bInline || (R && (R->Inlines.count(DefId) || R->Inlines.count(PrevId)));
+    if (!bInline)
+    {
+        if (!R) return false;
+        const auto M = R->Methods.find(Method);
+        if (M == R->Methods.end()) return false;
+        /* A free function is a static of the source's library, whatever its declaration says. */
+        if (R != &FreeLib && !IsStaticDecl(*M->second) && (!Cur || FinalOwner(Cur, Method) != R)) return false;
+        for (const FRecord* A = R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            auto AM = A->Methods.find(Method);
+            if (AM == A->Methods.end()) continue;
+            if (A->IsNative() || NetFlagsOf(*AM->second) || AccessFlagsOf(*AM->second)) return false;
+            if (auto D = A->MethodDefs.find(Method); D != A->MethodDefs.end() && (NetFlagsOf(*D->second) || AccessFlagsOf(*D->second)))
+                return false;
+        }
+    }
+    std::set<const Json*> Seen;
+    if (HasGoto(Body) || ResumesLater(Body, Seen)) return false;
+    /* ponytail: a lambda's capture names the parameter by its declaration, which the local below is not. */
+    const bool bShadows = std::find(Shadowed.begin(), Shadowed.end(), true) != Shadowed.end();
+    std::function<bool(const Json&)> HasLambda = [&](const Json& N) {
+        bool bFound = Kind(N) == "LambdaExpr";
+        ForEach(N, [&](const Json& C) { bFound = bFound || HasLambda(C); });
+        return bFound;
+    };
+    if (bShadows && HasLambda(Body)) return false;
+
+    /* What the body names each parameter by: itself, or the local read in a const reference's place. */
+    struct FTarget { Json Decl; std::string Type; };
+    std::vector<FTarget> Targets(Parms.size());
+    Json Top = Json::array();
+    for (size_t I = 0; I < Parms.size(); ++I)
+    {
+        const Json& P = *Parms[I];
+        std::string T = TypeOf(P);
+        while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+        T = StripTypeKeywords(T);
+        const std::string Id = P.value("id", std::string());
+        const Json OfParm = { {"id", Id}, {"kind", "ParmVarDecl"}, {"name", Name(P)}, {"type", P.value("type", Json::object())} };
+        Targets[I] = { OfParm, T };
+        if (!Shadowed[I]) continue;
+        const Json Type = { {"qualType", T} };
+        const std::string LocalId = "tail:" + Id, Local = "__Tail_" + Name(P);
+        const Json Read = ReadOf({ {"kind", "DeclRefExpr"}, {"type", Type}, {"valueCategory", "lvalue"}, {"referencedDecl", OfParm} });
+        Top.push_back({ {"kind", "DeclStmt"}, {"inner", Json::array({
+            { {"kind", "VarDecl"}, {"id", LocalId}, {"name", Local}, {"type", Type}, {"init", "c"}, {"inner", Json::array({ Read })} } })} });
+        Targets[I].Decl = { {"id", LocalId}, {"kind", "VarDecl"}, {"name", Local}, {"type", Type} };
+        std::function<void(Json&)> Rename = [&](Json& N) {
+            if (!N.is_structured()) return;
+            if (N.is_object())
+                if (const auto Ref = N.find("referencedDecl"); Ref != N.end() && Ref->is_object() && Ref->value("id", std::string()) == Id)
+                    *Ref = Targets[I].Decl;
+            for (Json& C : N) Rename(C);
+        };
+        Rename(Loop);
+    }
+    for (const std::vector<size_t>& Where : Sites)
+    {
+        Json* At = &Loop;
+        for (size_t I : Where) At = &(*At)["inner"][I];
+        const Json* Call = SelfCallIn(Kind(*At) == "ReturnStmt" ? *First(*At) : *At);
+        const std::vector<const Json*> Args = ArgsOf(*Call);
+        Json Seq = Json::array(), Sets = Json::array();
+        for (size_t I = 0; I < Parms.size(); ++I)
+        {
+            const std::string Named = Targets[I].Decl.value("id", std::string());
+            if (PassesOn(*Args[I], I, Named)) continue;
+            const Json To = { {"kind", "DeclRefExpr"}, {"type", { {"qualType", Targets[I].Type} }}, {"valueCategory", "lvalue"},
+                              {"referencedDecl", Targets[I].Decl} };
+            Sets.push_back(AssignOf(To, SynthLocal(Targets[I].Type, *DefaultedArg(*Args[I], Parms[I]), Seq)));
+        }
+        for (Json& S : Sets) Seq.push_back(std::move(S));
+        Seq.push_back(Json{ {"kind", "ContinueStmt"} });
+        *At = Json{ {"kind", "CompoundStmt"}, {"inner", std::move(Seq)} };
+    }
+    Json Round = Loop.contains("inner") ? Loop["inner"] : Json::array();
+    Round.push_back(Json{ {"kind", "BreakStmt"} });
+    const Json True = { {"kind", "CXXBoolLiteralExpr"}, {"type", { {"qualType", "bool"} }}, {"value", true} };
+    Top.push_back({ {"kind", "WhileStmt"},
+                    {"inner", Json::array({ True, Json{ {"kind", "CompoundStmt"}, {"inner", std::move(Round)} } })} });
+    *Out = { {"kind", "CompoundStmt"}, {"inner", std::move(Top)} };
+    return true;
+}
+
 /* The call becomes one Block statement in Out.Inline:
        <each by-value parameter> = <its argument>;
        <the body, locals renamed __Inl<N>_<name>, `return X` as `__Inl<N>_ReturnValue = X` + a jump to the end>
@@ -14431,6 +14992,17 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     const Json* Body = nullptr;
     ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
     if (!Body) { *Err = "inline function " + Method + " has no body"; return false; }
+    /* Its tail self-calls as a loop. ReadDef is Def with that body, for what reads how the body uses a parameter;
+       Def itself stays the expansion's identity (InlineStack). */
+    Json LoopBody, LoopDef;
+    const Json* ReadDef = &Def;
+    if (TailCallsToLoop(Def, *Body, &LoopBody))
+    {
+        LoopDef = Def;
+        for (Json& C : LoopDef["inner"]) if (Kind(C) == "CompoundStmt") C = LoopBody;
+        ReadDef = &LoopDef;
+        Body = &LoopBody;
+    }
 
     const std::string Prefix = "__Inl" + std::to_string(ReadTmpCounter++) + "_";
     std::vector<FPropertyDef>& Locals = *CurLocals;
@@ -14720,7 +15292,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
 
     /* A return that is the body's last statement already falls through to the end. */
     if (!B.Body->empty() && B.Body->back().K == FStmtIR::InlineReturn) B.Body->pop_back();
-    ArgumentsInPlace(*B.Body, Binds, Def, BindIds, Locals);
+    ArgumentsInPlace(*B.Body, Binds, *ReadDef, BindIds, Locals);
     Out.Intrinsic = "__Inline__";
     Out.Inline = Block;
     return true;
@@ -15583,6 +16155,66 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         /* `for (Init; T E : Range)`: the init-statement runs once, before the loop. */
         Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ *Init })} };
         if (!LowerBody(Wrap, BP, Out, Locals, Err)) return false;
+    }
+    /* `for (int32& X : Lists[K])`, `for (auto& S : Table[K].Items)`: Map_Find copies the map's value out, so a body
+       that writes through X would change the copy. The value goes into a local, the walk is over that, and it is stored
+       back under its key where the loop is left: at its end, a break, or a return in the body. A body that only reads
+       X walks the copy as before. */
+    if (const Json Seen = Unalias(*RangeExpr); const Json* Elem = IsMutableRef(TypeOf(*LoopDecl)) ? MapElementUnder(Seen) : nullptr)
+    {
+        std::set<std::string> Ids = { LoopDecl->value("id", std::string()) };
+        ForEach(*LoopDecl, [&](const Json& B) { if (Kind(B) == "BindingDecl") Ids.insert(B.value("id", std::string())); });
+        /* A use of X that is not read on the spot (assigned, updated, passed on, a method called on it) may write. */
+        std::function<bool(const Json&, bool)> Writes = [&](const Json& N, bool bRead) {
+            const std::string K = Kind(N);
+            if (K == "DeclRefExpr")
+                return !bRead && N.contains("referencedDecl") && Ids.count(N["referencedDecl"].value("id", std::string())) != 0;
+            const std::string Cast = K == "ImplicitCastExpr" ? N.value("castKind", std::string()) : std::string();
+            const bool bReads = Cast == "LValueToRValue" || (Cast == "NoOp" && TypeOf(N).compare(0, 6, "const ") == 0);
+            const bool bPass = K == "ParenExpr" || (K == "MemberExpr" && !N.value("isArrow", false));
+            bool bAny = false;
+            ForEach(N, [&](const Json& C) { bAny = bAny || Writes(C, bReads || (bPass && bRead)); });
+            return bAny;
+        };
+        if (Writes(*Body, false))
+        {
+            // ponytail: a goto has no one place it leaves by; give it the store when a mod needs one.
+            if (HasGoto(*Body))
+            { *Err = "a goto in a range-for that writes, by reference, the elements of an array a map holds: the array is "
+                     "a copy stored back when the loop is left; walk a local (`TArray<T> L = Map[K]; ...; Map[K] = L;`)"; return false; }
+            Json Pre = Json::array();
+            const Json Place = StabilizeLvalue(*Elem, Pre);
+            const Json E = SynthLocal(StripTypeKeywords(TypeOf(*Elem)), ReadOf(Place), Pre);
+            const Json Store = AssignOf(Place, E);
+            std::function<Json(const Json&)> Reroot = [&](const Json& N) {
+                if (&N == Elem) return Json(E["inner"][0]);
+                Json Up = N;
+                const size_t At = N["inner"].size() == 3 ? 1 : 0;      // an element's array; a member's or a wrapper's base
+                Up["inner"][At] = Reroot(N["inner"][At]);
+                return Up;
+            };
+            Json Loop = ForNode;
+            Loop["inner"][0] = Json::object();                          // the init-statement has run
+            std::function<bool(const Json&, Json&)> Swap = [&](const Json& From, Json& To) {
+                if (&From == RangeExpr) { To = Reroot(Seen); return true; }
+                if (!From.is_structured()) return false;
+                auto B = To.begin();
+                for (auto A = From.begin(); A != From.end(); ++A, ++B) if (Swap(*A, *B)) return true;
+                return false;
+            };
+            if (!Swap(ForNode["inner"][1], Loop["inner"][1])) { *Err = "internal: a range-for's range is not in its statement"; return false; }
+            std::function<void(Json&)> Leave = [&](Json& N) {           // a return in the body stores first
+                if (!N.is_structured() || (N.is_object() && Kind(N) == "LambdaExpr")) return;
+                if (N.is_object() && Kind(N) == "ReturnStmt")
+                { N = Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ Store, N })} }; return; }
+                for (Json& C : N) Leave(C);
+            };
+            Leave(Loop["inner"][7]);
+            Pre.push_back(std::move(Loop));
+            Pre.push_back(Store);
+            const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+            return LowerBody(Wrap, BP, Out, Locals, Err);
+        }
     }
     const Json Walked = Unalias(*RangeExpr);            // the container as the body names it, for WarnIteratedMutation
 
@@ -16926,6 +17558,8 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     if (Op == "+") Out.I = L.I + R.I;
     else if (Op == "-") Out.I = L.I - R.I;
     else if (Op == "*") Out.I = L.I * R.I;
+    /* The lowest int64 over -1 has no int64 quotient and traps here as it would in game: left unfolded. */
+    else if ((Op == "/" || Op == "%") && !bU64 && R.I == -1 && L.I == INT64_MIN) return false;
     else if (Op == "/" && R.I != 0) Out.I = bU64 ? int64(uint64(L.I) / uint64(R.I)) : L.I / R.I;
     else if (Op == "%" && R.I != 0) Out.I = bU64 ? int64(uint64(L.I) % uint64(R.I)) : L.I % R.I;
     else if (Op == "&") Out.I = L.I & R.I;
@@ -21204,6 +21838,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        empty body, listed in Children and FuncMap like any function. */
     CurSignatures.clear();
     bool bReplicatesAnything = false;
+    std::string InterfaceReplicated;                // the first replicated variable an interface gives the class
     for (const Json* F : R.Fields)
     {
         if (StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") != 0) continue;
@@ -21926,6 +22561,41 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     && !DiffAgainstDefaultObject(R.Base.empty() ? nullptr : Find(R.Base), Lhs->value("referencedMemberDecl", std::string()),
                                                  Where + ": " + Name(*Lhs), PD, BP, Err))
                 { bOk = false; return; }
+                /* A component's template loads the same way over its archetype: the template of the nearest class above
+                   that sets the member on this component, else the component class's default object. */
+                if (bThroughComponent && !bWidget && HoldsTaggedSetOrMap(PD))
+                {
+                    const std::string Id = Lhs->value("referencedMemberDecl", std::string());
+                    const Json *SetL = nullptr, *SetV = nullptr;
+                    for (const FRecord* A = DR == &R || R.Base.empty() ? nullptr : Find(R.Base); A && !SetL;
+                         A = A == DR || A->Base.empty() ? nullptr : Find(A->Base))
+                    {
+                        const Json* Its = nullptr;
+                        if (A->Defaults) ForEach(*A->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
+                        if (Its)
+                            ForEach(*Its, [&](const Json& St) {
+                                const Json *L = nullptr, *V = nullptr, *Through = nullptr;
+                                if (DefaultAssignment(St, L, V, Through) && Through && Name(*Through) == CompName
+                                    && L->value("referencedMemberDecl", std::string()) == Id)
+                                { SetL = L; SetV = V; }
+                            });
+                    }
+                    if (SetL)
+                    {
+                        FPropertyDef Above = PD;
+                        Above.Default = FDefaultValue();
+                        if (!LowerDefault(*SetL, Above, BP, Err, SetV, /*bKeepZero=*/true)) { bOk = false; return; }
+                        DiffTaggedAgainstParent(PD, Above);
+                    }
+                    else
+                    {
+                        std::string CompType = StripTypeKeywords(TypeOf(*Owner));
+                        while (!CompType.empty() && (CompType.back() == '*' || CompType.back() == ' ')) CompType.pop_back();
+                        if (!DiffAgainstDefaultObject(Find(StripTypeKeywords(CompType)), Id, Where + ": " + CompName + "->" + Name(*Lhs),
+                                                      PD, BP, Err))
+                        { bOk = false; return; }
+                    }
+                }
                 /* A statement is the member's whole new value, as an assignment is in C++: one before it on the same
                    member is gone, not a tag under this one's (whose left-out members would load its values). One that
                    sets part of it joins the member's tag instead (Put). */
@@ -22269,6 +22939,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             { *Err = R.CppName + "::" + FieldName + ": unknown replication condition " + Cond; return false; }
             PD.RepCondition = C.empty() ? 0 : uint8(At - std::begin(Conditions));
             bReplicatesAnything = true;
+            if (&Decl != &R && InterfaceReplicated.empty()) InterfaceReplicated = Decl.CppName + "::" + FieldName;
         }
         AddVariable(TypeOf(*F), PD);
     }
@@ -22968,7 +23639,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (!R.bIsInterface && std::none_of(Ancestry.begin(), Ancestry.end(), [](const std::string& A) {
             return A == "Actor" || A == "ActorComponent"; }))
     {
-        std::string What = R.Replicated.empty() ? std::string() : "the replicated variable " + R.Replicated.begin()->first;
+        std::string What = !R.Replicated.empty() ? "the replicated variable " + R.Replicated.begin()->first
+                         : !InterfaceReplicated.empty() ? "the replicated variable " + InterfaceReplicated + " of an interface it implements"
+                         : std::string();
         for (const FMethod& Fn : Methods)
             if (What.empty() && (NetFlagsOf(*Fn.Decl) | NetFlagsOf(*Fn.Def))) What = "the RPC " + Fn.Name;
         if (!What.empty())
@@ -23125,8 +23798,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                       : (!RetType.empty() && RetType != "void") || bWritableRef
                           ? "a function that resumes later returns nothing and takes no non-const reference parameters"
                       : "";
-        Json SlicedBody;
+        Json SlicedBody, LoopBody;
         const Json* BodyNode = Fn.Body;
+        if (BodyNode && TailCallsToLoop(M, *BodyNode, &LoopBody)) CurFnBody = BodyNode = &LoopBody;
         if (BodyNode)
         {
             const int Sliced = SliceStructCopies(*BodyNode, &SlicedBody, Err);
@@ -23174,7 +23848,68 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            RF_StrongRefOnFrame object is strong (UObjectGlobals.cpp 3460-3483). A local of a function that does not
            wait dies with the call, after which a collection takes the proxy and its dispatchers never fire; so it is
            stored into a transient member too, one per local, as the editor's frame keeps one per node. A waiting
-           function's locals are the frame's already. */
+           function's locals are the frame's already.
+           A proxy made in the middle of an expression (`Create(...)->OnCompleted.Add(this, &X::Done)`, the call
+           straight into a Cast or an argument) is no local's value, so nothing would hold it: it gets a local of its
+           own first, which is then kept like any other. A bare call statement, whose proxy nothing uses, is left.
+           ponytail: the proxy's call moves in front of its statement, so a statement that makes another call beside
+           it is refused; a loop's or a branch's condition is not looked at. Order the calls if that is ever met. */
+        {
+            std::string Why;
+            ForEachStmt(Stmts, [&](std::vector<FStmtIR>& List, size_t I) {
+                if (!Why.empty()) return;
+                FStmtIR& St = List[I];
+                const bool bLocalValue = (St.K == FStmtIR::Decl || St.K == FStmtIR::Assign) && St.Var.K == FArgIR::Local;
+                FArgIR* Found = nullptr;
+                int32 Others = 0;       // calls beside the proxy's, not ones it is an argument of
+                std::function<bool(FArgIR&)> Arg;
+                auto Call = [&](FCallIR& C) {
+                    bool bIn = C.Target && Arg(*C.Target);
+                    for (FArgIR& A : C.Args) bIn = Arg(A) || bIn;
+                    return bIn;
+                };
+                Arg = [&](FArgIR& A) {
+                    if (A.K == FArgIR::Call && A.Sub && A.Sub->bFrameHeld && !(bLocalValue && &A == &St.Value))
+                    {
+                        if (Found) ++Others; else Found = &A;
+                        return true;
+                    }
+                    bool bIn = A.Sub && Call(*A.Sub);
+                    bIn = (A.Base && Arg(*A.Base)) || bIn;
+                    if (A.K == FArgIR::Call && !bIn) ++Others;
+                    return bIn;
+                };
+                Call(St.Target);
+                Call(St.Call);
+                Arg(St.Var);
+                Arg(St.Value);
+                if (!Found) return;
+                std::string Type = StripTypeKeywords(Found->InnerType);
+                FPropertyDef PD;
+                const std::string Local = "__Proxy" + std::to_string(ReadTmpCounter++);
+                if (Others || Type.empty() || !TypeToProperty(Type, Local, 0, "a proxy", BP, &PD, &Why))
+                {
+                    Why = "a proxy that only the frame keeps alive (a montage or widget animation proxy) is made in the middle of a "
+                          "statement that calls something else too: put it in a local of its own first";
+                    return;
+                }
+                PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                Locals.push_back(PD);
+                FStmtIR Make;
+                Make.K = FStmtIR::Assign;
+                Make.Var.K = FArgIR::Local;
+                Make.Var.S = Local;
+                Make.Var.LetOp = LetOpFor(Type);
+                Make.bAssignLocal = true;
+                FArgIR Read = Make.Var;
+                Read.InnerType = Found->InnerType;
+                Read.Class = Found->Class;
+                Make.Value = std::move(*Found);
+                *Found = std::move(Read);
+                List.insert(List.begin() + I, std::move(Make));
+            });
+            if (!Why.empty()) { *Err = R.CppName + "::" + Fn.Name + ": " + Why; return false; }
+        }
         if (!bMadeLatentCall)
             ForEachStmt(Stmts, [&](std::vector<FStmtIR>& List, size_t I) {
                 const FStmtIR& St = List[I];
@@ -24611,15 +25346,17 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         GAg.Mark("AG_DOM_SAVE to_cbor + write (ignore)");
     }
 
+    BindStaticClassParms(Doc, Json::object());
     if (!LoadTables(IncludeDir, Err)) return false;
     GAg.Mark("LoadTables");
     if (!Collect(Err)) { GAg.Mark("Collect (failed)"); return false; }
     GAg.Mark("Collect");
+    std::vector<const Json*> ConstVarOrder;     // ConstVars as the sources write them: its key is a clang id, an address
     std::function<void(const Json&, bool)> IndexConsts = [&](const Json& N, bool bInClass) {
         const std::string K = Kind(N);
         if (K == "VarDecl" && N.contains("init") && N.contains("id")
             && (N.value("constexpr", false) || TypeOf(N).compare(0, 6, "const ") == 0))
-            ConstVars[N.value("id", std::string())] = &N;
+        { ConstVars[N.value("id", std::string())] = &N; ConstVarOrder.push_back(&N); }
         else if (K == "VarDecl" && N.contains("id") && bInClass)
             MutableStatics[N.value("id", std::string())] = &N;
         if (K == "TranslationUnitDecl" || K == "NamespaceDecl" || K == "CXXRecordDecl" || K == "LinkageSpecDecl")
@@ -24744,7 +25481,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             for (const Json* F : R.Fields) WarnKeyLiterals(*F, Cpp + "::" + Name(*F));
             if (R.Defaults) WarnKeyLiterals(*R.Defaults, Cpp + "::UE_DEFAULTS");
         }
-    for (const auto& [Id, Var] : ConstVars) WarnKeyLiterals(*Var, Name(*Var));
+    for (const Json* Var : ConstVarOrder) WarnKeyLiterals(*Var, Name(*Var));
     for (const FChain* C : ChainOrder) if (C->Def) WarnKeyLiterals(*C->Def, Name(*C->Def));
     /* A local or a parameter named None, in any case, is NAME_None: the bytecode names a local by its FName and
        FindFProperty returns null for None, so every read and write of it would be dead in game. The editor never keeps
@@ -24816,6 +25553,31 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         for (const auto& M : Entry.second.Methods) NormalizePointers(const_cast<Json&>(*M.second));
         for (const auto& M : Entry.second.MethodDefs) NormalizePointers(const_cast<Json&>(*M.second));
         for (const auto& M : Entry.second.Inlines) NormalizePointers(const_cast<Json&>(*M.second));
+    }
+    /* Constants of plain structs, in every body and initializer a value can come from, before the lambdas: a method
+       bound to a constant is one more inline function whose lambdas are found below. */
+    IndexPlain(Doc, false, false);
+    if (!PlainFields.empty() || !PlainMethods.empty())
+    {
+        std::vector<Json*> Bodies;
+        std::set<const Json*> Seen;
+        auto Add = [&](const Json* B) { if (B && Seen.insert(B).second) Bodies.push_back(const_cast<Json*>(B)); };
+        for (const FChain* C : ChainOrder) Add(C->Def);
+        for (const auto& M : MemberTemplates) Add(M.second);
+        for (const auto& M : PlainMethods) Add(M.second);
+        for (const auto& V : ConstVars) Add(V.second);
+        for (const auto& Entry : Records)
+        {
+            const FRecord& R = Entry.second;
+            if (!R.IsGenerated() && !R.IsModStruct() && !R.bIsPatch) continue;
+            for (const Json* M : R.AllMethods) Add(M);
+            for (const auto& M : R.MethodDefs) Add(M.second);
+            for (const auto& M : R.Inlines) Add(M.second);
+            for (const Json* F : R.Fields) Add(F);
+            for (const Json* C : R.Ctors) Add(C);
+            Add(R.Defaults);
+        }
+        for (Json* B : Bodies) FoldConstObjects(*B);
     }
     /* Lambdas, in every body a call can reach or a function is compiled from: first each closure's operator() is
        registered as an inline function, then each call of one is rewritten into a call of that (RewriteLambdaCalls). */

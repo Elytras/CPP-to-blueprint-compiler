@@ -279,7 +279,9 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
 {
     const std::string& S = P.StructName;
     if (S != "GameplayTagContainer" && S != "NiagaraTypeDefinitionHandle" && S != "NiagaraVariableBase"
-        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset" && S != "SoftObjectPath" && S != "SoftClassPath")
+        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset" && S != "SoftObjectPath" && S != "SoftClassPath"
+        && S != "PerPlatformFloat" && S != "PerPlatformInt" && S != "PerPlatformBool" && S != "MovieSceneFrameRange"
+        && S != "MovieSceneFloatChannel" && S != "SkeletalMeshSamplingLODBuiltData" && S != "NiagaraDataInterfaceGPUParamInfo")
         return false;
     const auto& Members = D.Members ? D.Members : P.Members;
     auto Member = [&](const char* Name) -> const FPropertyDef* {
@@ -295,6 +297,75 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         const std::string Rest = Sub && Sub->Default.K == FDefaultValue::Str ? Sub->Default.S : std::string();
         if (IsUE5()) WriteSoftPath(V, Rest.empty() ? Path : Path + ":" + Rest);
         else { V.Name(Path); WriteFStringValue(V, Rest); }
+        return true;
+    }
+    if (S == "SkeletalMeshSamplingLODBuiltData")
+    {
+        /* Written for the value gate (Cooked.cpp's reader says the layout): Prob and Alias, each a count and its words, then
+           TotalWeight. */
+        for (const char* Name : { "Prob", "Alias" })
+        {
+            const FPropertyDef* M = Member(Name);
+            V.I32(M ? int32(M->Default.Items.size()) : 0);
+            if (M) for (const FDefaultValue& W : M->Default.Items) V.U32(uint32(W.I));
+        }
+        const FPropertyDef* Total = Member("TotalWeight");
+        V.U32(Total ? uint32(Total->Default.I) : 0);
+        return true;
+    }
+    if (S == "NiagaraDataInterfaceGPUParamInfo")
+    {
+        /* Written for the value gate: the symbol and class name, then each generated function's definition name, instance
+           name and specifier pairs. */
+        const auto Text = [&](const char* Name) { const FPropertyDef* M = Member(Name); WriteFStringValue(V, M ? M->Default.S : std::string()); };
+        Text("DataInterfaceHLSLSymbol"); Text("DIClassName");
+        const FPropertyDef* Functions = Member("GeneratedFunctions");
+        V.I32(Functions ? int32(Functions->Default.Items.size()) : 0);
+        if (Functions)
+            for (const FDefaultValue& F : Functions->Default.Items)
+            {
+                const auto Part = [&](const char* Name) -> const FPropertyDef* {
+                    if (F.Members) for (const FPropertyDef& M : *F.Members) if (M.Name == Name) return &M;
+                    return nullptr;
+                };
+                const FPropertyDef *Def = Part("DefinitionName"), *Instance = Part("InstanceName"), *Spec = Part("Specifiers");
+                V.Name(Def && !Def->Default.S.empty() ? Def->Default.S : std::string("None"));
+                WriteFStringValue(V, Instance ? Instance->Default.S : std::string());
+                V.I32(Spec ? int32(Spec->Default.Items.size() / 2) : 0);
+                if (Spec) for (const FDefaultValue& N : Spec->Default.Items) V.Name(N.S.empty() ? std::string("None") : N.S);
+            }
+        return true;
+    }
+    if (S == "MovieSceneFrameRange" || S == "MovieSceneFloatChannel")
+    {
+        /* Written for the value gate, which proves the forms; NativeUnwritten still refuses a mod's own value of either, as
+           their defaults are not measured. Each member is written in order: bytes for the two Type / Extrapolation ones,
+           ints for the rest, the bulk arrays behind their element size and count (Cooked.cpp's reader says the layout). */
+        auto Word = [&](const char* Name, bool bByte) {
+            const FPropertyDef* M = Member(Name);
+            const uint32 W = M ? uint32(M->Default.I) : 0;
+            if (bByte) V.U8(uint8(W)); else V.U32(W);
+        };
+        if (S == "MovieSceneFrameRange") { Word("LowerType", true); Word("LowerValue", false); Word("UpperType", true); Word("UpperValue", false); return true; }
+        auto Bulk = [&](const char* Name, int32 Size, int32 Words) {
+            const FPropertyDef* M = Member(Name);
+            V.I32(Size);
+            V.I32(M ? int32(M->Default.Items.size()) / Words : 0);
+            if (M) for (const FDefaultValue& W : M->Default.Items) V.U32(uint32(W.I));
+        };
+        Word("PreInfinityExtrap", true); Word("PostInfinityExtrap", true);
+        Bulk("Times", 4, 1); Bulk("Values", 28, 7);
+        Word("DefaultValue", false); Word("bHasDefaultValue", false); Word("TickNumerator", false); Word("TickDenominator", false);
+        return true;
+    }
+    if (S == "PerPlatformFloat" || S == "PerPlatformInt" || S == "PerPlatformBool")
+    {
+        /* A bool bCooked (4 bytes: a bool in an archive is a uint32), then Default alone, which is all a game reads; a
+           cooked value always has bCooked set (FPerPlatformFloat's operator<<, PerPlatformProperties.h). */
+        const FPropertyDef* Default = Member("Default");
+        V.U32(1);
+        if (S == "PerPlatformFloat") { const float F = Default ? float(Default->Default.F) : 0.0f; V.Raw(&F, 4); }
+        else V.U32(Default ? uint32(Default->Default.I) : 0);
         return true;
     }
     if (S == "GameplayTagContainer")
@@ -357,13 +428,42 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
             /* A literal is a culture-invariant text, like EX_TextConst's LiteralString: Flags,
                ETextHistoryType::None, bHasCultureInvariantString, the string. */
             const bool bText = bSet && !D.S.empty();
-            V.U32(bText ? 2 : 0);           // ETextFlag::CultureInvariant
-            V.U8(0xFF);
-            V.I32(bText ? 1 : 0);
-            if (bText) WriteFStringValue(V, D.S);
+            if (D.TextHistory == 0 && D.Items.size() == 2)          // a localized text: namespace, key, source (FTextHistory_Base)
+            {
+                /* An empty string flagged in F (Cooked.cpp's ReadTextString) is a lone terminator, as the engine saves one. */
+                const auto Part = [&](const std::string& S, double Terminator) {
+                    if (S.empty() && Terminator != 0) { V.I32(1); V.U8(0); } else WriteFStringValue(V, S);
+                };
+                V.U32(uint32(D.I)); V.U8(0);
+                Part(D.Items[0].S, D.Items[0].F); Part(D.Items[1].S, D.Items[1].F); Part(D.S, D.F);
+            }
+            else if (D.TextHistory == 11 && D.Items.size() == 2)    // a string table entry: the table's id, the key
+            {
+                V.U32(uint32(D.I)); V.U8(11);
+                V.Name(D.Items[0].S);
+                if (D.Items[1].S.empty() && D.Items[1].F != 0) { V.I32(1); V.U8(0); } else WriteFStringValue(V, D.Items[1].S);
+            }
+            else
+            {
+                V.U32(bText ? 2 : 0);           // ETextFlag::CultureInvariant
+                V.U8(0xFF);
+                V.I32(bText ? 1 : 0);
+                if (bText) WriteFStringValue(V, D.S);
+            }
         }
         else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
-        else if (P.Type == "InterfaceProperty") V.I32(0);
+        else if (P.Type == "InterfaceProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
+        else if (P.Type == "FieldPathProperty")
+        {
+            V.I32(int32(D.Items.size()));
+            for (const FDefaultValue& N : D.Items) V.Name(N.S.empty() ? std::string("None") : N.S);
+            V.Idx(D.Object);
+        }
+        else if (P.Type == "MulticastInlineDelegateProperty" || P.Type == "MulticastSparseDelegateProperty")
+        {
+            V.I32(int32(D.Items.size()));
+            for (const FDefaultValue& Bound : D.Items) { V.Idx(Bound.Object); V.Name(Bound.S.empty() ? std::string("None") : Bound.S); }
+        }
         else if (P.Type == "DelegateProperty")      // FScriptDelegate: the object, the function's name (ScriptDelegates.h
         { V.Idx(Null()); V.Name("None"); }           // 138-142); a default is unbound, as a bound one is refused
         else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty")    // FSoftObjectPath: AssetPathName, SubPathString
@@ -475,7 +575,9 @@ int32 NativeStructSize(const std::string& StructName)
         { "Box2D", 17 }, { "FrameNumber", 4 },
         /* RichCurveKey: Interp, TangentMode, TangentWeightMode, then Time, Value and the four tangent floats (RichCurve.cpp,
            FRichCurveKey::Serialize); all zeros is FRichCurveKey()'s default. */
-        { "RichCurveKey", 27 } };
+        { "RichCurveKey", 27 },
+        /* FMovieSceneSequenceID: its uint32 Value, 0 the root sequence, which is its default. */
+        { "MovieSceneSequenceID", 4 } };
     /* UE5's large world coordinates make the math structs' components doubles (S40): the rest keep their 4.27 size. */
     static const std::map<std::string, int32> Lwc = {
         { "Vector", 24 }, { "Vector2D", 16 }, { "Vector4", 32 }, { "Rotator", 24 }, { "Quat", 32 },
@@ -490,7 +592,7 @@ bool NativeUnwritten(const std::string& StructName)
 {
     // ponytail: the census's list; a native struct the pak holds no value of is not in it
     static const char* const Unwritten[] = {
-        "PerPlatformFloat", "PerPlatformInt",
+        
         "KeyHandleMap", "FontData", "FontCharacter", "ColorMaterialInput", "ScalarMaterialInput", "VectorMaterialInput",
         "MaterialAttributesInput",
         "MovieSceneFloatChannel", "MovieSceneFrameRange", "MovieSceneEvaluationFieldEntityTree",

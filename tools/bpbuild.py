@@ -319,8 +319,16 @@ def content_of(src, bp, root):
 
 def kept_source(entry, mod, bp, i):
     """The Content folder a `kept` entry's packages come from: its `from`, extracted under build/<mod>/kept (kept<i>
-    for the i-th entry after the first)."""
-    return content_of(entry["from"], bp, os.path.join(bp, "build", mod["name"], "kept" + (str(i) if i else "")))
+    for the i-th entry after the first). A local `from` may be a glob (`Foo_General_*.pak.zip`): the newest file it
+    matches is taken and named in the output, so a pak that is re-released under a new name needs no edit here."""
+    src = entry["from"]
+    if "://" not in src and glob.has_magic(src):
+        hits = sorted(glob.glob(src), key=os.path.getmtime)
+        if not hits:
+            sys.exit("%s: kept from %s matches no file" % (mod["name"], src))
+        src = hits[-1]
+        print("%s: kept from %s" % (mod["name"], src))
+    return content_of(src, bp, os.path.join(bp, "build", mod["name"], "kept" + (str(i) if i else "")))
 
 
 def place_kept(mod, bp, stage_fsd):
@@ -429,7 +437,8 @@ def check_mod_imports(staged, mod_packages):
               for mod, content, package in staged]
     produced = set()
     for _mod, content, package in staged:
-        produced.update(package + "/" + f[:-len(".uasset")] for f in packages(content))
+        produced.update((package + "/" + f[:-len(".uasset")]).lower() for f in packages(content))
+    roots = [m.lower() for m in mod_packages]       # a package's name is an FName: it compares without case
 
     bad = []
     for _mod, content, _package in staged:
@@ -440,8 +449,9 @@ def check_mod_imports(staged, mod_packages):
                 if not entry.startswith("Package'"):
                     continue
                 name = entry[len("Package'"):-1]
-                under = any(name == m or name.startswith(m + "/") for m in mod_packages)
-                if under and name not in produced:
+                low = name.lower()
+                under = any(low == m or low.startswith(m + "/") for m in roots)
+                if under and low not in produced:
                     bad.append((f, name))
     for asset, name in bad:
         print("  %s imports %s, which no mod in this build produces" % (asset, name))
@@ -622,6 +632,15 @@ def main():
         if unknown:
             sys.exit("--only: mods.yaml has no mod %s" % ", ".join(unknown))
         keep = set(only).union(*(transitive_needs(n, by_name) for n in only))
+        mods = [m for m in mods if m["name"] in keep]
+    else:
+        # `skip: true` keeps a mod listed but out of a plain build, so a mod nobody is working on costs nothing and
+        # a missing input of it cannot fail the others. --only still builds it, and so does a built mod that needs it:
+        on = [m["name"] for m in mods if not m.get("skip")]
+        keep = set(on).union(*(transitive_needs(n, by_name) for n in on))
+        off = [m["name"] for m in mods if m["name"] not in keep]
+        if off:
+            print("skip: true, not built (name one with --only): " + ", ".join(off))
         mods = [m for m in mods if m["name"] in keep]
 
     built, packed, skipped, failed = [], [], [], []
