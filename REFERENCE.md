@@ -2031,6 +2031,7 @@ int32 Names(int32 N) {
 |---|---|---|
 | <a id="reference-locals.int32-alias-count"></a>`int32 &Alias = Count;` | Another name for a local, a parameter or a member of this (`Score` or `this->Score`), or for a member of one of their structs (`float &Z = Spawn.Z;`). Reads and writes are that variable's own Get and Set. | Yes |
 | <a id="reference-locals.int32-slot-slots-i"></a>`int32 &Slot = Slots[I];` | A TArray element (of this object or another), `*P` or `P[I]`: the reference keeps the place's address in a hidden int64 local, and reads and writes go straight to that memory. | Yes |
+| <a id="reference-locals.auto-l-lists-k"></a>`auto &L = Lists[K];`, `FBag &B = Table[K];`, `int32 &R = Scores[K];`, `int32 &X = Lists[K][I];` on a TMap | Blueprint has no reference to a map's value (Find copies it out), so the reference is another name for the place: the key and any index are read once, where it is declared. A read through it finds the value again, so it sees later writes; a write through it (`L[0] = 7`, `B.Count += 1`, `L.Add(X)`, `R = 5`) copies the value out, changes it and stores it back under its key, as the place written in full does ([Assignment and updates](#assignment-and-updates)). | Yes |
 | <a id="reference-locals.const-fvector-home-k2"></a>`const FVector &Home = K2_GetActorLocation();` | A `const T&` bound to a temporary is a copy, which lives as long as the reference. | Yes |
 | <a id="reference-locals.int32-r-other-score"></a>`int32 &R = Other->Score;` | Another object's field has no Blueprint reference, so R keeps the field's address, found by name at run time as `&Other->Score` is. That needs the ReadProperty class you supply (see [Pointers and memory](#pointers-and-memory)); without one the build stops ("include ReadProperty.h"). The `const` and `auto &` forms, and `O->Score` through a local pointer, are the same. Without the helper, write to the field directly, or pass it to an inline function's `T&` parameter, which binds the field itself. | Yes |
 | <a id="reference-locals.float-x-other-loc-x"></a>`float &X = Other->Loc.X;` | X keeps the address of Loc, found by name at run time as `&Other->Loc` is, plus X's offset. That needs the ReadProperty class, as the row above does. | Yes |
@@ -7735,7 +7736,7 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   inline or static class variable. A bare `&K` gives the address-of message above instead. Fix: use the value; a
   constant is its initializer at each use. See [Pointers and memory](#pointers-and-memory).
 - `reference <Name>: <Reason>`: a reference local, `T &R = X;`, whose initializer is neither a variable nor a member
-  reached with `.` from this or from a variable, so AssetGen needs an address it cannot take. `int32 &R = Scores[Name];`
+  reached with `.` from this or from a variable, so AssetGen needs an address it cannot take. `int32 &R = B ? X : Y;`
   gives the address-of message above as the reason. Fix: follow `<Reason>`, use the place directly, or copy it into a
   local and store it back. `T &R = LocalVar` and `T &R = MemberVar` work. See [Locals](#locals).
 - `__PtrCast__ of <Name>, a reference to a Blueprint variable, which has no address`: `__PtrCast__` of a reference

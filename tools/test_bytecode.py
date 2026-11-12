@@ -17495,6 +17495,16 @@ def map_arrays():
     check('MapArrays', 'Others', lambda V: 5 * 10000 + 10 * 100 + 30, [dict(V=v) for v in (9, 77)])
     check('MapArrays', 'KeyOnce', lambda V: V * 10 + 1, [dict(V=v) for v in (6, 2)])
     assert "Grow's reference parameter V is bound to an element of a map element's array" in LOGS['MapArrays'], LOGS['MapArrays']
+    proves('reference-locals.auto-l-lists-k')
+    check('MapArrays', 'Named', lambda V: V * 10000 + (V + 1) * 100 + V + 2 + 4000000, [dict(V=v) for v in (7, 40)])
+    check('MapArrays', 'NamedBag', lambda V: (3 + V) * 1000 + V, [dict(V=v) for v in (7, 0)])
+    check('MapArrays', 'NamedElem', lambda V: 30 + 2 * V, [dict(V=v) for v in (7, -3)])
+    check('MapArrays', 'NamedPinned', lambda V: V * 100 + 5, [dict(V=v) for v in (7, 12)])
+    check('MapArrays', 'NamedScore', lambda V: (10 + V) * 2, [dict(V=v) for v in (7, -10)])
+    check('MapArrays', 'NamedRead', lambda V: V, [dict(V=v) for v in (7, 99)])
+    check('MapArrays', 'NamedKeyOnce', lambda V: 1000 + 2 * V, [dict(V=v) for v in (7, 3)])
+    refused('RefPick', '  int32 X = 0, Y = 0;\n  void F(bool B) {\n    int32 &R = B ? X : Y;\n    R = 1;\n  }\n',
+            'reference R: TODO: the address of ConditionalOperator')
     proves('range-for-over.for-int32-x-lists-k')
     check('MapArrays', 'Walk', lambda V: wrap(60 * V), [dict(V=v) for v in (7, 0, -2)])
     check('MapArrays', 'WalkMember', lambda V: (10 + V) * 10000 + (20 + V) * 100 + 30 + V, [dict(V=v) for v in (7, 1)])

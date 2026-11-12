@@ -11702,6 +11702,22 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         RefAlias[D.value("id", std::string())] = *RefInit;
                         return;
                     }
+                    /* `auto& L = Map[K];`, `FBag& B = Table[K];`, `int32& X = Map[K].Items[I];`: Blueprint has no
+                       reference to a map's value, which Map_Find copies out. R is another name for the place, what
+                       locates it (the key, an index) found once, here; a read through R finds the value again, and a
+                       write through it stores the value back under its key (MapElementUnder). */
+                    if (const Json Seen = Unalias(*RefInit); MapElementUnder(Seen))
+                    {
+                        Json Pre = Json::array();
+                        Json Place = StabilizeLvalue(Seen, Pre, true);
+                        if (!Pre.empty())
+                        {
+                            const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
+                            if (!LowerBody(Wrap, BP, Out, Locals, Err)) { bOk = false; return; }
+                        }
+                        RefAlias[D.value("id", std::string())] = std::move(Place);
+                        return;
+                    }
                     std::string Pointee;
                     if (!LowerAddress(*RefInit, BP, Ds.Value, &Pointee, Err))
                     { *Err = "reference " + VarName + ": " + *Err; bOk = false; return; }
