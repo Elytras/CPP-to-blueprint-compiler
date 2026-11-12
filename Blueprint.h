@@ -348,7 +348,11 @@ private:
     uint32 ClassFlags = 0x00840814;
     std::string WithinPackage = "/Script/CoreUObject", WithinClass = "Object", ConfigName = "Engine";
 
-    std::unordered_map<std::string, int32> ImportCache;
+    /* The import row of each thing asked for, by kind and path. An FName compares without case, so the keys do: one
+       package or object asked for in two spellings is one row, the first spelling's, as the cook imports it once. */
+    struct FNoCaseHash { size_t operator()(const std::string& S) const { return std::hash<std::string>()(Lower(S)); } };
+    struct FNoCaseEqual { bool operator()(const std::string& A, const std::string& B) const { return Lower(A) == Lower(B); } };
+    std::unordered_map<std::string, int32, FNoCaseHash, FNoCaseEqual> ImportCache;
 
     /*
     Union of every import a body may reach; each function export declares all of them as

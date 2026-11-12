@@ -8424,6 +8424,24 @@ subobject_chain()
 print('ok  InstancedDefaults: an instanced object is an export under its outer, its tag that export, its archetype the '
       'outer archetype\'s object of its name or its class\'s CDO; %s' % instanced_defaults())
 self_ref_import()
+
+
+def import_case():
+    """ImportCase: a package's and an object's name is an FName, which compares without case, so one asset named in two
+    spellings is one package row and one object row; two would be two imports of one object."""
+    b = asset('ImportCase')
+    paths = [p.lower() for p in import_paths(b)]
+    proves('ue-asset-at.two-spellings')
+    assert len(paths) == len(set(paths)), sorted(p for p in set(paths) if paths.count(p) > 1)
+    assert '/game/enemies/spider/grunt/ed_spider_grunt.ed_spider_grunt' in paths, paths
+    mine = {}
+    run(b, 'Keep', self_vars=mine)
+    assert mine['A'] and mine['A'] == mine['B'], mine
+    keeps_invariants(b)
+    print('ok  ImportCase: an asset named in two spellings is one import of its package and one of the object')
+
+
+import_case()
 abstract_instances()
 proves('declaring-components.ue-component-ucharges-ammo')
 refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP)
