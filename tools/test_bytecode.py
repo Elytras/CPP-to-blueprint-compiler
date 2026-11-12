@@ -15612,17 +15612,26 @@ def proxy_frame_held():
         for n in invariants.statements(pkg, i)[0]:
             if n.op in (0x0F, 0x5F) and factory(n.kids[1]): held.append(holder(i, n.kids[0]))
             elif n.op == 0x64 and factory(n.kids[0]): held.append('the frame')
-    assert len(held) == 1, held
-    assert held[0] in ('a member', 'the frame'), 'the montage proxy is kept in %s' % held[0]
-    made = []
-    vm = VM(base, {'CreateProxyObjectForPlayMontage': lambda vm, ctx, *a: made.append(Obj('PlayMontageCallbackProxy')) or made[-1]},
-            Mesh='mesh', Montage='montage', Last='None')
-    vm.call('Play')
-    assert any(v is made[-1] for v in vm.self.vars.values()), 'nothing of the object holds the proxy: %s' % vm.self.vars
-    vm.broadcast(made[-1], 'OnCompleted', 'End')
-    assert vm.self.vars['Last'] == 'End', vm.self.vars
+    # Play's, and PlayChained's, which the source gives no local: `Create(...)->OnCompleted.Add(...)`.
+    assert len(held) == 2, held
+    assert all(h in ('a member', 'the frame') for h in held), 'the montage proxy is kept in %s' % held
+    for play in ('Play', 'PlayChained'):
+        made = []
+        vm = VM(base, {'CreateProxyObjectForPlayMontage': lambda vm, ctx, *a: made.append(Obj('PlayMontageCallbackProxy')) or made[-1]},
+                Mesh='mesh', Montage='montage', Last='None')
+        vm.call(play)
+        assert len(made) == 1 and any(v is made[-1] for v in vm.self.vars.values()), \
+            '%s: nothing of the object holds the proxy: %s' % (play, vm.self.vars)
+        vm.broadcast(made[-1], 'OnCompleted', 'End')
+        assert vm.self.vars['Last'] == 'End', (play, vm.self.vars)
     keeps_invariants(base)
-    print('ok  ProxyLocalHeld.Play: a callback proxy bound in a plain function is kept in a member, where the GC sees it')
+    # Beside another call of its statement the proxy's call cannot move in front: refused, saying what to write.
+    refused('ProxyBeside', '  USkeletalMeshComponent *Mesh;\n  UAnimMontage *Montage;\n  int32 N = 0;\n'
+            '  int32 Bump() { return ++N; }\n  void Take(int32 A, UObject *P) {}\n'
+            '  void F() { Take(Bump(), UPlayMontageCallbackProxy::CreateProxyObjectForPlayMontage(Mesh, Montage, 1.0f, 0.0f, FName())); }\n',
+            'put it in a local of its own first', top='#include "UeApi/AnimGraphRuntime.h"\n')
+    print('ok  ProxyLocalHeld.Play: a callback proxy bound in a plain function, held in a local or made in the middle of the '
+          'bind, is kept in a member, where the GC sees it')
 
 
 def deferred_left():
