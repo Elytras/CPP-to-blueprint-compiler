@@ -16950,6 +16950,8 @@ def lambdas():
         ('InitCapture', lambda V: (V + 1) * 7),
         ('InitCaptures', lambda V: ((V * 10 + V * 2) + (V + V * 2)) * 100 + V + 2),
         ('InitUnused', lambda V: V * 3 + 1),
+        ('InitLambda', lambda V: (3 + V) * 2 + (V + V) * 2),
+        ('InitLambdaInPlace', lambda V: 4 * V + 1),
         ('Immediate', lambda V: V * 5),
         ('ImmediateInCondition', lambda V: 1 if V > 3 else 0),
         ('ToTemplate', lambda V: (V + 5) * 2 + 1 + V + 5),
@@ -16977,7 +16979,7 @@ def lambdas():
     ]
     proves('other-declarations.auto-inc-int32-v-return', 'lambdas.auto-l-int32-a-x', 'lambdas-function.auto-l-x-int32-y',
            'lambdas.c-int32-a-mutable-c', 'lambdas.z-x-1-int32-a', 'lambdas.const-int32-r-return-v', 'lambdas.apply-5-int32-a-x',
-           'lambdas.auto-a-auto-b-return', 'lambdas.a-lambda-calling-or-capturing')
+           'lambdas.auto-a-auto-b-return', 'lambdas.a-lambda-calling-or-capturing', 'lambdas.g-l-int32-b')
     for fn, want in forms:
         for v in (-5, 0, 3, 8):
             got = run(base, fn, V=v)[0]
@@ -17027,6 +17029,8 @@ def lambda_refusals():
         ('LamPassMutable', 'template <class G> inline int32 Use(G Fn) { return Fn(1); }', 'int32 F(int32 V) { %s return Use(L); }' % src,
          'takes a mutable lambda by value, which copies its state'),
         ('LamCaptureMutable', '', 'int32 F(int32 V) { %s auto K = [=](int32 A) mutable { return L(A); }; return K(1); }' % src,
+         'which would fork its state: capture it by reference'),
+        ('LamInitMutable', '', 'int32 F(int32 V) { %s auto K = [G = L](int32 A) mutable { return G(A); }; return K(1); }' % src,
          'which would fork its state: capture it by reference'),
         ('LamStatic', '', 'int32 F(int32 V) { auto L = [](int32 A) { static int32 N = 0; N += A; return N; }; return L(V); }',
          "static N lives in the ubergraph's frame"),

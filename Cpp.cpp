@@ -14548,6 +14548,7 @@ bool FCompiler::DeclareLambda(const Json& L, FBlueprintClass& BP, std::vector<FS
             if (RK == "VarDecl" || RK == "ParmVarDecl") Free[R.value("id", std::string())] = R.value("name", std::string());
         }
         ForEach(N, Walk);
+        if (auto Obj = N.find("lambdaObj"); Obj != N.end()) Walk(*Obj);      // the lambda a call is made on (RewriteLambdaCalls)
     };
     Walk(*Body);
     if (Op) ForEach(*Op, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Own.insert(C.value("id", std::string())); });
@@ -14609,6 +14610,21 @@ bool FCompiler::DeclareLambda(const Json& L, FBlueprintClass& BP, std::vector<FS
             if (Same.size() > 1)
             { *Err = Lam->Where + ": more than one variable named " + Names[I] + " in an init-capture's scope"; return false; }
             Cap.DeclId = Same.empty() ? std::string() : Same[0];
+            /* `[G = L]`, `[G = [](int32 A) { ... }]`: G is that lambda, as one captured by its own name is (below). */
+            if (IsClosureType(FT))
+            {
+                std::shared_ptr<FLambda> Held;
+                bool bCopy = false;
+                if (!ResolveLambda(*Inits[I], BP, &Out, &Held, &bCopy, Err)) return false;
+                if (Held)
+                {
+                    if (Held->bRefCapture) Lam->bRefCapture = true;
+                    if (Held->bMutable && bCopy && !bRefField)
+                    { *Err = Lam->Where + ": it copies the mutable lambda " + Held->Where + ", which would fork its state: capture it by reference"; return false; }
+                    if (!Cap.DeclId.empty()) LambdaOf[Cap.DeclId] = Held;
+                    continue;
+                }
+            }
         }
         else
         {

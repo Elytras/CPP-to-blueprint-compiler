@@ -88,6 +88,18 @@ public:
     auto L = [A = V + 1, B = V * 3](int32 K) { return B + K; };
     return L(1);
   }
+  /* A lambda an init-capture holds is that lambda, as one captured by its own name is. */
+  int32 InitLambda(int32 V) {
+    int32 X = V;
+    auto  L = [X](int32 A) { return A + X; };
+    X       = 0;
+    auto M  = [G = L](int32 B) { return G(B) * 2; };
+    return M(3) + M(V) + X;
+  }
+  int32 InitLambdaInPlace(int32 V) {
+    auto M = [G = [V](int32 A) { return A * V; }](int32 B) { return G(B) + 1; };
+    return M(4);
+  }
 
   /* [this] and a member */
   int32 ThisMember(int32 V) {
