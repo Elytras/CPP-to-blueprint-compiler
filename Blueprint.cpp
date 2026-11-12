@@ -217,6 +217,10 @@ FIndex FBlueprintClass::Asset(const std::string& ClassPackage, const std::string
     return Imp(Row);
 }
 
+/* UUserDefinedStruct's module: Engine on 4.27, CoreUObject on 5.6 (RC's own UDS packages import it from there). An
+   import from the wrong one resolves to null, so every property of the struct loads as FallbackStruct. */
+static const char* UdsPackage() { return IsUE5() ? "/Script/CoreUObject" : "/Script/Engine"; }
+
 FIndex FBlueprintClass::ScriptStruct(const std::string& PackageName, const std::string& StructName)
 {
     const std::string Key = "str:" + PackageName + "." + StructName;
@@ -226,7 +230,7 @@ FIndex FBlueprintClass::ScriptStruct(const std::string& PackageName, const std::
     // A /Game struct is a UserDefinedStruct; its bytecode references need it created first.
     const bool bBlueprint = PackageName.compare(0, 6, "/Game/") == 0;
     const FIndex Outer = PackageImport(PackageName);
-    const int32 Row = P.AddImport({ bBlueprint ? "/Script/Engine" : "/Script/CoreUObject",
+    const int32 Row = P.AddImport({ bBlueprint ? UdsPackage() : "/Script/CoreUObject",
                                     bBlueprint ? "UserDefinedStruct" : "ScriptStruct",
                                     Outer, StructName });
     ImportCache.emplace(Key, Row);
@@ -1618,8 +1622,8 @@ bool FBlueprintClass::WriteApiEnum(const std::string& OutDir,
 
 void FBlueprintClass::FinishStruct(const uint32 (&Guid)[4])
 {
-    const FIndex UdsClass = EngineClass("/Script/Engine", "UserDefinedStruct");
-    const FIndex UdsCdo = ClassDefaultObject("/Script/Engine", "UserDefinedStruct");
+    const FIndex UdsClass = EngineClass(UdsPackage(), "UserDefinedStruct");
+    const FIndex UdsCdo = ClassDefaultObject(UdsPackage(), "UserDefinedStruct");
     ClassRow = 0;
 
     FExport S;

@@ -41,6 +41,26 @@ class TagTreeTests(unittest.TestCase):
                 'typing_opcodes_known', 'struct_body_exact']
         self.assertEqual(invariants.check(self.pkg, only), [])
 
+    def test_every_script_class_import_names_its_5_6_module(self):
+        # an import of a class from the wrong module resolves to null in game: on 5.6 UserDefinedStruct moved from Engine
+        # to CoreUObject, and TagsRc's map of FTagRow then loaded as FallbackStruct and NameN crashed (rcq, 2026-11-12)
+        import re
+        module = {}
+        for h in glob.glob(os.path.join(API, '*.h')):
+            for pkg, name in re.findall(r'UE_CLASS\("(/Script/[^"]+)", "([^"]+)"\)', __import__('pathlib').Path(h).read_text(encoding='utf-8-sig')):
+                module[name] = pkg
+        bad = []
+        for base in glob.glob(os.path.join(self.out, 'out', '**', '*.uasset'), recursive=True):
+            pkg = invariants.Package(base[:-len('.uasset')])
+            for im in pkg.imports:
+                outer = pkg.imports[-im['outer'] - 1]['name'] if im['outer'] < 0 else None
+                if im['class_name'] == 'Class' and outer in module.values() and module.get(im['name'], outer) != outer:
+                    bad.append((base, im['name'], outer, module[im['name']]))
+                if im['class_package'].startswith('/Script/') and module.get(im['class_name'], im['class_package']) != im['class_package']:
+                    bad.append((base, im['name'], im['class_package'], module[im['class_name']]))
+        self.assertGreater(len(module), 1000)
+        self.assertEqual(bad, [])
+
     def test_array_of_structs_names_its_struct_and_has_no_inner_tag(self):
         self.assertEqual(self.tags['Points']['inner'], 'StructProperty')
         # the count and two FVectors of three doubles: 5.6 writes no inner tag between them
