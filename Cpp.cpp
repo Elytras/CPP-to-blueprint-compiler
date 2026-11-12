@@ -13391,7 +13391,7 @@ bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& B
         for (const std::string& O : TimelineItems(Bar < Spec.size() ? Spec.substr(Bar + 1) : std::string()))
             if (O == "AutoPlay") T.bAutoPlay = true;
             else if (O == "Loop") T.bLoop = true;
-            else if (O == "Replicated") T.bReplicated = true;
+            else if (O == "Replicated") { T.bReplicated = true; BP.SetReplicates(true); }      // a component replicates only with its actor
             else if (O == "IgnoreTimeDilation") T.bIgnoreTimeDilation = true;
             else if (O == "LastKeyframe") T.bLastKeyframe = true;
             else return Refuse("(" + Name_ + ") has an unknown option " + O + ": the options are AutoPlay, Loop, Replicated, "
@@ -21717,6 +21717,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        empty body, listed in Children and FuncMap like any function. */
     CurSignatures.clear();
     bool bReplicatesAnything = false;
+    std::string InterfaceReplicated;                // the first replicated variable an interface gives the class
     for (const Json* F : R.Fields)
     {
         if (StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") != 0) continue;
@@ -22782,6 +22783,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             { *Err = R.CppName + "::" + FieldName + ": unknown replication condition " + Cond; return false; }
             PD.RepCondition = C.empty() ? 0 : uint8(At - std::begin(Conditions));
             bReplicatesAnything = true;
+            if (&Decl != &R && InterfaceReplicated.empty()) InterfaceReplicated = Decl.CppName + "::" + FieldName;
         }
         AddVariable(TypeOf(*F), PD);
     }
@@ -23481,7 +23483,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (!R.bIsInterface && std::none_of(Ancestry.begin(), Ancestry.end(), [](const std::string& A) {
             return A == "Actor" || A == "ActorComponent"; }))
     {
-        std::string What = R.Replicated.empty() ? std::string() : "the replicated variable " + R.Replicated.begin()->first;
+        std::string What = !R.Replicated.empty() ? "the replicated variable " + R.Replicated.begin()->first
+                         : !InterfaceReplicated.empty() ? "the replicated variable " + InterfaceReplicated + " of an interface it implements"
+                         : std::string();
         for (const FMethod& Fn : Methods)
             if (What.empty() && (NetFlagsOf(*Fn.Decl) | NetFlagsOf(*Fn.Def))) What = "the RPC " + Fn.Name;
         if (!What.empty())

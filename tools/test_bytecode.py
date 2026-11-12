@@ -7330,6 +7330,19 @@ def uber_frames():
     print('ok  LatentTest / AsyncTest: each ubergraph is the class\'s UberGraphFunction and runs on the persistent frame')
 
 
+def repl_nowhere():
+    """A replicated variable on a class that is no actor and no component goes nowhere: refused, its own and one an
+    interface gives it."""
+    proves('replicated-variables-on.no-actor')
+    refused('ReplIfaceObject', '  int32 Read() { return Points; }\n', 'the replicated variable IReplScored::Points of an interface it '
+            'implements does nothing, since only an actor or an actor component replicates',
+            top='class IReplScored {\npublic:\n  UE_INTERFACE;\n  UE_REPLICATED(int32, Points) = 0;\n};\n',
+            base='UObject, public IReplScored')
+    refused('ReplOwnObject', '  UE_REPLICATED(int32, Points) = 0;\n',
+            'the replicated variable Points does nothing, since only an actor or an actor component replicates', base='UObject')
+    print('ok  ReplNowhere: a replicated variable on a class that is no actor or component is refused, an interface\'s too')
+
+
 def repl_defaults():
     """The actor replicates (CDO bReplicates, or no replicated variable ever leaves the server) and keeps Score's
     initializer; ReplKid inherits both rather than overriding them."""
@@ -7349,6 +7362,7 @@ def repl_defaults():
 
 
 replication()
+repl_nowhere()
 repl_defaults()
 repl_runs()
 rpc_routing()
@@ -15943,10 +15957,17 @@ def timelines():
     assert [(props[n].type, props[n].flags) for n in ('Alpha', 'Lift', 'Tint', 'Beat')] == [
         ('FloatProperty', 0), ('StructProperty', 0), ('StructProperty', 0), ('FloatProperty', 0)]
 
+    lamp_base = os.path.join(ROOT, 'FadingLamp', 'FSD', 'Content', '_AssetGenExamples', 'FadingLamp', 'FadingLamp')
     kid = timelines_of(child)
     assert list(kid) == ['Spin'] and kid['Spin']['UpdateFunctionName'] == 'OnSpin' and 'FinishedFunctionName' not in kid['Spin'], kid
     assert timelines_of(plain) == {}
-    lamp = os.path.join(ROOT, 'FadingLamp', 'FSD', 'Content', '_AssetGenExamples', 'FadingLamp', 'FadingLamp')
+    # A replicated timeline's component replicates only with its actor: the class's CDO replicates, and a subclass inherits it.
+    cdo_of = lambda b: dump('dumptags.py', b, [e['name'] for e in dumpexp.load(b)[5]].index('Default__%s_C' % os.path.basename(b)))
+    proves('declaring-a-timeline.ue-timeline-fade-2-0f-2')
+    assert re.search(r'bReplicates \[0\] BoolProperty size=0 value=1', cdo_of(base)), cdo_of(base)
+    assert 'bReplicates' not in cdo_of(child) and 'bReplicates' not in cdo_of(plain)
+    assert 'bReplicates' not in cdo_of(lamp_base), cdo_of(lamp_base)      # no Replicated option: the actor is left as it was
+    lamp = lamp_base
     assert os.path.exists(lamp + '.uasset'), 'the examples are not built under ' + ROOT
     lit = timelines_of(lamp)
     assert list(lit) == ['Fade'] and (lit['Fade']['UpdateFunctionName'], lit['Fade']['FinishedFunctionName']) == ('OnFade', 'OnFaded'), lit
