@@ -8107,10 +8107,17 @@ def infer_meta():
         files = {
             'Owner/Shared.h': '#pragma once\n' + head + 'struct FShared { int32 A; };\nenum class EShared : uint8 { One, Two };\n'
                               'struct FMarked { UE_STRUCT; int32 B; };\nenum class EMarked : uint8 { X, Y };\nUE_ENUM(EMarked);\n'
-                              'class UShared : public UObject { public: FShared S; EShared E; FMarked M; EMarked K; };\n',
+                              'class UShared : public UObject { public: FShared S; EShared E; FMarked M; EMarked K; };\n'
+                              'namespace Core { class UInit : public UObject { public: int32 A; };\n'
+                              'struct FPair { int32 A; }; enum class EKind : uint8 { One, Two };\n'
+                              'class UCoreUser : public UObject { public: FPair P; EKind K; }; }\n',
             'Owner/Owner.cpp': '#include "Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Owner");\n',
             'User/User.cpp': '#include "../Owner/Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/User");\n'
-                             'class AUser : public AActor { FShared S; EShared E; FMarked M; EMarked K; UShared *D; };\n',
+                             'class AUser : public AActor { FShared S; EShared E; FMarked M; EMarked K; UShared *D; };\n'
+                             'namespace Spawn { class UInit : public UObject { public: int32 B; };\n'
+                             'struct FPair { int32 B; }; enum class EKind : uint8 { Three, Four }; }\n'
+                             'class ATwo : public AActor { Core::UInit *Theirs; Spawn::UInit *Mine; Core::FPair TP; Spawn::FPair MP;\n'
+                             '  Core::EKind TK; Spawn::EKind MK; };\n',
             'Mixed/Mixed.h': '#pragma once\n' + head + 'struct FMixed { int32 A; };\n',
             'Mixed/A.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixA");\nclass AMixA : public AActor { FMixed M; };\n',
             'Mixed/B.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixB");\nclass AMixB : public AActor {};\n'}
@@ -8124,13 +8131,22 @@ def infer_meta():
         proves('sharing-a-class.include-turrets-turrets-h')
         assert {'EShared.uasset', 'FShared.uasset', 'UShared.uasset', 'FMarked.uasset', 'EMarked.uasset'} \
             <= set(os.listdir(out('Owner'))), os.listdir(out('Owner'))
-        assert {f for f in os.listdir(out('User')) if f.endswith('.uasset')} == {'AUser.uasset'}, os.listdir(out('User'))
+        assert {f for f in os.listdir(out('User')) if f.endswith('.uasset')} == {'AUser.uasset', 'ATwo.uasset'}, os.listdir(out('User'))
         imports = set(import_paths(os.path.join(out('User'), 'AUser')))
         assert {'/Game/_ElytrasMods/Owner/FShared.FShared', '/Game/_ElytrasMods/Owner/EShared.EShared',
                 '/Game/_ElytrasMods/Owner/UShared.UShared_C'} <= imports, sorted(imports)
         # Its UE_STRUCT and UE_ENUM too, never cooked again here:
         proves('sharing-a-class.include-marked')
         assert {'/Game/_ElytrasMods/Owner/FMarked.FMarked', '/Game/_ElytrasMods/Owner/EMarked.EMarked'} <= imports, sorted(imports)
+        # Two mods' types of one name, each in its own namespace: each is its own file's mod's.
+        proves('sharing-a-class.two-mods-one-name')
+        made = lambda mod, ns: {f for f in os.listdir(os.path.join(out(mod), ns)) if f.endswith('.uasset')}
+        assert made('Owner', 'Core') >= {'UInit.uasset', 'FPair.uasset', 'EKind.uasset'}, made('Owner', 'Core')
+        assert made('User', 'Spawn') == {'UInit.uasset', 'FPair.uasset', 'EKind.uasset'}, made('User', 'Spawn')
+        assert not os.path.exists(os.path.join(out('User'), 'Core')), os.listdir(os.path.join(out('User'), 'Core'))
+        imports = set(import_paths(os.path.join(out('User'), 'ATwo')))
+        assert {'/Game/_ElytrasMods/%s/%s' % (mod, leaf) for mod in ('Owner/Core', 'User/Spawn')
+                for leaf in ('UInit.UInit_C', 'FPair.FPair', 'EKind.EKind')} <= imports, sorted(imports)
         proves('sharing-a-class.a-header-in-a-folder')
         proc = assetgen_compile([os.path.join(tmp, 'Mixed/A.cpp'), UEAPI, out('MixA')])
         assert proc.returncode != 0 and 'unimplemented property M: FMixed' in proc.stdout, proc.stdout
