@@ -22505,6 +22505,41 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     && !DiffAgainstDefaultObject(R.Base.empty() ? nullptr : Find(R.Base), Lhs->value("referencedMemberDecl", std::string()),
                                                  Where + ": " + Name(*Lhs), PD, BP, Err))
                 { bOk = false; return; }
+                /* A component's template loads the same way over its archetype: the template of the nearest class above
+                   that sets the member on this component, else the component class's default object. */
+                if (bThroughComponent && !bWidget && HoldsTaggedSetOrMap(PD))
+                {
+                    const std::string Id = Lhs->value("referencedMemberDecl", std::string());
+                    const Json *SetL = nullptr, *SetV = nullptr;
+                    for (const FRecord* A = DR == &R || R.Base.empty() ? nullptr : Find(R.Base); A && !SetL;
+                         A = A == DR || A->Base.empty() ? nullptr : Find(A->Base))
+                    {
+                        const Json* Its = nullptr;
+                        if (A->Defaults) ForEach(*A->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
+                        if (Its)
+                            ForEach(*Its, [&](const Json& St) {
+                                const Json *L = nullptr, *V = nullptr, *Through = nullptr;
+                                if (DefaultAssignment(St, L, V, Through) && Through && Name(*Through) == CompName
+                                    && L->value("referencedMemberDecl", std::string()) == Id)
+                                { SetL = L; SetV = V; }
+                            });
+                    }
+                    if (SetL)
+                    {
+                        FPropertyDef Above = PD;
+                        Above.Default = FDefaultValue();
+                        if (!LowerDefault(*SetL, Above, BP, Err, SetV, /*bKeepZero=*/true)) { bOk = false; return; }
+                        DiffTaggedAgainstParent(PD, Above);
+                    }
+                    else
+                    {
+                        std::string CompType = StripTypeKeywords(TypeOf(*Owner));
+                        while (!CompType.empty() && (CompType.back() == '*' || CompType.back() == ' ')) CompType.pop_back();
+                        if (!DiffAgainstDefaultObject(Find(StripTypeKeywords(CompType)), Id, Where + ": " + CompName + "->" + Name(*Lhs),
+                                                      PD, BP, Err))
+                        { bOk = false; return; }
+                    }
+                }
                 /* A statement is the member's whole new value, as an assignment is in C++: one before it on the same
                    member is gone, not a tag under this one's (whose left-out members would load its values). One that
                    sets part of it joins the member's tag instead (Put). */

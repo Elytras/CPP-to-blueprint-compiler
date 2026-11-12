@@ -12899,6 +12899,32 @@ def prop_set_delta():
           'parent\'s elements it drops as removed, and loads as its own value, not the union')
 
 
+def comp_set_delta():
+    """UE_DEFAULTS on a component's TSet / TMap is what the template loads: read as the loader reads each tag on top of
+    its archetype's loaded value (loaded_container), the component class's default object for a class's own component
+    and the parent's template for an inherited one. Any encoding that loads the value the source says passes."""
+    import invariants
+    folder = os.path.dirname(asset('CompSetDelta'))
+    part, base, kid = (invariants.Package(os.path.join(folder, n)) for n in ('UCsdHolder', 'CsdBase', 'CompSetDelta'))
+    cdo = part.find('Default__UCsdHolder_C')
+    cls = {('Ids',): loaded_container(part, cdo, 'Ids', 'set', set()), ('Score',): loaded_container(part, cdo, 'Score', 'map', {}),
+           ('Held', 'Ids'): loaded_container(part, cdo, ('Held', 'Ids'), 'set', set())}
+    assert cls == {('Ids',): {1, 2}, ('Score',): {'a': 1, 'c': 3}, ('Held', 'Ids'): {1, 2}}, cls
+    kinds = {('Ids',): 'set', ('Score',): 'map', ('Held', 'Ids'): 'set'}
+    over = lambda pkg, name, start: {k: loaded_container(pkg, pkg.find(name), k, kinds[k], start[k]) for k in kinds}
+    proves('ue-defaults.holder-ids-2-3')
+    holder = over(base, 'Holder_GEN_VARIABLE', cls)
+    assert holder == {('Ids',): {2, 3}, ('Score',): {'a': 5, 'b': 2}, ('Held', 'Ids'): {2, 4}}, 'CsdBase.Holder loads %s' % holder
+    assert over(base, 'Plain_GEN_VARIABLE', cls) == cls
+    kid_holder = over(kid, 'Holder_GEN_VARIABLE', holder)
+    assert kid_holder == {('Ids',): {3, 9}, ('Score',): {'a': 5, 'b': 2}, ('Held', 'Ids'): {2, 4}}, 'CompSetDelta.Holder loads %s' % kid_holder
+    kid_plain = over(kid, 'Plain_GEN_VARIABLE', cls)
+    assert kid_plain == {('Ids',): {7}, ('Score',): {'a': 1, 'c': 3}, ('Held', 'Ids'): {1, 2}}, 'CompSetDelta.Plain loads %s' % kid_plain
+    for n in ('UCsdHolder', 'CsdBase', 'CompSetDelta'): keeps_invariants(os.path.join(folder, n))
+    print('ok  CompSetDelta: a component\'s TSet / TMap default, the class\'s own component or an inherited one, lists its '
+          'archetype\'s elements it drops as removed, and loads as the braces say, not the union')
+
+
 def prop_enum_class():
     """A property of a native `enum class : uint8` is an EnumProperty over a ByteProperty, as the editor makes it
     (KismetCompilerMisc.cpp 1071-1094; every EnumProperty of the game's Blueprints is over a ByteProperty): a variable, a
@@ -12993,6 +13019,7 @@ prop_flag_predicates()
 prop_hash_keys()
 prop_enum_casts()
 prop_set_delta()
+comp_set_delta()
 prop_enum_class()
 
 
