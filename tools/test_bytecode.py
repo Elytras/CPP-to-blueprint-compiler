@@ -7330,6 +7330,19 @@ def uber_frames():
     print('ok  LatentTest / AsyncTest: each ubergraph is the class\'s UberGraphFunction and runs on the persistent frame')
 
 
+def repl_nowhere():
+    """A replicated variable on a class that is no actor and no component goes nowhere: refused, its own and one an
+    interface gives it."""
+    proves('replicated-variables-on.no-actor')
+    refused('ReplIfaceObject', '  int32 Read() { return Points; }\n', 'the replicated variable IReplScored::Points of an interface it '
+            'implements does nothing, since only an actor or an actor component replicates',
+            top='class IReplScored {\npublic:\n  UE_INTERFACE;\n  UE_REPLICATED(int32, Points) = 0;\n};\n',
+            base='UObject, public IReplScored')
+    refused('ReplOwnObject', '  UE_REPLICATED(int32, Points) = 0;\n',
+            'the replicated variable Points does nothing, since only an actor or an actor component replicates', base='UObject')
+    print('ok  ReplNowhere: a replicated variable on a class that is no actor or component is refused, an interface\'s too')
+
+
 def repl_defaults():
     """The actor replicates (CDO bReplicates, or no replicated variable ever leaves the server) and keeps Score's
     initializer; ReplKid inherits both rather than overriding them."""
@@ -7349,6 +7362,7 @@ def repl_defaults():
 
 
 replication()
+repl_nowhere()
 repl_defaults()
 repl_runs()
 rpc_routing()
@@ -15943,10 +15957,17 @@ def timelines():
     assert [(props[n].type, props[n].flags) for n in ('Alpha', 'Lift', 'Tint', 'Beat')] == [
         ('FloatProperty', 0), ('StructProperty', 0), ('StructProperty', 0), ('FloatProperty', 0)]
 
+    lamp_base = os.path.join(ROOT, 'FadingLamp', 'FSD', 'Content', '_AssetGenExamples', 'FadingLamp', 'FadingLamp')
     kid = timelines_of(child)
     assert list(kid) == ['Spin'] and kid['Spin']['UpdateFunctionName'] == 'OnSpin' and 'FinishedFunctionName' not in kid['Spin'], kid
     assert timelines_of(plain) == {}
-    lamp = os.path.join(ROOT, 'FadingLamp', 'FSD', 'Content', '_AssetGenExamples', 'FadingLamp', 'FadingLamp')
+    # A replicated timeline's component replicates only with its actor: the class's CDO replicates, and a subclass inherits it.
+    cdo_of = lambda b: dump('dumptags.py', b, [e['name'] for e in dumpexp.load(b)[5]].index('Default__%s_C' % os.path.basename(b)))
+    proves('declaring-a-timeline.ue-timeline-fade-2-0f-2')
+    assert re.search(r'bReplicates \[0\] BoolProperty size=0 value=1', cdo_of(base)), cdo_of(base)
+    assert 'bReplicates' not in cdo_of(child) and 'bReplicates' not in cdo_of(plain)
+    assert 'bReplicates' not in cdo_of(lamp_base), cdo_of(lamp_base)      # no Replicated option: the actor is left as it was
+    lamp = lamp_base
     assert os.path.exists(lamp + '.uasset'), 'the examples are not built under ' + ROOT
     lit = timelines_of(lamp)
     assert list(lit) == ['Fade'] and (lit['Fade']['UpdateFunctionName'], lit['Fade']['FinishedFunctionName']) == ('OnFade', 'OnFaded'), lit
@@ -17474,6 +17495,16 @@ def map_arrays():
     check('MapArrays', 'Others', lambda V: 5 * 10000 + 10 * 100 + 30, [dict(V=v) for v in (9, 77)])
     check('MapArrays', 'KeyOnce', lambda V: V * 10 + 1, [dict(V=v) for v in (6, 2)])
     assert "Grow's reference parameter V is bound to an element of a map element's array" in LOGS['MapArrays'], LOGS['MapArrays']
+    proves('reference-locals.auto-l-lists-k')
+    check('MapArrays', 'Named', lambda V: V * 10000 + (V + 1) * 100 + V + 2 + 4000000, [dict(V=v) for v in (7, 40)])
+    check('MapArrays', 'NamedBag', lambda V: (3 + V) * 1000 + V, [dict(V=v) for v in (7, 0)])
+    check('MapArrays', 'NamedElem', lambda V: 30 + 2 * V, [dict(V=v) for v in (7, -3)])
+    check('MapArrays', 'NamedPinned', lambda V: V * 100 + 5, [dict(V=v) for v in (7, 12)])
+    check('MapArrays', 'NamedScore', lambda V: (10 + V) * 2, [dict(V=v) for v in (7, -10)])
+    check('MapArrays', 'NamedRead', lambda V: V, [dict(V=v) for v in (7, 99)])
+    check('MapArrays', 'NamedKeyOnce', lambda V: 1000 + 2 * V, [dict(V=v) for v in (7, 3)])
+    refused('RefPick', '  int32 X = 0, Y = 0;\n  void F(bool B) {\n    int32 &R = B ? X : Y;\n    R = 1;\n  }\n',
+            'reference R: TODO: the address of ConditionalOperator')
     proves('range-for-over.for-int32-x-lists-k')
     check('MapArrays', 'Walk', lambda V: wrap(60 * V), [dict(V=v) for v in (7, 0, -2)])
     check('MapArrays', 'WalkMember', lambda V: (10 + V) * 10000 + (20 + V) * 100 + 30 + V, [dict(V=v) for v in (7, 1)])
@@ -17517,6 +17548,24 @@ def unsigned64():
 
 
 unsigned64()
+
+
+# ---- TmplStaticClass: `T::StaticClass()` in a template names the class it was instantiated with (REFERENCE.md,
+# StaticClass on the mod's classes)
+
+def tmpl_static_class():
+    base = asset('TmplStaticClass')
+    proves('staticclass-on-the.t-staticclass')
+    for fn, want in (('Direct', 'Lexer_C'), ('Free', 'Lexer_C'), ('FreeOther', 'Parser_C'), ('Member', 'Lexer_C'),
+                     ('MemberOther', 'Parser_C'), ('Pair', 'Parser_C'), ('PairSwapped', 'Lexer_C'), ('OfStruct', 'Parser_C'),
+                     ('Engine', 'Actor')):
+        assert run(base, fn)[0] == want, (fn, run(base, fn)[0], want)
+    assert run(base, 'Nested', bFirst=True)[0] == 'Lexer_C' and run(base, 'Nested', bFirst=False)[0] == 'Parser_C'
+    print('ok  TmplStaticClass: T::StaticClass() in a free, a member and a class template names each instantiation\'s own '
+          'class, by the parameter\'s place, an inner template\'s too')
+
+
+tmpl_static_class()
 
 
 

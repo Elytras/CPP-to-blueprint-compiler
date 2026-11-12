@@ -78,6 +78,60 @@ public:
     return Lists[1][0] * 10 + Calls;
   }
 
+  /* A reference local to a map's value, or to a place in it: another name for the place, its key found once. */
+  TMap<int32, int32> Scores;
+  int32 Named(int32 V) {
+    Seed();
+    auto &L = Lists[1];
+    L[0] = V;
+    L[1] = V + 1;
+    L.Add(V + 2);
+    return Lists[1][0] * 10000 + Lists[1][1] * 100 + Lists[1][3] + L.Num() * 1000000;
+  }
+  int32 NamedBag(int32 V) {
+    Seed();
+    FBag &B = Table[7];
+    B.Count += V;
+    B.Items[0] = V;
+    return Table[7].Count * 1000 + Table[7].Items[0];
+  }
+  int32 NamedElem(int32 V) {
+    Seed();
+    int32 &X = Lists[1][2];
+    X += V;
+    X += V;
+    return Lists[1][2];
+  }
+  int32 NamedPinned(int32 V) { // the key is read where L is declared
+    Seed();
+    int32 K = 1;
+    auto &L = Lists[K];
+    K = 2;
+    L[0] = V;
+    return Lists[1][0] * 100 + Lists[2][0];
+  }
+  int32 NamedScore(int32 V) { // the value itself
+    Scores.Clear();
+    Scores.Add(4, 10);
+    int32 &R = Scores[4];
+    R += V;
+    R = R * 2;
+    return Scores[4];
+  }
+  int32 NamedRead(int32 V) { // a reference sees a later write
+    Seed();
+    const auto &L = Lists[1];
+    Lists[1][0] = V;
+    return L[0];
+  }
+  int32 NamedKeyOnce(int32 V) {
+    Seed();
+    auto &L = Lists[Key()];
+    L[0] = V;
+    L[1] = V;
+    return Calls * 1000 + Lists[1][0] + Lists[1][1];
+  }
+
   /* A range-for by reference over an array a map holds: the walk is over the copy, stored back when the loop is left. */
   int32 Walk(int32 V) {
     Seed();

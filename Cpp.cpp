@@ -2436,6 +2436,9 @@ private:
     std::map<std::string, const Json*> PlainMethods;    // CXXMethodDecl id -> its definition
     std::map<std::string, Json> BoundMethods;           // "<method id>@<variable id>" -> the method with that `this`
     void IndexPlain(const Json& N, bool bApi, bool bInTemplate);
+    /* `T::StaticClass()` in a template's body: each such reference in an instantiation gets the arguments its
+       template's parameters stand for there ("templateArgs"), which NamedQualifier reads the written `T` through. */
+    void BindStaticClassParms(Json& N, const Json& Bound);
     const Json* PlainConstInit(const Json& E, std::string* VarId = nullptr) const;
     void FoldConstObjects(Json& N, bool bAddressed = false);
     bool CaptureNames(const Json& Lambda, const std::vector<const Json*>& Inits, std::vector<std::string>* Names,
@@ -8989,6 +8992,9 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
     if (End.is_null())
     {
         const std::string Q = QualifierBefore(*T, Off, Len, "StaticClass");
+        /* A template's parameter, in an instantiation: the class it stands for there (BindStaticClassParms). */
+        if (const auto B = Ref.find("templateArgs"); B != Ref.end() && B->contains(Q))
+            return Find(StripTypeKeywords((*B)[Q].get<std::string>()));
         return Q.empty() ? nullptr : Find(Q);
     }
     /* In a macro: its body has `::StaticClass` at End, and the qualifier is the whole identifier at Off. */
@@ -11696,6 +11702,22 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         RefAlias[D.value("id", std::string())] = *RefInit;
                         return;
                     }
+                    /* `auto& L = Map[K];`, `FBag& B = Table[K];`, `int32& X = Map[K].Items[I];`: Blueprint has no
+                       reference to a map's value, which Map_Find copies out. R is another name for the place, what
+                       locates it (the key, an index) found once, here; a read through R finds the value again, and a
+                       write through it stores the value back under its key (MapElementUnder). */
+                    if (const Json Seen = Unalias(*RefInit); MapElementUnder(Seen))
+                    {
+                        Json Pre = Json::array();
+                        Json Place = StabilizeLvalue(Seen, Pre, true);
+                        if (!Pre.empty())
+                        {
+                            const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
+                            if (!LowerBody(Wrap, BP, Out, Locals, Err)) { bOk = false; return; }
+                        }
+                        RefAlias[D.value("id", std::string())] = std::move(Place);
+                        return;
+                    }
                     std::string Pointee;
                     if (!LowerAddress(*RefInit, BP, Ds.Value, &Pointee, Err))
                     { *Err = "reference " + VarName + ": " + *Err; bOk = false; return; }
@@ -13391,7 +13413,7 @@ bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& B
         for (const std::string& O : TimelineItems(Bar < Spec.size() ? Spec.substr(Bar + 1) : std::string()))
             if (O == "AutoPlay") T.bAutoPlay = true;
             else if (O == "Loop") T.bLoop = true;
-            else if (O == "Replicated") T.bReplicated = true;
+            else if (O == "Replicated") { T.bReplicated = true; BP.SetReplicates(true); }      // a component replicates only with its actor
             else if (O == "IgnoreTimeDilation") T.bIgnoreTimeDilation = true;
             else if (O == "LastKeyframe") T.bLastKeyframe = true;
             else return Refuse("(" + Name_ + ") has an unknown option " + O + ": the options are AutoPlay, Loop, Replicated, "
@@ -14126,6 +14148,49 @@ void FCompiler::RewriteLambdaCalls(Json& N)
     N["lambdaObj"] = std::move(N["inner"][1]);
     N["inner"].erase(N["inner"].begin() + 1);
     N["kind"] = "CallExpr";
+}
+
+/* StaticClass is declared once, on a native class, so `T::StaticClass()` in a template names the declaring class in
+   every instantiation and only the source says more: `T`. Under each template, every instantiation's references to
+   StaticClass are given what the template's type parameters are there, by name; an inner template adds its own to its
+   outer's. Nothing else is walked: a pattern has no arguments, and code outside a template none to read. */
+void FCompiler::BindStaticClassParms(Json& N, const Json& Bound)
+{
+    if (!N.is_object()) return;
+    const std::string K = Kind(N);
+    if (K == "DeclRefExpr" && !Bound.empty() && N.contains("referencedDecl") && Name(N["referencedDecl"]) == "StaticClass")
+        N["templateArgs"] = Bound;
+    if (!N.contains("inner") || !N["inner"].is_array()) return;
+    if (K == "FunctionTemplateDecl" || K == "ClassTemplateDecl")
+    {
+        std::vector<std::string> Parms;
+        for (const Json& P : N["inner"])
+            if (const std::string PK = Kind(P); PK == "TemplateTypeParmDecl" || PK == "NonTypeTemplateParmDecl" || PK == "TemplateTemplateParmDecl")
+                Parms.push_back(PK == "TemplateTypeParmDecl" ? Name(P) : std::string());
+        for (Json& C : N["inner"])
+        {
+            Json Mine = Bound;
+            size_t At = 0;
+            bool bInstance = false;
+            if (C.is_object() && C.contains("inner") && C["inner"].is_array())
+                for (const Json& A : C["inner"])
+                {
+                    if (Kind(A) != "TemplateArgument") continue;
+                    bInstance = true;
+                    // ponytail: a pack's arguments are not bound; `Ts::StaticClass()...` stays the declaring class.
+                    if (At < Parms.size() && !Parms[At].empty() && A.contains("type") && !A.value("isPack", false))
+                        Mine[Parms[At]] = A["type"].value("qualType", std::string());
+                    ++At;
+                }
+            if (bInstance) BindStaticClassParms(C, Mine);
+            else if (!Bound.empty()) BindStaticClassParms(C, Bound);        // a member template's pattern in an instantiated class
+        }
+        return;
+    }
+    const bool bScope = K == "TranslationUnitDecl" || K == "NamespaceDecl" || K == "LinkageSpecDecl" || K == "CXXRecordDecl"
+                     || K == "ClassTemplateSpecializationDecl";
+    if (!bScope && Bound.empty()) return;
+    for (Json& C : N["inner"]) BindStaticClassParms(C, Bound);
 }
 
 /* Every struct of the mod's own sources with no base: its fields by their place, its methods that have a body. A
@@ -21717,6 +21782,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        empty body, listed in Children and FuncMap like any function. */
     CurSignatures.clear();
     bool bReplicatesAnything = false;
+    std::string InterfaceReplicated;                // the first replicated variable an interface gives the class
     for (const Json* F : R.Fields)
     {
         if (StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") != 0) continue;
@@ -22782,6 +22848,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             { *Err = R.CppName + "::" + FieldName + ": unknown replication condition " + Cond; return false; }
             PD.RepCondition = C.empty() ? 0 : uint8(At - std::begin(Conditions));
             bReplicatesAnything = true;
+            if (&Decl != &R && InterfaceReplicated.empty()) InterfaceReplicated = Decl.CppName + "::" + FieldName;
         }
         AddVariable(TypeOf(*F), PD);
     }
@@ -23481,7 +23548,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (!R.bIsInterface && std::none_of(Ancestry.begin(), Ancestry.end(), [](const std::string& A) {
             return A == "Actor" || A == "ActorComponent"; }))
     {
-        std::string What = R.Replicated.empty() ? std::string() : "the replicated variable " + R.Replicated.begin()->first;
+        std::string What = !R.Replicated.empty() ? "the replicated variable " + R.Replicated.begin()->first
+                         : !InterfaceReplicated.empty() ? "the replicated variable " + InterfaceReplicated + " of an interface it implements"
+                         : std::string();
         for (const FMethod& Fn : Methods)
             if (What.empty() && (NetFlagsOf(*Fn.Decl) | NetFlagsOf(*Fn.Def))) What = "the RPC " + Fn.Name;
         if (!What.empty())
@@ -25125,6 +25194,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         GAg.Mark("AG_DOM_SAVE to_cbor + write (ignore)");
     }
 
+    BindStaticClassParms(Doc, Json::object());
     if (!LoadTables(IncludeDir, Err)) return false;
     GAg.Mark("LoadTables");
     if (!Collect(Err)) { GAg.Mark("Collect (failed)"); return false; }
