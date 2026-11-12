@@ -23848,7 +23848,68 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            RF_StrongRefOnFrame object is strong (UObjectGlobals.cpp 3460-3483). A local of a function that does not
            wait dies with the call, after which a collection takes the proxy and its dispatchers never fire; so it is
            stored into a transient member too, one per local, as the editor's frame keeps one per node. A waiting
-           function's locals are the frame's already. */
+           function's locals are the frame's already.
+           A proxy made in the middle of an expression (`Create(...)->OnCompleted.Add(this, &X::Done)`, the call
+           straight into a Cast or an argument) is no local's value, so nothing would hold it: it gets a local of its
+           own first, which is then kept like any other. A bare call statement, whose proxy nothing uses, is left.
+           ponytail: the proxy's call moves in front of its statement, so a statement that makes another call beside
+           it is refused; a loop's or a branch's condition is not looked at. Order the calls if that is ever met. */
+        {
+            std::string Why;
+            ForEachStmt(Stmts, [&](std::vector<FStmtIR>& List, size_t I) {
+                if (!Why.empty()) return;
+                FStmtIR& St = List[I];
+                const bool bLocalValue = (St.K == FStmtIR::Decl || St.K == FStmtIR::Assign) && St.Var.K == FArgIR::Local;
+                FArgIR* Found = nullptr;
+                int32 Others = 0;       // calls beside the proxy's, not ones it is an argument of
+                std::function<bool(FArgIR&)> Arg;
+                auto Call = [&](FCallIR& C) {
+                    bool bIn = C.Target && Arg(*C.Target);
+                    for (FArgIR& A : C.Args) bIn = Arg(A) || bIn;
+                    return bIn;
+                };
+                Arg = [&](FArgIR& A) {
+                    if (A.K == FArgIR::Call && A.Sub && A.Sub->bFrameHeld && !(bLocalValue && &A == &St.Value))
+                    {
+                        if (Found) ++Others; else Found = &A;
+                        return true;
+                    }
+                    bool bIn = A.Sub && Call(*A.Sub);
+                    bIn = (A.Base && Arg(*A.Base)) || bIn;
+                    if (A.K == FArgIR::Call && !bIn) ++Others;
+                    return bIn;
+                };
+                Call(St.Target);
+                Call(St.Call);
+                Arg(St.Var);
+                Arg(St.Value);
+                if (!Found) return;
+                std::string Type = StripTypeKeywords(Found->InnerType);
+                FPropertyDef PD;
+                const std::string Local = "__Proxy" + std::to_string(ReadTmpCounter++);
+                if (Others || Type.empty() || !TypeToProperty(Type, Local, 0, "a proxy", BP, &PD, &Why))
+                {
+                    Why = "a proxy that only the frame keeps alive (a montage or widget animation proxy) is made in the middle of a "
+                          "statement that calls something else too: put it in a local of its own first";
+                    return;
+                }
+                PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                Locals.push_back(PD);
+                FStmtIR Make;
+                Make.K = FStmtIR::Assign;
+                Make.Var.K = FArgIR::Local;
+                Make.Var.S = Local;
+                Make.Var.LetOp = LetOpFor(Type);
+                Make.bAssignLocal = true;
+                FArgIR Read = Make.Var;
+                Read.InnerType = Found->InnerType;
+                Read.Class = Found->Class;
+                Make.Value = std::move(*Found);
+                *Found = std::move(Read);
+                List.insert(List.begin() + I, std::move(Make));
+            });
+            if (!Why.empty()) { *Err = R.CppName + "::" + Fn.Name + ": " + Why; return false; }
+        }
         if (!bMadeLatentCall)
             ForEachStmt(Stmts, [&](std::vector<FStmtIR>& List, size_t I) {
                 const FStmtIR& St = List[I];

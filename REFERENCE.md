@@ -4648,7 +4648,10 @@ Notes:
   `CreatePlayAnimationProxyObject`, `CreatePlayAnimationTimeRangeProxyObject`) are kept alive by nothing but the
   variable that holds them. Put in a local of a method that does not wait, the compiler also stores it into a hidden
   transient member of the class, `<Method>_<Local>`, so it outlives the call as the editor's event graph keeps it;
-  a later call of the method replaces it there.
+  a later call of the method replaces it there. One made in the middle of a statement
+  (`CreateProxyObjectForPlayMontage(...)->OnCompleted.Add(this, &AMine::Done);`, or the call straight into a `Cast` or
+  an argument) is given a local first and kept the same way; where the statement calls something else as well it is
+  refused (`put it in a local of its own first`), since the proxy's call would move in front of that one.
 - To continue a function when a dispatcher next fires, instead of binding a handler, use `UE_AWAIT`: see
   [Waiting on events](#waiting-on-events). [examples/AwaitEvents.cpp](examples/AwaitEvents.cpp) uses UE_AWAIT and
   contrasts it with the callback style in a comment.
