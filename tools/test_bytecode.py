@@ -8107,10 +8107,17 @@ def infer_meta():
         files = {
             'Owner/Shared.h': '#pragma once\n' + head + 'struct FShared { int32 A; };\nenum class EShared : uint8 { One, Two };\n'
                               'struct FMarked { UE_STRUCT; int32 B; };\nenum class EMarked : uint8 { X, Y };\nUE_ENUM(EMarked);\n'
-                              'class UShared : public UObject { public: FShared S; EShared E; FMarked M; EMarked K; };\n',
+                              'class UShared : public UObject { public: FShared S; EShared E; FMarked M; EMarked K; };\n'
+                              'namespace Core { class UInit : public UObject { public: int32 A; };\n'
+                              'struct FPair { int32 A; }; enum class EKind : uint8 { One, Two };\n'
+                              'class UCoreUser : public UObject { public: FPair P; EKind K; }; }\n',
             'Owner/Owner.cpp': '#include "Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Owner");\n',
             'User/User.cpp': '#include "../Owner/Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/User");\n'
-                             'class AUser : public AActor { FShared S; EShared E; FMarked M; EMarked K; UShared *D; };\n',
+                             'class AUser : public AActor { FShared S; EShared E; FMarked M; EMarked K; UShared *D; };\n'
+                             'namespace Spawn { class UInit : public UObject { public: int32 B; };\n'
+                             'struct FPair { int32 B; }; enum class EKind : uint8 { Three, Four }; }\n'
+                             'class ATwo : public AActor { Core::UInit *Theirs; Spawn::UInit *Mine; Core::FPair TP; Spawn::FPair MP;\n'
+                             '  Core::EKind TK; Spawn::EKind MK; };\n',
             'Mixed/Mixed.h': '#pragma once\n' + head + 'struct FMixed { int32 A; };\n',
             'Mixed/A.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixA");\nclass AMixA : public AActor { FMixed M; };\n',
             'Mixed/B.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixB");\nclass AMixB : public AActor {};\n'}
@@ -8124,13 +8131,22 @@ def infer_meta():
         proves('sharing-a-class.include-turrets-turrets-h')
         assert {'EShared.uasset', 'FShared.uasset', 'UShared.uasset', 'FMarked.uasset', 'EMarked.uasset'} \
             <= set(os.listdir(out('Owner'))), os.listdir(out('Owner'))
-        assert {f for f in os.listdir(out('User')) if f.endswith('.uasset')} == {'AUser.uasset'}, os.listdir(out('User'))
+        assert {f for f in os.listdir(out('User')) if f.endswith('.uasset')} == {'AUser.uasset', 'ATwo.uasset'}, os.listdir(out('User'))
         imports = set(import_paths(os.path.join(out('User'), 'AUser')))
         assert {'/Game/_ElytrasMods/Owner/FShared.FShared', '/Game/_ElytrasMods/Owner/EShared.EShared',
                 '/Game/_ElytrasMods/Owner/UShared.UShared_C'} <= imports, sorted(imports)
         # Its UE_STRUCT and UE_ENUM too, never cooked again here:
         proves('sharing-a-class.include-marked')
         assert {'/Game/_ElytrasMods/Owner/FMarked.FMarked', '/Game/_ElytrasMods/Owner/EMarked.EMarked'} <= imports, sorted(imports)
+        # Two mods' types of one name, each in its own namespace: each is its own file's mod's.
+        proves('sharing-a-class.two-mods-one-name')
+        made = lambda mod, ns: {f for f in os.listdir(os.path.join(out(mod), ns)) if f.endswith('.uasset')}
+        assert made('Owner', 'Core') >= {'UInit.uasset', 'FPair.uasset', 'EKind.uasset'}, made('Owner', 'Core')
+        assert made('User', 'Spawn') == {'UInit.uasset', 'FPair.uasset', 'EKind.uasset'}, made('User', 'Spawn')
+        assert not os.path.exists(os.path.join(out('User'), 'Core')), os.listdir(os.path.join(out('User'), 'Core'))
+        imports = set(import_paths(os.path.join(out('User'), 'ATwo')))
+        assert {'/Game/_ElytrasMods/%s/%s' % (mod, leaf) for mod in ('Owner/Core', 'User/Spawn')
+                for leaf in ('UInit.UInit_C', 'FPair.FPair', 'EKind.EKind')} <= imports, sorted(imports)
         proves('sharing-a-class.a-header-in-a-folder')
         proc = assetgen_compile([os.path.join(tmp, 'Mixed/A.cpp'), UEAPI, out('MixA')])
         assert proc.returncode != 0 and 'unimplemented property M: FMixed' in proc.stdout, proc.stdout
@@ -12899,6 +12915,32 @@ def prop_set_delta():
           'parent\'s elements it drops as removed, and loads as its own value, not the union')
 
 
+def comp_set_delta():
+    """UE_DEFAULTS on a component's TSet / TMap is what the template loads: read as the loader reads each tag on top of
+    its archetype's loaded value (loaded_container), the component class's default object for a class's own component
+    and the parent's template for an inherited one. Any encoding that loads the value the source says passes."""
+    import invariants
+    folder = os.path.dirname(asset('CompSetDelta'))
+    part, base, kid = (invariants.Package(os.path.join(folder, n)) for n in ('UCsdHolder', 'CsdBase', 'CompSetDelta'))
+    cdo = part.find('Default__UCsdHolder_C')
+    cls = {('Ids',): loaded_container(part, cdo, 'Ids', 'set', set()), ('Score',): loaded_container(part, cdo, 'Score', 'map', {}),
+           ('Held', 'Ids'): loaded_container(part, cdo, ('Held', 'Ids'), 'set', set())}
+    assert cls == {('Ids',): {1, 2}, ('Score',): {'a': 1, 'c': 3}, ('Held', 'Ids'): {1, 2}}, cls
+    kinds = {('Ids',): 'set', ('Score',): 'map', ('Held', 'Ids'): 'set'}
+    over = lambda pkg, name, start: {k: loaded_container(pkg, pkg.find(name), k, kinds[k], start[k]) for k in kinds}
+    proves('ue-defaults.holder-ids-2-3')
+    holder = over(base, 'Holder_GEN_VARIABLE', cls)
+    assert holder == {('Ids',): {2, 3}, ('Score',): {'a': 5, 'b': 2}, ('Held', 'Ids'): {2, 4}}, 'CsdBase.Holder loads %s' % holder
+    assert over(base, 'Plain_GEN_VARIABLE', cls) == cls
+    kid_holder = over(kid, 'Holder_GEN_VARIABLE', holder)
+    assert kid_holder == {('Ids',): {3, 9}, ('Score',): {'a': 5, 'b': 2}, ('Held', 'Ids'): {2, 4}}, 'CompSetDelta.Holder loads %s' % kid_holder
+    kid_plain = over(kid, 'Plain_GEN_VARIABLE', cls)
+    assert kid_plain == {('Ids',): {7}, ('Score',): {'a': 1, 'c': 3}, ('Held', 'Ids'): {1, 2}}, 'CompSetDelta.Plain loads %s' % kid_plain
+    for n in ('UCsdHolder', 'CsdBase', 'CompSetDelta'): keeps_invariants(os.path.join(folder, n))
+    print('ok  CompSetDelta: a component\'s TSet / TMap default, the class\'s own component or an inherited one, lists its '
+          'archetype\'s elements it drops as removed, and loads as the braces say, not the union')
+
+
 def prop_enum_class():
     """A property of a native `enum class : uint8` is an EnumProperty over a ByteProperty, as the editor makes it
     (KismetCompilerMisc.cpp 1071-1094; every EnumProperty of the game's Blueprints is over a ByteProperty): a variable, a
@@ -12993,6 +13035,7 @@ prop_flag_predicates()
 prop_hash_keys()
 prop_enum_casts()
 prop_set_delta()
+comp_set_delta()
 prop_enum_class()
 
 
@@ -17519,6 +17562,27 @@ def map_arrays():
 
 
 map_arrays()
+
+
+# ---- MathEdges: where Blueprint's arithmetic leaves C++ (REFERENCE.md, Arithmetic)
+
+def math_edges():
+    s = lambda x: (x + 2**63) % 2**64 - 2**63
+    ints = [dict(A=a, B=b) for a in (-7, 0, 7, 2**31 - 1, -2**31) for b in (0, 3, -2)]
+    proves('arithmetic.hits-shots')
+    check('MathEdges', 'Div', lambda A, B: cdiv(A, B) if B else 0, ints)
+    check('MathEdges', 'Mod', lambda A, B: cmod(A, B) if B else 0, ints)
+    check('MathEdges', 'Div64', lambda A, B: cdiv(A, B) if B else 0, ints + [dict(A=2**62, B=0), dict(A=-2**40, B=7)])
+    check('MathEdges', 'DivF', lambda A, B: A / B if B else 0.0, [dict(A=a, B=b) for a in (-1.5, 0.0, 8.0) for b in (0.0, 0.5, -4.0)])
+    check('MathEdges', 'Guarded', lambda A, B: 1 if B != 0 and cdiv(A, B) > 2 else 0, ints)
+    proves('arithmetic.x-1')
+    wide = [dict(A=a, B=b) for a in (2**63 - 1, -2**63, 2**62, -5, 3) for b in (1, -1, 2**62, 2**63 - 1, -2**63)]
+    check('MathEdges', 'Add64', lambda A, B: s(A + B), wide)
+    check('MathEdges', 'Sub64', lambda A, B: s(A - B), wide)
+    check('MathEdges', 'Mul64', lambda A, B: s(A * B), wide)
+
+
+math_edges()
 
 
 # ---- Unsigned64: a uint64 value shifts right and orders as unsigned (REFERENCE.md, Bitwise operators and shifts)

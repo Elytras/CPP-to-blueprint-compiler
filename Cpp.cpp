@@ -8666,8 +8666,11 @@ static std::string WithoutComments(std::string T)
     return T;
 }
 
-/* The names of the types T defines, comments gone: `struct X {`, `class X final : public Y {`, `enum class X : uint8 {`.
-   A forward declaration, a template's parameter (`class T>`) and an elaborated type (`class UObject *O;`) are none. */
+/* The types T defines, comments gone, each by its qualified name, the namespaces and types it is written in:
+   `struct X {`, `class X final : public Y {`, `enum class X : uint8 {`. A forward declaration, a template's parameter
+   (`class T>`) and an elaborated type (`class UObject *O;`) are none.
+   ponytail: the scopes are counted by braces, so a namespace a macro opens is not seen and a brace in a raw string
+   miscounts; the caller falls back to the last segment (InferFromSources' OwnerOf). */
 static std::vector<std::string> DefinedTypes(const std::string& T)
 {
     auto IsIdent = [](char C) { return isalnum(uint8(C)) || C == '_'; };
@@ -8677,12 +8680,30 @@ static std::vector<std::string> DefinedTypes(const std::string& T)
         while (At < T.size() && IsIdent(T[At])) ++At;
         return T.substr(Begin, At - Begin);
     };
-    std::vector<std::string> Out;
+    std::vector<std::string> Out, Scope;     // Scope: one per open brace, the name it is the body of or empty
+    std::string Opens;                       // what the `{` that comes next is the body of
     for (size_t At = 0; At < T.size(); ++At)
     {
+        if (const char C = T[At]; C == '"' || C == '\'')
+        {
+            for (++At; At < T.size() && T[At] != C && T[At] != '\n'; ++At) if (T[At] == '\\') ++At;
+            continue;
+        }
+        if (T[At] == '{') { Scope.push_back(Opens); Opens.clear(); continue; }
+        if (T[At] == '}') { if (!Scope.empty()) Scope.pop_back(); continue; }
         if (!IsIdent(T[At]) || (At > 0 && IsIdent(T[At - 1]))) continue;
         size_t P = At;
         std::string Key = Word(P);
+        if (Key == "namespace")
+        {
+            /* `namespace A::B {`; an alias (`namespace X = Y;`) and `using namespace X;` open nothing. */
+            std::string Name = Word(P);
+            while (T.compare(P, 2, "::") == 0) { P += 2; Name += "::" + Word(P); }
+            while (P < T.size() && isspace(uint8(T[P]))) ++P;
+            if (P < T.size() && T[P] == '{') Opens = Name;
+            At = P - 1;
+            continue;
+        }
         if (Key == "enum")
         {
             const size_t Q = P;
@@ -8694,7 +8715,13 @@ static std::vector<std::string> DefinedTypes(const std::string& T)
         if (Word(Q) == "final") P = Q;
         while (P < T.size() && isspace(uint8(T[P]))) ++P;
         if (P < T.size() && T[P] == ':' && T.compare(P, 2, "::") != 0) P = std::min(T.find_first_of("{;", P), T.size());
-        if (!Name.empty() && P < T.size() && T[P] == '{') Out.push_back(Name);
+        if (!Name.empty() && P < T.size() && T[P] == '{')
+        {
+            std::string Full;
+            for (const std::string& S : Scope) if (!S.empty()) Full += S + "::";
+            Out.push_back(Full + Name);
+            Opens = Name;
+        }
         At = P - 1;
     }
     return Out;
@@ -8721,13 +8748,14 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
     if (Mine.empty()) return;
 
     /* First the owners: each type the reached files define, by name, and each of those files' mod. */
-    std::map<std::string, std::string> TypeFile;        // name -> canonical file, empty when two files define it
-    std::map<std::string, std::string> FileText;
+    std::map<std::string, std::string> TypeFile, QualFile;      // a name's last segment, and the name whole -> canonical
+    std::map<std::string, std::string> FileText;                // file, empty when two files define it
     for (const auto& [Key, Entry] : ReachedByIncludes(fs::path(SourceFile)))
     {
         FileText[Key] = WithoutComments(Entry.second);
         for (const std::string& N : DefinedTypes(FileText[Key]))
-            if (auto [It, bNew] = TypeFile.emplace(N, Key); !bNew && It->second != Key) It->second.clear();
+            for (auto [Map, Name] : { std::pair(&QualFile, N), std::pair(&TypeFile, LeafOf(N)) })
+                if (auto [It, bNew] = Map->emplace(Name, Key); !bNew && It->second != Key) It->second.clear();
     }
     std::map<std::string, std::string> FileOwner, DirOwner;
     auto OwnerOfDir = [&](fs::path Dir) {
@@ -8755,9 +8783,12 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
         for (const std::string& K : Seen) DirOwner[K] = Owner;
         return Owner;
     };
-    auto OwnerOf = [&](const std::string& Leaf) -> std::string {
-        auto T = TypeFile.find(Leaf);
-        if (T == TypeFile.end() || T->second.empty()) return std::string();
+    /* By the whole name, so two mods' types of one name, each in its own namespace, have each their file; by the last
+       segment when the text's scopes do not spell that name (DefinedTypes). */
+    auto OwnerOf = [&](const std::string& Name) -> std::string {
+        auto T = QualFile.find(Name);
+        if (T == QualFile.end() && (T = TypeFile.find(LeafOf(Name))) == TypeFile.end()) return std::string();
+        if (T->second.empty()) return std::string();
         auto [It, bNew] = FileOwner.emplace(T->second, std::string());
         if (bNew)
         {
@@ -8771,7 +8802,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
     /* A class of another mod's folder is imported from it. */
     for (auto& [Key, R] : Records)
         if (R.UePackage.empty() && !R.bIsStruct && !R.bIsPatch && !R.bCooked && (!R.Base.empty() || R.bIsInterface))
-            if (const std::string O = OwnerOf(LeafOf(R.CppName)); !O.empty() && O != Mine)
+            if (const std::string O = OwnerOf(R.CppName); !O.empty() && O != Mine)
             {
                 R.UePackage = PathIn(O, R.CppName);
                 R.UeName = LeafOf(R.CppName) + "_C";
@@ -8783,14 +8814,14 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
        here would be another type, which the owner's saves and results do not hold. */
     for (auto& [Key, R] : Records)
         if (R.bIsStruct && R.UePackage.empty() && !R.bIsPatch && !R.bCooked)
-            if (const std::string O = OwnerOf(LeafOf(R.CppName)); !O.empty() && O != Mine)
+            if (const std::string O = OwnerOf(R.CppName); !O.empty() && O != Mine)
             {
                 R.UePackage = PathIn(O, R.CppName);
                 R.UeName = LeafOf(R.CppName);
                 R.InOwner = O;
             }
     for (auto& [Enum, Owner] : EnumMarks)
-        if (const std::string O = OwnerOf(LeafOf(Enum)); Owner.empty() && !O.empty() && O != Mine)
+        if (const std::string O = OwnerOf(Enum); Owner.empty() && !O.empty() && O != Mine)
             Owner = O;
 
     /* The candidates: a plain struct, its members values a struct holds (no text pointer, array or reference), and a
@@ -8799,7 +8830,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
     for (auto& [Key, R] : Records)
     {
         if (!R.UePackage.empty() || R.bIsStruct || R.bIsInterface || R.bIsPatch || R.bCooked || !R.Base.empty()
-            || R.Defaults || R.Fields.empty() || OwnerOf(LeafOf(R.CppName)).empty())
+            || R.Defaults || R.Fields.empty() || OwnerOf(R.CppName).empty())
             continue;
         if (std::none_of(R.Fields.begin(), R.Fields.end(), [](const Json* F) {
                 const std::string T = TypeOf(*F);
@@ -8812,7 +8843,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
     std::map<std::string, std::vector<std::string>> PlainEnums;     // by name, the last segment -> the C++ names
     for (const auto& [Enum, Values] : EnumDecls)
         if (auto U = EnumUnderlying.find(Enum); !Values.empty() && !Marked.count(Enum) && U != EnumUnderlying.end()
-            && U->second == "uint8" && !OwnerOf(LeafOf(Enum)).empty())
+            && U->second == "uint8" && !OwnerOf(Enum).empty())
             PlainEnums[LeafOf(Enum)].push_back(Enum);
     if (Plain.empty() && PlainEnums.empty()) return;
 
@@ -8871,7 +8902,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
                     {
                         R->bIsStruct = bMore = true;
                         for (const Json* F : R->Fields) Names(TypeOf(*F));
-                        if (const std::string O = OwnerOf(Leaf); O != Mine)
+                        if (const std::string O = OwnerOf(R->CppName); O != Mine)
                         {
                             R->UePackage = PathIn(O, R->CppName);
                             R->UeName = Leaf;
@@ -8882,7 +8913,7 @@ void FCompiler::InferFromSources(std::vector<std::pair<std::string, std::string>
     for (const auto& [Leaf, Of] : PlainEnums)
         if (Used.count(Leaf))
             for (const std::string& Enum : Of)
-                EnumMarks.push_back({ Enum, OwnerOf(Leaf) == Mine ? std::string() : OwnerOf(Leaf) });
+                EnumMarks.push_back({ Enum, OwnerOf(Enum) == Mine ? std::string() : OwnerOf(Enum) });
 }
 
 /* The AST keeps no file of a declaration (DroppedAstKey), and the leaf UE_FINAL_AS declares is spelled in UeMeta.h, so
@@ -22505,6 +22536,41 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     && !DiffAgainstDefaultObject(R.Base.empty() ? nullptr : Find(R.Base), Lhs->value("referencedMemberDecl", std::string()),
                                                  Where + ": " + Name(*Lhs), PD, BP, Err))
                 { bOk = false; return; }
+                /* A component's template loads the same way over its archetype: the template of the nearest class above
+                   that sets the member on this component, else the component class's default object. */
+                if (bThroughComponent && !bWidget && HoldsTaggedSetOrMap(PD))
+                {
+                    const std::string Id = Lhs->value("referencedMemberDecl", std::string());
+                    const Json *SetL = nullptr, *SetV = nullptr;
+                    for (const FRecord* A = DR == &R || R.Base.empty() ? nullptr : Find(R.Base); A && !SetL;
+                         A = A == DR || A->Base.empty() ? nullptr : Find(A->Base))
+                    {
+                        const Json* Its = nullptr;
+                        if (A->Defaults) ForEach(*A->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
+                        if (Its)
+                            ForEach(*Its, [&](const Json& St) {
+                                const Json *L = nullptr, *V = nullptr, *Through = nullptr;
+                                if (DefaultAssignment(St, L, V, Through) && Through && Name(*Through) == CompName
+                                    && L->value("referencedMemberDecl", std::string()) == Id)
+                                { SetL = L; SetV = V; }
+                            });
+                    }
+                    if (SetL)
+                    {
+                        FPropertyDef Above = PD;
+                        Above.Default = FDefaultValue();
+                        if (!LowerDefault(*SetL, Above, BP, Err, SetV, /*bKeepZero=*/true)) { bOk = false; return; }
+                        DiffTaggedAgainstParent(PD, Above);
+                    }
+                    else
+                    {
+                        std::string CompType = StripTypeKeywords(TypeOf(*Owner));
+                        while (!CompType.empty() && (CompType.back() == '*' || CompType.back() == ' ')) CompType.pop_back();
+                        if (!DiffAgainstDefaultObject(Find(StripTypeKeywords(CompType)), Id, Where + ": " + CompName + "->" + Name(*Lhs),
+                                                      PD, BP, Err))
+                        { bOk = false; return; }
+                    }
+                }
                 /* A statement is the member's whole new value, as an assignment is in C++: one before it on the same
                    member is gone, not a tag under this one's (whose left-out members would load its values). One that
                    sets part of it joins the member's tag instead (Put). */
