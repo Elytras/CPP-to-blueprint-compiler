@@ -17548,6 +17548,27 @@ def map_arrays():
 map_arrays()
 
 
+# ---- MathEdges: where Blueprint's arithmetic leaves C++ (REFERENCE.md, Arithmetic)
+
+def math_edges():
+    s = lambda x: (x + 2**63) % 2**64 - 2**63
+    ints = [dict(A=a, B=b) for a in (-7, 0, 7, 2**31 - 1, -2**31) for b in (0, 3, -2)]
+    proves('arithmetic.hits-shots')
+    check('MathEdges', 'Div', lambda A, B: cdiv(A, B) if B else 0, ints)
+    check('MathEdges', 'Mod', lambda A, B: cmod(A, B) if B else 0, ints)
+    check('MathEdges', 'Div64', lambda A, B: cdiv(A, B) if B else 0, ints + [dict(A=2**62, B=0), dict(A=-2**40, B=7)])
+    check('MathEdges', 'DivF', lambda A, B: A / B if B else 0.0, [dict(A=a, B=b) for a in (-1.5, 0.0, 8.0) for b in (0.0, 0.5, -4.0)])
+    check('MathEdges', 'Guarded', lambda A, B: 1 if B != 0 and cdiv(A, B) > 2 else 0, ints)
+    proves('arithmetic.x-1')
+    wide = [dict(A=a, B=b) for a in (2**63 - 1, -2**63, 2**62, -5, 3) for b in (1, -1, 2**62, 2**63 - 1, -2**63)]
+    check('MathEdges', 'Add64', lambda A, B: s(A + B), wide)
+    check('MathEdges', 'Sub64', lambda A, B: s(A - B), wide)
+    check('MathEdges', 'Mul64', lambda A, B: s(A * B), wide)
+
+
+math_edges()
+
+
 # ---- Unsigned64: a uint64 value shifts right and orders as unsigned (REFERENCE.md, Bitwise operators and shifts)
 
 def unsigned64():
