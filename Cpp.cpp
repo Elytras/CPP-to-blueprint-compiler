@@ -2436,6 +2436,9 @@ private:
     std::map<std::string, const Json*> PlainMethods;    // CXXMethodDecl id -> its definition
     std::map<std::string, Json> BoundMethods;           // "<method id>@<variable id>" -> the method with that `this`
     void IndexPlain(const Json& N, bool bApi, bool bInTemplate);
+    /* `T::StaticClass()` in a template's body: each such reference in an instantiation gets the arguments its
+       template's parameters stand for there ("templateArgs"), which NamedQualifier reads the written `T` through. */
+    void BindStaticClassParms(Json& N, const Json& Bound);
     const Json* PlainConstInit(const Json& E, std::string* VarId = nullptr) const;
     void FoldConstObjects(Json& N, bool bAddressed = false);
     bool CaptureNames(const Json& Lambda, const std::vector<const Json*>& Inits, std::vector<std::string>* Names,
@@ -8989,6 +8992,9 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
     if (End.is_null())
     {
         const std::string Q = QualifierBefore(*T, Off, Len, "StaticClass");
+        /* A template's parameter, in an instantiation: the class it stands for there (BindStaticClassParms). */
+        if (const auto B = Ref.find("templateArgs"); B != Ref.end() && B->contains(Q))
+            return Find(StripTypeKeywords((*B)[Q].get<std::string>()));
         return Q.empty() ? nullptr : Find(Q);
     }
     /* In a macro: its body has `::StaticClass` at End, and the qualifier is the whole identifier at Off. */
@@ -14126,6 +14132,49 @@ void FCompiler::RewriteLambdaCalls(Json& N)
     N["lambdaObj"] = std::move(N["inner"][1]);
     N["inner"].erase(N["inner"].begin() + 1);
     N["kind"] = "CallExpr";
+}
+
+/* StaticClass is declared once, on a native class, so `T::StaticClass()` in a template names the declaring class in
+   every instantiation and only the source says more: `T`. Under each template, every instantiation's references to
+   StaticClass are given what the template's type parameters are there, by name; an inner template adds its own to its
+   outer's. Nothing else is walked: a pattern has no arguments, and code outside a template none to read. */
+void FCompiler::BindStaticClassParms(Json& N, const Json& Bound)
+{
+    if (!N.is_object()) return;
+    const std::string K = Kind(N);
+    if (K == "DeclRefExpr" && !Bound.empty() && N.contains("referencedDecl") && Name(N["referencedDecl"]) == "StaticClass")
+        N["templateArgs"] = Bound;
+    if (!N.contains("inner") || !N["inner"].is_array()) return;
+    if (K == "FunctionTemplateDecl" || K == "ClassTemplateDecl")
+    {
+        std::vector<std::string> Parms;
+        for (const Json& P : N["inner"])
+            if (const std::string PK = Kind(P); PK == "TemplateTypeParmDecl" || PK == "NonTypeTemplateParmDecl" || PK == "TemplateTemplateParmDecl")
+                Parms.push_back(PK == "TemplateTypeParmDecl" ? Name(P) : std::string());
+        for (Json& C : N["inner"])
+        {
+            Json Mine = Bound;
+            size_t At = 0;
+            bool bInstance = false;
+            if (C.is_object() && C.contains("inner") && C["inner"].is_array())
+                for (const Json& A : C["inner"])
+                {
+                    if (Kind(A) != "TemplateArgument") continue;
+                    bInstance = true;
+                    // ponytail: a pack's arguments are not bound; `Ts::StaticClass()...` stays the declaring class.
+                    if (At < Parms.size() && !Parms[At].empty() && A.contains("type") && !A.value("isPack", false))
+                        Mine[Parms[At]] = A["type"].value("qualType", std::string());
+                    ++At;
+                }
+            if (bInstance) BindStaticClassParms(C, Mine);
+            else if (!Bound.empty()) BindStaticClassParms(C, Bound);        // a member template's pattern in an instantiated class
+        }
+        return;
+    }
+    const bool bScope = K == "TranslationUnitDecl" || K == "NamespaceDecl" || K == "LinkageSpecDecl" || K == "CXXRecordDecl"
+                     || K == "ClassTemplateSpecializationDecl";
+    if (!bScope && Bound.empty()) return;
+    for (Json& C : N["inner"]) BindStaticClassParms(C, Bound);
 }
 
 /* Every struct of the mod's own sources with no base: its fields by their place, its methods that have a body. A
@@ -25129,6 +25178,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         GAg.Mark("AG_DOM_SAVE to_cbor + write (ignore)");
     }
 
+    BindStaticClassParms(Doc, Json::object());
     if (!LoadTables(IncludeDir, Err)) return false;
     GAg.Mark("LoadTables");
     if (!Collect(Err)) { GAg.Mark("Collect (failed)"); return false; }

@@ -17540,6 +17540,24 @@ def unsigned64():
 unsigned64()
 
 
+# ---- TmplStaticClass: `T::StaticClass()` in a template names the class it was instantiated with (REFERENCE.md,
+# StaticClass on the mod's classes)
+
+def tmpl_static_class():
+    base = asset('TmplStaticClass')
+    proves('staticclass-on-the.t-staticclass')
+    for fn, want in (('Direct', 'Lexer_C'), ('Free', 'Lexer_C'), ('FreeOther', 'Parser_C'), ('Member', 'Lexer_C'),
+                     ('MemberOther', 'Parser_C'), ('Pair', 'Parser_C'), ('PairSwapped', 'Lexer_C'), ('OfStruct', 'Parser_C'),
+                     ('Engine', 'Actor')):
+        assert run(base, fn)[0] == want, (fn, run(base, fn)[0], want)
+    assert run(base, 'Nested', bFirst=True)[0] == 'Lexer_C' and run(base, 'Nested', bFirst=False)[0] == 'Parser_C'
+    print('ok  TmplStaticClass: T::StaticClass() in a free, a member and a class template names each instantiation\'s own '
+          'class, by the parameter\'s place, an inner template\'s too')
+
+
+tmpl_static_class()
+
+
 
 # ---- Rows that said "refused" and are not: tests/RowStd.cpp. std::min is built into the source's function library, a
 # whole TArray is copied out through a pointer, and a goto in a TMap loop whose value is no container leaves after the
