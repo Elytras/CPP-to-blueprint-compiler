@@ -631,6 +631,15 @@ def main():
             sys.exit("--only: mods.yaml has no mod %s" % ", ".join(unknown))
         keep = set(only).union(*(transitive_needs(n, by_name) for n in only))
         mods = [m for m in mods if m["name"] in keep]
+    else:
+        # `skip: true` keeps a mod listed but out of a plain build, so a mod nobody is working on costs nothing and
+        # a missing input of it cannot fail the others. --only still builds it, and so does a built mod that needs it:
+        on = [m["name"] for m in mods if not m.get("skip")]
+        keep = set(on).union(*(transitive_needs(n, by_name) for n in on))
+        off = [m["name"] for m in mods if m["name"] not in keep]
+        if off:
+            print("skip: true, not built (name one with --only): " + ", ".join(off))
+        mods = [m for m in mods if m["name"] in keep]
 
     built, packed, skipped, failed = [], [], [], []
     staged = []
