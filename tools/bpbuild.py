@@ -319,8 +319,16 @@ def content_of(src, bp, root):
 
 def kept_source(entry, mod, bp, i):
     """The Content folder a `kept` entry's packages come from: its `from`, extracted under build/<mod>/kept (kept<i>
-    for the i-th entry after the first)."""
-    return content_of(entry["from"], bp, os.path.join(bp, "build", mod["name"], "kept" + (str(i) if i else "")))
+    for the i-th entry after the first). A local `from` may be a glob (`Foo_General_*.pak.zip`): the newest file it
+    matches is taken and named in the output, so a pak that is re-released under a new name needs no edit here."""
+    src = entry["from"]
+    if "://" not in src and glob.has_magic(src):
+        hits = sorted(glob.glob(src), key=os.path.getmtime)
+        if not hits:
+            sys.exit("%s: kept from %s matches no file" % (mod["name"], src))
+        src = hits[-1]
+        print("%s: kept from %s" % (mod["name"], src))
+    return content_of(src, bp, os.path.join(bp, "build", mod["name"], "kept" + (str(i) if i else "")))
 
 
 def place_kept(mod, bp, stage_fsd):
