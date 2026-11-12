@@ -437,7 +437,8 @@ def check_mod_imports(staged, mod_packages):
               for mod, content, package in staged]
     produced = set()
     for _mod, content, package in staged:
-        produced.update(package + "/" + f[:-len(".uasset")] for f in packages(content))
+        produced.update((package + "/" + f[:-len(".uasset")]).lower() for f in packages(content))
+    roots = [m.lower() for m in mod_packages]       # a package's name is an FName: it compares without case
 
     bad = []
     for _mod, content, _package in staged:
@@ -448,8 +449,9 @@ def check_mod_imports(staged, mod_packages):
                 if not entry.startswith("Package'"):
                     continue
                 name = entry[len("Package'"):-1]
-                under = any(name == m or name.startswith(m + "/") for m in mod_packages)
-                if under and name not in produced:
+                low = name.lower()
+                under = any(low == m or low.startswith(m + "/") for m in roots)
+                if under and low not in produced:
                     bad.append((f, name))
     for asset, name in bad:
         print("  %s imports %s, which no mod in this build produces" % (asset, name))

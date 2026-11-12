@@ -8424,6 +8424,24 @@ subobject_chain()
 print('ok  InstancedDefaults: an instanced object is an export under its outer, its tag that export, its archetype the '
       'outer archetype\'s object of its name or its class\'s CDO; %s' % instanced_defaults())
 self_ref_import()
+
+
+def import_case():
+    """ImportCase: a package's and an object's name is an FName, which compares without case, so one asset named in two
+    spellings is one package row and one object row; two would be two imports of one object."""
+    b = asset('ImportCase')
+    paths = [p.lower() for p in import_paths(b)]
+    proves('ue-asset-at.two-spellings')
+    assert len(paths) == len(set(paths)), sorted(p for p in set(paths) if paths.count(p) > 1)
+    assert '/game/enemies/spider/grunt/ed_spider_grunt.ed_spider_grunt' in paths, paths
+    mine = {}
+    run(b, 'Keep', self_vars=mine)
+    assert mine['A'] and mine['A'] == mine['B'], mine
+    keeps_invariants(b)
+    print('ok  ImportCase: an asset named in two spellings is one import of its package and one of the object')
+
+
+import_case()
 abstract_instances()
 proves('declaring-components.ue-component-ucharges-ammo')
 refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP)
@@ -16932,6 +16950,8 @@ def lambdas():
         ('InitCapture', lambda V: (V + 1) * 7),
         ('InitCaptures', lambda V: ((V * 10 + V * 2) + (V + V * 2)) * 100 + V + 2),
         ('InitUnused', lambda V: V * 3 + 1),
+        ('InitLambda', lambda V: (3 + V) * 2 + (V + V) * 2),
+        ('InitLambdaInPlace', lambda V: 4 * V + 1),
         ('Immediate', lambda V: V * 5),
         ('ImmediateInCondition', lambda V: 1 if V > 3 else 0),
         ('ToTemplate', lambda V: (V + 5) * 2 + 1 + V + 5),
@@ -16959,7 +16979,7 @@ def lambdas():
     ]
     proves('other-declarations.auto-inc-int32-v-return', 'lambdas.auto-l-int32-a-x', 'lambdas-function.auto-l-x-int32-y',
            'lambdas.c-int32-a-mutable-c', 'lambdas.z-x-1-int32-a', 'lambdas.const-int32-r-return-v', 'lambdas.apply-5-int32-a-x',
-           'lambdas.auto-a-auto-b-return', 'lambdas.a-lambda-calling-or-capturing')
+           'lambdas.auto-a-auto-b-return', 'lambdas.a-lambda-calling-or-capturing', 'lambdas.g-l-int32-b')
     for fn, want in forms:
         for v in (-5, 0, 3, 8):
             got = run(base, fn, V=v)[0]
@@ -17009,6 +17029,8 @@ def lambda_refusals():
         ('LamPassMutable', 'template <class G> inline int32 Use(G Fn) { return Fn(1); }', 'int32 F(int32 V) { %s return Use(L); }' % src,
          'takes a mutable lambda by value, which copies its state'),
         ('LamCaptureMutable', '', 'int32 F(int32 V) { %s auto K = [=](int32 A) mutable { return L(A); }; return K(1); }' % src,
+         'which would fork its state: capture it by reference'),
+        ('LamInitMutable', '', 'int32 F(int32 V) { %s auto K = [G = L](int32 A) mutable { return G(A); }; return K(1); }' % src,
          'which would fork its state: capture it by reference'),
         ('LamStatic', '', 'int32 F(int32 V) { auto L = [](int32 A) { static int32 N = 0; N += A; return N; }; return L(V); }',
          "static N lives in the ubergraph's frame"),
@@ -17479,6 +17501,9 @@ def const_objects():
     proves('constant-objects.static-constexpr-finthandle')
     check('ConstObjects', 'Handle', lambda Stored: (Stored or 12) + (Stored or 12) * 2000, [dict(Stored=s) for s in (0, 1, 40)])
     check('ConstObjects', 'Statics', lambda Stored: (Stored or 3) * 10 + 3 + 1100, [dict(Stored=s) for s in (0, 5)])
+    proves('constant-objects.method-below')
+    check('ConstObjects', 'Below', lambda Stored: (Stored or 12) * 2 + 12 + ((Stored or 3) * 2 + 3) * 1000,
+          [dict(Stored=s) for s in (0, 1, 40)])
     proves('constant-objects.static-constexpr-thandle-float')
     check('ConstObjects', 'Templated', lambda Stored, bHas: Stored if bHas else 7,
           [dict(Stored=s, bHas=h) for s in (0, 9) for h in (False, True)])
