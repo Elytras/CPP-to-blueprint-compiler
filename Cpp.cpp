@@ -14224,7 +14224,8 @@ void FCompiler::BindStaticClassParms(Json& N, const Json& Bound)
     for (Json& C : N["inner"]) BindStaticClassParms(C, Bound);
 }
 
-/* Every struct of the mod's own sources with no base: its fields by their place, its methods that have a body. A
+/* Every struct of the mod's own sources with no base: its fields by their place, its methods that have a body, in the
+   struct or below it. A
    template's instantiations are found under the template, whose pattern says where it is written (an instantiation
    keeps no location). UeApi's types are never indexed, so nothing below touches a TEnum, a TArray or an FVector. */
 void FCompiler::IndexPlain(const Json& N, bool bApi, bool bInTemplate)
@@ -14247,14 +14248,22 @@ void FCompiler::IndexPlain(const Json& N, bool bApi, bool bInTemplate)
                 bool bBody = false;
                 ForEach(C, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
                 if (Kind(C) == "FieldDecl") PlainFields[C.value("id", std::string())] = At++;
-                else if (Kind(C) == "CXXMethodDecl" && bBody && !C.value("isImplicit", false))
-                    PlainMethods[C.value("id", std::string())] = &C;
+                else if (Kind(C) == "CXXMethodDecl" && !C.value("isImplicit", false))
+                    PlainMethods[C.value("id", std::string())] = bBody ? &C : nullptr;      // null until its body is met below
             });
         ForEach(N, [&](const Json& C) { IndexPlain(C, false, false); });
         return;
     }
     if (K == "TranslationUnitDecl" || K == "NamespaceDecl" || K == "LinkageSpecDecl")
-        ForEach(N, [&](const Json& C) { IndexPlain(C, false, false); });
+        ForEach(N, [&](const Json& C) {
+            if (Kind(C) != "CXXMethodDecl") { IndexPlain(C, false, false); return; }
+            /* A method defined below its struct (`float FHandle::Get() const { ... }`) is its declaration's body. */
+            const auto Declared = PlainMethods.find(C.value("previousDecl", std::string()));
+            bool bBody = false;
+            ForEach(C, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+            if (Declared != PlainMethods.end() && !Declared->second && bBody)
+                Declared->second = PlainMethods[C.value("id", std::string())] = &C;
+        });
 }
 
 /* The braces E's value was written as, when E names a `const` or `constexpr` variable made from braces, or is such
@@ -14322,7 +14331,7 @@ void FCompiler::FoldConstObjects(Json& N, bool bAddressed)
     const Json* Callee = Strip(&N["inner"][0]);
     const auto M = Callee && Kind(*Callee) == "MemberExpr" ? PlainMethods.find(Callee->value("referencedMemberDecl", std::string()))
                                                           : PlainMethods.end();
-    const Json* Obj = M == PlainMethods.end() ? nullptr : First(*Callee);
+    const Json* Obj = M == PlainMethods.end() || !M->second ? nullptr : First(*Callee);
     std::string Var;
     if (!Obj || !PlainConstInit(*Obj, &Var) || Var.empty()) return;
     const std::string Key = M->first + "@" + Var;

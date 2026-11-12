@@ -898,6 +898,7 @@ and a default written once, and used through its methods.
 | <a id="constant-objects.static-constexpr-finthandle"></a>`static constexpr FIntHandle Lives{"Lives", 3};` in a class, then `Lives.Get(Stored)` | A method of the struct called on the constant is expanded at the call, as an inline function is, and every member its body reads is that constant's: `Default` is 3 there. A method may call another method of the same constant, and `(*this).Default` is the member too. | Yes |
 | <a id="constant-objects.static-constexpr-thandle-float"></a>`static constexpr THandle<float> Volume{"Audio.Volume", 0.5f};` then `Volume.Or(Stored, bHas)` | The same for a struct template: `THandle<float>` and `THandle<int32>` are two structs, and each constant has its own members. | Yes |
 | <a id="constant-objects.fname-key-const-return-name"></a>`FName Key() const { return Name; }` in such a struct, where `Name` is a `const char*` member | The string the braces gave, as the type the use asks for: an FName here, an FString or an FText elsewhere. | Yes |
+| <a id="constant-objects.method-below"></a>`int32 Late(int32 Stored) const;` in the struct and `inline int32 FIntHandle::Late(int32 Stored) const { ... }` below it | The same method: the definition below is the body that is expanded where the method is called on a constant, with that constant's members. | Yes |
 | <a id="constant-objects.this"></a>`this` as a value in such a method, `Register(this)` | Refused (`the constant has no address`): only the members' values exist. Pass the members. | Refused |
 
 ```cpp

@@ -27,7 +27,9 @@ struct FIntHandle {
   int32 Twice(int32 Stored) const { return Get(Stored) * 2; } // another method of the same constant
   FName Key() const { return Name; }
   int32 Spare() const { return (*this).Default - 1; }
+  int32 Late(int32 Stored) const; // defined below the struct
 };
+inline int32 FIntHandle::Late(int32 Stored) const { return Twice(Stored) + Default; }
 constexpr FIntHandle kWaves = {"Waves.Max", 12};
 
 template <class T> struct THandle {
@@ -51,6 +53,7 @@ public:
   int32 Shift(int32 V) { return V << kTable.X; } // a constant amount
   int32 Handle(int32 Stored) { return kWaves.Get(Stored) + kWaves.Twice(Stored) * 1000; }
   int32 Statics(int32 Stored) { return Lives.Get(Stored) * 10 + this->Lives.Default + kWaves.Spare() * 100; }
+  int32 Below(int32 Stored) { return kWaves.Late(Stored) + Lives.Late(Stored) * 1000; }
   int32 Templated(int32 Stored, bool bHas) { return Count.Or(Stored, bHas); }
   float TemplatedReal(float Stored, bool bHas) { return Volume.Or(Stored, bHas); }
   FName Keys(int32 Which) { return Which == 0 ? kWaves.Key() : Which == 1 ? Volume.Key() : Count.Key(); }

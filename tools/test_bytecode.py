@@ -17497,6 +17497,9 @@ def const_objects():
     proves('constant-objects.static-constexpr-finthandle')
     check('ConstObjects', 'Handle', lambda Stored: (Stored or 12) + (Stored or 12) * 2000, [dict(Stored=s) for s in (0, 1, 40)])
     check('ConstObjects', 'Statics', lambda Stored: (Stored or 3) * 10 + 3 + 1100, [dict(Stored=s) for s in (0, 5)])
+    proves('constant-objects.method-below')
+    check('ConstObjects', 'Below', lambda Stored: (Stored or 12) * 2 + 12 + ((Stored or 3) * 2 + 3) * 1000,
+          [dict(Stored=s) for s in (0, 1, 40)])
     proves('constant-objects.static-constexpr-thandle-float')
     check('ConstObjects', 'Templated', lambda Stored, bHas: Stored if bHas else 7,
           [dict(Stored=s, bHas=h) for s in (0, 9) for h in (False, True)])
