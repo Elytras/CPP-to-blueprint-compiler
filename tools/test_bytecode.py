@@ -14444,7 +14444,36 @@ def widget_tree():
     refused('WtBindFar', widgets + '  WtBindFar() { Root->AddChildToCanvas(Title); UE_BIND(Title, Text, &UWtOther::Get); }\n',
             'is a function of this class or of a class above it',
             top='class UWtOther : public UUserWidget {\npublic:\n  FText Get() const { return FText("x"); }\n};\n', base='UUserWidget')
-    print('ok  WidgetTree: a widget class\'s constructor cooks its tree, slots and their layout, as the engine walks it')
+
+    # A class spelled through a namespace alias, which clang keeps as written (`Kt::UPane *`): another mod's widget, the
+    # game's, through an alias of an alias, and another mod's component, each the class its namespace holds.
+    with tempfile.TemporaryDirectory() as tmp:
+        head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\n#include "UeApi/UMG.h"\n'
+        files = {
+            'Owner/Panes.h': '#pragma once\n' + head + 'namespace Kit { namespace Ui {\n'
+                             'class UPane : public UUserWidget {};\nclass UPart : public USceneComponent {}; } }\n',
+            'Owner/Owner.cpp': '#include "Panes.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Owner");\n',
+            'User/User.cpp': '#include "../Owner/Panes.h"\n#include "UeApi/Game/UI_CurvedCanvas.h"\n'
+                             'UE_MOD_PACKAGE("/Game/_ElytrasMods/User");\n'
+                             'namespace Kt = ::Kit::Ui;\nnamespace Gui = ::Game::UI::Global_UI_Elements;\nnamespace Gui2 = Gui;\n'
+                             'class UWtAliased : public UUserWidget {\npublic:\n  UE_WIDGET(UCanvasPanel, Root);\n'
+                             '  UE_WIDGET(Kt::UPane, Pane);\n  UE_WIDGET(Gui2::UI_CurvedCanvas, Curve);\n'
+                             '  UWtAliased() { Root->AddChildToCanvas(Pane); Root->AddChildToCanvas(Curve); }\n};\n'
+                             'class AAliased : public AActor {\npublic:\n  UE_COMPONENT(Kt::UPart, Part);\n};\n'}
+        for name, text in files.items():
+            os.makedirs(os.path.join(tmp, os.path.dirname(name)), exist_ok=True)
+            with open(os.path.join(tmp, name), 'w', encoding='utf-8') as f: f.write(text)
+        out = lambda mod: os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
+        for mod in ('Owner', 'User'):
+            proc = assetgen_compile([os.path.join(tmp, mod, mod + '.cpp'), UEAPI, out(mod)])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        ap, aci = class_pkg(os.path.join(out('User'), 'UWtAliased'))
+        proves('names.namespace-alias')
+        assert {pr.name: ap.path(pr.ref) for pr in ap.struct(aci).props if pr.type == 'ObjectProperty'} == {
+            'Root': '/Script/UMG.CanvasPanel', 'Pane': '/Game/_ElytrasMods/Owner/Kit/Ui/UPane.UPane_C',
+            'Curve': '/Game/UI/Global_UI_Elements/UI_CurvedCanvas.UI_CurvedCanvas_C'}
+        assert '/Game/_ElytrasMods/Owner/Kit/Ui/UPart.UPart_C' in import_paths(os.path.join(out('User'), 'AAliased'))
+    print('ok  WidgetTree:a widget class\'s constructor cooks its tree, slots and their layout, as the engine walks it')
 
 
 def widget_event_flags():

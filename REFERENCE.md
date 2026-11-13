@@ -526,6 +526,7 @@ Notes:
 | <a id="names.using-emodealias-emode"></a>`using EModeAlias = EMode;`, `typedef EMode EModeAlias;` at namespace scope | A global alias of an enum is that enum wherever it is used. | Yes |
 | <a id="names.emode-m"></a>`::EMode M;`, `TArray<::FPair> Pairs;`, `(::int32)X` | A type spelled from the global namespace is that type: the leading `::` is dropped. | Yes |
 | <a id="names.using-grapple-game-weaponsntools"></a>`using Grapple = Game::WeaponsNTools::GrapplingGun::WPN_GrapplingGun_C;` | An alias to a game class's full `Game::` path. The SDK gives a game class a short name at global scope only when no other game package has a class of that name. For one that does, write such an alias. | Yes |
+| <a id="names.namespace-alias"></a>`namespace Emm = ::Manager::Widget;`, then `UE_WIDGET(Emm::PreviewView, View);` or `UE_COMPONENT(Emm::UPart, Part);` | A class spelled through a namespace alias is the class that namespace holds: another mod's, or the game's through its `Game::` path. An alias of an alias works too. | Yes |
 
 ```cpp
 class NameTest : public UFSDSaveGame {

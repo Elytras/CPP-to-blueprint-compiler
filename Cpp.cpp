@@ -2740,8 +2740,14 @@ private:
         /* `using Gun_C = Game::Weapons::Rifles::Gun_C;` - how a mod names a class two
            packages both have, which the headers can give no short name. clang spells a use as the alias. */
         if (auto S = SlotStructs.find(CppName); S != SlotStructs.end()) return &S->second;
-        auto A = Aliases.find(CppName);
-        return A == Aliases.end() || A->second == CppName ? nullptr : Find(A->second);
+        if (auto A = Aliases.find(CppName); A != Aliases.end()) return A->second == CppName ? nullptr : Find(A->second);
+        /* `Emm::PreviewView` under `namespace Emm = ::Manager::Widget;`: clang spells a type through a namespace alias
+           as written, and a pointer to it (`Emm::PreviewView *`) has no desugared spelling. The longest aliased
+           qualifier is replaced by the namespace it names. */
+        for (size_t At = CppName.rfind("::"); At != std::string::npos && At > 0; At = CppName.rfind("::", At - 1))
+            if (auto N = NamespaceAliases.find(CppName.substr(0, At)); N != NamespaceAliases.end())
+                return Find(N->second + CppName.substr(At));
+        return nullptr;
     }
     /* A record's package and UClass / UScriptStruct name. A mod's own is cooked where its namespace says (PathIn),
        named after its leaf, a class with _C, a struct by its `__UeName` marker where it has one; the engine's and the
@@ -2952,6 +2958,7 @@ private:
     std::set<std::string> ReadOnlyFields;             // decl ids of the UE_READONLY (`mutable`) fields, any record's
     std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
     std::map<std::string, std::string> Aliases;       // a namespace-scope `using A = B;` / typedef: A -> B
+    std::map<std::string, std::string> NamespaceAliases;  // `namespace E = ::A::B;`: E (and Ns::E) -> A::B
     const FRecord* Cur = nullptr;                     // record Generate is working on
     std::set<std::string> CurrentOutParms;            // T& parm names of the function being lowered
     std::set<std::string> SingleParms;                // UE5: its parameters a native parent makes 4-byte floats (S40)
@@ -3480,6 +3487,7 @@ bool FCompiler::Collect(std::string* Err)
     std::map<std::string, std::string> EnumUnderlying;
     std::vector<std::pair<std::string, std::string>> EnumMarks;      // enum, owning mod ("" for this one)
     std::map<std::string, std::string> GlobalAliases;                // a global `using A = B;` / typedef: A -> B
+    std::map<std::string, std::string> NamespaceIds;                 // a namespace's or namespace alias's id -> A::B
     struct FStaticTemplate { std::string Owner; const Json* Inst; const Json* Tmpl; uint32 Access; };
     std::vector<FStaticTemplate> StaticTemplates;                    // a static member template's instantiations
 
@@ -3490,9 +3498,14 @@ bool FCompiler::Collect(std::string* Err)
     ForEach(Scope, [&](const Json& N) {
         if (Kind(N) == "NamespaceDecl" && N.contains("name"))
         {
+            NamespaceIds[N.value("id", std::string())] = Ns + Name(N);
             Walk(N, Ns + Name(N) + "::");
             return;
         }
+        /* `namespace Emm = ::A::B;` names B by its id, or the alias it was written through by that alias's. */
+        if (Kind(N) == "NamespaceAliasDecl" && N.contains("aliasedNamespace"))
+            if (auto T = NamespaceIds.find(N["aliasedNamespace"].value("id", std::string())); T != NamespaceIds.end())
+                NamespaceIds[N.value("id", std::string())] = NamespaceAliases[Ns + Name(N)] = NamespaceAliases[Name(N)] = T->second;
         if ((Kind(N) == "TypeAliasDecl" || Kind(N) == "TypedefDecl") && N.contains("name"))
         {
             Aliases[Ns + Name(N)] = Aliases[Name(N)] = StripTypeKeywords(TypeOf(N));
