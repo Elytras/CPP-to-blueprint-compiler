@@ -792,6 +792,17 @@ bool CallsInstanced(const Json& N)
     return bFound;
 }
 
+/* Does this value make an instanced object, or name a local (a VarDecl id of Locals) that holds one? */
+bool PointsAtInstanced(const Json& N, const std::set<std::string>& Locals)
+{
+    if (IsInstancedRef(N)) return true;
+    if (Kind(N) == "DeclRefExpr" && N.contains("referencedDecl") && Locals.count(N["referencedDecl"].value("id", std::string())))
+        return true;
+    bool bFound = false;
+    ForEach(N, [&](const Json& C) { if (!bFound) bFound = PointsAtInstanced(C, Locals); });
+    return bFound;
+}
+
 /* A variable's braced initializer, or null. A temporary inside the braces (a container's list) wraps them in cleanups. */
 const Json* BracedInit(const Json& Var)
 {
@@ -4571,6 +4582,7 @@ bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
         Subst(Out);
         return &Out;
     };
+    std::set<std::string> InstLocals;      // the locals holding a UE_INSTANCED, by VarDecl id
     std::function<void(const Json&)> Statement;
     Statement = [&](const Json& S) {
         if (!bOk || Kind(S) == "NullStmt") return;
@@ -4598,7 +4610,12 @@ bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
             bOk = false;
             return;
         }
-        if (Json* F = bAssign && !Through && Part.empty() ? OwnField(Lhs->value("referencedMemberDecl", std::string())) : nullptr)
+        /* A local holding a UE_INSTANCED: an own member pointed at it, or at one made in place, is set in the defaults
+           block, where the object is made (Generate), not as the member's initializer. */
+        if (const Json* N = Strip(&S); N && Kind(*N) == "DeclStmt" && CallsInstanced(S))
+            if (const Json* Var = First(*N); Var && Kind(*Var) == "VarDecl") InstLocals.insert(Var->value("id", std::string()));
+        if (Json* F = bAssign && !Through && Part.empty() ? OwnField(Lhs->value("referencedMemberDecl", std::string())) : nullptr;
+            F && !PointsAtInstanced(*Rhs, InstLocals))
         {
             SetInit(*F, *Rhs);
             return;
@@ -18478,7 +18495,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         if (InstancedValue && InstancedValue(*Init, PD.Default, bFailed)) return true;
         if (bFailed) return false;
         if (K != "DeclRefExpr")
-        { *Err = Name(F) + ": UE_INSTANCED makes an object in a class's UE_DEFAULTS, pointed at by one of its defaults"; return false; }
+        { *Err = Name(F) + ": UE_INSTANCED makes an object under a class's default object, set in its UE_DEFAULTS or constructor"; return false; }
     }
     if (FIndex Asset; PD.Type == "ObjectProperty" && AssetRef(*Init, BP, &Asset))
     {
@@ -21897,7 +21914,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::vector<FPropertyDef> InheritedDefaults;
     std::vector<FInstSpec> Insts;                       // UE_INSTANCED, in the order written
     std::vector<std::vector<FPropertyDef>> InstDefaults;    // each one's tags
-    std::map<std::string, FPropertyDef> InterfaceVarDefaults;     // a default for a variable an implemented interface declares
+    /* UE_DEFAULTS' default for a variable of this class's own: one an implemented interface declares, or an own member
+       pointed at a UE_INSTANCED object. */
+    std::map<std::string, FPropertyDef> OwnVarDefaults;
     std::map<std::string, FBlueprintClass::FAttachment> Attachments;    // a UE_COMPONENT -> where SetupAttachment puts it
     /* S39: a UE_WIDGET's defaults, and the slots the layout's AddChild calls make, in the order written. A canvas slot's
        setters each set part of its LayoutData, kept per member path ("Offsets.Left", "Anchors.Minimum.X") until the tag
@@ -22453,7 +22472,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 { *Err = Where + ": " + CompName + " is a widget of " + DR->CppName + "'s tree; set it there"; bOk = false; return; }
                 if (bThroughComponent && !DR->Components.count(CompName) && !DR->IsNative() && !bWidget)
                 { *Err = Where + ": " + CompName + " is not a UE_COMPONENT"; bOk = false; return; }
-                if (!bThroughComponent && DR == &R)
+                /* An own member is its initializer's, but for one pointed at a UE_INSTANCED object, made only here. */
+                std::set<std::string> Held;
+                for (const FInstSpec& I : Insts) if (!I.Local.empty()) Held.insert(I.Local);
+                const bool bOwnInstanced = !bThroughComponent && DR == &R && Part.empty() && !Element && Rhs
+                                        && PointsAtInstanced(*Rhs, Held);
+                if (!bThroughComponent && DR == &R && !bOwnInstanced)
                 { *Err = Where + ": " + Name(*Lhs) + " is declared here - give it an initializer instead"; bOk = false; return; }
                 /* An interface's variable is this class's own property when this class is the one implementing
                    it; below a parent that does, it is one more inherited property. */
@@ -22581,7 +22605,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         bOk = false;
                         return;
                     }
-                if (bInterfaceVar) { InterfaceVarDefaults[Name(*Lhs)] = PD; return; }
+                if (bInterfaceVar || bOwnInstanced) { OwnVarDefaults[Name(*Lhs)] = PD; return; }
 
                 /* An inherited set or map loads over the parent CDO's value (PropertySet.cpp 285-358, PropertyMap.cpp
                    316-400: copied in, the listed removals taken out, the rest added), so written whole it would load as
@@ -22842,12 +22866,16 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!TypeToProperty(TypeOf(*F), UeNameOf(&Decl, FieldName), 0, "property " + FieldName, BP, &PD, &PErr))
         { *Err = PErr; return false; }
         if (!LowerDefault(*F, PD, BP, Err)) return false;
-        /* UE_DEFAULTS naming an interface's variable is this class's own default for it. */
-        if (auto Own = InterfaceVarDefaults.find(FieldName); Own != InterfaceVarDefaults.end())
+        /* UE_DEFAULTS naming an interface's variable, or an own one it points at a UE_INSTANCED object, is this class's
+           own default for it. */
+        bool bInstancedDefault = false;
+        if (auto Own = OwnVarDefaults.find(FieldName); Own != OwnVarDefaults.end())
         {
             PD.Default = Own->second.Default;
             PD.Members = Own->second.Members;
-            InterfaceVarDefaults.erase(Own);
+            bInstancedDefault = PD.Default.Instanced > 0 || std::any_of(PD.Default.Items.begin(), PD.Default.Items.end(),
+                                                                        [](const FDefaultValue& I) { return I.Instanced > 0; });
+            OwnVarDefaults.erase(Own);
         }
 
         /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment -
@@ -22856,6 +22884,21 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
         if (TypeOf(*F).compare(0, 6, "const ") == 0 || F->value("mutable", false)) PD.PropertyFlags |= CPF_BlueprintReadOnly;
+        /* One whose default points at an object instanced under the default object is instanced too, as UPROPERTY(Instanced)
+           is: else a spawned actor's points at the default object's, shared by all (InstancePropertyValue instances an
+           object of a class not DefaultToInstanced only for a flagged property, CoreNative.cpp 265-282). It then gets its
+           own copy, as the C++ constructor would make each instance one. */
+        if (bInstancedDefault)
+        {
+            if (PD.Type == "ObjectProperty") PD.PropertyFlags |= CPF_InstancedReference;
+            for (std::shared_ptr<FPropertyDef>* Part : { &PD.Inner, &PD.Value })
+                if (*Part && (*Part)->Type == "ObjectProperty")
+                {
+                    *Part = std::make_shared<FPropertyDef>(**Part);
+                    (*Part)->PropertyFlags |= CPF_InstancedReference;
+                    PD.PropertyFlags |= CPF_ContainsInstancedReference;
+                }
+        }
         /* A member that refers to a component or holds one is instanced, and then so is the class, or instancing never
            looks at it (KismetCompiler.cpp 2521-2529). */
         FlagInstancing(TypeOf(*F), PD);
