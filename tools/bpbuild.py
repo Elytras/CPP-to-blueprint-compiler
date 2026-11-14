@@ -222,6 +222,77 @@ def net_contract_holds(stage_content, baseline, name):
     return not problems
 
 
+def manifest_misses(stage_content, owners):
+    """What this build lacks of each owner's manifest contract (a mod's `manifest` in mods.yaml: {class, frozen, apis},
+    ElytrasModManager/API.md "Versions"). The owner reads a dependent's manifest before loading anything of it, so a
+    mod that imports any of the owner's `apis` packages (but the `frozen` ones) must ship one package named `class`
+    that imports nothing but the engine and `frozen` (the mod's own classes by soft path only), whose defaults name
+    every API the mod imports with as many majors and minors; and no InitCave / InitSpacerig of its may reach the
+    owner's packages, since the game loads and spawns those unchecked."""
+    import invariants, struct
+    pkgs = {}
+    for root, _dirs, files in os.walk(stage_content):
+        for f in files:
+            if f.endswith(".uasset"):
+                pkg = invariants.load(os.path.join(root, f)[:-len(".uasset")])
+                pkgs[pkg.package_name()] = pkg
+
+    def imported(pkg):
+        return {i["name"] for i in pkg.imports if i["outer"] == 0 and i["class_name"] == "Package"}
+
+    def reach(name, seen):              # every package `name` loads, through the mod's own packages
+        for dep in imported(pkgs[name]):
+            if dep not in seen:
+                seen.add(dep)
+                if dep in pkgs:
+                    reach(dep, seen)
+        return seen
+
+    def array(tag, inner):              # an ArrayProperty tag's elements: names or int32s
+        b, n = tag["value"], struct.unpack_from("<i", tag["value"])[0]
+        if inner == "name":
+            return [manifest.names[struct.unpack_from("<i", b, 4 + 8 * k)[0]] for k in range(n)]
+        return list(struct.unpack_from("<%di" % n, b, 4))
+
+    misses = []
+    for owner, spec in owners:
+        prefixes = sorted(((p.rstrip("/"), api) for api, ps in spec["apis"].items() for p in ps), key=lambda x: -len(x[0]))
+        frozen = set(spec.get("frozen") or [])
+        api_of = lambda dep: next((api for p, api in prefixes if dep == p or dep.startswith(p + "/")), None)
+        used = {}
+        for name, pkg in pkgs.items():
+            for dep in imported(pkg):
+                if dep not in frozen and dep not in pkgs and api_of(dep):
+                    used.setdefault(api_of(dep), dep)
+        manifests = [n for n in pkgs if n.rsplit("/", 1)[-1] == spec["class"]]
+        for name in pkgs:
+            if name.rsplit("/", 1)[-1] in ("InitCave", "InitSpacerig"):
+                hit = sorted(d for d in reach(name, set()) if d not in frozen and d not in pkgs and api_of(d))
+                if hit:
+                    misses.append("%s reaches %s (%s): the game loads and spawns it before %s can read a manifest. Name "
+                                  "it otherwise and list it in the %s's SpaceRig / Cave" % (name, owner, hit[0], owner, spec["class"]))
+        if not used:
+            continue
+        if len(manifests) != 1:
+            misses.append("uses %s's %s API (%s) but ships %s %s" % (owner, ", ".join(sorted(used)), sorted(used.values())[0],
+                          "no" if not manifests else "%d" % len(manifests), spec["class"]))
+            continue
+        manifest = pkgs[manifests[0]]
+        hard = sorted(d for d in imported(manifest) if not d.startswith("/Script/") and d not in frozen)
+        if hard:
+            misses.append("%s imports %s: a manifest names the mod's classes by soft path only" % (manifests[0], hard[0]))
+        cdo = next((k for k, e in enumerate(manifest.exports) if e["name"].startswith("Default__")), None)
+        tags = {t["name"]: t for t in manifest.tags(cdo)} if cdo is not None else {}
+        apis = array(tags["Apis"], "name") if "Apis" in tags else []
+        counts = [len(array(tags[k], "int")) if k in tags else 0 for k in ("Majors", "Minors")]
+        missing = sorted(set(used) - set(apis))
+        if missing:
+            misses.append("%s does not name the %s API it uses (%s)" % (manifests[0], ", ".join(missing), used[missing[0]]))
+        if counts != [len(apis)] * 2:
+            misses.append("%s names %d APIs but %d majors and %d minors" % (manifests[0], len(apis), counts[0], counts[1]))
+    return misses
+
+
 def embed_deps(dep_stages, stage_fsd, assetgen):
     """Copy each dep's staged assets into this mod's FSD tree so the pak is self-contained, and its
     registry rows into the pak's one FSD/AssetRegistry.bin. Clears each dest first so a
@@ -626,6 +697,11 @@ def main():
     toolchain_time = max(newest(tree_files(ue_api)), newest(tree_files(ue_assets)), newest([assetgen]))
 
     by_name = dict((m["name"], m) for m in mods)
+    # Each `manifest` contract with its owner, from every mod listed (--only below keeps fewer): the owner and what it
+    # embeds are its own side of it, so they are not held to it.
+    owners = [(m["name"], m["manifest"]) for m in mods if m.get("manifest")]
+    owned = {m["name"]: {o for o, _s in owners if o == m["name"] or m["name"] in transitive_needs(o, by_name)}
+             for m in mods}
     # --only builds the named mods and what they `need`, which an embed bakes in; the rest stay as they are:
     if only:
         unknown = [n for n in only if n not in by_name]
@@ -794,6 +870,13 @@ def main():
             skipped.append(name)
             continue
         if no_pak:
+            continue
+        # Every root the mod compiled (EEE's entries are in a second one), before its deps are embedded beside them.
+        misses = manifest_misses(os.path.join(stage_fsd, "Content"), [o for o in owners if o[0] not in owned[name]])
+        for line in misses:
+            print("%-16s %s" % (name, line))
+        if misses:
+            failed.append(name)
             continue
         if embed and not embed_deps(dep_stages, stage_fsd, assetgen):
             failed.append(name)
