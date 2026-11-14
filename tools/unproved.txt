@@ -84,7 +84,6 @@ instanced-objects.ue-instanced-2
 instanced-objects.ue-instanced-3
 instanced-objects.ue-instanced-getowner
 instanced-objects.ue-instanced-4
-instanced-objects.ue-instanced-5
 instanced-objects.an-object-under-a-game
 objects-and-widgets.newobject-uobject-this-kind
 validity-and-comparison.obj-nullptr
