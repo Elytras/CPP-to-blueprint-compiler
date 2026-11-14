@@ -8653,6 +8653,53 @@ def instanced_refs():
           'the class HasInstancedReference')
 
 
+OWN_INSTANCED = (
+    '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/OwnInstanced");\n'
+    'class OwnProbe : public UObject {\npublic:\n  int32 V = 1;\n};\n'
+    'class OwnInstanced : public AActor {\npublic:\n  TArray<UObject *> Probes;\n  UObject *One;\n'
+    '  OwnInstanced() {\n    OwnProbe *L = NewObject<OwnProbe>(this, "lower");\n    L->V = 7;\n'
+    '    Probes = {L, NewObject<OwnProbe>(this, "Upper")};\n  }\n'
+    '  UE_DEFAULTS { One = UE_INSTANCED(OwnProbe, this, "Single"); }\n};\n')
+
+
+def own_instanced():
+    """OwnInstanced: an own member, or an array of them, pointed at named instanced objects - in the constructor,
+    through a local, or in UE_DEFAULTS - holds exports under the CDO and is CPF_InstancedReference (an array, its inner;
+    the array CPF_ContainsInstancedReference), so a spawned actor gets copies of its own (CoreNative.cpp:265-282
+    instances an object of a class not DefaultToInstanced only for a flagged property). A member initializer is refused,
+    naming the two places that take one."""
+    tmp, out, _ = compile_to(OWN_INSTANCED, 'OwnInstanced')
+    base = os.path.join(out, 'OwnInstanced')
+    p = invariants.Package(base)
+    cdo = p.find('Default__OwnInstanced_C')
+
+    def points(tag):
+        t = p.tag(cdo, tag)
+        v = bytes(t['value'])
+        refs = ([struct.unpack_from('<i', v, 4 + 4 * j)[0] for j in range(struct.unpack_from('<i', v)[0])]
+                if t['type'] == 'ArrayProperty' else [struct.unpack('<i', v)[0]])
+        for x in refs:
+            assert x > 0 and p.exports[x - 1]['outer'] == cdo + 1, (tag, p.path(x))
+        return [p.path(x).rsplit(':', 1)[-1] for x in refs]
+    proves('instanced-objects.own-member-instanced')
+    assert points('Probes') == ['lower', 'Upper'] and points('One') == ['Single'], (points('Probes'), points('One'))
+    assert 'V' in {t['name'] for t in p.tags(p.find('lower'))}, 'lower lost its V'
+    st = class_tail(base)[2]
+    props = {q.name: q for q in st.props}
+    need = [('Probes', props['Probes'].flags, 0x8000000000), ('Probes inner', props['Probes'].subs[0].flags, 0x80000),
+            ('One', props['One'].flags, 0x80000)]
+    missing = ['%s %#x lacks %#x' % (n, f, bit) for n, f, bit in need if not f & bit]
+    assert not missing, '; '.join(missing)
+    assert st.class_flags & 0x800000, hex(st.class_flags)
+    keeps_invariants(base)
+    shutil.rmtree(tmp, ignore_errors=True)
+    proves('instanced-objects.ue-instanced-5')
+    refused('OwnInstancedInit', '  TArray<UObject *> Probes = {NewObject<UDamageImpulse>(this, "x")};\n',
+            'set in its UE_DEFAULTS or constructor')
+    print('ok  OwnInstanced: own members point at exports under the CDO, flagged instanced; a member initializer is '
+          'refused')
+
+
 def run_fname(chain, fn, fields, **parms):
     """run_as without its exact-case name match: fn is run on an object of class chain[0] (mod ancestors chain[1:]),
     and every call by name - the first included - finds the most derived function of that FName, case-insensitively,
@@ -8731,6 +8778,7 @@ for _name, (_parent, _bits, _within, _config) in TAIL_META.items():
 walker_config()
 print('ok  OverrideTest Walker: ClassConfigName Game, ACharacter\'s')
 instanced_refs()
+own_instanced()
 for _mod, (_src, _member, _oracle, _what) in SHADOWS.items():
     refused_or_distinct(_mod, _src, _member, _oracle)
 print('ok  member names: one per FName, overloads and case twins included, none reused from an ancestor (%d cases)'
