@@ -315,7 +315,18 @@ def embed_deps(dep_stages, stage_fsd, assetgen):
 
 def bundle_files(mod, bp):
     """The files a mod's `bundle:` folders hold, each as (the file, its path under the FSD tree). A folder is laid out
-    like a staged FSD tree (`Content/...`), so the relative path is the one the pak ships it at."""
+    like a staged FSD tree (`Content/...`), so the relative path is the one the pak ships it at. A mod whose bundle is
+    built by a script, not tracked, names that script and what it makes in `generate`; we run it when a file it makes
+    is missing, and stop if it still is, so a pak never ships without them."""
+    gen = mod.get("generate")
+    if gen:
+        missing = [f for f in gen.get("makes") or [] if not os.path.exists(os.path.join(bp, f))]
+        if missing:
+            print("%-16s generate: %s (missing %s)" % (mod["name"], " ".join(gen["run"]), missing[0]))
+            subprocess.run(gen["run"], cwd=bp)
+            missing = [f for f in missing if not os.path.exists(os.path.join(bp, f))]
+            if missing:
+                sys.exit("mods.yaml: %s's `generate` ran but did not make %s" % (mod["name"], ", ".join(missing)))
     out = []
     for folder in mod.get("bundle") or []:
         root = os.path.join(bp, folder)
