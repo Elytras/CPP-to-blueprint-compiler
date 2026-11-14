@@ -18709,6 +18709,12 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         else { D.K = bKeepZero || Int != 0 ? FDefaultValue::Int : FDefaultValue::None; D.I = Int; }
         return true;
     }
+    /* `constexpr EMood kNap = EMood::Sleepy;` in an enum default: the enumerator its initializer names, as FoldConst
+       follows an int constant to its value. */
+    if (!bNeg && K == "DeclRefExpr" && (T == "ByteProperty" || T == "EnumProperty") && !PD.StructName.empty())
+        if (auto C = ConstVars.find(Init->value("referencedDecl", Json::object()).value("id", std::string()));
+            C != ConstVars.end() && First(*C->second))
+            return LowerDefault(F, PD, BP, Err, First(*C->second), bKeepZero);
     if (!bNeg && K == "DeclRefExpr" && (T == "ByteProperty" || T == "EnumProperty") && !PD.StructName.empty()
         && (*Init)["referencedDecl"].value("kind", std::string()) == "EnumConstantDecl")
     {

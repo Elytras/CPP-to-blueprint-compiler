@@ -5153,7 +5153,9 @@ def material_instance():
     import invariants
     folder = os.path.dirname(asset('MaterialInstance'))
     fire = invariants.Package(os.path.join(folder, 'M_Fire'))
-    proves('material-instances.ue-asset-defaults-umaterialinstanceconstant')
+    # kGlobal, a constexpr enum, gives each ParameterInfo its Association.
+    proves('material-instances.ue-asset-defaults-umaterialinstanceconstant',
+           'constants-and-constant.constexpr-emood-knap-emood-sleepy')
     assert fire.class_of(1) == 'MaterialInstanceConstant', fire.class_of(1)
     got = tag_values(fire, 0, fire.tags(0))
     info = lambda n: {'Name': n, 'Association': 'GlobalParameter', 'Index': -1}
