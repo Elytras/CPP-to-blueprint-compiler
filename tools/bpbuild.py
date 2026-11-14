@@ -222,6 +222,27 @@ def net_contract_holds(stage_content, baseline, name):
     return not problems
 
 
+def gate_misses(stage_content, gates):
+    """The gates (a mod's `gate` in mods.yaml: {call, packages}) this build imports past without calling: a package of
+    `packages` imported while `call` is not. That owner's pak can change those packages under an older or newer pak of
+    this mod, and only the call lets it refuse the mod instead of crashing (ElytrasModManager/API.md "Versions")."""
+    import invariants
+    imported = set()
+    for root, _dirs, files in os.walk(stage_content):
+        for f in files:
+            if f.endswith(".uasset"):
+                pkg = invariants.load(os.path.join(root, f)[:-len(".uasset")])
+                imported.update(i["name"] for i in pkg.imports if i["outer"] == 0 and i["class_name"] == "Package")
+    misses = []
+    for owner, gate in gates:
+        used = sorted(i for i in imported if any(i.startswith(p.rstrip("/") + "/") for p in gate["packages"]))
+        if used and gate["call"] not in imported:
+            misses.append("imports %s (%s%s) but never calls its gate %s: a mismatched %s would crash it. Make its "
+                          "BeginPlay start with the gate (ElytrasModManager/API.md \"Versions\")"
+                          % (owner, used[0], " and %d more" % (len(used) - 1) if len(used) > 1 else "", gate["call"], owner))
+    return misses
+
+
 def embed_deps(dep_stages, stage_fsd, assetgen):
     """Copy each dep's staged assets into this mod's FSD tree so the pak is self-contained, and its
     registry rows into the pak's one FSD/AssetRegistry.bin. Clears each dest first so a
@@ -626,6 +647,11 @@ def main():
     toolchain_time = max(newest(tree_files(ue_api)), newest(tree_files(ue_assets)), newest([assetgen]))
 
     by_name = dict((m["name"], m) for m in mods)
+    # Each `gate` with its owner, from every mod listed (--only below keeps fewer): the owner and what it embeds are its
+    # own side of the gate, so they are not held to it.
+    gates = [(m["name"], m["gate"]) for m in mods if m.get("gate")]
+    gated_free = {m["name"]: {o for o, _g in gates if o == m["name"] or m["name"] in transitive_needs(o, by_name)}
+                  for m in mods}
     # --only builds the named mods and what they `need`, which an embed bakes in; the rest stay as they are:
     if only:
         unknown = [n for n in only if n not in by_name]
@@ -794,6 +820,13 @@ def main():
             skipped.append(name)
             continue
         if no_pak:
+            continue
+        # Every root the mod compiled (EEE's entries are in a second one), before its deps are embedded beside them.
+        misses = gate_misses(os.path.join(stage_fsd, "Content"), [g for g in gates if g[0] not in gated_free[name]])
+        for line in misses:
+            print("%-16s %s" % (name, line))
+        if misses:
+            failed.append(name)
             continue
         if embed and not embed_deps(dep_stages, stage_fsd, assetgen):
             failed.append(name)
