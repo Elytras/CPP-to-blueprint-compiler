@@ -506,9 +506,12 @@ def run_compile(cmd):
     return proc.returncode == 0, proc.stdout
 
 
-def check_mod_imports(staged, mod_packages):
+def check_mod_imports(staged, mod_packages, external=None):
     """A generated asset is <mod package>/<class>; a UE_CLASS naming the folder instead writes an
-    import that loads fine and resolves to null, first seen as a null UFunction inside the VM."""
+    import that loads fine and resolves to null, first seen as a null UFunction inside the VM.
+    external maps a mod to the package prefixes its mods.yaml `external` names: packages another pak, built outside
+    bpbuild, provides (RcBackportLogic's meshes, from RcBackportEnemies_P.pak). Its imports under them are not
+    checked."""
     def packages(content):
         return sorted(os.path.relpath(f, content).replace(os.sep, "/")
                       for f in cooked_assets(content) if f.endswith(".uasset"))
@@ -523,7 +526,8 @@ def check_mod_imports(staged, mod_packages):
     roots = [m.lower() for m in mod_packages]       # a package's name is an FName: it compares without case
 
     bad = []
-    for _mod, content, _package in staged:
+    for mod, content, _package in staged:
+        skip = [e.lower().rstrip("/") for e in (external or {}).get(mod, [])]
         for f in packages(content):
             base = os.path.join(content, f[:-len(".uasset")])
             imports = load_package(base)[4]
@@ -533,6 +537,8 @@ def check_mod_imports(staged, mod_packages):
                 name = entry[len("Package'"):-1]
                 low = name.lower()
                 under = any(low == m or low.startswith(m + "/") for m in roots)
+                if any(low == e or low.startswith(e + "/") for e in skip):
+                    continue
                 if under and low not in produced:
                     bad.append((f, name))
     for asset, name in bad:
@@ -907,7 +913,8 @@ def main():
             failed.append(name)
 
     # Under --no-pak no mod's kept packages are placed, so every import of one would read as missing:
-    if not failed and not no_pak and not check_mod_imports(staged, set(p for _n, _c, p in staged)):
+    if not failed and not no_pak and not check_mod_imports(
+            staged, set(p for _n, _c, p in staged), {m["name"]: m.get("external") or [] for m in mods}):
         failed.append("cross-mod imports")
 
     print("built %d, packed %d, up to date %d, failed %d"
