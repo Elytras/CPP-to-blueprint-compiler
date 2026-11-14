@@ -3046,7 +3046,8 @@ argument, it is an ordinary call of the function's Blueprint body. A `consteval`
 | <a id="constexpr-and-consteval.nested"></a>`Built = Twice(Tri(3));` in the constructor, `constexpr int32 kSeven = Twice(3) + 1;` | 12 and 7: an argument may be another call's answer, or a constant made by one. | Yes |
 | <a id="constexpr-and-consteval.runtime-only"></a>`int32 R = UKismetMathLibrary::RandomInteger(3);`, `FMath::RandRange(1, 6)` as a default | Refused, naming the function ("is not constexpr, so it runs only in the game"). An engine function is never worked out at build time. In code the call stays a call. | Refused |
 | <a id="constexpr-and-consteval.not-a-constant"></a>`int32 C = Twice(A);` as a default, where `A` is a member | Refused, naming the argument: `argument 1 (A) of Twice` ("is not a constant"). In code, `Twice(A)` is a call. | Refused |
-| <a id="constexpr-and-consteval.clang-cannot"></a>`int32 B = Bad(2);` where Bad calls a function that is not constexpr, `Twice(0x7FFFFFFF)` | Refused with clang's reason and the line it stopped at ("clang could not run"): for Bad, `non-constexpr function 'NotC' cannot be used in a constant expression (Mod.cpp:6)`; for the overflow, `value 4294967294 is outside the range of representable values of type 'int'`. In code the call stays a call, and computes in the game. | Refused |
+| <a id="constexpr-and-consteval.never-constexpr"></a>`constexpr int32 Bad(int32 X) { return NotC(X); }` with NotC not constexpr | Warns ("is constexpr, but it can never be worked out when the mod is built"), naming the run-time-only action every call of it reaches: a call of a function that is not constexpr (every engine and game function), a read of a mod variable, or a call of another such function. A default calling it is refused with the same reason. A run-time-only action behind a branch (`X > 0 ? NotC(X) : 1`), on the right of `&&` or `\|\|`, in a loop, or in the game's arm of `__builtin_is_constant_evaluated()` does not count: the function can still be worked out for some arguments. | Warns |
+| <a id="constexpr-and-consteval.clang-cannot"></a>`int32 B = Maybe(2);` where Maybe calls a function that is not constexpr for that argument, `Twice(0x7FFFFFFF)` | Refused with clang's reason and the line it stopped at ("clang could not run"): for Maybe, `non-constexpr function 'NotC' cannot be used in a constant expression (Mod.cpp:6)`; for the overflow, `value 4294967294 is outside the range of representable values of type 'int'`. In code the call stays a call, and computes in the game. | Refused |
 | <a id="constexpr-and-consteval.consteval-int32-fnv-const-char"></a>`consteval int32 Fnv(const char *S)` | clang runs the call while compiling, and only the answer reaches the Blueprint; see [Constants](#constants). | Yes |
 
 ```cpp
@@ -3063,6 +3064,11 @@ public:
 
 Notes:
 
+- Each action a constexpr body can take is build-time capable or run-time only. Build-time capable: arithmetic,
+  comparisons, logic, casts, locals and parameters, loops and branches, constants, string literals read through a
+  pointer, and calls of constexpr functions. Run-time only: a call of a function that is not constexpr (all of UeApi:
+  the engine's and the game's functions, the Kismet libraries), a read of a mod variable, and a call of a constexpr
+  function that is itself never worked out.
 - What is worked out is a call whose callee is a `constexpr` or `consteval` free function, static method, or a
   template's instantiation, whose arguments are each a constant (a literal, a constant, an enumerator, a string
   literal, another such call), and whose result is a number, a bool or an enum. Everything else in code is an ordinary

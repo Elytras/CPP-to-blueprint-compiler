@@ -18850,15 +18850,34 @@ void FCompiler::ProbeConstCalls(const std::string& SourcePath, const std::string
             else Unspelled(M);
         });
     };
+    /* Every constexpr function, methods and constructors included, by each declaration's id; its definition and the
+       name a warning gives it. A non-constexpr callee is a run-time-only action (RunTimeOnly). std's own and
+       reserved names are left out: their bodies are the C++ library's. */
+    std::set<std::string> Constexpr;
+    std::map<std::string, const Json*> Bodies;
+    std::map<const Json*, std::string> Shown;
+    const auto Note = [&](const Json& F, const std::string& Qual) {
+        const std::string K = Kind(F);
+        if ((K != "FunctionDecl" && K != "CXXMethodDecl" && K != "CXXConstructorDecl") || !F.value("constexpr", false)) return;
+        Constexpr.insert(F.value("id", std::string()));
+        bool bBody = false;
+        ForEach(F, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+        if (!bBody || F.value("immediate", false) || Qual.compare(0, 5, "std::") == 0 || Name(F).compare(0, 1, "_") == 0) return;
+        Bodies[F.value("id", std::string())] = &F;
+        if (F.contains("previousDecl")) Bodies[F.value("previousDecl", std::string())] = &F;
+        Shown[&F] = Qual;
+    };
     std::function<void(const Json&, const std::string&)> Scan = [&](const Json& N, const std::string& Scope) {
         ForEach(N, [&](const Json& C) {
             const std::string K = Kind(C);
             std::string Args;
+            Note(C, Scope + Name(C));
             if (K == "NamespaceDecl") Scan(C, C.contains("name") ? Scope + Name(C) + "::" : Scope);
             else if (K == "LinkageSpecDecl") Scan(C, Scope);
             else if (K == "CXXRecordDecl" && C.contains("name") && C.value("completeDefinition", false)) Scan(C, Scope + Name(C) + "::");
             else if (K == "FunctionTemplateDecl")
                 ForEach(C, [&](const Json& F) {
+                    Note(F, Scope + Name(C) + (Spelled(F, Args) ? Args : std::string()));
                     if (!IsCallable(F)) return;
                     if (Spelled(F, Args)) Named[F.value("id", std::string())] = Scope + Name(C) + Args;
                     else Templated.insert(F.value("id", std::string()));      // the pattern too, which no call names
@@ -18873,6 +18892,109 @@ void FCompiler::ProbeConstCalls(const std::string& SourcePath, const std::string
         });
     };
     Scan(Doc, std::string());
+
+    /*
+    Then which of them can ever be worked out. Each action a body can take is build-time capable or run-time only:
+    arithmetic, a local, a parameter, a constant, and a call of a constexpr function are the first; a call of a
+    function that is not constexpr (every engine and game function, which UeApi declares with no body) and a read of a
+    mod variable are the second. A function one of whose run-time-only actions is reached on every call, whatever its
+    arguments, can never be worked out, constexpr or not: it is warned of, and its calls are not probed. "Every call"
+    is the body read in order up to the first statement that may leave it early: a branch's condition counts but not
+    its arms, the left side of `&&` and `||` but not the right, and a loop not at all, which may run no time. Under
+    `__builtin_is_constant_evaluated()` only the arm clang takes at build time counts, so FMath.h's guarded engine call
+    is not one. A call of a function that can never be worked out is itself such an action.
+    */
+    std::map<const Json*, std::string> Never;     // a definition -> the action that rules it out, "" if none, "?" while read
+    std::function<std::string(const std::string&)> RunTimeOnly = [&](const std::string& Id) -> std::string {
+        const auto B = Bodies.find(Id);
+        if (B == Bodies.end()) return std::string();
+        if (const auto W = Never.find(B->second); W != Never.end()) return W->second == "?" ? std::string() : W->second;
+        Never[B->second] = "?";
+        std::string Found;
+        const auto Leaves = [](const Json& N) {
+            bool bExit = false;
+            std::function<void(const Json&)> Look = [&](const Json& M) {
+                const std::string K = Kind(M);
+                bExit = bExit || K == "ReturnStmt" || K == "BreakStmt" || K == "ContinueStmt" || K == "GotoStmt" || K == "CXXThrowExpr";
+                if (!bExit && K != "LambdaExpr") ForEach(M, Look);
+            };
+            Look(N);
+            return bExit;
+        };
+        /* An action, by the callee or variable it names. */
+        const auto Action = [&](const Json& N) {
+            const std::string K = Kind(N);
+            if (K == "DeclRefExpr" && N.contains("referencedDecl"))
+            {
+                const std::string Ref = N["referencedDecl"].value("id", std::string());
+                if (NsVars.count(Ref) && !ConstVars.count(Ref))
+                    Found = "reads `" + N["referencedDecl"].value("name", std::string()) + "`, a variable";
+                return;
+            }
+            if ((K != "CallExpr" && K != "CXXMemberCallExpr" && K != "CXXOperatorCallExpr") || IsConstantEvaluatedCall(N)) return;
+            const Json* Callee = First(N) ? Strip(First(N)) : nullptr;
+            if (!Callee) return;
+            std::string Fn, FnId;
+            if (Kind(*Callee) == "DeclRefExpr" && Callee->contains("referencedDecl"))
+            {
+                Fn = (*Callee)["referencedDecl"].value("name", std::string());
+                FnId = (*Callee)["referencedDecl"].value("id", std::string());
+            }
+            else if (Kind(*Callee) == "MemberExpr")
+            {
+                Fn = Callee->value("name", std::string());
+                FnId = Callee->value("referencedMemberDecl", std::string());
+            }
+            if (FnId.empty() || Fn.compare(0, 10, "__builtin_") == 0) return;
+            if (!Constexpr.count(FnId)) Found = "calls `" + Fn + "`, which is not constexpr";
+            else if (!RunTimeOnly(FnId).empty()) Found = "calls `" + Fn + "`, which can never be worked out either";
+        };
+        /* The body in order; false once what follows may not run. */
+        std::function<bool(const Json&)> Walk = [&](const Json& N) -> bool {
+            if (!Found.empty() || !N.is_object()) return false;
+            const std::string K = Kind(N);
+            if (K == "CompoundStmt")
+            {
+                bool bOn = true;
+                ForEach(N, [&](const Json& C) { bOn = bOn && Walk(C); });
+                return bOn;
+            }
+            if (K == "ReturnStmt") { if (First(N)) Walk(*First(N)); return false; }
+            if (K == "BreakStmt" || K == "ContinueStmt" || K == "GotoStmt" || K == "SwitchStmt" || K == "LambdaExpr"
+                || K == "ForStmt" || K == "WhileStmt" || K == "DoStmt" || K == "CXXForRangeStmt")
+                return !Leaves(N);
+            if (K == "IfStmt")
+            {
+                if (N.value("hasInit", false) || N.value("hasVar", false) || N.value("isConstexpr", false)) return !Leaves(N);
+                const Json *Cond = Nth(N, 0), *Then = Nth(N, 1), *Else = Nth(N, 2);
+                if (Cond && Then && IsConstantEvaluatedCall(*Cond)) return Walk(*Then);
+                if (Cond) Walk(*Cond);
+                return !(Then && Leaves(*Then)) && !(Else && Leaves(*Else));
+            }
+            Action(N);
+            if (K == "ConditionalOperator" && Nth(N, 0))
+            {
+                if (IsConstantEvaluatedCall(*Nth(N, 0))) { if (Nth(N, 1)) Walk(*Nth(N, 1)); }
+                else Walk(*Nth(N, 0));
+                return true;
+            }
+            if (K == "BinaryOperator" && (N.value("opcode", std::string()) == "&&" || N.value("opcode", std::string()) == "||"))
+            {
+                if (Nth(N, 0)) Walk(*Nth(N, 0));
+                return true;
+            }
+            ForEach(N, [&](const Json& C) { if (Found.empty() && Kind(C) != "CompoundStmt") Walk(C); });
+            return true;
+        };
+        ForEach(*B->second, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C); });
+        Never[B->second] = Found;
+        return Found;
+    };
+    std::set<std::string> Warned;
+    for (const auto& [Id, Def] : Bodies)
+        if (const std::string Why = RunTimeOnly(Id); !Why.empty() && Warned.insert(Shown[Def]).second)
+            printf("  warning: %s is constexpr, but it can never be worked out when the mod is built: every call of it %s. "
+                   "Its calls run in the game\n", Shown[Def].c_str(), Why.c_str());
 
     /* Then the calls: each one either becomes a probe, or gets the reason it stays a call. One whose argument is another
        call's answer (`Twice(Tri(3))`, `Plus(2, kSeven)` over `kSeven = Twice(3) + 1`) waits for the next round, which
@@ -18901,6 +19023,11 @@ void FCompiler::ProbeConstCalls(const std::string& SourcePath, const std::string
         const std::string Fn = Decl.value("name", std::string()), DeclId = Decl.value("id", std::string());
         const auto Q = Named.find(DeclId);
         Done.insert(Id);
+        if (const std::string Why = RunTimeOnly(DeclId); !Why.empty())
+        {
+            UnprobedWhy[Id] = "`" + Fn + "` can never be worked out when the mod is built: every call of it " + Why;
+            return;
+        }
         if (Q == Named.end())
         {
             UnprobedWhy[Id] = Templated.count(DeclId)

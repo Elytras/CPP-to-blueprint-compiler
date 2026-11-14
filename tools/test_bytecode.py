@@ -17217,6 +17217,7 @@ ROW_IAIM = 'class IAimable {\npublic:\n  UE_INTERFACE;\n  void Aim();\n};\n'
 ROW_IMARK = 'class IMarkable {\npublic:\n  UE_INTERFACE;\n  int32 Marks = 0;\n  void Mark();\n};\n'
 ROW_FNV = 'consteval int32 Fnv(int32 X) { return (X * 31 + 7) % 1000003; }\n'
 ROW_TWICE = 'constexpr int32 Twice(int32 X) { return X * 2; }\n'
+ROW_NEVER = 'int32 NotC(int32 X) { return X; }\nconstexpr int32 Bad(int32 X) { return NotC(X); }\n'
 ROW_FMATH = '#include "%s"\n' % os.path.join(AG, 'include', 'FMath.h').replace('\\', '/')
 ROW_REFUSALS = [
     ('the-mod-package.ue-mod-package', 'NoPkg', '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nclass NoPkg : public AActor {\npublic:\n  int32 X;\n};\n',
@@ -17260,9 +17261,11 @@ ROW_REFUSALS = [
      '(`RandRange` is not constexpr, so it runs only in the game)', ROW_FMATH),
     ('constexpr-and-consteval.not-a-constant', 'CxArg', '  int32 A = 1;\n  int32 C = Twice(A);\n',
      '(argument 1 (`A`) of `Twice` is not a constant)', ROW_TWICE),
-    ('constexpr-and-consteval.clang-cannot', 'CxBad', '  int32 B = Bad(2);\n',
-     "(clang could not run `Bad` when the mod is built: non-constexpr function 'NotC' cannot be used in a constant expression (CxBad.cpp:",
-     'int32 NotC(int32 X) { return X; }\nconstexpr int32 Bad(int32 X) { return NotC(X); }\n'),
+    ('constexpr-and-consteval.clang-cannot', 'CxMaybe', '  int32 B = Maybe(2);\n',
+     "(clang could not run `Maybe` when the mod is built: non-constexpr function 'NotC' cannot be used in a constant expression (CxMaybe.cpp:",
+     'int32 NotC(int32 X) { return X; }\nconstexpr int32 Maybe(int32 X) { return X > 0 ? NotC(X) : 1; }\n'),
+    ('constexpr-and-consteval.never-constexpr', 'CxNeverDef', '  int32 B = Bad(2);\n',
+     '(`Bad` can never be worked out when the mod is built: every call of it calls `NotC`, which is not constexpr)', ROW_NEVER),
     ('constexpr-and-consteval.clang-cannot', 'CxOver', '  int32 O = Twice(0x7FFFFFFF);\n',
      "(clang could not run `Twice` when the mod is built: value 4294967294 is outside the range of representable values", ROW_TWICE),
     ('inline-class-variables.khold-1-0f', 'ConstAssign', '  static inline const float kHold = 1.0f;\n  void F() { kHold = 2.0f; }\n',
@@ -17382,6 +17385,12 @@ ROW_REFUSALS = [
     ('math-and-utility.std-min-a-b', 'BiSqrt', '  float F(float X) { return __builtin_sqrtf(X); }\n', 'call to an unknown function', ''),
 ]
 ROW_WARNINGS = [
+    ('constexpr-and-consteval.never-constexpr', 'CxNever', '  int32 F(int32 V) { return Bad(V); }\n',
+     'Bad is constexpr, but it can never be worked out when the mod is built: every call of it calls `NotC`, which is not '
+     'constexpr. Its calls run in the game', ROW_NEVER),
+    ('constexpr-and-consteval.never-constexpr', 'CxNeverChain', '  int32 F(int32 V) { return Chain(V); }\n',
+     'Chain is constexpr, but it can never be worked out when the mod is built: every call of it calls `Bad`, which can '
+     'never be worked out either', ROW_NEVER + 'constexpr int32 Chain(int32 X) { int32 Y = X + 1; return Bad(Y); }\n'),
     ('number-conversions.float-big', 'I64F', '  float F(int64 Big) { return (float)Big; }\n', 'int64 -> float goes through int32', ''),
     ('the-root-s.body-relativescale3d-fvector-2', 'RootScale',
      '  UE_COMPONENT(UStaticMeshComponent, Body);\n  UE_DEFAULTS { Body->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f); }\n',
@@ -17463,6 +17472,29 @@ proves('arithmetic.id-count', 'binding-handlers.onhit-isbound', 'blueprint-class
 proves('declaring-an-interface.int32-marks', 'jumps.goto', 'range-for-over.goto', 'math-and-utility.std-min-a-b',
        'reading-and-writing.tarray-int32-a-pa')
 row_refusals()
+
+
+def constexpr_never_quiet():
+    """The other side of the never-constexpr warning: a function whose run-time-only action is behind a branch, the
+    right side of `&&`, a loop or the game's arm of `__builtin_is_constant_evaluated()` (every FMath.h function) can
+    still be worked out for some arguments, so it draws no warning."""
+    text = (ROW_HEAD % 'CxQuiet' + ROW_FMATH + 'int32 NotC(int32 X) { return X; }\n'
+            'constexpr int32 Maybe(int32 X) { return X > 0 ? NotC(X) : 1; }\n'
+            'constexpr int32 IfSo(int32 X) { if (X > 9) return NotC(X); return X; }\n'
+            'constexpr bool Both(int32 X) { return X > 0 && NotC(X) > 1; }\n'
+            'constexpr int32 Loop(int32 X) { for (int32 I = 0; I < X; ++I) NotC(I); return X; }\n'
+            'constexpr int32 Guard(int32 X) { if (__builtin_is_constant_evaluated()) return X; return NotC(X); }\n'
+            'class CxQuiet : public AActor {\npublic:\n'
+            '  int32 M = Maybe(-1) + IfSo(3) + Both(0) + Loop(0) + Guard(4) + FMath::Max(1, 2);\n'
+            '  int32 F(int32 V) { return Maybe(V) + IfSo(V) + Both(V) + Loop(V) + Guard(V) + FMath::Abs(V); }\n};\n')
+    proc = row_compile('CxQuiet', text)
+    proves('constexpr-and-consteval.never-constexpr')
+    assert proc.returncode == 0 and 'warning:' not in proc.stdout, proc.stdout + proc.stderr
+    print('ok  CxQuiet: a constexpr function whose run-time-only call is not reached on every call draws no warning, '
+          'and its constant calls are worked out')
+
+
+constexpr_never_quiet()
 
 
 
