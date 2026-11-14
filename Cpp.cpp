@@ -19861,6 +19861,17 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
 bool FCompiler::FinishAssetDefaults(const FRecord& R, const FRecord& Class, FPackage& P, FBlueprintClass& BP,
                                     const std::vector<FPropertyDef>& Tags, const std::string& OutDir, std::string* Err)
 {
+    /* A material instance that overrides its parent's base properties or static parameters needs shaders of its own (a
+       static permutation: UMaterialInstance::UpdateStaticPermutation), which the editor compiles at save and AssetGen
+       does not. Cooked without them, it draws with the parent's shaders whatever the override says. */
+    if (const FRecord* Mi = Find("UMaterialInstance"); Mi && (&Class == Mi || IsSubclassOf(Class, *Mi)))
+        for (const FPropertyDef& PD : Tags)
+            if (PD.Name == "BasePropertyOverrides" || PD.Name == "StaticParameters" || PD.Name == "bHasStaticPermutationResource")
+            {
+                *Err = ClassOf(R) + ": TODO: a material instance's " + PD.Name + " needs shaders of its own (a static "
+                       "permutation), which AssetGen does not write; leave it out, and the instance takes it from its parent";
+                return false;
+            }
     for (const FPropertyDef& PD : Tags) BP.AddVariable(PD);
     const std::string ClassPkg = PackageOf(Class), ClassName = ClassOf(Class), PackageName = PackageOf(R);
     const FIndex Cdo = BP.ClassDefaultObject(ClassPkg, ClassName);

@@ -5133,6 +5133,51 @@ def asset_defaults_refusals():
     print('ok  AssetDefaults refusals')
 
 
+# M_FireBulkArmor of EEE as DRG's cooker wrote it (BpMods/build/EEE/kept/.../materials), less the two fields the cooker
+# works out from the parent and AssetGen does not write (CachedReferencedTextures, TextureStreamingData) and the
+# BasePropertyOverrides it copies from the parent with no override flag set (UMaterialInstance::UpdateOverridableBaseProperties).
+MIC_FIRE_PARENT = '/Game/GameElements/Resources/Embedded/UnknownArtifact/M_UnknownArtifact_debris.M_UnknownArtifact_debris'
+MIC_FIRE_SCALARS = [('Diffuse_Fresnel_Power', 1.5, '845dff7059abb242880ec115d252bfeb'),
+                    ('EmissiveMultiplier', 1000.0, 'd9ca0730ea7cdd458063f06d15222c3d'),
+                    ('Metallic', 0.0, 'fbe8c7d7d7902946af220e68696fc2a7'),
+                    ('NoiseSpeed', -225.0, '938b9eb5f5f8e3498d2e58150cb069f3'),
+                    ('Subsurface Opacity', 1.0, '4621babc7cbfaa49bd5b897d3fd0d97c'),
+                    ('RefractionDepthBias', 0.0, '0' * 32)]
+MIC_FIRE_VECTORS = [('Diffuse_Edge', '0000c0408656273f000000000000803f', '98080374e5a1de41b5ac335f6b6a4f2a'),
+                    ('Diffuse_Main', '0000000000000000000000000000803f', '81c873f90561a340a109f8846ed809f5')]
+
+
+def material_instance():
+    """MaterialInstance: a UMaterialInstanceConstant from UE_ASSET_DEFAULTS has the tags a cooked one has, parameter
+    for parameter; an override that needs shaders of its own is refused."""
+    import invariants
+    folder = os.path.dirname(asset('MaterialInstance'))
+    fire = invariants.Package(os.path.join(folder, 'M_Fire'))
+    proves('material-instances.ue-asset-defaults-umaterialinstanceconstant')
+    assert fire.class_of(1) == 'MaterialInstanceConstant', fire.class_of(1)
+    got = tag_values(fire, 0, fire.tags(0))
+    info = lambda n: {'Name': n, 'Association': 'GlobalParameter', 'Index': -1}
+    want = {'Parent': MIC_FIRE_PARENT,
+            'ScalarParameterValues': [{'ParameterInfo': info(n), 'ParameterValue': v, 'ExpressionGUID': bytes.fromhex(g)}
+                                      for n, v, g in MIC_FIRE_SCALARS],
+            'VectorParameterValues': [{'ParameterInfo': info(n), 'ParameterValue': bytes.fromhex(c), 'ExpressionGUID': bytes.fromhex(g)}
+                                      for n, c, g in MIC_FIRE_VECTORS]}
+    assert got == want, got
+    assert fire.blob(0)[fire.tags(0).end:] == b'\0' * 4, fire.blob(0)[fire.tags(0).end:]   # UObject's lazy guid; no shader maps
+    keeps_invariants(fire.base)
+    proves('material-instances.textureparametervalues')
+    tex = invariants.Package(os.path.join(folder, 'M_Tex'))
+    got = tag_values(tex, 0, tex.tags(0))['TextureParameterValues']
+    assert got == [{'ParameterInfo': info('Noise'), 'ParameterValue': '/Game/Art/Textures/T_Noise01.T_Noise01',
+                    'ExpressionGUID': bytes(16)}], got
+    assert ('/Game/_ElytrasMods/MaterialInstance/M_Fire.M_Fire', 'MaterialInstanceConstant') in registry_rows(registry_of('MaterialInstance'))
+    proves('material-instances.basepropertyoverrides')
+    for member in ('BasePropertyOverrides.bOverride_ShadingModel = true;', 'bHasStaticPermutationResource = true;'):
+        refused('MicOverride', '', "a material instance's %s needs shaders of its own" % member.split('.')[0].split(' ')[0],
+                top='#include "UeApi/Engine.h"\n', after='UE_ASSET_DEFAULTS(UMaterialInstanceConstant, M_O) { %s }\n' % member)
+    print('ok  MaterialInstance: a material instance cooks as the editor saves one')
+
+
 def particle_tables(p, name):
     """Each raw distribution of the export named name, as {member: its tags (tag_values)}, its Table's float values
     rounded to 4 places."""
@@ -13675,6 +13720,12 @@ def tag_values(pkg, i, tags):
         elif ty == 'ObjectProperty': x = pkg.path(struct.unpack('<i', v)[0])
         elif ty == 'ArrayProperty' and t['inner'] == 'ObjectProperty':
             x = [pkg.path(r) for r in struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4)]
+        elif ty == 'ArrayProperty' and t['inner'] == 'StructProperty':    # count, the inner tag (49 bytes), each element's tags
+            x, at = [], t['at'] + 4 + 49
+            for _ in range(struct.unpack_from('<i', v)[0]):
+                tl = pkg.tags(i, at)
+                x.append(tag_values(pkg, i, tl))
+                at = tl.end
         elif ty == 'FloatProperty': x = struct.unpack('<f', v)[0]
         elif ty == 'BoolProperty': x = bool(t['bool'])
         elif ty == 'NameProperty' or ty in ('ByteProperty', 'EnumProperty') and t['size'] == 8:
@@ -13736,6 +13787,7 @@ print('ok  DefaultsOwnNest: braces in a value that starts as a struct\'s default
       'leaves out, and are refused at what it gives')
 asset_defaults()
 asset_defaults_refusals()
+material_instance()
 particle_bake()
 particle_lod_validity()
 particle_starts()

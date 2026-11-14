@@ -4214,6 +4214,44 @@ Notes:
 - An empty `RapidIterationParameters` the cook writes as an empty struct tag loads the same as none, so bpdecomp
   writes nothing for it.
 
+### Material instances
+
+A material instance (`UMaterialInstanceConstant`) is a `UE_ASSET_DEFAULTS` asset: a parent and the parameter values
+it overrides, as the editor's Material Instance editor saves them. It draws with its parent's shaders, which the game
+already holds, so nothing is compiled.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="material-instances.ue-asset-defaults-umaterialinstanceconstant"></a>`UE_ASSET_DEFAULTS(UMaterialInstanceConstant, M_White) { Parent = &M_Base; ScalarParameterValues = {FScalarParameterValue(FMaterialParameterInfo("NoiseSpeed", EMaterialParameterAssociation::GlobalParameter, -1), -225.0f, FGuid())}; VectorParameterValues = {FVectorParameterValue(FMaterialParameterInfo("Diffuse_Edge", EMaterialParameterAssociation::GlobalParameter, -1), FLinearColor(1, 1, 1, 1), FGuid())}; }` | An instance of `M_Base` (a material or another instance, often one `UE_ASSET_AT` names) with those parameters, cooked at `<mod package>/M_White`. Each parameter is matched to the parent's by its `ParameterInfo`: its name, `GlobalParameter` and index -1 for a parameter of the material itself. A parameter the instance does not list keeps the parent's value. A cooked instance written this way compiles back to the same parameters, `ExpressionGUID`s included. | Yes |
+| <a id="material-instances.textureparametervalues"></a>`TextureParameterValues = {FTextureParameterValue(FMaterialParameterInfo("Noise", EMaterialParameterAssociation::GlobalParameter, -1), &T_Noise01, FGuid())};` | A texture parameter, the texture an `&Asset`. | Yes |
+| <a id="material-instances.basepropertyoverrides"></a>`BasePropertyOverrides.bOverride_ShadingModel = true;`, or any `BasePropertyOverrides`, `StaticParameters` or `bHasStaticPermutationResource` | Refused: "a material instance's BasePropertyOverrides needs shaders of its own (a static permutation), which AssetGen does not write". The editor compiles an instance that overrides these its own shaders; without them it would draw with the parent's whatever the override says. Leave them out and the instance takes them from its parent. | Not yet |
+
+```cpp
+UE_ASSET_AT(::UMaterialInstanceConstant, M_UnknownArtifact_debris,
+            "/Game/GameElements/Resources/Embedded/UnknownArtifact/M_UnknownArtifact_debris.M_UnknownArtifact_debris");
+
+UE_ASSET_DEFAULTS(UMaterialInstanceConstant, M_WhiteLines) {
+  Parent = &M_UnknownArtifact_debris;
+  ScalarParameterValues = {
+      FScalarParameterValue(FMaterialParameterInfo("NoiseSpeed", EMaterialParameterAssociation::GlobalParameter, -1), -225.0f, FGuid())};
+  VectorParameterValues = {
+      FVectorParameterValue(FMaterialParameterInfo("Diffuse_Edge", EMaterialParameterAssociation::GlobalParameter, -1),
+                            FLinearColor(6.0f, 6.0f, 6.0f, 1.0f), FGuid())};
+}
+```
+
+Notes:
+
+- Give `FMaterialParameterInfo` all three values. `FMaterialParameterInfo()` is the first layer's parameter
+  (`LayerParameter`, index 0), which a material without layers does not have, so the value is never used.
+- `ExpressionGUID` is the editor's link to the parent's parameter node. The game finds parameters by `ParameterInfo`
+  alone, so `FGuid()` does.
+- The parameter names are the parent's: a cooked instance's `tags` dump (`AssetGen/tools/uasset.py tags <base> 0`)
+  lists the ones it overrides.
+- The cooker also writes `CachedReferencedTextures` and `TextureStreamingData`, worked out from the parent; AssetGen
+  writes neither. The game reads the first only for an instance with shaders of its own. Without the second, the
+  texture streamer has no per-instance UV scale for its textures.
+
 ### Behaviour trees and blackboards
 
 A blackboard (`UBlackboardData`) and a behaviour tree (`UBehaviorTree`) are assets with objects inside, declared with
