@@ -72,8 +72,6 @@ world-context-in.firstpawn
 world-context-in.firstpawn-other
 world-context-in.an-engine-call-inside-the
 templates.template-class-t-inline-int32
-constexpr-and-consteval.constexpr-int32-sqm-int32-x
-constexpr-and-consteval.inline-constexpr-int32-sq-int32
 declaring-components.mesh-sethiddeningame-true-false
 declaring-components.ue-component-uhealthcomponent
 adding-components-at.addcomponentbytype-ucharges-this

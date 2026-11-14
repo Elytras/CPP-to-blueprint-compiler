@@ -12,6 +12,7 @@
 #include <functional>
 #include <iterator>
 #include <set>
+#include <sstream>
 #include <map>
 #include <filesystem>
 #include <fstream>
@@ -205,6 +206,17 @@ const Json* Strip(const Json* N)
         N = Inner;
     }
     return nullptr;
+}
+
+/* `__builtin_is_constant_evaluated()` or `std::is_constant_evaluated()`: true only while clang evaluates a constant, so
+   false in everything AssetGen compiles, which runs in the game. FMath.h's build-time branches stand on it. */
+bool IsConstantEvaluatedCall(const Json& N)
+{
+    const Json* C = Strip(&N);
+    const Json* Callee = C && Kind(*C) == "CallExpr" && First(*C) ? Strip(First(*C)) : nullptr;
+    if (!Callee || Kind(*Callee) != "DeclRefExpr" || !Callee->contains("referencedDecl")) return false;
+    const std::string Fn = (*Callee)["referencedDecl"].value("name", std::string());
+    return Fn == "__builtin_is_constant_evaluated" || Fn == "is_constant_evaluated";
 }
 
 template <typename F>
@@ -2347,6 +2359,13 @@ private:
     }
     struct FConstVal { bool bFloat = false; double F = 0; int64 I = 0; double Num() const { return bFloat ? F : double(I); } };
     bool FoldConst(const Json& E, FConstVal& Out) const;
+    /* The constexpr probe (ProbeConstCalls): each call of a constexpr or consteval function with constant arguments, by
+       its CallExpr's id, and the value clang worked out for it; FoldConst reads it as it reads a literal. A call it did
+       not evaluate has the reason in UnprobedWhy, which a default's refusal gives. */
+    std::map<std::string, FConstVal> ProbedCalls;
+    std::map<std::string, std::string> UnprobedWhy;
+    void ProbeConstCalls(const std::string& SourcePath, const std::string& IncludeDir, const std::vector<const Json*>& Roots);
+    std::string UnfoldedCallWhy(const Json& Init) const;
     const Json* ValueCastBelow(const Json& N) const;
     const Json* StructConversionBelow(const Json& N) const;
     bool FreeNegation(const Json& C, Json& Out) const;
@@ -7154,6 +7173,11 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     for (const Json* W = &ArgNode; W; W = IsCastOrParen(*W) ? First(*W) : nullptr)
         if (FConstVal V; Kind(*W) == "ConstantExpr" && W->contains("value") && FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out))
             return true;
+    /* A constexpr call clang ran in the probe (ProbeConstCalls) is its answer, with no call left; so is
+       `__builtin_is_constant_evaluated()`, false. */
+    if (const Json* Bare = Strip(&ArgNode); Bare && Kind(*Bare) == "CallExpr"
+        && (ProbedCalls.count(Bare->value("id", std::string())) || IsConstantEvaluatedCall(*Bare)))
+        if (FConstVal V; FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out)) return true;
     /* Strip peels every cast, but one that changes the value - to bool, to a narrower integer, float to integer - must
        still happen: `(uint8)V + X` wraps V, `(bool)F + X` adds 0 or 1. The value is lowered as that cast's type, and
        only then converted to the slot's. Over constants FoldConst runs the whole chain. */
@@ -8375,6 +8399,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         return true;
     }
 
+    /* `__builtin_is_constant_evaluated() ? A : B`, FMath.h's spelling: A is what clang's probe runs, B what the game does. */
+    if (K == "ConditionalOperator" && Nth(*N, 0) && Nth(*N, 2) && IsConstantEvaluatedCall(*Nth(*N, 0)))
+        return LowerArg(*Nth(*N, 2), BP, Out, Err);
     if (K == "ConditionalOperator")
     {
         /* `C ? A : B`: the hoist pass turns this into `if (C) T = A; else T = B;`. */
@@ -12273,7 +12300,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
 
             /* `if constexpr`: clang has chosen, and an instantiation leaves the discarded branch empty. Only the kept
                one is lowered, so no `JumpIfNot False` chain is left behind (MakeValue<T>'s six-way dispatch). */
-            if (FConstVal V; S->value("isConstexpr", false) && FoldConst(*Cond, V))
+            /* `if (__builtin_is_constant_evaluated())` the same way, in a UE_NO_OPTIMIZE function too: its branch is clang's. */
+            if (FConstVal V; (S->value("isConstexpr", false) || IsConstantEvaluatedCall(*Cond)) && FoldConst(*Cond, V))
             {
                 if (const Json* Kept = V.Num() != 0 ? Then : Else)
                 {
@@ -17373,16 +17401,23 @@ bool IsTEnumType(std::string T, const std::string& Of)
    arithmetic, comparisons, `&&`, `||` and `?:` over them, each step rounded to the type clang gave it so `2 * 50.f` and
    `1 << 31` come out as C++ has them. `false && X`, `true || X` and `?:` need only the side C++ evaluates. False for
    anything else (a call, sizeof) and for a division by zero. */
+/* What FoldConst can hold of a type, keywords and enums already taken off: 1 an integer or a bool, 2 a float, 0 neither. */
+static int32 NumberKind(const std::string& T)
+{
+    if (T == "float" || T == "double") return 2;
+    return T == "bool" || T == "int" || T == "int32" || T == "unsigned int" || T == "uint32" || T == "uint8"
+        || T == "unsigned char" || T == "int8" || T == "signed char" || T == "short" || T == "unsigned short"
+        || T == "int16" || T == "uint16" || IsInt64Type(T);
+}
+
 bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
 {
     const std::string K = Kind(E);
     const auto Fit = [&](FConstVal& V) {
         std::string T = StripTypeKeywords(TypeOf(E));
         if (auto En = Enums.find(T); En != Enums.end()) T = En->second.Underlying;
-        const bool bWantFloat = T == "float" || T == "double";
-        const bool bInt = T == "bool" || T == "int" || T == "int32" || T == "unsigned int" || T == "uint32" || T == "uint8"
-                       || T == "unsigned char" || T == "int8" || T == "signed char" || T == "short" || T == "unsigned short"
-                       || T == "int16" || T == "uint16" || IsInt64Type(T);
+        const bool bWantFloat = NumberKind(T) == 2;
+        const bool bInt = NumberKind(T) == 1;
         if (!bWantFloat && !bInt) return false;
         if (bWantFloat) { V.F = T == "float" ? double(float(V.Num())) : V.Num(); V.bFloat = true; return true; }
         /* A float goes to bool by comparing with zero, not by truncating (0.5f is true). */
@@ -17417,6 +17452,17 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     }
     if (K == "ParenExpr" || K == "ConstantExpr" || K == "ExprWithCleanups")
         return First(E) && FoldConst(*First(E), Out);
+    /* A constexpr call clang ran in the probe (ProbeConstCalls), or `__builtin_is_constant_evaluated()`, which is false
+       in the game. */
+    if (K == "CallExpr")
+    {
+        Out = {};
+        if (IsConstantEvaluatedCall(E)) return Fit(Out);
+        const auto P = ProbedCalls.find(E.value("id", std::string()));
+        if (P == ProbedCalls.end()) return false;
+        Out = P->second;
+        return Fit(Out);
+    }
     /* A template's value parameter, `template <int32 S>`: its declaration, then the argument it stands for. */
     if (K == "SubstNonTypeTemplateParmExpr")
     {
@@ -18733,11 +18779,270 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         }
     }
     if (!AssetValueWhy.empty()) { *Err = Name(F) + ": " + AssetValueWhy; return false; }
-    *Err = Name(F) + ": a default is a value known when the mod is built - a literal, a constant expression over "
-           "literals, enum constants and constexpr variables, a braced struct, an &Asset or a class, X::StaticClass(). A "
-           "function call counts only through `constexpr T k = F();` with F consteval, which clang runs itself. Anything "
-           "computed when the game runs belongs in ReceiveBeginPlay or UserConstructionScript";
+    const std::string Why = Whole ? UnfoldedCallWhy(*Whole) : std::string();
+    *Err = Name(F) + ": a default is a value known when the mod is built" + (Why.empty() ? std::string() : " (" + Why + ")")
+         + " - a literal, a constant expression over literals, enum constants and constexpr variables, a call of a "
+           "constexpr or consteval function with constant arguments, a braced struct, an &Asset or a class, "
+           "X::StaticClass(). Anything computed when the game runs belongs in ReceiveBeginPlay or UserConstructionScript";
     return false;
+}
+
+std::string ClangCommand(const std::string& SourcePath, const std::string& IncludeDir);     // below
+
+/* Why the first call in Init that the constexpr probe did not evaluate stays a call (ProbeConstCalls), or empty. */
+std::string FCompiler::UnfoldedCallWhy(const Json& Init) const
+{
+    std::string Why;
+    std::function<void(const Json&)> Find = [&](const Json& N) {
+        if (!Why.empty() || !N.is_object() || (Kind(N) == "ConstantExpr" && N.contains("value"))) return;
+        if (Kind(N) == "CallExpr")
+            if (const auto W = UnprobedWhy.find(N.value("id", std::string())); W != UnprobedWhy.end()) { Why = W->second; return; }
+        ForEach(N, Find);
+    };
+    Find(Init);
+    return Why;
+}
+
+/*
+The constexpr probe. clang evaluates a constexpr call only where C++ needs a constant, and its dump keeps an answer only
+there (a consteval call's ConstantExpr). So every call under Roots of a constexpr or consteval function whose arguments
+are all constants is written again, as the argument of a consteval function, into a second source that includes the
+mod's, and clang compiles that one. Each answer comes back on a ConstantExpr; each failure is an error whose note says
+what stopped it (a function that is not constexpr, an overflow), kept in UnprobedWhy. -ast-dump-filter dumps only that
+source's own functions, so the second parse costs clang's time but no second tree, and a source with no such call runs
+no probe. An answer is a number: the integer, or a double's bits, which keep every float exactly. A call is keyed by its
+id, which a copy of the node keeps. Its arguments were folded here without an inline expansion's context (ParmConst is
+empty), so they are the same constants wherever the node is lowered.
+*/
+void FCompiler::ProbeConstCalls(const std::string& SourcePath, const std::string& IncludeDir, const std::vector<const Json*>& Roots)
+{
+    /* First the functions a call can name from outside the source: a free function or a static method, constexpr or
+       consteval, by every declaration's id -> its qualified name. A template's instantiation is spelled with its
+       arguments, `Times<long long, 3>`, `TBox<int>::Twice`: each a type or a number. One with an argument it cannot
+       spell (a pack, a template) is Templated, and not probed. */
+    std::map<std::string, std::string> Named;
+    std::set<std::string> Templated;
+    const auto Spelled = [](const Json& Inst, std::string& Out) {
+        bool bAll = true, bAny = false;
+        Out.clear();
+        ForEach(Inst, [&](const Json& A) {
+            if (Kind(A) != "TemplateArgument") return;
+            bAny = true;
+            const Json& T = A.contains("type") ? A["type"] : Json::object();
+            std::string One = T.value("desugaredQualType", T.value("qualType", std::string()));
+            if (One.empty() && A.contains("value") && A["value"].is_number_integer()) One = std::to_string(A["value"].get<int64>());
+            bool bPack = false;     // a pack's arguments are TemplateArguments under it
+            ForEach(A, [&](const Json& In) { bPack = bPack || Kind(In) == "TemplateArgument"; });
+            bAll = bAll && !One.empty() && !bPack;
+            Out += (Out.empty() ? "" : ", ") + One;
+        });
+        Out = "<" + Out + ">";
+        return bAny && bAll;
+    };
+    const auto IsCallable = [](const Json& F) {
+        const std::string K = Kind(F);
+        return (K == "FunctionDecl" || (K == "CXXMethodDecl" && F.value("storageClass", std::string()) == "static"))
+            && F.value("constexpr", false) && F.contains("name");
+    };
+    std::function<void(const Json&)> Unspelled = [&](const Json& T) {
+        ForEach(T, [&](const Json& M) {
+            if (Kind(M) == "FunctionDecl" || Kind(M) == "CXXMethodDecl") Templated.insert(M.value("id", std::string()));
+            else Unspelled(M);
+        });
+    };
+    std::function<void(const Json&, const std::string&)> Scan = [&](const Json& N, const std::string& Scope) {
+        ForEach(N, [&](const Json& C) {
+            const std::string K = Kind(C);
+            std::string Args;
+            if (K == "NamespaceDecl") Scan(C, C.contains("name") ? Scope + Name(C) + "::" : Scope);
+            else if (K == "LinkageSpecDecl") Scan(C, Scope);
+            else if (K == "CXXRecordDecl" && C.contains("name") && C.value("completeDefinition", false)) Scan(C, Scope + Name(C) + "::");
+            else if (K == "FunctionTemplateDecl")
+                ForEach(C, [&](const Json& F) {
+                    if (!IsCallable(F)) return;
+                    if (Spelled(F, Args)) Named[F.value("id", std::string())] = Scope + Name(C) + Args;
+                    else Templated.insert(F.value("id", std::string()));      // the pattern too, which no call names
+                });
+            else if (K == "ClassTemplateDecl")
+                ForEach(C, [&](const Json& R) {
+                    if (Kind(R) != "ClassTemplateSpecializationDecl") return;
+                    if (Spelled(R, Args)) Scan(R, Scope + Name(C) + Args + "::");
+                    else Unspelled(R);
+                });
+            else if (IsCallable(C)) Named[C.value("id", std::string())] = Scope + Name(C);
+        });
+    };
+    Scan(Doc, std::string());
+
+    /* Then the calls: each one either becomes a probe, or gets the reason it stays a call. One whose argument is another
+       call's answer (`Twice(Tri(3))`, `Plus(2, kSeven)` over `kSeven = Twice(3) + 1`) waits for the next round, which
+       runs while the last one brought new answers. */
+    struct FProbe { std::string Id, Fn; bool bFloat = false; };
+    std::vector<FProbe> Probes;
+    std::string Lines;
+    std::set<std::string> Done;
+    const auto Literal = [](const FConstVal& V, const std::string& Type) {
+        char Buf[64];
+        if (V.bFloat && std::isnan(V.F)) snprintf(Buf, sizeof Buf, "__builtin_nan(\"\")");
+        else if (V.bFloat && std::isinf(V.F)) snprintf(Buf, sizeof Buf, "%s__builtin_huge_val()", V.F < 0 ? "-" : "");
+        else if (V.bFloat) snprintf(Buf, sizeof Buf, "%a", V.F);
+        else if (V.I < 0) snprintf(Buf, sizeof Buf, "-0x%llxLL - 1", (unsigned long long)(-(V.I + 1)));
+        else snprintf(Buf, sizeof Buf, "0x%llxULL", (unsigned long long)V.I);
+        return "(" + Type + ")(" + Buf + ")";
+    };
+    std::function<void(const Json&)> Calls = [&](const Json& N) {
+        if (!N.is_object() || (Kind(N) == "ConstantExpr" && N.contains("value"))) return;     // clang ran that one
+        ForEach(N, Calls);
+        const std::string Id = N.value("id", std::string());
+        if (Kind(N) != "CallExpr" || Done.count(Id)) return;
+        const Json* Callee = First(N) ? Strip(First(N)) : nullptr;
+        if (!Callee || Kind(*Callee) != "DeclRefExpr" || !Callee->contains("referencedDecl") || IsConstantEvaluatedCall(N)) return;
+        const Json& Decl = (*Callee)["referencedDecl"];
+        const std::string Fn = Decl.value("name", std::string()), DeclId = Decl.value("id", std::string());
+        const auto Q = Named.find(DeclId);
+        Done.insert(Id);
+        if (Q == Named.end())
+        {
+            UnprobedWhy[Id] = Templated.count(DeclId)
+                ? "`" + Fn + "` is a template's function whose arguments AssetGen cannot spell (a pack, a template), so "
+                  "it does not run its calls when it builds the mod"
+                : "`" + Fn + "` is not constexpr, so it runs only in the game";
+            return;
+        }
+        std::string RT = StripTypeKeywords(TypeOf(N));
+        if (const auto En = Enums.find(RT); En != Enums.end()) RT = En->second.Underlying;
+        const int32 Number = NumberKind(StripTypeKeywords(RT));
+        if (!Number)
+        {
+            UnprobedWhy[Id] = "`" + Fn + "` returns " + TypeOf(N) + ", and AssetGen keeps only a number worked out when it builds the mod";
+            return;
+        }
+        std::string Args;
+        for (size_t I = 1; const Json* A = Nth(N, I); ++I)
+        {
+            if (Kind(*A) == "CXXDefaultArgExpr") break;          // the probe's call takes the same default
+            const Json* Leaf = Strip(A);
+            std::string Text;
+            if (FConstVal V; Leaf && Kind(*Leaf) == "StringLiteral") Text = Leaf->value("value", std::string());
+            else if (FoldConst(*A, V))
+            {
+                const Json& T = A->contains("type") ? (*A)["type"] : Json::object();
+                Text = Literal(V, T.value("desugaredQualType", T.value("qualType", std::string("int"))));
+            }
+            else
+            {
+                const Json* Ref = Leaf && Leaf->contains("referencedDecl") ? &(*Leaf)["referencedDecl"] : Leaf;
+                const std::string What = Ref && Ref->contains("name") ? " (`" + Ref->value("name", std::string()) + "`)" : std::string();
+                UnprobedWhy[Id] = "argument " + std::to_string(I) + What + " of `" + Fn + "` is not a constant";
+                Done.erase(Id);
+                return;
+            }
+            Args += (Args.empty() ? "" : ", ") + Text;
+        }
+        Lines += "void AgProbe__" + std::to_string(Probes.size()) + "() { (void)AgProbe__::"
+               + (Number == 2 ? "FoldF((double)(" : "Fold((long long)(") + "::" + Q->second + "(" + Args + "))); }\n";
+        Probes.push_back({ Id, Fn, Number == 2 });
+    };
+    const auto RunRound = [&] {
+        /* The probe source: the mod's, then one function per call, each on its own line (line 3 + its number), so an error
+           says which call it is. */
+        std::error_code Ec;
+        const std::string Stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        const std::filesystem::path Dir = std::filesystem::temp_directory_path(Ec);
+        const std::filesystem::path Src = Dir / ("assetgen-probe-" + Stamp + ".cpp"), ErrFile = Dir / ("assetgen-probe-" + Stamp + ".txt");
+        {
+            std::ofstream Out(Src, std::ios::binary | std::ios::trunc);
+            Out << "#include \"" << std::filesystem::absolute(SourcePath, Ec).generic_string() << "\"\n"
+                << "namespace AgProbe__ { consteval long long Fold(long long V) { return V; } "
+                   "consteval unsigned long long FoldF(double V) { return __builtin_bit_cast(unsigned long long, V); } }\n"
+                << Lines;
+        }
+        std::string Cmd = ClangCommand(Src.string(), IncludeDir) + " -ferror-limit=0 -Xclang -ast-dump-filter -Xclang AgProbe__";
+        if (const char* Extra = getenv("AG_CLANG_EXTRA")) Cmd += std::string(" ") + Extra;
+        std::string Dump;
+        if (FCommandPipe Clang; OpenCommand(Cmd, Clang, ErrFile.string()))
+        {
+            static char Buf[1 << 16];
+            for (size_t Got; (Got = fread(Buf, 1, sizeof Buf, Clang.Out)) != 0;) Dump.append(Buf, Got);
+            CloseCommand(Clang);     // nonzero when a call did not evaluate: those are read off the errors
+        }
+        const std::string Diag = ReadText(ErrFile.string());
+        std::filesystem::remove(Src, Ec);
+        std::filesystem::remove(ErrFile, Ec);
+
+        /* The answers: each AgProbe__<n>'s ConstantExpr. The dump is one JSON object per declaration the filter kept. */
+        std::map<size_t, std::string> Answer;
+        std::function<void(const Json&, int64)> Read = [&](const Json& N, int64 At) {
+            if (!N.is_object()) return;
+            if (Kind(N) == "FunctionDecl" && Name(N).size() > 9 && Name(N).compare(0, 9, "AgProbe__") == 0)
+                At = std::strtoll(Name(N).c_str() + 9, nullptr, 10);
+            if (At >= 0 && Kind(N) == "ConstantExpr" && N.contains("value") && N["value"].is_string())
+                Answer[size_t(At)] = N["value"].get<std::string>();
+            ForEach(N, [&](const Json& C) { Read(C, At); });
+        };
+        std::istringstream Objects(Dump);
+        while ((Objects >> std::ws).peek() != std::char_traits<char>::eof())
+        {
+            Json J;
+            try { Objects >> J; } catch (...) { break; }
+            Read(J, -1);
+        }
+        /* The reasons: the first note after a probe's error that points outside the probe source (at the function clang
+           could not run, say), or else the error itself. */
+        std::map<size_t, std::string> Reason;
+        std::set<size_t> Noted;
+        const std::string ProbeName = Src.filename().string() + ":";
+        std::istringstream DiagLines(Diag);
+        int64 Open = -1;
+        for (std::string L; std::getline(DiagLines, L);)
+        {
+            if (!L.empty() && L.back() == '\r') L.pop_back();
+            const size_t At = L.find(ProbeName), ErrAt = L.find(": error: "), NoteAt = L.find(": note: ");
+            if (ErrAt != std::string::npos)
+            {
+                Open = At != std::string::npos && At < ErrAt ? std::strtoll(L.c_str() + At + ProbeName.size(), nullptr, 10) - 3 : -1;
+                if (Open >= 0) Reason.emplace(size_t(Open), L.substr(ErrAt + 9));
+                continue;
+            }
+            if (Open < 0 || NoteAt == std::string::npos || At != std::string::npos || !Noted.insert(size_t(Open)).second) continue;
+            /* `<file>:<line>:<col>: note: why`: the why, at the file's name and line. */
+            std::string Where = L.substr(0, NoteAt);
+            Where = Where.substr(0, Where.rfind(':'));
+            const size_t Line = Where.rfind(':');
+            Where = std::filesystem::path(Where.substr(0, Line)).filename().string() + Where.substr(Line);
+            Reason[size_t(Open)] = L.substr(NoteAt + 8) + " (" + Where + ")";
+        }
+        for (size_t I = 0; I < Probes.size(); ++I)
+        {
+            const auto A = Answer.find(I);
+            if (A == Answer.end())
+            {
+                const auto R = Reason.find(I);
+                UnprobedWhy[Probes[I].Id] = "clang could not run `" + Probes[I].Fn + "` when the mod is built: "
+                                          + (R == Reason.end() ? std::string("it gave no answer") : R->second);
+                continue;
+            }
+            FConstVal V;
+            if (Probes[I].bFloat)
+            {
+                const uint64 Bits = std::strtoull(A->second.c_str(), nullptr, 10);
+                V.bFloat = true;
+                memcpy(&V.F, &Bits, sizeof V.F);
+            }
+            else V.I = std::strtoll(A->second.c_str(), nullptr, 10);
+            ProbedCalls[Probes[I].Id] = V;
+            UnprobedWhy.erase(Probes[I].Id);
+        }
+    };
+    for (size_t Answered = 0;; Answered = ProbedCalls.size())
+    {
+        Probes.clear();
+        Lines.clear();
+        for (const Json* R : Roots) if (R) Calls(*R);
+        if (Probes.empty()) return;
+        RunRound();
+        if (ProbedCalls.size() == Answered) return;
+    }
 }
 
 FIndex FCompiler::ClassImportOf(const FRecord& R, FBlueprintClass& BP) const
@@ -25507,6 +25812,22 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         }
     for (const Json* Var : ConstVarOrder) WarnKeyLiterals(*Var, Name(*Var));
     for (const FChain* C : ChainOrder) if (C->Def) WarnKeyLiterals(*C->Def, Name(*C->Def));
+    /* The constexpr calls clang can answer (ProbeConstCalls), in the same places and the namespace-scope variables. */
+    {
+        std::vector<const Json*> Roots;
+        for (const auto& [Cpp, R] : Records)
+            if (R.IsGenerated() || R.bIsPatch)
+            {
+                Roots.insert(Roots.end(), R.AllMethods.begin(), R.AllMethods.end());
+                for (const auto& [Method, Def] : R.MethodDefs) Roots.push_back(Def);
+                Roots.insert(Roots.end(), R.Fields.begin(), R.Fields.end());
+                Roots.push_back(R.Defaults);
+            }
+        for (const auto& [Id, Var] : NsVars) Roots.push_back(Var);
+        for (const FChain* C : ChainOrder) if (C->Def) Roots.push_back(C->Def);
+        ProbeConstCalls(SourcePath, IncludeDir, Roots);
+        GAg.Mark("constexpr probe");
+    }
     /* A local or a parameter named None, in any case, is NAME_None: the bytecode names a local by its FName and
        FindFProperty returns null for None, so every read and write of it would be dead in game. The editor never keeps
        one: its validator calls the name empty (FKismetNameValidator::IsValid, Kismet2NameValidators.cpp 139-142), and

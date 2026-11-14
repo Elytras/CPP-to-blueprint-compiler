@@ -6776,6 +6776,66 @@ globals_()
 free_functions()
 
 
+def constexpr_fold():
+    """ConstexprFold: a call of a constexpr or consteval function with constant arguments is the answer clang works out
+    when the mod is built (the probe), cooked as a default, a constructor's value and a constant in code; called with a
+    run-time argument, the same function is a call of its Blueprint body. FMath.h's exact functions fold through their
+    build-time branch, and with a run-time argument still run their math node."""
+    import struct, invariants
+    base = asset('ConstexprFold')
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__ConstexprFold_C')
+    tags = {t['name']: t for t in pkg.tags(cdo)}
+    ints = {k: struct.unpack('<i', tags[k]['value'])[0] for k in ('Doubled', 'Summed', 'Hashed', 'Scaled', 'Named', 'Seven',
+                                                                 'Summed2', 'Capped', 'Floored', 'Built', 'Boxed', 'Nine')}
+    proves('consteval-functions.int32-v-twice-3', 'constexpr-and-consteval.int32-k-sq-3',
+           'constexpr-and-consteval.loop', 'consteval-functions.int32-seed-fnv-types', 'defaults.call-constexpr')
+    assert ints['Doubled'] == 42 and ints['Summed'] == 55 and ints['Hashed'] == fnv('types'), ints
+    proves('constexpr-and-consteval.default-args', 'constexpr-and-consteval.static-method')
+    assert ints['Scaled'] == 12 and ints['Named'] == 5 and ints['Summed2'] == 9, ints
+    proves('constexpr-and-consteval.nested')
+    assert ints['Seven'] == 7 and ints['Built'] == 12, ints
+    proves('constexpr-and-consteval.template')
+    assert struct.unpack('<q', tags['Tripled']['value'])[0] == 15 and ints['Boxed'] == 8, (tags['Tripled'], ints)
+    assert struct.unpack('<ff', tags['Halved']['value'] + tags['Negated']['value']) == (2.5, -1.5), (tags['Halved'], tags['Negated'])
+    proves('math-and-utility.fmath-constant')
+    assert ints['Capped'] == 50 and ints['Floored'] == -3 and tags['bNear']['bool'] == 1, (ints, tags['bNear'])
+    print('ok  ConstexprFold: a constexpr call with constant arguments is cooked as its answer - a default, a static '
+          'method, a template, a constructor\'s value, a constant made of one, FMath\'s exact functions')
+    # In code: the answer with no call left; a run-time argument calls the library's Twice, and FMath::Max the Max node.
+    proves('constexpr-and-consteval.in-code')
+    assert calls_in(base, 'UseConst') == [] and run(base, 'UseConst')[0] == 52, calls_in(base, 'UseConst')
+    proves('constexpr-and-consteval.constexpr-int32-sq-int32-x')
+    assert calls_in(base, 'UseRun') == [('Twice', 0x1C)], calls_in(base, 'UseRun')
+    lib = os.path.join(os.path.dirname(base), 'BPL_ConstexprFold')
+    assert [e for e in exports_of(lib) if not e.endswith('_C')] == ['Twice'], exports_of(lib)      # Tri, Half...: never called in game
+    shared = Obj('BPL_ConstexprFold_C')
+    lib_vm = VM(lib, objects={'Default__BPL_ConstexprFold_C': shared})
+    vm = VM(base, objects={'Default__BPL_ConstexprFold_C': shared},
+            natives={'Twice': lambda _vm, ctx, *a: lib_vm.call('Twice', *a)})
+    assert [vm.call('UseRun', 20), vm.call('UseRun', -3)] == [41, -5]
+
+    def math_calls(fn):
+        out = []
+
+        def walk(n):
+            if n.op == 0x68: out.append(n.val)
+            for k in n.kids: walk(k)
+        for n in runscript.script_of(base, fn): walk(n)
+        return sorted(out)
+    proves('math-and-utility.fmath-constant')
+    assert math_calls('UseMath') == ['Add_IntInt', 'Max'], math_calls('UseMath')
+    # An inline constexpr function is 9 for SqI(3) and expanded for SqI(V); a constexpr method called on this is a call.
+    proves('constexpr-and-consteval.inline-constexpr-int32-sq-int32', 'constexpr-and-consteval.constexpr-int32-sqm-int32-x')
+    assert ints['Nine'] == 9 and math_calls('UseSq') == ['Add_IntInt', 'Multiply_IntInt'], math_calls('UseSq')
+    assert calls_in(base, 'UseSq') == [('SqM', 0x45)] and run(base, 'UseSq', V=5)[0] == 34, calls_in(base, 'UseSq')
+    check('ConstexprFold', 'UseMath', lambda V: 9 + max(V, 0), [dict(V=v) for v in (-4, 0, 5)])
+    print('ok  ConstexprFold: in code a constant call is its answer, and the same function with a run-time argument a call')
+
+
+constexpr_fold()
+
+
 def template_instances():
     """TemplateInst: a template without inline is compiled once per instantiation, named by its arguments
     (REFERENCE.md#templates.instance-names): a free one is a function of BPL_TemplateInst, a static member one a static
@@ -17156,6 +17216,8 @@ ROW_INTRIN = '#include "%s"\n' % os.path.join(AG, 'include', 'Intrin.h').replace
 ROW_IAIM = 'class IAimable {\npublic:\n  UE_INTERFACE;\n  void Aim();\n};\n'
 ROW_IMARK = 'class IMarkable {\npublic:\n  UE_INTERFACE;\n  int32 Marks = 0;\n  void Mark();\n};\n'
 ROW_FNV = 'consteval int32 Fnv(int32 X) { return (X * 31 + 7) % 1000003; }\n'
+ROW_TWICE = 'constexpr int32 Twice(int32 X) { return X * 2; }\n'
+ROW_FMATH = '#include "%s"\n' % os.path.join(AG, 'include', 'FMath.h').replace('\\', '/')
 ROW_REFUSALS = [
     ('the-mod-package.ue-mod-package', 'NoPkg', '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nclass NoPkg : public AActor {\npublic:\n  int32 X;\n};\n',
      'the source declares no UE_MOD_PACKAGE', ''),
@@ -17191,12 +17253,18 @@ ROW_REFUSALS = [
      'a default is a value known when the mod is built', ''),
     ('copies-and-braced.tarray-int32-rolls', 'RollDef2', '  TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};\n',
      'a default is a value known when the mod is built', ''),
-    ('consteval-functions.int32-seed-fnv-types', 'FnvDef', '  int32 Seed = Fnv(3);\n', 'a default is a value known when the mod is built', ROW_FNV),
     ('consteval-functions.fnv-name', 'FnvRun', '  int32 F(int32 N) { return Fnv(N); }\n', 'is not a constant expression', ROW_FNV),
-    ('consteval-functions.int32-v-twice-3', 'TwiceDef', '  int32 V = Twice(3);\n', 'a default is a value known when the mod is built',
-     'constexpr int32 Twice(int32 X) { return X * 2; }\n'),
-    ('constexpr-and-consteval.int32-k-sq-3', 'SqDef', '  int32 K = Sq(3);\n', 'a default is a value known when the mod is built',
-     'constexpr int32 Sq(int32 X) { return X * X; }\n'),
+    ('constexpr-and-consteval.runtime-only', 'CxRandom', '  int32 R = UKismetMathLibrary::RandomInteger(3);\n',
+     '(`RandomInteger` is not constexpr, so it runs only in the game)', ''),
+    ('constexpr-and-consteval.runtime-only', 'CxFRand', '  int32 R = FMath::RandRange(1, 6);\n',
+     '(`RandRange` is not constexpr, so it runs only in the game)', ROW_FMATH),
+    ('constexpr-and-consteval.not-a-constant', 'CxArg', '  int32 A = 1;\n  int32 C = Twice(A);\n',
+     '(argument 1 (`A`) of `Twice` is not a constant)', ROW_TWICE),
+    ('constexpr-and-consteval.clang-cannot', 'CxBad', '  int32 B = Bad(2);\n',
+     "(clang could not run `Bad` when the mod is built: non-constexpr function 'NotC' cannot be used in a constant expression (CxBad.cpp:",
+     'int32 NotC(int32 X) { return X; }\nconstexpr int32 Bad(int32 X) { return NotC(X); }\n'),
+    ('constexpr-and-consteval.clang-cannot', 'CxOver', '  int32 O = Twice(0x7FFFFFFF);\n',
+     "(clang could not run `Twice` when the mod is built: value 4294967294 is outside the range of representable values", ROW_TWICE),
     ('inline-class-variables.khold-1-0f', 'ConstAssign', '  static inline const float kHold = 1.0f;\n  void F() { kHold = 2.0f; }\n',
      "cannot assign to variable 'kHold' with const-qualified type", ''),
     ('game-enums.ecreaturesize-size', 'EnumU32', '  ECreatureSize Size;\n', 'a uint8, int32 or int64 enum only', ''),
@@ -17355,8 +17423,8 @@ def row_refusals():
 proves('arithmetic.id-count', 'binding-handlers.onhit-isbound', 'blueprint-classes.class-x-public-anotincluded',
        'casts-and-class.a-b', 'classof.classof-obj-field', 'comparing-and-testing.a-b-3', 'comparisons.a-b',
        'components-a-parent.controller-battachtopawn-true', 'constants-and-constant.tarray-int32-rolls',
-       'consteval-functions.fnv-name', 'consteval-functions.int32-seed-fnv-types',
-       'consteval-functions.int32-v-twice-3', 'constexpr-and-consteval.int32-k-sq-3',
+       'consteval-functions.fnv-name', 'constexpr-and-consteval.runtime-only', 'constexpr-and-consteval.not-a-constant',
+       'constexpr-and-consteval.clang-cannot',
        'constructors.lantern-charges-max-1', 'container-methods.getitems-add-3', 'container-methods.items-empty',
        'container-methods.seen-0', 'converting-strings.fname-n-big', 'copies-and-braced.tarray-int32-rolls',
        'declaring-a-dispatcher.tmulticastinlinedelegate-void',

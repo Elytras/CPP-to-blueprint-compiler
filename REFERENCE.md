@@ -429,7 +429,8 @@ public:
 | <a id="defaults.int32-hits-0"></a>`int32 Hits = 0;`, `int32 Hits;` | A zero default writes nothing, as the engine cooks it, and the variable starts at zero. The same holds for the zero enumerator, `nullptr` and an empty string. | Yes |
 | <a id="defaults.int32-hits"></a>`int32 Hits{};`, `EMood Mood = EMood();`, `int32 Budget{25};` | `{}` and `T()` are the zero, and write nothing; braces around one value are that value. | Yes |
 | <a id="defaults.int32-x-ukismetmathlibrary"></a>`int32 X = UKismetMathLibrary::RandomInteger(5);` | Refused: "a default is a value known when the mod is built". Set such a value in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
-| <a id="defaults.static-constexpr-int32-kseed-fnv"></a>`static constexpr int32 kSeed = Fnv("types");` then `int32 Seed = kSeed;` | A call counts as a default only through a `consteval` function, which clang runs itself. A call to a plain `constexpr` function is refused like any call. See [Constants](#constants). | Yes |
+| <a id="defaults.static-constexpr-int32-kseed-fnv"></a>`static constexpr int32 kSeed = Fnv("types");` then `int32 Seed = kSeed;` | A constant made by a call is a default like any constant. See [Constants](#constants). | Yes |
+| <a id="defaults.call-constexpr"></a>`int32 Slots = Twice(3);`, `int32 Seed = Fnv("types");` | A call of a `constexpr` or `consteval` function with constant arguments is a default: clang works it out when the mod is built, and its answer is cooked. A call it cannot work out is refused, naming why: [constexpr and consteval functions](#constexpr-and-consteval-functions). | Yes |
 | <a id="defaults.tsubclassof-aactor-kind-aactor"></a>`TSubclassOf<AActor> Kind = AActor::StaticClass();`, `UClass *Any = AMyEnemy::StaticClass();` | The class is the default, as picking it under Class Defaults makes it: an engine or game class, a game Blueprint, or one of the mod's own classes, this one included. The same holds in a container's braces, a struct value, a `UE_DEFAULTS` statement and an asset's braces. `= nullptr` is the zero. | Yes |
 | <a id="defaults.tsubclassof-apawn-kind-aactor"></a>`TSubclassOf<APawn> Kind = AActor::StaticClass();` | Refused: "a TSubclassOf<APawn> holds APawn or a subclass of it, and AActor is neither". C++ converts any class to a `TSubclassOf`, but the editor's class picker offers only those. | Refused |
 | <a id="defaults.tsoftclassptr-aactor-soft-game-a"></a>`TSoftClassPtr<AActor> Soft = "/Game/A/BP_A.BP_A_C";` | A soft reference's default is its path. `"/Game/Dir/Pkg"` means `Pkg.Pkg`, so write the full path for a Blueprint class. See [Types](#types). | Yes |
@@ -458,8 +459,8 @@ int32 Hits = 0;                           // writes nothing
 
 Notes:
 
-- An initializer can be a literal; a constant expression over literals, enum constants and `constexpr` variables; an
-  enum constant, which is written by name; `nullptr`; a braced or constructed struct; a braced list for a container; or
+- An initializer can be a literal; a constant expression over literals, enum constants and `constexpr` variables; a
+  call of a `constexpr` or `consteval` function with constant arguments; an enum constant, which is written by name; `nullptr`; a braced or constructed struct; a braced list for a container; or
   `&Asset`, which points an object member at an asset (see [Data assets](#data-assets) and
   [Game assets](#game-assets)). How constants fold is in [Constants](#constants).
 - In `UE_DEFAULTS`, in a struct's member defaults and in a braced asset, an explicit zero is written, because there the
@@ -866,9 +867,10 @@ FString Line(FName Key, int32 Hits) { return Format("{Name}: {Hits} hits", Key, 
 
 This section covers constants, `consteval` functions and inline class variables. A constant has no storage in a
 Blueprint. Each use of it is its value, worked out when the mod is built, and a member default computed from constants
-is folded the same way. The rule to remember: build-time evaluation covers constants, constant expressions and
-`consteval` calls, and a default reaches a `consteval` call only through a constant. A plain `constexpr` function call
-is not run at build time.
+is folded the same way. The rule to remember: build-time evaluation covers constants, constant expressions, and calls
+of `constexpr` and `consteval` functions with constant arguments, which clang runs while it compiles the mod. A
+`constexpr` call with a run-time argument is an ordinary call in the game: [constexpr and consteval
+functions](#constexpr-and-consteval-functions).
 
 ### Constants and constant expressions
 
@@ -880,7 +882,7 @@ is not run at build time.
 | <a id="constants-and-constant.int32-budget-kslots-2-1"></a>`int32 Budget = kSlots * 2 + 1;` | A default from a constant expression is folded when the mod is built. Each step is rounded to its C++ type: `1 / 2.f` is 0.5 and `1 << 31` wraps. | Yes |
 | <a id="constants-and-constant.bool-ready-kstep-2-kstep"></a>`bool Ready = kStep > 2 && kStep < 10;` | Comparisons, `&&`, `\|\|` and `?:` fold too, as do casts, enum constants and unary `-`, `~` and `!`. | Yes |
 | <a id="constants-and-constant.int32-counter-5"></a>`int32 Counter = 5;` at namespace scope | Not a constant: a variable every class of the mod shares. See [Global variables](#global-variables). | Yes |
-| <a id="constants-and-constant.tarray-int32-rolls"></a>`TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};` | Refused (`a default is a value known when the mod is built`): a default cannot call a function. Compute it in `ReceiveBeginPlay`. See [Classes and variables](#classes-and-variables). | Refused |
+| <a id="constants-and-constant.tarray-int32-rolls"></a>`TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};` | Refused (`a default is a value known when the mod is built`): a default cannot call a function that runs only in the game. Compute it in `ReceiveBeginPlay`. See [Classes and variables](#classes-and-variables). | Refused |
 | <a id="constants-and-constant.sizeof-fvector"></a>`sizeof(FVector)`, `alignof(FTransform)` in code | The game's layout: [Pointers and memory](#pointers-and-memory). Refused in a default. | Yes |
 
 Notes:
@@ -932,10 +934,10 @@ Notes:
 |---|---|---|
 | <a id="consteval-functions.static-constexpr-int32-kseed-fnv"></a>`static constexpr int32 kSeed = Fnv("types");` | clang runs a `consteval` function while it compiles the mod, and AssetGen uses the result. The body can be any C++: loops, `uint32` math, pointers. | Yes |
 | <a id="consteval-functions.int32-seed-kseed"></a>`int32 Seed = kSeed;` | The result as a default, through the constant. | Yes |
-| <a id="consteval-functions.int32-seed-fnv-types"></a>`int32 Seed = Fnv("types");` | Refused (`a default is a value known when the mod is built`): a call in a default counts only through a constant, `constexpr int32 kSeed = Fnv("types");`. | Refused |
+| <a id="consteval-functions.int32-seed-fnv-types"></a>`int32 Seed = Fnv("types");` | The result as a default, written straight. | Yes |
 | <a id="consteval-functions.return-n-fnv-angry"></a>`return N + Fnv("angry");` | The result as a constant in code. | Yes |
 | <a id="consteval-functions.fnv-name"></a>`Fnv(Name)` with a run-time argument | Refused by clang (`call to consteval function ... is not a constant expression`). The arguments must be constants. | Refused |
-| <a id="consteval-functions.int32-v-twice-3"></a>`int32 V = Twice(3);` with a `constexpr` (not `consteval`) `Twice` | Refused with the default rule's message, which points at `consteval`. A plain `constexpr` call is not evaluated at build time, in a default or in code: [Inline functions and templates](#inline-functions-and-templates). | Refused |
+| <a id="consteval-functions.int32-v-twice-3"></a>`int32 V = Twice(3);` with a `constexpr` (not `consteval`) `Twice` | 6, worked out when the mod is built, as a `consteval` call is. Unlike a `consteval` function, `Twice(N)` with a run-time `N` is allowed: it is a call in the game. See [constexpr and consteval functions](#constexpr-and-consteval-functions). | Yes |
 
 ```cpp
 constexpr int32 kStep = 3;
@@ -2104,7 +2106,7 @@ int32 Budget(int32 N) { return N * kStep + kSlots * 2 + (1 << 4 | kStep); }
 ```
 
 Note: a constant is a literal, an enumerator, a constexpr, const or static constexpr variable, a consteval result, a
-constant argument of an inlined call, or a const local that nothing writes. [Constants](#constants) says how to
+constexpr call with constant arguments, a constant argument of an inlined call, or a const local that nothing writes. [Constants](#constants) says how to
 declare them.
 
 ### Constant locals and branches
@@ -2696,6 +2698,7 @@ Notes:
 | <a id="math-and-utility.a-b"></a>`A + B`, `A < B`, `Dir * 2.0f` | Operators on numbers and vectors need no written call: they become the math library's operator functions; see [Operators](#operators). | Yes |
 | <a id="math-and-utility.s-x"></a>`S == "x"` on an FString | Ignores case, as FString's `==` does in UE C++; see [Strings and text](#strings-and-text). | Yes |
 | <a id="math-and-utility.fmath-h"></a>`FMath::Clamp(V, 0, 10)`, `FMath::Max(A, B)`, `FMath::Abs(X)` with `#include "../include/FMath.h"` | UE C++'s spellings from `AssetGen/include/FMath.h`. Each is an inline function whose body is the math node for its argument type: `FMath::Max` is Max for int32, MaxInt64 for int64 and FMax for float, as UE's template picks the arithmetic. Two arguments of different types are ambiguous, as they are a deduction error in UE. The header has Max, Min, Clamp, Abs, Sign, Square, Sqrt, Pow, Exp, Loge, Fmod (Percent_FloatFloat), Frac, FloorToInt, CeilToInt, RoundToInt, TruncToInt, the trigonometry, DegreesToRadians, RadiansToDegrees, Lerp, IsNearlyEqual, RandRange, FRandRange, FRand and RandHelper. | Yes |
+| <a id="math-and-utility.fmath-constant"></a>`int32 Capped = FMath::Clamp(70, 0, 50);`, `FMath::FloorToInt(-2.5f)`, `FMath::Max(3, 9) + FMath::Max(V, 0)` | 50 and -3 when the mod is built, as UE's FMath computes them; the last is 9 plus the Max node for V. FMath.h's exact functions are `constexpr` with a build-time branch: see [constexpr and consteval functions](#constexpr-and-consteval-functions). Sqrt, Pow, the trigonometry and Lerp always run in the game, so a float result is the engine's to the last bit; the random ones too. | Yes |
 | <a id="math-and-utility.fmath-clamp-v-0-10"></a>`FMath::Clamp(V, 0, 10)` without FMath.h | clang error `use of undeclared identifier 'FMath'`: the engine's FMath is not part of the reflected API, so UeApi does not declare it. | Refused |
 | <a id="math-and-utility.std-min-a-b"></a>`std::sqrt(X)`, `__builtin_sqrtf(X)` | Refused, even with `#include <cmath>` (`call to an unknown function`): they are C runtime functions with no body for AssetGen to read. Use UKismetMathLibrary, or write the helper as an inline function. | Refused |
 | <a id="math-and-utility.std-min-a-b-2"></a>`std::min(A, B)` with `#include <algorithm>` | Compiles. A function template from a header is an ordinary function of the source: it is cooked as a static of the source's function library (`BPL_<Mod>::std__min__int32`) and the call goes to it. Warns "returns const int&: a Blueprint function returns a copy". The answer is right; a caller that keeps the reference does not see a later change. Prefer `UKismetMathLibrary::Min`. | Warns |
@@ -2721,8 +2724,8 @@ Notes:
 - On Windows clang finds the MSVC headers, so `#include <cmath>` parses and only the call is refused. On Linux a mod can
   include only `<initializer_list>`, `<type_traits>` and `<cstddef>`, AssetGen's stand-ins for what MSVC's
   `<initializer_list>` declares (the basic traits such as `std::is_same_v`, and `std::size_t`).
-- For math on constants, a `consteval` function runs at build time and only its answer reaches the Blueprint; see
-  [Constants](#constants).
+- For math on constants, a `constexpr` or `consteval` function called with constant arguments runs at build time and
+  only its answer reaches the Blueprint; see [constexpr and consteval functions](#constexpr-and-consteval-functions).
 
 ### Messages on screen
 
@@ -3025,23 +3028,54 @@ Notes:
 
 ### constexpr and consteval functions
 
+A function marked `constexpr` serves both uses. Called with constant arguments, clang works the call out while it
+compiles the mod and only the answer is cooked: in a default, in a constructor, in code. Called with a run-time
+argument, it is an ordinary call of the function's Blueprint body. A `consteval` function has only the first use.
+
 | You write | What it does | Status |
 |---|---|---|
-| <a id="constexpr-and-consteval.constexpr-int32-sqm-int32-x"></a>`constexpr int32 SqM(int32 X) const` in a class | An ordinary Blueprint function that runs in the game; `constexpr` changes nothing. Mark it `inline` to expand it at calls, or `consteval` to run it at build time. | Yes |
-| <a id="constexpr-and-consteval.inline-constexpr-int32-sq-int32"></a>`inline constexpr int32 Sq(int32 X)` at namespace scope | Expanded like any inline function and computed in the game. | Yes |
-| <a id="constexpr-and-consteval.constexpr-int32-sq-int32-x"></a>`constexpr int32 Sq(int32 X)` at namespace scope, without `inline` | A Blueprint function of the source's library, computed in the game like any [free function](#free-functions): AssetGen does not run a plain constexpr call at build time. Use `consteval` for that. | Yes |
+| <a id="constexpr-and-consteval.constexpr-int32-sqm-int32-x"></a>`constexpr int32 SqM(int32 X) const` in a class | An ordinary Blueprint function that runs in the game; `constexpr` changes nothing, since a call on an object is never worked out at build time. Mark it `static` to have constant calls worked out, `inline` to expand it at calls, or `consteval` to run it at build time only. | Yes |
+| <a id="constexpr-and-consteval.inline-constexpr-int32-sq-int32"></a>`inline constexpr int32 Sq(int32 X)` at namespace scope | `Sq(3)` is 9 when the mod is built; `Sq(V)` is expanded like any inline function and computed in the game. | Yes |
+| <a id="constexpr-and-consteval.constexpr-int32-sq-int32-x"></a>`constexpr int32 Sq(int32 X)` at namespace scope, without `inline`, then `Sq(V)` | A Blueprint function of the source's library, computed in the game like any [free function](#free-functions). The library holds it only if some call is left to run in the game. | Yes |
+| <a id="constexpr-and-consteval.in-code"></a>`return Twice(21) + Tri(4);` in a function | The constant 52: no call is left in the bytecode. | Yes |
+| <a id="constexpr-and-consteval.loop"></a>`constexpr int32 Tri(int32 N)` with a loop, then `int32 Summed = Tri(10);` | 55. The body can be any C++ clang runs at compile time, as a `consteval` body can: loops, locals, `uint32` math, a string walked through a pointer (`Len("seven")`). | Yes |
+| <a id="constexpr-and-consteval.int32-k-sq-3"></a>`int32 K = Sq(3);` as a member initializer, with a plain constexpr `Sq` | 9, written into Class Defaults. A `consteval` `Sq` works the same way. | Yes |
+| <a id="constexpr-and-consteval.default-args"></a>`int32 Scaled = Calc::Scale(4);` with `constexpr int32 Scale(int32 X, int32 By = 3)` | 12: a default argument is used as C++ uses it. | Yes |
+| <a id="constexpr-and-consteval.static-method"></a>`static constexpr int32 Plus(int32 A, int32 B)` in the class, then `int32 S = Plus(2, kSeven);` | 9. A static method works as a free function does. | Yes |
+| <a id="constexpr-and-consteval.template"></a>`Times<int64, 3>(5)` with `template <class T, int32 K> constexpr T Times(T X)`, `Neg(1.5f)` of a static member template, `TBox<int32>::Twice(4)` of a class template | 15, -1.5 and 8: a template's instantiation is worked out like any function. | Yes |
+| <a id="constexpr-and-consteval.nested"></a>`Built = Twice(Tri(3));` in the constructor, `constexpr int32 kSeven = Twice(3) + 1;` | 12 and 7: an argument may be another call's answer, or a constant made by one. | Yes |
+| <a id="constexpr-and-consteval.runtime-only"></a>`int32 R = UKismetMathLibrary::RandomInteger(3);`, `FMath::RandRange(1, 6)` as a default | Refused, naming the function ("is not constexpr, so it runs only in the game"). An engine function is never worked out at build time. In code the call stays a call. | Refused |
+| <a id="constexpr-and-consteval.not-a-constant"></a>`int32 C = Twice(A);` as a default, where `A` is a member | Refused, naming the argument: `argument 1 (A) of Twice` ("is not a constant"). In code, `Twice(A)` is a call. | Refused |
+| <a id="constexpr-and-consteval.clang-cannot"></a>`int32 B = Bad(2);` where Bad calls a function that is not constexpr, `Twice(0x7FFFFFFF)` | Refused with clang's reason and the line it stopped at ("clang could not run"): for Bad, `non-constexpr function 'NotC' cannot be used in a constant expression (Mod.cpp:6)`; for the overflow, `value 4294967294 is outside the range of representable values of type 'int'`. In code the call stays a call, and computes in the game. | Refused |
 | <a id="constexpr-and-consteval.consteval-int32-fnv-const-char"></a>`consteval int32 Fnv(const char *S)` | clang runs the call while compiling, and only the answer reaches the Blueprint; see [Constants](#constants). | Yes |
-| <a id="constexpr-and-consteval.int32-k-sq-3"></a>`int32 K = Sq(3);` as a member initializer, with a plain constexpr `Sq` | Refused (`a default is a value known when the mod is built`), and so is a consteval `Sq` called there directly. A default reaches a function call only through a constant: `static constexpr int32 kSq = Sq(3);` with `Sq` a consteval function at namespace scope, then `int32 K = kSq;`. See [Constants](#constants). | Refused |
 
 ```cpp
-inline constexpr int32 Sq(int32 X) { return X * X; }   // expanded, computed in the game
+inline constexpr int32 Sq(int32 X) { return X * X; }   // Sq(3) is 9; Sq(V) is expanded, computed in the game
+constexpr int32 Twice(int32 X) { return X * 2; }       // Twice(V) calls BPL_<Mod>::Twice
 
 class AMyActor : public AActor {
 public:
+  int32 Slots = Twice(3);                                // 6 in Class Defaults
   constexpr int32 SqM(int32 X) const { return X * X; }   // a Blueprint function
-  int32 Use(int32 V) { return Sq(V) + SqM(V); }
+  int32 Use(int32 V) { return Sq(V) + SqM(V) + Twice(V) + Twice(21); }   // ... + 42
 };
 ```
+
+Notes:
+
+- What is worked out is a call whose callee is a `constexpr` or `consteval` free function, static method, or a
+  template's instantiation, whose arguments are each a constant (a literal, a constant, an enumerator, a string
+  literal, another such call), and whose result is a number, a bool or an enum. Everything else in code is an ordinary
+  call, which is always correct; only a default, which has to be a value, is refused.
+- An engine or game function (UeApi) is run-time only. FMath.h's exact functions (Max, Min, Clamp, Abs, Sign, Square,
+  FloorToInt, CeilToInt, RoundToInt, TruncToInt, IsNearlyEqual) are `constexpr` with a build-time branch, so a constant
+  call of one is worked out too: [Math and utility functions](#math-and-utility-functions).
+- `__builtin_is_constant_evaluated()` (and `std::is_constant_evaluated()`) is true while clang works a call out and
+  false in the game. A `constexpr` function of the mod's can use it, as FMath.h does, to give clang plain C++ and the
+  game an engine call: `return __builtin_is_constant_evaluated() ? (A >= B ? A : B) : UKismetMathLibrary::Max(A, B);`.
+  The branch only clang takes is not compiled, in a UE_NO_OPTIMIZE function too.
+- Each source with such calls costs one more clang run over a small file that includes it (two when a call's
+  argument is another call's answer).
 
 ## Components
 
@@ -6611,15 +6645,16 @@ and where the feature is described. In each group, the messages you are most lik
   for example a file that holds only inline helper functions. Fix: declare a class that derives from a UE class, a
   UE_STRUCT or a UE_ENUM in it. A file of shared helpers belongs in a header that the mod's sources include, not in the
   mod's `sources` list in `mods.yaml`. See [Mod sources and packages](#mod-sources-and-packages).
-- `` <Member>: a default is a value known when the mod is built - a literal, a constant expression over literals, enum
-  constants and constexpr variables, a braced struct, an &Asset or a class, X::StaticClass(). A function call counts
-  only through `constexpr T k = F();` with F consteval, which clang runs itself. Anything computed when the game runs
-  belongs in ReceiveBeginPlay or UserConstructionScript ``: a member's initializer that AssetGen cannot work out when
-  it builds the mod: a call such as `int32 Roll = UKismetMathLibrary::RandomInteger(3);`, a call to a plain
-  `constexpr` function, `sizeof`, or a class read off an object, `GetClass()`. A value in UE_DEFAULTS gets the same
-  message. Fix: use a literal or a constant expression, compute a constant with a `consteval` function through a
-  `constexpr` variable, or set the value in ReceiveBeginPlay or UserConstructionScript. See
-  [Classes and variables](#classes-and-variables).
+- `` <Member>: a default is a value known when the mod is built (<why>) - a literal, a constant expression over
+  literals, enum constants and constexpr variables, a call of a constexpr or consteval function with constant
+  arguments, a braced struct, an &Asset or a class, X::StaticClass(). Anything computed when the game runs belongs in
+  ReceiveBeginPlay or UserConstructionScript ``: a member's initializer that AssetGen cannot work out when it builds
+  the mod: a call such as `int32 Roll = UKismetMathLibrary::RandomInteger(3);`, a `constexpr` call with an argument
+  that is not a constant, `sizeof`, or a class read off an object, `GetClass()`. For a call, `<why>` names the function
+  that runs only in the game, the argument that is not a constant, or the reason clang gave for not running it. A
+  value in UE_DEFAULTS gets the same message. Fix: use a literal, a constant expression or a `constexpr` call with
+  constant arguments, or set the value in ReceiveBeginPlay or UserConstructionScript. See
+  [constexpr and consteval functions](#constexpr-and-consteval-functions).
 - `<Member>: a TSubclassOf<<Class>> holds <Class> or a subclass of it, and <Other> is neither`: a class as the default
   of a `TSubclassOf` that does not take it, `TSubclassOf<APawn> Kind = AActor::StaticClass();`. C++ converts any class
   to a `TSubclassOf`, but the editor's class picker offers only those. Fix: name a class the member takes, or widen the
