@@ -5,7 +5,7 @@
 /* An Anim Blueprint: its anim nodes are members, wired in the constructor, their dynamic inputs written in
    BlueprintUpdateAnimation. A state machine of two states (one a blend space, one named apart from its node) and a
    conduit, cached and read back, a blend by bool, an additive, a layered blend per bone, a bone turned in component
-   space and a slot, then the output pose; and an actor whose mesh plays it. */
+   space, its limbs simulated on a physics asset, and a slot, then the output pose; and an actor whose mesh plays it. */
 UE_MOD_PACKAGE("/Game/_ElytrasMods/AnimBlueprint");
 
 UE_ASSET_AT(UAnimSequence, Anim_Idle, "/Game/_MyMods/Critter/Animations/ANIM_Critter_Idle");
@@ -14,6 +14,7 @@ UE_ASSET_AT(UAnimSequence, Anim_Lean, "/Game/_MyMods/Critter/Animations/ANIM_Cri
 UE_ASSET_AT(UAnimSequence, Anim_Bite, "/Game/_MyMods/Critter/Animations/ANIM_Critter_Bite");
 UE_ASSET_AT(UBlendSpace1D, BS_Move, "/Game/_MyMods/Critter/Animations/BS_Critter_Move");
 UE_ASSET_AT(USkeletalMesh, SK_Critter, "/Game/_MyMods/Critter/SK_Critter");
+UE_ASSET_AT(UPhysicsAsset, PA_Critter_Sim, "/Game/_MyMods/Critter/PA_Critter_Sim");
 
 class ABP_Critter : public UAnimInstance {
 public:
@@ -44,6 +45,7 @@ public:
     FAnimNode_LayeredBoneBlend Upper;
     FAnimNode_ConvertLocalToComponentSpace ToCs;
     FAnimNode_ModifyBone Tilt;
+    FAnimNode_RigidBody Physics;
     FAnimNode_ConvertComponentToLocalSpace ToLocal;
     FAnimNode_Slot Slot;
     FAnimNode_Root Output;
@@ -81,7 +83,9 @@ public:
         Tilt.ComponentPose = UE_LINK_CS(ToCs);
         Tilt.BoneToModify.BoneName = FName("spine_01");
         Tilt.RotationMode = EBoneModificationMode::BMM_Additive;
-        ToLocal.ComponentPose = UE_LINK_CS(Tilt);
+        Physics.ComponentPose = UE_LINK_CS(Tilt);
+        Physics.OverridePhysicsAsset = &PA_Critter_Sim;
+        ToLocal.ComponentPose = UE_LINK_CS(Physics);
         Slot.Source = UE_LINK(ToLocal);
         Output.Result = UE_LINK(Slot);
     }
@@ -92,6 +96,7 @@ public:
         HurtBlend.bActiveValue = bHurt;
         Pick.bCanEnterTransition = bMoving;
         Tilt.Rotation = FRotator(TiltPitch, 0.0f, 0.0f);
+        Physics.ExternalForce = FVector(0.0f, 0.0f, -Speed);
     }
 };
 

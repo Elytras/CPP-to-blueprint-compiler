@@ -5785,9 +5785,12 @@ def anim_blueprints():
     keeps_invariants(os.path.join(folder, 'AnimBlueprint'))
     p = invariants.Package(base)
     cls = p.find('ABP_Critter_C')
-    nodes = ['Idle', 'Move', 'IdleState', 'MoveState', 'ToMove', 'ToIdle', 'Pick', 'ToPick', 'PickToMove', 'Locomotion',
-             'LocoCache', 'UseLoco', 'Hurt', 'HurtBlend', 'Lean', 'Leaning', 'Bite', 'Upper', 'ToCs', 'Tilt', 'ToLocal',
-             'Slot', 'Output']
+    # The nodes in the class's property order, the one the engine numbers them by: declaration order, but the rigid
+    # body (16-byte aligned) first, as the class lays out its members by alignment.
+    nodes = ['Physics', 'Idle', 'Move', 'IdleState', 'MoveState', 'ToMove', 'ToIdle', 'Pick', 'ToPick', 'PickToMove',
+             'Locomotion', 'LocoCache', 'UseLoco', 'Hurt', 'HurtBlend', 'Lean', 'Leaning', 'Bite', 'Upper', 'ToCs', 'Tilt',
+             'ToLocal', 'Slot', 'Output']
+    assert [str(n.name) for n in p.struct(cls).props if str(n.name) in nodes] == nodes, p.struct(cls).props
     fwd, rev = nodes.index, lambda n: len(nodes) - 1 - nodes.index(n)
     proves('anim-blueprints.ue-skeleton')
     assert p.class_of(cls + 1) == 'AnimBlueprintGeneratedClass', p.class_of(cls + 1)
@@ -5813,8 +5816,11 @@ def anim_blueprints():
     assert (link(cdo['Upper']['BasePose']), [link(l) for l in cdo['Upper']['BlendPoses']]) == (fwd('Leaning'), [fwd('Bite')])
     assert link(cdo['Slot']['Source']) == fwd('ToLocal')
     proves('anim-blueprints.ue-link-cs')
-    assert (link(cdo['ToCs']['LocalPose']), link(cdo['Tilt']['ComponentPose']), link(cdo['ToLocal']['ComponentPose'])) ==         (fwd('Upper'), fwd('ToCs'), fwd('Tilt')), (cdo['ToCs'], cdo['Tilt'], cdo['ToLocal'])
+    assert (link(cdo['ToCs']['LocalPose']), link(cdo['Tilt']['ComponentPose']), link(cdo['ToLocal']['ComponentPose'])) ==         (fwd('Upper'), fwd('ToCs'), fwd('Physics')), (cdo['ToCs'], cdo['Tilt'], cdo['ToLocal'])
     assert cdo['Tilt']['BoneToModify'] == {'BoneName': 'spine_01'} and cdo['Tilt']['RotationMode'] == 'BMM_Additive', cdo['Tilt']
+    proves('anim-blueprints.fanimnode-rigidbody')
+    assert cdo['Physics'] == {'ComponentPose': {'LinkID': fwd('Tilt')},
+                              'OverridePhysicsAsset': '/Game/_MyMods/Critter/PA_Critter_Sim.PA_Critter_Sim'}, cdo['Physics']
     proves('anim-blueprints.fanimnode-root-output')
     assert cdo['Output'] == {'Result': {'LinkID': fwd('Slot')}, 'Name': 'AnimGraph'}, cdo['Output']   # the root of AnimGraph
     assert cdo['Locomotion'] == {'StateMachineIndexInClass': 0}, cdo['Locomotion']
