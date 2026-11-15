@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include <algorithm>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -301,7 +302,14 @@ public:
        FAnimNode_StateResult variable, its name too; a transition's Rule is an FAnimNode_TransitionResult variable whose
        bCanEnterTransition takes it, or, bAutomatic, the time left in the state's animation. */
     struct FAnimTransition { std::string From, To, Rule; float Crossfade = 0.2f; bool bAutomatic = false; };
-    struct FStateMachine { std::string Node; std::vector<std::string> States; std::vector<FAnimTransition> Transitions; };
+    struct FStateMachine
+    {
+        std::string Node;
+        std::vector<std::string> States;            // each state's node: its FAnimNode_StateResult, a conduit's rule
+        std::vector<FAnimTransition> Transitions;
+        std::map<std::string, std::string> Names;   // a state named other than its node (UE_STATE_AS, UE_CONDUIT)
+        std::set<std::string> Conduits;
+    };
     void AddStateMachine(const FStateMachine& Machine) { StateMachines.push_back(Machine); }
 
     /* The actor has a root before this class's SCS runs: a Blueprint parent's SCS leaves one, and a native parent's

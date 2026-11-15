@@ -446,14 +446,15 @@ std::string LayoutHelperCall(const Json& S)
     return Name == "UeSlot__" || Name == "UeBind__" || Name == "UeKeys__" ? Name : std::string();
 }
 
-/* UE_STATE's and UE_TRANSITION's call (UeMeta.h), "UeState__" or "UeTransition__", or "" for any other statement. */
+/* UE_STATE's, UE_CONDUIT's and UE_TRANSITION's call (UeMeta.h), "UeState__", "UeConduit__" or "UeTransition__", or ""
+   for any other statement. */
 std::string AnimHelperCall(const Json& S)
 {
     const Json* N = Strip(&S);
     const Json* Fn = N && Kind(*N) == "CallExpr" ? Strip(First(*N)) : nullptr;
     const std::string Name = Fn && Kind(*Fn) == "DeclRefExpr" ? Fn->value("referencedDecl", Json::object()).value("name", std::string())
                                                                : std::string();
-    return Name == "UeState__" || Name == "UeTransition__" ? Name : std::string();
+    return Name == "UeState__" || Name == "UeConduit__" || Name == "UeTransition__" ? Name : std::string();
 }
 
 /* S39: a statement of a widget class's layout by its shape alone, `Root->AddChildToCanvas(Title)->SetPosition(...);`,
@@ -18645,7 +18646,8 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     /* UE_LINK(Walk): a pose link reading the anim node Walk, a variable of this Anim Blueprint. Its LinkID is Walk's number
        among the class's anim nodes, which FBlueprintClass::Finish knows once the variables are in their final order. */
     if (const Json* Callee = !bNeg && PD.Type == "StructProperty" && K == "CallExpr" ? Strip(First(*Init)) : nullptr;
-        Callee && Kind(*Callee) == "DeclRefExpr" && Name((*Callee)["referencedDecl"]) == "UeLink__")
+        Callee && Kind(*Callee) == "DeclRefExpr"
+        && (Name((*Callee)["referencedDecl"]) == "UeLink__" || Name((*Callee)["referencedDecl"]) == "UeLinkCs__"))
     {
         const Json* Node = Strip(Nth(*Init, 1));
         if (!Node || Kind(*Node) != "MemberExpr" || !First(*Node) || Kind(*Strip(First(*Node))) != "CXXThisExpr"
@@ -22905,18 +22907,20 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     bOk = Layout(S);
                     return;
                 }
-                /* UE_STATE(Machine, State), UE_TRANSITION(Machine, From, To, Rule, Crossfade[, automatic]): each an own anim
-                   node by its member name, which clang has held to its node type (UeMeta.h). */
+                /* UE_STATE(Machine, State[, Name]), UE_CONDUIT(Machine, Rule, Name), UE_TRANSITION(Machine, From, To, Rule,
+                   Crossfade[, automatic]): each an own anim node by its member name, which clang has held to its node type
+                   (UeMeta.h). */
                 if (const std::string Helper = AnimHelperCall(S); !Helper.empty())
                 {
                     const Json* N = Strip(&S);
-                    const bool bState = Helper == "UeState__";
+                    const bool bState = Helper == "UeState__" || Helper == "UeConduit__";
                     auto Own = [&](int32 I) {
                         const Json* E = Strip(Nth(*N, I));
                         return E && Kind(*E) == "MemberExpr" && First(*E) && Kind(*Strip(First(*E))) == "CXXThisExpr"
                                    && OwnerOf(*E) == R.CppName ? Name(*E) : std::string();
                     };
-                    const char* const Form = bState ? "`UE_STATE(Locomotion, Idle)`" : "`UE_TRANSITION(Locomotion, Idle, Walk, ToWalk, 0.2f)`";
+                    const char* const Form = Helper == "UeConduit__" ? "`UE_CONDUIT(Locomotion, NotStaggered, \"Not Staggered\")`"
+                                             : bState ? "`UE_STATE(Locomotion, Idle)`" : "`UE_TRANSITION(Locomotion, Idle, Walk, ToWalk, 0.2f)`";
                     const std::string Machine = Own(1);
                     std::vector<std::string> Args;
                     for (int32 I = 2; I <= (bState ? 2 : 4); ++I) Args.push_back(Own(I));
@@ -22931,6 +22935,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                             if (std::find(O.States.begin(), O.States.end(), Args[0]) != O.States.end())
                             { *Err = Where + ": " + Args[0] + " is a state of " + O.Node + " already; a state's result node is its own"; bOk = false; return; }
                         M->States.push_back(Args[0]);
+                        if (Helper == "UeConduit__") M->Conduits.insert(Args[0]);
+                        std::string Shown;
+                        if (const Json* L = Nth(*N, 3); L && FindLiteral(*L, Shown) && !Shown.empty()) M->Names[Args[0]] = Shown;
                         return;
                     }
                     for (const std::string& St : { Args[0], Args[1] })
@@ -26331,9 +26338,9 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     for (const auto& Entry : Records)
         if (!Entry.second.IsNative() && !Entry.second.bIsStruct && HasWidgetTree(Entry.second))
             GameClassKinds[PackageOf(Entry.second) + "." + ClassOf(Entry.second)] = { "/Script/UMG", "WidgetBlueprintGeneratedClass" };
-    /* And a mod's Anim Blueprint (UE_SKELETON). */
+    /* And a mod's Anim Blueprint (UE_SKELETON), this mod's or another's declared with UE_CLASS_IN. */
     for (const auto& Entry : Records)
-        if (!Entry.second.IsNative() && !Entry.second.bIsStruct && !Entry.second.bIsPatch && !Entry.second.Skeleton.empty())
+        if (!Entry.second.bIsStruct && !Entry.second.bIsPatch && !Entry.second.Skeleton.empty())
             GameClassKinds[PackageOf(Entry.second) + "." + ClassOf(Entry.second)] = { "/Script/Engine", "AnimBlueprintGeneratedClass" };
 
     GAg.Mark("package-name + asset checks");

@@ -757,7 +757,31 @@ void FBlueprintClass::Finish()
         std::map<std::string, std::vector<int32>> Players;
         std::map<std::string, int32> Rev;
         for (const std::string& N : Nodes) Rev[N] = Reversed(N);
-        for (const FStateMachine& M : StateMachines) for (const std::string& S : M.States) Players[S] = PlayersOf(S);
+        for (const FStateMachine& M : StateMachines)
+            for (const std::string& S : M.States) Players[S] = M.Conduits.count(S) ? std::vector<int32>() : PlayersOf(S);
+        /* The cached poses in the order the proxy updates them after the graph (PostGraphUpdate): a saved pose
+           before every saved pose its own source reads, since updating it is what queues theirs. */
+        std::vector<int32> SavedOrder;
+        {
+            std::set<std::string> Done;
+            std::vector<std::string> Post;
+            std::function<void(const std::string&)> Visit = [&](const std::string& Save) {
+                if (!Done.insert(Save).second) return;
+                std::set<std::string> Seen;
+                std::vector<std::string> Todo = Links[Save];
+                while (!Todo.empty())
+                {
+                    const std::string N = Todo.back();
+                    Todo.pop_back();
+                    if (!Seen.insert(N).second) continue;
+                    if (NodeStruct[N] == "AnimNode_SaveCachedPose") { Visit(N); continue; }
+                    for (const std::string& L : Links[N]) Todo.push_back(L);
+                }
+                Post.push_back(Save);
+            };
+            for (const std::string& N : Nodes) if (NodeStruct[N] == "AnimNode_SaveCachedPose") Visit(N);
+            for (auto It = Post.rbegin(); It != Post.rend(); ++It) SavedOrder.push_back(Reversed(*It));
+        }
         const FIndex Skeleton = TargetSkeleton;
         const std::vector<FStateMachine> Machines = StateMachines;
         AnimTags = [=](FArc& Ar) {
@@ -780,7 +804,10 @@ void FBlueprintClass::Finish()
                             FArc States(SV.Owner());
                             for (const std::string& S : M.States)
                             {
-                                Tag(States, "StateName", "NameProperty", [=](FArc& E) { E.Name(S); });
+                                const auto Shown = M.Names.find(S);
+                                const std::string StateName = Shown == M.Names.end() ? S : Shown->second;
+                                const bool bConduit = M.Conduits.count(S) != 0;
+                                Tag(States, "StateName", "NameProperty", [=](FArc& E) { E.Name(StateName); });
                                 Tag(States, "Transitions", "ArrayProperty", [&](FArc& TV) {
                                     FArc Exits(TV.Owner());
                                     int32 Count = 0;
@@ -799,12 +826,12 @@ void FBlueprintClass::Finish()
                                     }
                                     StructArray(TV, "Transitions", "BakedStateExitTransition", Count, Exits);
                                 }, "StructProperty");
-                                Int(States, "StateRootNodeIndex", Reversed(S));
+                                Int(States, "StateRootNodeIndex", bConduit ? -1 : Reversed(S));   // a conduit has no pose
                                 Int(States, "StartNotify", -1);
                                 Int(States, "EndNotify", -1);
                                 Int(States, "FullyBlendedNotify", -1);
-                                TagBool(States, "bIsAConduit", false);
-                                Int(States, "EntryRuleNodeIndex", -1);
+                                TagBool(States, "bIsAConduit", bConduit);
+                                Int(States, "EntryRuleNodeIndex", bConduit ? Reversed(S) : -1);
                                 IntArray(States, "PlayerNodeIndices", Players.at(S));
                                 IntArray(States, "LayerNodeIndices", {});
                                 TagBool(States, "bAlwaysResetOnEntry", false);
@@ -836,6 +863,15 @@ void FBlueprintClass::Finish()
                     StructArray(V, "BakedStateMachines", "BakedAnimationStateMachine", int32(Machines.size()), MachinesAr);
                 }, "StructProperty");
             Tag(Ar, "TargetSkeleton", "ObjectProperty", [=](FArc& V) { V.Idx(Skeleton); });
+            /* Every cooked anim class has the AnimGraph entry, empty without cached poses (ABP_Dice): each update reads
+               it with FindChecked (FAnimInstanceProxy::UpdateAnimationNode_WithRoot), a null read in Shipping. */
+            Tag(Ar, "OrderedSavedPoseIndicesMap", "MapProperty", [=](FArc& M) {
+                M.I32(0);                                   // keys to remove
+                M.I32(1);
+                M.Name("AnimGraph");
+                IntArray(M, "OrderedSavedPoseNodeIndices", SavedOrder);
+                TagEnd(M);
+            }, "NameProperty,StructProperty");
         };
     }
     Class.Serialize = [=](FArc& Ar) {

@@ -5785,8 +5785,9 @@ def anim_blueprints():
     keeps_invariants(os.path.join(folder, 'AnimBlueprint'))
     p = invariants.Package(base)
     cls = p.find('ABP_Critter_C')
-    nodes = ['Idle', 'Move', 'IdleState', 'MoveState', 'ToMove', 'ToIdle', 'Locomotion', 'Hurt', 'HurtBlend', 'Lean',
-             'Leaning', 'Bite', 'Upper', 'Slot', 'Output']
+    nodes = ['Idle', 'Move', 'IdleState', 'MoveState', 'ToMove', 'ToIdle', 'Pick', 'ToPick', 'PickToMove', 'Locomotion',
+             'LocoCache', 'UseLoco', 'Hurt', 'HurtBlend', 'Lean', 'Leaning', 'Bite', 'Upper', 'ToCs', 'Tilt', 'ToLocal',
+             'Slot', 'Output']
     fwd, rev = nodes.index, lambda n: len(nodes) - 1 - nodes.index(n)
     proves('anim-blueprints.ue-skeleton')
     assert p.class_of(cls + 1) == 'AnimBlueprintGeneratedClass', p.class_of(cls + 1)
@@ -5807,27 +5808,46 @@ def anim_blueprints():
     assert cdo['Slot']['slotName'] == 'DefaultSlot', cdo['Slot']
     proves('anim-blueprints.ue-link-idle')
     assert link(cdo['IdleState']['Result']) == fwd('Idle') and link(cdo['MoveState']['Result']) == fwd('Move')
-    assert [link(l) for l in cdo['HurtBlend']['BlendPose']] == [fwd('Locomotion'), fwd('Hurt')], cdo['HurtBlend']
+    assert [link(l) for l in cdo['HurtBlend']['BlendPose']] == [fwd('UseLoco'), fwd('Hurt')], cdo['HurtBlend']
     assert (link(cdo['Leaning']['Base']), link(cdo['Leaning']['Additive'])) == (fwd('HurtBlend'), fwd('Lean'))
     assert (link(cdo['Upper']['BasePose']), [link(l) for l in cdo['Upper']['BlendPoses']]) == (fwd('Leaning'), [fwd('Bite')])
-    assert link(cdo['Slot']['Source']) == fwd('Upper')
+    assert link(cdo['Slot']['Source']) == fwd('ToLocal')
+    proves('anim-blueprints.ue-link-cs')
+    assert (link(cdo['ToCs']['LocalPose']), link(cdo['Tilt']['ComponentPose']), link(cdo['ToLocal']['ComponentPose'])) ==         (fwd('Upper'), fwd('ToCs'), fwd('Tilt')), (cdo['ToCs'], cdo['Tilt'], cdo['ToLocal'])
+    assert cdo['Tilt']['BoneToModify'] == {'BoneName': 'spine_01'} and cdo['Tilt']['RotationMode'] == 'BMM_Additive', cdo['Tilt']
     proves('anim-blueprints.fanimnode-root-output')
     assert cdo['Output'] == {'Result': {'LinkID': fwd('Slot')}, 'Name': 'AnimGraph'}, cdo['Output']   # the root of AnimGraph
     assert cdo['Locomotion'] == {'StateMachineIndexInClass': 0}, cdo['Locomotion']
+    proves('anim-blueprints.fanimnode-savecachedpose')
+    assert cdo['LocoCache'] == {'pose': {'LinkID': fwd('Locomotion')}, 'CachePoseName': 'Loco'}, cdo['LocoCache']
+    assert cdo['UseLoco'] == {'LinkToCachingNode': {'LinkID': fwd('LocoCache')}, 'CachePoseName': 'Loco'}, cdo['UseLoco']
+    # The proxy reads the AnimGraph entry with FindChecked on every update, so it is there with or without cached poses:
+    # 0 keys to remove, 1 pair, AnimGraph -> {OrderedSavedPoseNodeIndices: the saved poses, by reversed index}.
+    [saved] = [t for t in p.tags(cls) if t['name'] == 'OrderedSavedPoseIndicesMap']
+    v = bytes(saved['value'])
+    assert struct.unpack_from('<ii', v) == (0, 1) and p.names[struct.unpack_from('<i', v, 8)[0]] == 'AnimGraph', v.hex()
+    inner = p.tags(cls, saved['at'] + 16)
+    assert [(t['name'], t['inner']) for t in inner] == [('OrderedSavedPoseNodeIndices', 'IntProperty')], inner
+    assert struct.unpack_from('<2i', bytes(inner[0]['value'])) == (1, rev('LocoCache')), bytes(inner[0]['value']).hex()
 
     proves('anim-blueprints.ue-state-locomotion-idlestate')
     [machine] = top['BakedStateMachines']
     assert (machine['MachineName'], machine['InitialState']) == ('Locomotion', 0), machine
-    states = [(s['StateName'], s['StateRootNodeIndex'], s['PlayerNodeIndices'], s['bIsAConduit']) for s in machine['States']]
-    assert states == [('IdleState', rev('IdleState'), [rev('Idle')], False),
-                      ('MoveState', rev('MoveState'), [rev('Move')], False)], states
+    states = [(s['StateName'], s['StateRootNodeIndex'], s['PlayerNodeIndices'], s['bIsAConduit'], s['EntryRuleNodeIndex'])
+              for s in machine['States']]
+    proves('anim-blueprints.ue-state-as', 'anim-blueprints.ue-conduit')
+    assert states == [('IdleState', rev('IdleState'), [rev('Idle')], False, -1),
+                      ('Moving', rev('MoveState'), [rev('Move')], False, -1),
+                      ('Pick Next', -1, [], True, rev('Pick'))], states     # a conduit: no pose, its rule its entry
     proves('anim-blueprints.ue-transition-locomotion')
     exits = [[(t['TransitionIndex'], t['CanTakeDelegateIndex'], t['CustomResultNodeIndex'], t['bDesiredTransitionReturnValue'],
                t['bAutomaticRemainingTimeRule']) for t in s['Transitions']] for s in machine['States']]
-    assert exits == [[(0, rev('ToMove'), -1, True, False)], [(1, rev('ToIdle'), -1, True, True)]], exits
+    assert exits == [[(0, rev('ToMove'), -1, True, False), (2, rev('ToPick'), -1, True, False)],
+                     [(1, rev('ToIdle'), -1, True, True)], [(3, rev('PickToMove'), -1, True, False)]], exits
     between = [(t['PreviousState'], t['NextState'], round(t['CrossfadeDuration'], 3), t['BlendMode'], t['LogicType'])
                for t in machine['Transitions']]
-    assert between == [(0, 1, 0.2, 'HermiteCubic', 'TLT_StandardBlend'), (1, 0, 0.3, 'HermiteCubic', 'TLT_StandardBlend')], between
+    assert between == [(0, 1, 0.2, 'HermiteCubic', 'TLT_StandardBlend'), (1, 0, 0.3, 'HermiteCubic', 'TLT_StandardBlend'),
+                       (0, 2, 0.1, 'HermiteCubic', 'TLT_StandardBlend'), (2, 1, 0.15, 'HermiteCubic', 'TLT_StandardBlend')], between
 
     proves('anim-blueprints.blueprintupdateanimation')
     text = dump('walkscript.py', base, export_index(base, 'BlueprintUpdateAnimation'))
@@ -5839,6 +5859,15 @@ def anim_blueprints():
     actor = tag_values(*(lambda q: (q, q.find('Mesh_GEN_VARIABLE'), q.tags(q.find('Mesh_GEN_VARIABLE'))))(
         invariants.Package(os.path.join(folder, 'AnimBlueprint'))))
     assert actor['AnimClass'] == '/Game/_ElytrasMods/AnimBlueprint/ABP_Critter.ABP_Critter_C', actor
+    proves('anim-blueprints.ue-class-in-other')
+    tmp, out, _ = compile_to('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/AnimUser");\n'
+                             'class ABP_Other : public UAnimInstance {\npublic:\n  UE_CLASS_IN("/Game/_MyMods/Critters");\n'
+                             '  UE_SKELETON("/Game/_MyMods/Critter/SK_Critter_Skeleton");\n};\n'
+                             'class AnimUser : public AActor {\npublic:\n  UE_COMPONENT(USkeletalMeshComponent, Mesh);\n'
+                             '  UE_DEFAULTS { Mesh->AnimClass = ABP_Other::StaticClass(); }\n};\n', 'AnimUser')
+    kinds = dict(import_paths(os.path.join(out, 'AnimUser'), classes=True))
+    assert kinds['/Game/_MyMods/Critters/ABP_Other.ABP_Other_C'] == '/Script/Engine.AnimBlueprintGeneratedClass', kinds
+    shutil.rmtree(tmp)
     print('ok  AnimBlueprint: nodes, links, a baked state machine and its rules, and a mesh that plays it')
 
 
