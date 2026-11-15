@@ -820,6 +820,9 @@ const Json* BracedInit(const Json& Var)
 {
     const Json* I = First(Var);
     if (I && Kind(*I) == "ExprWithCleanups") I = First(*I);
+    /* `T X = {};` of a mod class that declares a constructor: no aggregate, so clang calls the constructor, braced and
+       with no argument. It names no member, as empty braces do; the constructor's values are the class's defaults. */
+    if (I && Kind(*I) == "CXXConstructExpr" && I->value("list", false) && !First(*I)) return I;
     return I && Kind(*I) == "InitListExpr" ? I : nullptr;
 }
 
@@ -18237,7 +18240,8 @@ bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::strin
                "leave the statement out to keep that value"
              : Path + ": `" + SR.CppName + "()` or `{}` holds what the engine's " + SR.CppName + " constructor sets, which "
                "its header does not say, so AssetGen cannot write it over the value already there; leave the statement "
-               "out to keep that value, or give the members in braces, `{.Member = value}`";
+               "out to keep that value, give the members in braces, `{.Member = value}`, or set only the members "
+               "you mean, one statement each (`Value.Member = ...;` in a constructor, UE_DEFAULTS or UE_ASSET_DEFAULTS)";
         return false;
     }
     bZeros = bZeros || bEngine;
@@ -18735,9 +18739,17 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
             {
                 if (!bFreshValue)
                 {
+                    /* A member-path statement writes the given member alone, the rest kept as they are there
+                       (REFERENCE.md#declaring-data-assets.influencerdensitycurve-externalcurve). */
+                    size_t G = 0;
+                    while (G < Args.size() && (IsUnsetInit(*Args[G]) || IsKeepArg(*Args[G]))) ++G;
                     *Err = Name(F) + "." + Name(*Fields[I]) + ", left out of the braces, holds what the engine's "
                          + SR->CppName + " constructor sets, which its header does not say, so AssetGen cannot write it "
-                           "over the value already there; give it in the braces, or leave the statement out to keep that value";
+                           "over the value already there; give it in the braces, "
+                         + (G < Args.size() ? "set only " + Name(*Fields[G]) + " with a statement (`" + Name(F) + "."
+                                              + Name(*Fields[G]) + " = ...;` in a constructor, UE_DEFAULTS or UE_ASSET_DEFAULTS), "
+                                            : std::string())
+                         + "or leave the statement out to keep that value";
                     return false;
                 }
                 continue;

@@ -4052,6 +4052,8 @@ not a C++ value, so point at it with `&`.
 |---|---|---|
 | <a id="declaring-data-assets.umooddef-md-big-health-500"></a>`UMoodDef MD_Big = {.Health = -500.5f, .Title = "Big"};` | An asset of the class, cooked as `<mod package>/MD_Big`. Only the members the braces name are written, and the rest keep the class defaults. A member named with a zero value is still written. | Yes |
 | <a id="declaring-data-assets.umooddef-md-plain"></a>`UMoodDef MD_Plain = {};` | An asset with the class defaults only. | Yes |
+| <a id="declaring-data-assets.class-uceiling-public-udebrispositioning"></a>`class UCeiling : public UDebrisPositioning { public: UCeiling() { MinVerticalAngle = 150.0f; } };` then `UCeiling DP_Ceiling = {};` and `.Positioning = &DP_Ceiling` | An asset of the mod's own child of a game data-asset class whose constructor sets its defaults. A class that declares a constructor is no aggregate, so `= {}` is its only braces: the asset holds the class defaults, and `&` points at it, as for any asset of the mod. | Yes |
+| <a id="declaring-data-assets.influencerdensitycurve-externalcurve"></a>`InfluencerDensityCurve.ExternalCurve = &DIC_DefaultDensity;` in the constructor (or a `UE_ASSET_DEFAULTS` block) | One member of a struct whose UeApi header declares a constructor, so that `{.ExternalCurve = ...}` is a clang error and `FRuntimeFloatCurve(UE_KEEP, &C)` or `FRuntimeFloatCurve({}, &C)` is refused over the game class's value. The statement writes `ExternalCurve` alone, and `EditorCurveData` keeps the value already there, as the cook writes DRG's own positionings. | Yes |
 | <a id="declaring-data-assets.umooddef-md-zero-health"></a>`UMoodDef MD_Zero = {.Health = {}};` | `{}` for a member is its zero, written as `.Health = 0` is. A struct, container or name member's `{}` is written too: zeros, an empty container, None, or a `UE_STRUCT`'s own defaults, not the class default. | Yes |
 | <a id="declaring-data-assets.uhitdef-hd-near-h-hit"></a>`UHitDef HD_Near = {.H = {.Hit = {.Distance = 5.0f}}};` | An asset starts as its class's default object, so braces for a struct member are written over the default object's value, as a `UE_DEFAULTS` statement's are over a parent's. A member they leave out that the engine's constructor sets (`FHitResult`'s FaceIndex) stays unwritten where the default object's value of it is the engine's too. Where the class's own braces or a `UE_DEFAULTS` gave it another value (`H = {.Hit = {.FaceIndex = 3}}`), or the class is a game or engine class, whose value no header says, it is refused, naming the member. | Yes |
 | <a id="declaring-data-assets.uenemydescriptor-ed-mine"></a>`UEnemyDescriptor ED_Mine = {.SpawnSpread = 250.0f, .IdealSpawnSize = 4};` | An asset of a game or engine class. | Yes |
@@ -7283,8 +7285,8 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   `FLinearColor`, `FColor` and the `FVector_NetQuantize` types (another mod's `UE_STRUCT_IN` struct is no engine
   struct: its `T()` is its members' initializers). Its values are what the engine's constructor sets
   (`FHitResult::Time` is 1, `FTransform()` is the identity). Fix: leave the statement out to keep the parent's value,
-  or give the members in braces,
-  `Hit = {.Time = 1.0f};`. See [Class defaults](#class-defaults).
+  give the members in braces, `Hit = {.Time = 1.0f};`, or set only the members you mean, one statement each
+  (`Hit.Distance = 5.0f;`). See [Class defaults](#class-defaults).
 - `` <Member>.<Left>, left out of the braces, holds what the engine's <Struct> constructor sets, which its header does
   not say, so AssetGen cannot write it over the value already there ``: braces in UE_DEFAULTS give some members and
   leave `<Left>` out, over a parent's value that is not a fresh one: a member of an engine struct whose header has no
@@ -7299,8 +7301,9 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   gives, of a `UE_STRUCT` or another mod's struct (`UE_STRUCT_IN`): `H = {.Hit = {.Distance = 5.0f}}` names
   `H.Hit.Time`. A mod's own asset's braces say it over the class's default object, which the asset starts as:
   `{.H = {.Hit = {.Distance = 5.0f}}}` where the class's `H = {.Hit = {.FaceIndex = 3}}` names `H.Hit.FaceIndex`.
-  Fix: give that member in the braces, or leave the statement out to keep the parent's value. See
-  [Class defaults](#class-defaults) and [Data assets](#data-assets).
+  Fix: give that member in the braces, set only the member the braces give with a statement (the message names it:
+  `` set only ExternalCurve with a statement (`InfluencerDensityCurve.ExternalCurve = ...;` ...) ``), or leave the
+  statement out to keep the parent's value. See [Class defaults](#class-defaults) and [Data assets](#data-assets).
 - `warning: <Member>: every member of <Struct> is Transient, which the engine never loads from a default: nothing is
   written, and it keeps the parent's value`: `Handle = FTimerHandle();` in UE_DEFAULTS. No tag can set a Transient
   member (the loader skips it), so the default holds the parent's handle. Fix: none needed; drop the statement to

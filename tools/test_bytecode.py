@@ -5133,6 +5133,47 @@ def asset_defaults_refusals():
     print('ok  AssetDefaults refusals')
 
 
+def ctor_class_assets():
+    """An asset of a mod class that declares a constructor (`= {}` is a constructor call to clang, not braces) cooks
+    with the class defaults, and `&` points at it. A member-path statement writes one member of an engine struct whose
+    UeApi header declares a constructor (FRuntimeFloatCurve), the rest kept as the value already there; the braced and
+    UE_KEEP spellings, refused over a game class's value, name it."""
+    import invariants
+    mod = '/Game/_ElytrasMods/CtorAsset/'
+    tmp, out, log = compile_to(EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/CtorAsset");\n'
+                               'UE_FLOAT_CURVE(Dens, (0, 0), (1, 1));\n'
+                               'class UCeiling : public UDebrisPositioning {\npublic:\n'
+                               '  UCeiling() { MinVerticalAngle = 150.0f; InfluencerDensityCurve.ExternalCurve = &Dens; }\n};\n'
+                               'UCeiling DP_Ceiling = {};\n'
+                               'UEnemyDescriptor ED_Ceiling = {.Positioning = &DP_Ceiling};\n'
+                               'UE_ASSET_DEFAULTS(UDebrisPositioning, DP_Size) { InfluencerSizeCurve.ExternalCurve = &Dens; }\n',
+                               'CtorAsset')
+    proves('declaring-data-assets.class-uceiling-public-udebrispositioning')
+    asset = invariants.Package(os.path.join(out, 'DP_Ceiling'))
+    assert [e['name'] for e in asset.exports] == ['DP_Ceiling'] and asset.class_of(1) == 'UCeiling_C', asset.exports
+    assert tag_values(asset, 0, asset.tags(0)) == {}, asset.tags(0)
+    ed = invariants.Package(os.path.join(out, 'ED_Ceiling'))
+    assert tag_values(ed, 0, ed.tags(0)) == {'Positioning': mod + 'DP_Ceiling.DP_Ceiling'}, ed.tags(0)
+    proves('declaring-data-assets.influencerdensitycurve-externalcurve')
+    cls = invariants.Package(os.path.join(out, 'UCeiling'))
+    cdo = next(i for i, e in enumerate(cls.exports) if e['name'] == 'Default__UCeiling_C')
+    assert tag_values(cls, cdo, cls.tags(cdo)) == {'MinVerticalAngle': 150.0,
+                                                   'InfluencerDensityCurve': {'ExternalCurve': mod + 'Dens.Dens'}}, cls.tags(cdo)
+    size = invariants.Package(os.path.join(out, 'DP_Size'))
+    assert tag_values(size, 0, size.tags(0)) == {'InfluencerSizeCurve': {'ExternalCurve': mod + 'Dens.Dens'}}, size.tags(0)
+    for p in (asset, ed, cls, size): keeps_invariants(p.base)
+    shutil.rmtree(tmp, ignore_errors=True)
+    proves('declaring-data-assets.influencerdensitycurve-externalcurve')
+    curve = '#include "UeApi/Engine.h"\nUE_FLOAT_CURVE(Dens, (0, 0), (1, 1));\n'
+    refused('CtorKeep', '  CtorKeep() { InfluencerDensityCurve = FRuntimeFloatCurve(UE_KEEP, &Dens); }\n',
+            'set only ExternalCurve with a statement (`InfluencerDensityCurve.ExternalCurve = ...;`',
+            top=curve, base='UDebrisPositioning')
+    refused('CtorZero', '  CtorZero() { InfluencerDensityCurve = FRuntimeFloatCurve({}, &Dens); }\n',
+            'or set only the members you mean, one statement each', top=curve, base='UDebrisPositioning')
+    print('ok  CtorAsset: an asset of a mod class with a constructor cooks and is pointed at; one member of a struct '
+          'with a constructor is set by a statement')
+
+
 # M_FireBulkArmor of EEE as DRG's cooker wrote it (BpMods/build/EEE/kept/.../materials), less the two fields the cooker
 # works out from the parent and AssetGen does not write (CachedReferencedTextures, TextureStreamingData) and the
 # BasePropertyOverrides it copies from the parent with no override flag set (UMaterialInstance::UpdateOverridableBaseProperties).
@@ -13897,6 +13938,7 @@ print('ok  DefaultsOwnNest: braces in a value that starts as a struct\'s default
       'leaves out, and are refused at what it gives')
 asset_defaults()
 asset_defaults_refusals()
+ctor_class_assets()
 material_instance()
 particle_bake()
 particle_lod_validity()
