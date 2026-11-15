@@ -14,8 +14,10 @@ struct FCommandPipe
 /* Starts the command line Cmd, program first; its stdin and stderr are this process's. On Windows the program runs
    directly, not under cmd.exe as _popen runs it: one process per compile instead of two or three (cmd.exe, and any
    AutoRun command it runs first, such as a chcp), which matters where exited processes are not freed until a reboot.
-   So Cmd is quoted as the program's own argument parser reads it, with no shell syntax. False if it could not start. */
-bool OpenCommand(const std::string& Cmd, FCommandPipe& Pipe);
+   So Cmd is quoted as the program's own argument parser reads it, with no shell syntax. ErrPath, when not empty, is a
+   file the command's stderr goes to instead (the constexpr probe reads clang's notes from it). False if it could not
+   start. */
+bool OpenCommand(const std::string& Cmd, FCommandPipe& Pipe, const std::string& ErrPath = std::string());
 
 /* Closes the pipe, waits for the command to exit and returns its exit status: 0 for success. */
 int CloseCommand(FCommandPipe& Pipe);

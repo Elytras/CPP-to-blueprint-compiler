@@ -21,7 +21,7 @@ static HANDLE InheritableStd(DWORD Which)
     return Copy;
 }
 
-bool OpenCommand(const std::string& Cmd, FCommandPipe& Pipe)
+bool OpenCommand(const std::string& Cmd, FCommandPipe& Pipe, const std::string& ErrPath)
 {
     SECURITY_ATTRIBUTES Inherit{ sizeof Inherit, nullptr, TRUE };
     HANDLE Read = nullptr, Write = nullptr;
@@ -33,7 +33,9 @@ bool OpenCommand(const std::string& Cmd, FCommandPipe& Pipe)
     Start.dwFlags = STARTF_USESTDHANDLES;
     Start.hStdInput = InheritableStd(STD_INPUT_HANDLE);
     Start.hStdOutput = Write;
-    Start.hStdError = InheritableStd(STD_ERROR_HANDLE);
+    Start.hStdError = ErrPath.empty() ? InheritableStd(STD_ERROR_HANDLE)
+                    : CreateFileA(ErrPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &Inherit, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (Start.hStdError == INVALID_HANDLE_VALUE) Start.hStdError = nullptr;
     PROCESS_INFORMATION Info{};
     std::string Line = Cmd;     // CreateProcess may write to the command line it is given
     const bool bStarted = CreateProcessA(nullptr, Line.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &Start, &Info);
@@ -65,9 +67,9 @@ int CloseCommand(FCommandPipe& Pipe)
     return int(Code);
 }
 #else
-bool OpenCommand(const std::string& Cmd, FCommandPipe& Pipe)
+bool OpenCommand(const std::string& Cmd, FCommandPipe& Pipe, const std::string& ErrPath)
 {
-    Pipe.Out = popen(Cmd.c_str(), "r");
+    Pipe.Out = popen((ErrPath.empty() ? Cmd : Cmd + " 2>'" + ErrPath + "'").c_str(), "r");
     return Pipe.Out != nullptr;
 }
 

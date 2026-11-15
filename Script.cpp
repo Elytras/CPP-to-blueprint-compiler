@@ -251,16 +251,37 @@ namespace
 void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D);
 void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P);
 
+/* An FSoftObjectPath, `/Game/A/B.B:Sub` or `None`: 4.27 writes the path's FName, then the SubPathString (empty here). */
+void WriteSoftPath(FArc& V, const std::string& Path)
+{
+    if (!IsUE5()) { V.Name(Path); V.I32(0); return; }
+    /* 5.6 (FSOFTOBJECTPATH_REMOVE_ASSET_PATH_FNAMES): an FTopLevelAssetPath, the package and the asset as two
+       FNames, then the SubPathString: `/Game/A/B.B:Sub` is `/Game/A/B`, `B`, `Sub`; a path with no `.` names
+       the asset by its package's last segment; none is `None`, `None`, empty. */
+    const size_t Colon = Path.find(':');
+    const std::string Top = Path.substr(0, Colon);
+    size_t Dot = Top.find('.');
+    const bool bPath = Path != "None";
+    const std::string Package = !bPath ? Path : Top.substr(0, Dot);
+    const std::string Asset = !bPath ? Path : Dot != std::string::npos ? Top.substr(Dot + 1) : Top.substr(Top.rfind('/') + 1);
+    V.Name(Package);
+    V.Name(Asset);
+    WriteFStringValue(V, Colon == std::string::npos ? std::string() : Path.substr(Colon + 1));
+}
+
 /* A struct the engine serializes in a form of its own (WithSerializer), not as tags, whose form AssetGen knows; false for
    any other. FGameplayTagContainer::Serialize writes its tags, each tag its FName; FNiagaraTypeDefinitionHandle the
    definition it names, as tags; FNiagaraVariableBase its Name, then its handle, and FNiagaraVariable its VarData after
-   that, FNiagaraVariableWithOffset its Offset (each measured on EEE's cooked cloud stores). A member the value does not
+   that, FNiagaraVariableWithOffset its Offset (each measured on EEE's cooked cloud stores); FSoftObjectPath and
+   FSoftClassPath their AssetPathName and SubPathString. A member the value does not
    give is its zero. */
 bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
 {
     const std::string& S = P.StructName;
     if (S != "GameplayTagContainer" && S != "NiagaraTypeDefinitionHandle" && S != "NiagaraVariableBase"
-        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset")
+        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset" && S != "SoftObjectPath" && S != "SoftClassPath"
+        && S != "PerPlatformFloat" && S != "PerPlatformInt" && S != "PerPlatformBool" && S != "MovieSceneFrameRange"
+        && S != "MovieSceneFloatChannel" && S != "SkeletalMeshSamplingLODBuiltData" && S != "NiagaraDataInterfaceGPUParamInfo")
         return false;
     const auto& Members = D.Members ? D.Members : P.Members;
     auto Member = [&](const char* Name) -> const FPropertyDef* {
@@ -268,6 +289,85 @@ bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
             for (const FPropertyDef& M : *Members) if (M.Name == Name) return &M;
         return nullptr;
     };
+    if (S == "SoftObjectPath" || S == "SoftClassPath")
+    {
+        /* AssetPathName, then SubPathString (FSoftObjectPath::Serialize); a member the value does not give is empty. */
+        const FPropertyDef *Asset = Member("AssetPathName"), *Sub = Member("SubPathString");
+        const std::string Path = Asset && Asset->Default.K == FDefaultValue::Str && !Asset->Default.S.empty() ? Asset->Default.S : "None";
+        const std::string Rest = Sub && Sub->Default.K == FDefaultValue::Str ? Sub->Default.S : std::string();
+        if (IsUE5()) WriteSoftPath(V, Rest.empty() ? Path : Path + ":" + Rest);
+        else { V.Name(Path); WriteFStringValue(V, Rest); }
+        return true;
+    }
+    if (S == "SkeletalMeshSamplingLODBuiltData")
+    {
+        /* Written for the value gate (Cooked.cpp's reader says the layout): Prob and Alias, each a count and its words, then
+           TotalWeight. */
+        for (const char* Name : { "Prob", "Alias" })
+        {
+            const FPropertyDef* M = Member(Name);
+            V.I32(M ? int32(M->Default.Items.size()) : 0);
+            if (M) for (const FDefaultValue& W : M->Default.Items) V.U32(uint32(W.I));
+        }
+        const FPropertyDef* Total = Member("TotalWeight");
+        V.U32(Total ? uint32(Total->Default.I) : 0);
+        return true;
+    }
+    if (S == "NiagaraDataInterfaceGPUParamInfo")
+    {
+        /* Written for the value gate: the symbol and class name, then each generated function's definition name, instance
+           name and specifier pairs. */
+        const auto Text = [&](const char* Name) { const FPropertyDef* M = Member(Name); WriteFStringValue(V, M ? M->Default.S : std::string()); };
+        Text("DataInterfaceHLSLSymbol"); Text("DIClassName");
+        const FPropertyDef* Functions = Member("GeneratedFunctions");
+        V.I32(Functions ? int32(Functions->Default.Items.size()) : 0);
+        if (Functions)
+            for (const FDefaultValue& F : Functions->Default.Items)
+            {
+                const auto Part = [&](const char* Name) -> const FPropertyDef* {
+                    if (F.Members) for (const FPropertyDef& M : *F.Members) if (M.Name == Name) return &M;
+                    return nullptr;
+                };
+                const FPropertyDef *Def = Part("DefinitionName"), *Instance = Part("InstanceName"), *Spec = Part("Specifiers");
+                V.Name(Def && !Def->Default.S.empty() ? Def->Default.S : std::string("None"));
+                WriteFStringValue(V, Instance ? Instance->Default.S : std::string());
+                V.I32(Spec ? int32(Spec->Default.Items.size() / 2) : 0);
+                if (Spec) for (const FDefaultValue& N : Spec->Default.Items) V.Name(N.S.empty() ? std::string("None") : N.S);
+            }
+        return true;
+    }
+    if (S == "MovieSceneFrameRange" || S == "MovieSceneFloatChannel")
+    {
+        /* Written for the value gate, which proves the forms; NativeUnwritten still refuses a mod's own value of either, as
+           their defaults are not measured. Each member is written in order: bytes for the two Type / Extrapolation ones,
+           ints for the rest, the bulk arrays behind their element size and count (Cooked.cpp's reader says the layout). */
+        auto Word = [&](const char* Name, bool bByte) {
+            const FPropertyDef* M = Member(Name);
+            const uint32 W = M ? uint32(M->Default.I) : 0;
+            if (bByte) V.U8(uint8(W)); else V.U32(W);
+        };
+        if (S == "MovieSceneFrameRange") { Word("LowerType", true); Word("LowerValue", false); Word("UpperType", true); Word("UpperValue", false); return true; }
+        auto Bulk = [&](const char* Name, int32 Size, int32 Words) {
+            const FPropertyDef* M = Member(Name);
+            V.I32(Size);
+            V.I32(M ? int32(M->Default.Items.size()) / Words : 0);
+            if (M) for (const FDefaultValue& W : M->Default.Items) V.U32(uint32(W.I));
+        };
+        Word("PreInfinityExtrap", true); Word("PostInfinityExtrap", true);
+        Bulk("Times", 4, 1); Bulk("Values", 28, 7);
+        Word("DefaultValue", false); Word("bHasDefaultValue", false); Word("TickNumerator", false); Word("TickDenominator", false);
+        return true;
+    }
+    if (S == "PerPlatformFloat" || S == "PerPlatformInt" || S == "PerPlatformBool")
+    {
+        /* A bool bCooked (4 bytes: a bool in an archive is a uint32), then Default alone, which is all a game reads; a
+           cooked value always has bCooked set (FPerPlatformFloat's operator<<, PerPlatformProperties.h). */
+        const FPropertyDef* Default = Member("Default");
+        V.U32(1);
+        if (S == "PerPlatformFloat") { const float F = Default ? float(Default->Default.F) : 0.0f; V.Raw(&F, 4); }
+        else V.U32(Default ? uint32(Default->Default.I) : 0);
+        return true;
+    }
     if (S == "GameplayTagContainer")
     {
         const FPropertyDef* Tags = Member("GameplayTags");
@@ -316,7 +416,8 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         else if (P.Type == "FloatProperty") { const float F = float(D.F); V.Raw(&F, 4); }
         else if (P.Type == "DoubleProperty") V.Raw(&D.F, 8);
         else if (P.Type == "Int64Property") V.I64(D.I);
-        else if (P.Type == "UInt16Property") V.U16(uint16(D.I));
+        else if (P.Type == "UInt16Property" || P.Type == "Int16Property") V.U16(uint16(D.I));
+        else if (P.Type == "UInt64Property") V.I64(D.I);
         else if (P.Type == "UInt32Property") V.U32(uint32(D.I));
         else if (P.Type == "EnumProperty") V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero);
         else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(uint8(D.I)); else V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero); }   // an enum byte is its enumerator's name
@@ -327,17 +428,46 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
             /* A literal is a culture-invariant text, like EX_TextConst's LiteralString: Flags,
                ETextHistoryType::None, bHasCultureInvariantString, the string. */
             const bool bText = bSet && !D.S.empty();
-            V.U32(bText ? 2 : 0);           // ETextFlag::CultureInvariant
-            V.U8(0xFF);
-            V.I32(bText ? 1 : 0);
-            if (bText) WriteFStringValue(V, D.S);
+            if (D.TextHistory == 0 && D.Items.size() == 2)          // a localized text: namespace, key, source (FTextHistory_Base)
+            {
+                /* An empty string flagged in F (Cooked.cpp's ReadTextString) is a lone terminator, as the engine saves one. */
+                const auto Part = [&](const std::string& S, double Terminator) {
+                    if (S.empty() && Terminator != 0) { V.I32(1); V.U8(0); } else WriteFStringValue(V, S);
+                };
+                V.U32(uint32(D.I)); V.U8(0);
+                Part(D.Items[0].S, D.Items[0].F); Part(D.Items[1].S, D.Items[1].F); Part(D.S, D.F);
+            }
+            else if (D.TextHistory == 11 && D.Items.size() == 2)    // a string table entry: the table's id, the key
+            {
+                V.U32(uint32(D.I)); V.U8(11);
+                V.Name(D.Items[0].S);
+                if (D.Items[1].S.empty() && D.Items[1].F != 0) { V.I32(1); V.U8(0); } else WriteFStringValue(V, D.Items[1].S);
+            }
+            else
+            {
+                V.U32(bText ? 2 : 0);           // ETextFlag::CultureInvariant
+                V.U8(0xFF);
+                V.I32(bText ? 1 : 0);
+                if (bText) WriteFStringValue(V, D.S);
+            }
         }
         else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
-        else if (P.Type == "InterfaceProperty") V.I32(0);
+        else if (P.Type == "InterfaceProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
+        else if (P.Type == "FieldPathProperty")
+        {
+            V.I32(int32(D.Items.size()));
+            for (const FDefaultValue& N : D.Items) V.Name(N.S.empty() ? std::string("None") : N.S);
+            V.Idx(D.Object);
+        }
+        else if (P.Type == "MulticastInlineDelegateProperty" || P.Type == "MulticastSparseDelegateProperty")
+        {
+            V.I32(int32(D.Items.size()));
+            for (const FDefaultValue& Bound : D.Items) { V.Idx(Bound.Object); V.Name(Bound.S.empty() ? std::string("None") : Bound.S); }
+        }
         else if (P.Type == "DelegateProperty")      // FScriptDelegate: the object, the function's name (ScriptDelegates.h
         { V.Idx(Null()); V.Name("None"); }           // 138-142); a default is unbound, as a bound one is refused
         else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty")    // FSoftObjectPath: AssetPathName, SubPathString
-        { V.Name(D.K == FDefaultValue::Str && !D.S.empty() ? D.S : std::string("None")); V.I32(0); }
+            WriteSoftPath(V, D.K == FDefaultValue::Str && !D.S.empty() ? D.S : std::string("None"));
         else if (P.Type == "SetProperty" || P.Type == "MapProperty")
         {
             /* The removed elements (a map's keys), then the count and the elements; a map's Items alternate key, value.
@@ -359,7 +489,7 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
                Its Size is the elements' byte count, so they are measured first. */
             FArc Elements(V.Owner());
             if (P.Inner) for (const FDefaultValue& Item : D.Items) WriteValue(Elements, *P.Inner, Item);
-            if (P.Inner && P.Inner->Type == "StructProperty")
+            if (P.Inner && P.Inner->Type == "StructProperty" && !IsUE5())      // 5.6 has no inner tag: the type tree names the struct
             {
                 V.Name(P.Name); V.Name("StructProperty"); V.I32(int32(Elements.B.size())); V.I32(0);
                 V.Name(P.Inner->StructName);
@@ -396,20 +526,37 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
     }
 }
 
-void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P)
+/* UE5: P's type as a tag carries it (PROPERTY_TAG_COMPLETE_TYPE_NAME): its GetID, then a struct's or an enum's name, an
+   array's or set's element tree, a map's key and value trees. */
+FTypeTree TypeTreeOf(const FPropertyDef& P)
+{
+    FTypeTree T{ TagId(P.Type), {} };
+    if (P.Type == "StructProperty" || ((P.Type == "ByteProperty" || P.Type == "EnumProperty") && !P.StructName.empty()
+                                       && P.StructName != "None"))
+        T.Kids.push_back({ P.StructName, {} });
+    else if (P.Type == "ArrayProperty" || P.Type == "SetProperty" || P.Type == "MapProperty")
+        for (const std::shared_ptr<FPropertyDef>& Element : { P.Inner, P.Value })
+            if (Element) T.Kids.push_back(TypeTreeOf(*Element));
+    return T;
+}
+
+/* P's default as a tag: UE5 names a container's element types in full (a struct, an enum), 4.27's tag only their classes. */
+void WriteTag(FArc& Ar, const FPropertyDef& P)
 {
     const FDefaultValue& D = P.Default;
     if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
+    if (IsUE5() && P.Inner && (P.Type == "ArrayProperty" || P.Type == "SetProperty" || P.Type == "MapProperty"))
+    {
+        TagTree(Ar, P.Name, TypeTreeOf(P), [&](FArc& V) { WriteValue(V, P, D); }, P.ArrayIndex);
+        return;
+    }
     Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName, P.ArrayIndex);
 }
+
+void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P) { WriteTag(Ar, P); }
 }   // namespace
 
-void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
-{
-    const FDefaultValue& D = P.Default;
-    if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
-    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName, P.ArrayIndex);
-}
+void WriteDefaultTag(FArc& Ar, const FPropertyDef& P) { WriteTag(Ar, P); }
 
 void WriteDefaultValue(FArc& Ar, const FPropertyDef& P)
 {
@@ -425,7 +572,12 @@ int32 NativeStructSize(const std::string& StructName)
         { "Vector", 12 }, { "Vector2D", 8 }, { "Vector4", 16 }, { "Rotator", 12 }, { "Quat", 16 },
         { "Plane", 16 }, { "Matrix", 64 }, { "Color", 4 }, { "LinearColor", 16 }, { "IntPoint", 8 },
         { "IntVector", 12 }, { "Guid", 16 }, { "DateTime", 8 }, { "Timespan", 8 }, { "Box", 25 },
-        { "Box2D", 17 }, { "FrameNumber", 4 } };
+        { "Box2D", 17 }, { "FrameNumber", 4 },
+        /* RichCurveKey: Interp, TangentMode, TangentWeightMode, then Time, Value and the four tangent floats (RichCurve.cpp,
+           FRichCurveKey::Serialize); all zeros is FRichCurveKey()'s default. */
+        { "RichCurveKey", 27 },
+        /* FMovieSceneSequenceID: its uint32 Value, 0 the root sequence, which is its default. */
+        { "MovieSceneSequenceID", 4 } };
     /* UE5's large world coordinates make the math structs' components doubles (S40): the rest keep their 4.27 size. */
     static const std::map<std::string, int32> Lwc = {
         { "Vector", 24 }, { "Vector2D", 16 }, { "Vector4", 32 }, { "Rotator", 24 }, { "Quat", 32 },
@@ -440,7 +592,7 @@ bool NativeUnwritten(const std::string& StructName)
 {
     // ponytail: the census's list; a native struct the pak holds no value of is not in it
     static const char* const Unwritten[] = {
-        "SoftObjectPath", "SoftClassPath", "PerPlatformFloat", "PerPlatformInt", "RichCurveKey",
+        
         "KeyHandleMap", "FontData", "FontCharacter", "ColorMaterialInput", "ScalarMaterialInput", "VectorMaterialInput",
         "MaterialAttributesInput",
         "MovieSceneFloatChannel", "MovieSceneFrameRange", "MovieSceneEvaluationFieldEntityTree",
@@ -452,9 +604,11 @@ int32 FixedValueSize(const FPropertyDef& P)
 {
     const std::string& T = P.Type;
     if (T == "BoolProperty") return 1;
-    if (T == "IntProperty" || T == "FloatProperty" || T == "ObjectProperty" || T == "ClassProperty" || T == "InterfaceProperty")
+    if (T == "IntProperty" || T == "FloatProperty" || T == "ObjectProperty" || T == "ClassProperty" || T == "InterfaceProperty"
+        || T == "UInt32Property")
         return 4;
-    if (T == "Int64Property" || T == "DoubleProperty" || T == "EnumProperty" || T == "NameProperty") return 8;
+    if (T == "UInt16Property" || T == "Int16Property") return 2;
+    if (T == "Int64Property" || T == "UInt64Property" || T == "DoubleProperty" || T == "EnumProperty" || T == "NameProperty") return 8;
     if (T == "ByteProperty") return P.StructName.empty() ? 1 : 8;
     if (T == "StructProperty") return NativeStructSize(P.StructName);
     return 0;

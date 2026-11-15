@@ -27,6 +27,9 @@ template <ETiMode M> int32 ModeOf() { // ModeOf__Angry: an enum value by its enu
   else return 1;
 }
 
+template <ETiMode M> int32 ValueOf() { return M == ETiMode::Angry ? 7 : 3; } // the enum parameter as a value, not just if constexpr
+template <ETiMode M> inline bool InlineIs() { return M == ETiMode::Angry; }
+
 template <class T> struct FTiPair {
   UE_STRUCT;
   T Lo;
@@ -58,6 +61,7 @@ public:
   FTiPair<int32> IntBox;
   FTiTagged<ETiMode::Angry> Tag;
   int32 UseMode() { return ModeOf<ETiMode::Angry>() * 10 + ModeOf<ETiMode::Calm>(); }
+  int32 UseModeValue() { return ValueOf<ETiMode::Angry>() * 10 + ValueOf<ETiMode::Calm>() + (InlineIs<ETiMode::Angry>() ? 100 : 0); }
   int32 UseMax(int32 A, int32 B) { return Max2(A, B); }
   float UseMaxF(float A, float B) { return Max2(A, B); }
   int32 UseFact(int32 N) { return Fact(N); }

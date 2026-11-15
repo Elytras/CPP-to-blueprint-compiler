@@ -216,9 +216,48 @@ def tags(b, o, end, names, indent, out):
     return o
 
 
+def ue5_package(base):
+    """invariants.Package of base if it is a UE5 package (the 5.x tag grammar and RC's unversioned header are read there), else None."""
+    import invariants
+    pkg = invariants.Package(base)
+    return pkg if pkg.ue5 else None
+
+
+def tags5(pkg, idx, start):
+    t = pkg.tags(idx, start)
+    print("=== export[%d] %s" % (idx, pkg.exports[idx]['name']))
+    if getattr(pkg, 'unversioned_props', False):
+        print("  unversioned properties: a %d-byte header, values only the class's schema can place%s"
+              % (t.header_end - start, "" if t.end is not None else " (it counts values)"))
+        return
+    for g in t:
+        kinds = [g.get(k) for k in ('struct', 'enum', 'inner', 'value_type') if g.get(k)]
+        extra = ('bool=%d' % g['bool']) if 'bool' in g else ' '.join(kinds)
+        print("  %s %s%s size=%d %s" % (g['type'], g['name'], '[%d]' % g['index'] if g['index'] else '', g['size'], extra))
+
+
+def struct5(pkg, idx):
+    st = pkg.struct(idx)
+    print("=== export[%d] %s  class=%s" % (idx, pkg.exports[idx]['name'], pkg.class_of(idx + 1)))
+    if st is None:
+        print("not a struct"); return
+    print("SuperStruct %s" % pkg.path(st.super))
+    print("Children %s" % [pkg.path(c) for c in st.children])
+    def show(p, pad):
+        print("%s%s %s dim=%d size=%d flags=%#x" % (pad, p.type, p.name, p.dim, p.elem_size, p.flags))
+        for sub in p.subs: show(sub, pad + "    ")
+    for p in st.props: show(p, "  ")
+    print("Script mem=%d disk=%d" % (st.script_mem, st.script_disk))
+    for k in ('function_flags', 'class_flags', 'cdo', 'struct_flags'):
+        if hasattr(st, k): print("%s %#x" % (k, getattr(st, k)))
+    if hasattr(st, 'interfaces'): print("Interfaces %s" % [(pkg.path(i), o) for i, o, _ in st.interfaces])
+    print("consumed %d of %d" % (st.end, st.size))
+
+
 def tags_cmd(args):
     base, idx = args[0], int(args[1])
     start = int(args[2], 0) if len(args) > 2 else 0
+    if (pkg := ue5_package(base)): return tags5(pkg, idx, start)
     blob, e, names, _, _ = export_blob(base, idx)
     print("=== export[%d] %s" % (idx, e['name']))
     out = []
@@ -261,6 +300,7 @@ def field(r, ftype, pad, out):
 
 def struct_cmd(args):
     i = int(args[1])
+    if (pkg := ue5_package(args[0])): return struct5(pkg, i)
     blob, e, names, imports, exports = export_blob(args[0], i)
     r = StructReader(blob, names, imports, exports)
     out = ['=== export[%d] %s  class=%s' % (i, e['name'], pidx(e['cls'], imports, exports))]

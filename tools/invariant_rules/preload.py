@@ -112,10 +112,11 @@ def edl_preload_arcs(pkg):
             yield None, 'import %s: outer %d is not an import' % (imp['name'], imp['outer'])
     count, eoff = edl_summary(pkg)
     b = pkg.ua
+    sm = uasset_io.summary(b)             # the row's size and where its dependency run sits differ on 5.x
     for k, e in enumerate(pkg.exports):
         for f in ('cls', 'super', 'tmpl', 'outer'):
             if not edl_in_range(pkg, e[f]): yield k, '%s index %d out of range' % (f, e[f])
-        first, *counts = struct.unpack_from('<5i', b, eoff + 104 * k + 84)
+        first, *counts = struct.unpack_from('<5i', b, eoff + sm['erow'] * k + sm['edeps'])
         if first >= 0 and first + sum(counts) > count:
             yield k, 'dependencies %d..%d run past PreloadDependencyCount %d' % (first, first + sum(counts), count)
             continue

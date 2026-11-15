@@ -79,3 +79,30 @@ public:
 
   void OnHover() { PlayAnimation(Pop, 0.0f, 1, EUMGSequencePlayMode::Forward, 1.0f, false); }
 };
+
+/* A slot's member set where the slot is made, no local between: through the cast of the untyped AddChild, or the typed adder's result. */
+class UWtChain : public UUserWidget {
+public:
+  UE_WIDGET(UOverlay, Box);
+  UE_WIDGET(UBorder, Left);
+  UE_WIDGET(UBorder, Right);
+
+  UWtChain() {
+    Cast<UOverlaySlot>(Box->AddChild(Left))->Padding.Top = 6.0f;
+    Box->AddChildToOverlay(Right)->HorizontalAlignment = EHorizontalAlignment::HAlign_Center;
+  }
+};
+
+/* An inline helper in the constructor: its statements are read where it is called, each parameter as its argument. */
+class UWtHelper : public UUserWidget {
+public:
+  UE_WIDGET(UOverlay, Box);
+  UE_WIDGET(UBorder, Left);
+  UE_WIDGET(UBorder, Right);
+
+  inline void Put(UBorder *Child, float Top) { Cast<UOverlaySlot>(Box->AddChild(Child))->Padding.Top = Top; }
+  UWtHelper() {
+    Put(Left, 6.0f);
+    Put(Right, 2.0f);
+  }
+};

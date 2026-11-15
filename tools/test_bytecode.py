@@ -605,6 +605,9 @@ def build():
     # value is read into the model and encoded again, which must give the same bytes.
     proc = subprocess.run([ASSETGEN, 'roundtrip', ROOT], capture_output=True, encoding='utf-8')
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    # The encoder's gaps that are closed: a UInt16 / UInt32 value, an unbound delegate, a RichCurveKey (27 native bytes).
+    for gap in ('UInt16Property value', 'UInt32Property value', 'DelegateProperty value', 'RichCurveKey written natively'):
+        assert gap not in proc.stdout, gap + ' is read into the model again:\n' + proc.stdout
     print('ok  every package reads back and writes out byte for byte, and every tag value re-encodes (assetgen roundtrip)')
 
 
@@ -2799,6 +2802,88 @@ opt_raw()
 opt_flags()
 
 
+# ---- TailCalls: a self-call that is a function's last act is a loop (REFERENCE.md, Tail calls)
+
+def entered(base, fn, self_vars=None, **parms):
+    """fn's value, and how many times a function of the mod was entered to get it: 1 when nothing was called."""
+    real, count = runscript.run, [0]
+
+    def counted(*a, **kw):
+        count[0] += 1
+        return real(*a, **kw)
+    runscript.run = counted     # a script call inside runscript.run looks the name up again
+    try:
+        return counted(base, fn, self_vars, **parms)[0], count[0]
+    finally:
+        runscript.run = real
+
+
+def tail_steps(n, acc):
+    while True:
+        if n % 3 == 0:
+            if n == 0: return acc
+            n, acc = n - 3, acc + 1
+        elif n % 3 == 1: n, acc = n - 1, acc + 10
+        else: n, acc = n - 2, acc + 100
+
+
+def tail_calls():
+    import math
+    base = asset('TailCalls')
+    tri = lambda n: n * (n + 1) // 2
+    # One frame however deep: 5000 steps of a call would be 5000 frames.
+    proves('tail-calls.return-sum-n-1-acc-n')
+    for fn in ('Sum', 'StaticSum'):
+        for n in (0, 1, 7, 5000):
+            assert entered(base, fn, N=n, Acc=3) == (3 + tri(n), 1), (fn, n, entered(base, fn, N=n, Acc=3))
+    assert entered(base, 'Count', N=4000, Acc=1) == (8001, 1), entered(base, 'Count', N=4000, Acc=1)
+    assert entered(base, 'UseStatic', N=5000) == (tri(5000), 1)
+    got, frames = entered(base, 'UseFree', N=5000)      # the library's function is called once, and loops
+    assert got == tri(5000) and frames <= 2, (got, frames)
+    for n in (0, 3, 4, 5, 3002):
+        assert entered(base, 'Steps', N=n, Acc=7) == (tail_steps(n, 7), 1), n
+    proves('tail-calls.fill-n-1')
+    for fn, n, want in (('Fill', 4, [4, 3, 2, 1]), ('Fill', 0, []), ('FillEarly', 5, [5, 3, 1, 0]), ('FillEarly', 0, [0])):
+        me = dict(Seen=[])
+        assert entered(base, fn, me, N=n) == (None, 1) and me['Seen'] == want, (fn, n, me)
+    proves('tail-calls.return-b-0-a-gcd', 'tail-calls.inline-int32-sum-int32-n')
+    for n in (0, 1, 30, 5000):
+        want = tri(n) + math.gcd(n, 36) * 1000000 + math.gcd(n, 48) * 10000000
+        assert entered(base, 'UseInline', N=n) == (want, 1), (n, entered(base, 'UseInline', N=n), want)
+    refused('TailInlMid', '  inline int32 Loop(int32 X) { if (X > 0) { Loop(X - 1); Seen += 1; } return X; }\n  int32 Seen;\n'
+            '  int32 F(int32 X) { return Loop(X); }\n', 'calls itself')
+    proves('tail-calls.int32-step-tarray-int32-mine')
+    for n in (0, 1, 6):
+        assert entered(base, 'Fresh', N=n, Acc=2) == (2 + tri(n), 1), n
+    proves('tail-calls.return-longest-s-ab-limits')
+    for n in (0, 1, 40):
+        me = dict(Kept='', Pad=0)
+        got, frames = entered(base, 'CallLongest', me, N=n)
+        assert got == (1 + 2 * n + 3) * 100 + 1 and me['Kept'] == 'x' and frames <= 2, (n, got, me, frames)
+    proves('tail-calls.collect-out-n-1')
+    for n in (0, 1, 30):
+        got, frames = entered(base, 'CallCollect', N=n)
+        assert got == n * 1000 + (1 if n else 0) and frames <= 2, (n, got, frames)
+    # Still calls, one frame a step, and right.
+    proves('tail-calls.return-n-factorial-n-1')
+    assert entered(base, 'Factorial', N=5) == (120, 5)
+    proves('tail-calls.halve-other-n-1')
+    me = dict(Calls=0)
+    got, frames = entered(base, 'CallHalve', me, V=40, N=3)
+    assert got == 20 and me['Calls'] == 3 and frames >= 3, (got, me, frames)
+    proves('tail-calls.for-return-down-n-1')
+    assert entered(base, 'Down', N=2) == (2, 1) and entered(base, 'Down', N=6) == (2, 5), entered(base, 'Down', N=6)
+    refused('TailInlLoop', '  inline int32 Down(int32 N) { for (int32 I = 0; I < N; ++I) if (I == 2) return Down(N - 1); return N; }\n'
+            '  int32 F(int32 N) { return Down(N); }\n', 'calls itself')
+    proves('tail-calls.return-sum-n-1-acc-n-2')
+    assert entered(os.path.join(os.path.dirname(base), 'TailOpen'), 'Sum', N=5, Acc=0) == (15, 6)
+    print('ok  TailCalls: a self-call that is the last act is a loop, in one frame however deep; one that is not, one a '
+          'subclass could replace, one under a loop or re-binding a reference stays a call')
+
+
+tail_calls()
+
+
 # ---- FinalTest
 
 def calls_in(base, fn):
@@ -3668,10 +3753,49 @@ def types_defaults():
 def native_struct_values():
     """A struct the engine reads in its own binary form, which WriteValue does not write (it writes tags), gets no
     value: not as a default, and not as a UE_STRUCT member, whose default instance holds every member's."""
-    refused('NativeDefault', '  FPerPlatformFloat Scale = {};\n', 'PerPlatformFloat value in its own binary form')
+    refused('NativeDefault', '  FColorMaterialInput Tint = {};\n', 'ColorMaterialInput value in its own binary form')
     refused('NativeMember', '  int32 X = 0;\n', "a UE_STRUCT's defaults hold every member's",
-            top='struct FScaleHolder {\n  UE_STRUCT;\n  FPerPlatformFloat Scale;\n};\n')
-    print('ok  a PerPlatformFloat value is refused, as a default and as a UE_STRUCT member')
+            top='struct FTintHolder {\n  UE_STRUCT;\n  FColorMaterialInput Tint;\n};\n')
+    print('ok  a ColorMaterialInput value is refused, as a default and as a UE_STRUCT member')
+
+
+SOFT_PATHS_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/SoftPaths");
+struct FSoftHolder {
+  UE_STRUCT;
+  FSoftObjectPath Ref = FSoftObjectPath("/Game/A/B.B", "Sub");
+  FSoftClassPath Cls = FSoftClassPath("/Game/C/D.D_C", "");
+};
+class ASoftBox : public AActor {
+public:
+  FSoftObjectPath Path = FSoftObjectPath("/Game/E/F.F", "");
+  FSoftHolder Held;
+  FPerPlatformFloat Scale = FPerPlatformFloat(2.5f);
+  FPerPlatformInt Count = FPerPlatformInt(7);
+  FPerPlatformBool On = FPerPlatformBool(true);
+};
+'''
+
+
+def soft_path_values():
+    """FSoftObjectPath / FSoftClassPath as a default and as a UE_STRUCT member: written in their own binary form,
+    AssetPathName's FName then SubPathString's FString (FSoftObjectPath::Serialize), as the cook of a game asset has them."""
+    import dumpexp, struct
+    tmp, out, _ = compile_to(SOFT_PATHS_SRC, 'SoftPaths')
+    proves('struct-defaults.ref-fsoftobjectpath-game-a-b')
+    base = os.path.join(out, 'ASoftBox')
+    cdo = dump('dumptags.py', base, exports_of(base).index('Default__ASoftBox_C'))
+    names = dumpexp.load(base)[3]
+    m = re.search(r'Path \[0\] StructProperty size=12 struct=SoftObjectPath: ([0-9a-f]+)', cdo)
+    assert m, cdo
+    raw = bytes.fromhex(m.group(1))
+    assert names[struct.unpack_from('<i', raw, 0)[0]] == '/Game/E/F.F' and struct.unpack_from('<i', raw, 8)[0] == 0, (raw, cdo)
+    # A PerPlatform value: bCooked set (a bool in an archive is 4 bytes), then its Default alone.
+    proves('struct-defaults.scale-fperplatformfloat-2-5f')
+    for tag, want in (('Scale', struct.pack('<If', 1, 2.5)), ('Count', struct.pack('<Ii', 1, 7)), ('On', struct.pack('<II', 1, 1))):
+        m = re.search(tag + r' \[0\] StructProperty size=8 struct=PerPlatform\w+: ([0-9a-f]+)', cdo)
+        assert m and bytes.fromhex(m.group(1)) == want, (tag, m and m.group(1), cdo)
+    shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  a SoftObjectPath default is written in its own form (name, then sub-path), and a PerPlatform value as bCooked + Default')
 
 
 def string_behaviour():
@@ -3976,6 +4100,7 @@ constants()
 types_behaviour()
 types_defaults()
 native_struct_values()
+soft_path_values()
 string_behaviour()
 struct_behaviour()
 check('StructTest', 'MakeNative', lambda D: D + 0.5, [dict(D=d) for d in (0.0, 4.0)])
@@ -5008,6 +5133,53 @@ def asset_defaults_refusals():
     print('ok  AssetDefaults refusals')
 
 
+# M_FireBulkArmor of EEE as DRG's cooker wrote it (BpMods/build/EEE/kept/.../materials), less the two fields the cooker
+# works out from the parent and AssetGen does not write (CachedReferencedTextures, TextureStreamingData) and the
+# BasePropertyOverrides it copies from the parent with no override flag set (UMaterialInstance::UpdateOverridableBaseProperties).
+MIC_FIRE_PARENT = '/Game/GameElements/Resources/Embedded/UnknownArtifact/M_UnknownArtifact_debris.M_UnknownArtifact_debris'
+MIC_FIRE_SCALARS = [('Diffuse_Fresnel_Power', 1.5, '845dff7059abb242880ec115d252bfeb'),
+                    ('EmissiveMultiplier', 1000.0, 'd9ca0730ea7cdd458063f06d15222c3d'),
+                    ('Metallic', 0.0, 'fbe8c7d7d7902946af220e68696fc2a7'),
+                    ('NoiseSpeed', -225.0, '938b9eb5f5f8e3498d2e58150cb069f3'),
+                    ('Subsurface Opacity', 1.0, '4621babc7cbfaa49bd5b897d3fd0d97c'),
+                    ('RefractionDepthBias', 0.0, '0' * 32)]
+MIC_FIRE_VECTORS = [('Diffuse_Edge', '0000c0408656273f000000000000803f', '98080374e5a1de41b5ac335f6b6a4f2a'),
+                    ('Diffuse_Main', '0000000000000000000000000000803f', '81c873f90561a340a109f8846ed809f5')]
+
+
+def material_instance():
+    """MaterialInstance: a UMaterialInstanceConstant from UE_ASSET_DEFAULTS has the tags a cooked one has, parameter
+    for parameter; an override that needs shaders of its own is refused."""
+    import invariants
+    folder = os.path.dirname(asset('MaterialInstance'))
+    fire = invariants.Package(os.path.join(folder, 'M_Fire'))
+    # kGlobal, a constexpr enum, gives each ParameterInfo its Association.
+    proves('material-instances.ue-asset-defaults-umaterialinstanceconstant',
+           'constants-and-constant.constexpr-emood-knap-emood-sleepy')
+    assert fire.class_of(1) == 'MaterialInstanceConstant', fire.class_of(1)
+    got = tag_values(fire, 0, fire.tags(0))
+    info = lambda n: {'Name': n, 'Association': 'GlobalParameter', 'Index': -1}
+    want = {'Parent': MIC_FIRE_PARENT,
+            'ScalarParameterValues': [{'ParameterInfo': info(n), 'ParameterValue': v, 'ExpressionGUID': bytes.fromhex(g)}
+                                      for n, v, g in MIC_FIRE_SCALARS],
+            'VectorParameterValues': [{'ParameterInfo': info(n), 'ParameterValue': bytes.fromhex(c), 'ExpressionGUID': bytes.fromhex(g)}
+                                      for n, c, g in MIC_FIRE_VECTORS]}
+    assert got == want, got
+    assert fire.blob(0)[fire.tags(0).end:] == b'\0' * 4, fire.blob(0)[fire.tags(0).end:]   # UObject's lazy guid; no shader maps
+    keeps_invariants(fire.base)
+    proves('material-instances.textureparametervalues')
+    tex = invariants.Package(os.path.join(folder, 'M_Tex'))
+    got = tag_values(tex, 0, tex.tags(0))['TextureParameterValues']
+    assert got == [{'ParameterInfo': info('Noise'), 'ParameterValue': '/Game/Art/Textures/T_Noise01.T_Noise01',
+                    'ExpressionGUID': bytes(16)}], got
+    assert ('/Game/_ElytrasMods/MaterialInstance/M_Fire.M_Fire', 'MaterialInstanceConstant') in registry_rows(registry_of('MaterialInstance'))
+    proves('material-instances.basepropertyoverrides')
+    for member in ('BasePropertyOverrides.bOverride_ShadingModel = true;', 'bHasStaticPermutationResource = true;'):
+        refused('MicOverride', '', "a material instance's %s needs shaders of its own" % member.split('.')[0].split(' ')[0],
+                top='#include "UeApi/Engine.h"\n', after='UE_ASSET_DEFAULTS(UMaterialInstanceConstant, M_O) { %s }\n' % member)
+    print('ok  MaterialInstance: a material instance cooks as the editor saves one')
+
+
 def particle_tables(p, name):
     """Each raw distribution of the export named name, as {member: its tags (tag_values)}, its Table's float values
     rounded to 4 places."""
@@ -5934,11 +6106,14 @@ def edits():
     a, b = game('ED_AssetTest'), edited('ED_AssetTest')
     before, after = tags(a, 0), tags(b, 0)
     proves('ue-asset-at.changing-a-game-data-asset', 'editing-a-game.ue-asset-edit-ed-spider')
-    assert list(after) == list(before) + ['EnemySignificance'], (list(before), list(after))     # replaced in place, one appended
+    assert list(after) == list(before) + ['EnemySignificance', 'CreatureSize'], (list(before), list(after))     # replaced in place, two appended
     proves('editing-a-game.canbeusedforconstantpressure')
     assert after['SpawnSpread'].endswith(': 800.0') and 'value=0' in after['CanBeUsedForConstantPressure'], after
     # EEnemySignificance is an enum class: UEnemyDescriptor's member is an EnumProperty, and so is the tag (PropEnumClass)
     assert after['EnemySignificance'] == 'EnumProperty size=8 enum=EEnemySignificance: EEnemySignificance::Critical', after
+    # ECreatureSize is `: uint32`, no enum a variable can be, but a native member of one is an edit: the same tag
+    proves('editing-a-game.creaturesize-ecreaturesize-large')
+    assert after['CreatureSize'] == 'EnumProperty size=8 enum=ECreatureSize: ECreatureSize::Large', after
     for same in ('EnemyClass', 'IdealSpawnSize'):
         assert after[same] == before[same], (same, before[same], after[same])
     la, lb = dumpexp.load(a), dumpexp.load(b)
@@ -6603,6 +6778,66 @@ globals_()
 free_functions()
 
 
+def constexpr_fold():
+    """ConstexprFold: a call of a constexpr or consteval function with constant arguments is the answer clang works out
+    when the mod is built (the probe), cooked as a default, a constructor's value and a constant in code; called with a
+    run-time argument, the same function is a call of its Blueprint body. FMath.h's exact functions fold through their
+    build-time branch, and with a run-time argument still run their math node."""
+    import struct, invariants
+    base = asset('ConstexprFold')
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__ConstexprFold_C')
+    tags = {t['name']: t for t in pkg.tags(cdo)}
+    ints = {k: struct.unpack('<i', tags[k]['value'])[0] for k in ('Doubled', 'Summed', 'Hashed', 'Scaled', 'Named', 'Seven',
+                                                                 'Summed2', 'Capped', 'Floored', 'Built', 'Boxed', 'Nine')}
+    proves('consteval-functions.int32-v-twice-3', 'constexpr-and-consteval.int32-k-sq-3',
+           'constexpr-and-consteval.loop', 'consteval-functions.int32-seed-fnv-types', 'defaults.call-constexpr')
+    assert ints['Doubled'] == 42 and ints['Summed'] == 55 and ints['Hashed'] == fnv('types'), ints
+    proves('constexpr-and-consteval.default-args', 'constexpr-and-consteval.static-method')
+    assert ints['Scaled'] == 12 and ints['Named'] == 5 and ints['Summed2'] == 9, ints
+    proves('constexpr-and-consteval.nested')
+    assert ints['Seven'] == 7 and ints['Built'] == 12, ints
+    proves('constexpr-and-consteval.template')
+    assert struct.unpack('<q', tags['Tripled']['value'])[0] == 15 and ints['Boxed'] == 8, (tags['Tripled'], ints)
+    assert struct.unpack('<ff', tags['Halved']['value'] + tags['Negated']['value']) == (2.5, -1.5), (tags['Halved'], tags['Negated'])
+    proves('math-and-utility.fmath-constant')
+    assert ints['Capped'] == 50 and ints['Floored'] == -3 and tags['bNear']['bool'] == 1, (ints, tags['bNear'])
+    print('ok  ConstexprFold: a constexpr call with constant arguments is cooked as its answer - a default, a static '
+          'method, a template, a constructor\'s value, a constant made of one, FMath\'s exact functions')
+    # In code: the answer with no call left; a run-time argument calls the library's Twice, and FMath::Max the Max node.
+    proves('constexpr-and-consteval.in-code')
+    assert calls_in(base, 'UseConst') == [] and run(base, 'UseConst')[0] == 52, calls_in(base, 'UseConst')
+    proves('constexpr-and-consteval.constexpr-int32-sq-int32-x')
+    assert calls_in(base, 'UseRun') == [('Twice', 0x1C)], calls_in(base, 'UseRun')
+    lib = os.path.join(os.path.dirname(base), 'BPL_ConstexprFold')
+    assert [e for e in exports_of(lib) if not e.endswith('_C')] == ['Twice'], exports_of(lib)      # Tri, Half...: never called in game
+    shared = Obj('BPL_ConstexprFold_C')
+    lib_vm = VM(lib, objects={'Default__BPL_ConstexprFold_C': shared})
+    vm = VM(base, objects={'Default__BPL_ConstexprFold_C': shared},
+            natives={'Twice': lambda _vm, ctx, *a: lib_vm.call('Twice', *a)})
+    assert [vm.call('UseRun', 20), vm.call('UseRun', -3)] == [41, -5]
+
+    def math_calls(fn):
+        out = []
+
+        def walk(n):
+            if n.op == 0x68: out.append(n.val)
+            for k in n.kids: walk(k)
+        for n in runscript.script_of(base, fn): walk(n)
+        return sorted(out)
+    proves('math-and-utility.fmath-constant')
+    assert math_calls('UseMath') == ['Add_IntInt', 'Max'], math_calls('UseMath')
+    # An inline constexpr function is 9 for SqI(3) and expanded for SqI(V); a constexpr method called on this is a call.
+    proves('constexpr-and-consteval.inline-constexpr-int32-sq-int32', 'constexpr-and-consteval.constexpr-int32-sqm-int32-x')
+    assert ints['Nine'] == 9 and math_calls('UseSq') == ['Add_IntInt', 'Multiply_IntInt'], math_calls('UseSq')
+    assert calls_in(base, 'UseSq') == [('SqM', 0x45)] and run(base, 'UseSq', V=5)[0] == 34, calls_in(base, 'UseSq')
+    check('ConstexprFold', 'UseMath', lambda V: 9 + max(V, 0), [dict(V=v) for v in (-4, 0, 5)])
+    print('ok  ConstexprFold: in code a constant call is its answer, and the same function with a run-time argument a call')
+
+
+constexpr_fold()
+
+
 def template_instances():
     """TemplateInst: a template without inline is compiled once per instantiation, named by its arguments
     (REFERENCE.md#templates.instance-names): a free one is a function of BPL_TemplateInst, a static member one a static
@@ -6617,7 +6852,7 @@ def template_instances():
            'templates.template-class-t-inline-t')
     assert fns == ['Count__', 'Count__int32_float_bool', 'Fact__int32', 'Max2__float', 'Max2__int32', 'ModeOf__Angry',
                    'ModeOf__Calm', 'Pick__false', 'Pick__true', 'Times__3', 'Times__m2', 'Util__Twice__int32',
-                   'Width__float'], fns     # no Min2
+                   'ValueOf__Angry', 'ValueOf__Calm', 'Width__float'], fns     # no Min2, no InlineIs
     assert runscript.params_of(lib, 'Count__int32_float_bool') == ['V_0', 'V_1', 'V_2', 'WorldContextObject']
     proves('templates.static-member-template')
     assert sorted(e for e in exports_of(til) if not e.endswith('_C')) == ['Get__float', 'Get__int32']
@@ -6638,6 +6873,9 @@ def template_instances():
            vm.call('UsePick'), vm.call('UseCount'), vm.call('UseTwice', 4), vm.call('UseMin', 3, 9),
            vm.call('UseBox', 1.5, 4.0), vm.call('UseIntBox', 6), vm.call('UseGet', 5), vm.call('UseMode')]
     assert got == [9, 2.5, 120, 7 * 3 * 100 - 14, 12, 30, 8, 3, 2.5, 6, 15, 21], got
+    # An enum value parameter used as a value (`M == ETiMode::Angry`), in a function per instantiation and expanded inline.
+    proves('templates.template-emood-m-int32-valueof')
+    assert vm.call('UseModeValue') == 173, vm.call('UseModeValue')
     assert til_vm.call('Get__float', 1.5) == 4.5
     h = VM(holder, Value=4)
     h.call('ReceiveBeginPlay')
@@ -7199,6 +7437,19 @@ def uber_frames():
     print('ok  LatentTest / AsyncTest: each ubergraph is the class\'s UberGraphFunction and runs on the persistent frame')
 
 
+def repl_nowhere():
+    """A replicated variable on a class that is no actor and no component goes nowhere: refused, its own and one an
+    interface gives it."""
+    proves('replicated-variables-on.no-actor')
+    refused('ReplIfaceObject', '  int32 Read() { return Points; }\n', 'the replicated variable IReplScored::Points of an interface it '
+            'implements does nothing, since only an actor or an actor component replicates',
+            top='class IReplScored {\npublic:\n  UE_INTERFACE;\n  UE_REPLICATED(int32, Points) = 0;\n};\n',
+            base='UObject, public IReplScored')
+    refused('ReplOwnObject', '  UE_REPLICATED(int32, Points) = 0;\n',
+            'the replicated variable Points does nothing, since only an actor or an actor component replicates', base='UObject')
+    print('ok  ReplNowhere: a replicated variable on a class that is no actor or component is refused, an interface\'s too')
+
+
 def repl_defaults():
     """The actor replicates (CDO bReplicates, or no replicated variable ever leaves the server) and keeps Score's
     initializer; ReplKid inherits both rather than overriding them."""
@@ -7218,6 +7469,7 @@ def repl_defaults():
 
 
 replication()
+repl_nowhere()
 repl_defaults()
 repl_runs()
 rpc_routing()
@@ -7962,10 +8214,17 @@ def infer_meta():
         files = {
             'Owner/Shared.h': '#pragma once\n' + head + 'struct FShared { int32 A; };\nenum class EShared : uint8 { One, Two };\n'
                               'struct FMarked { UE_STRUCT; int32 B; };\nenum class EMarked : uint8 { X, Y };\nUE_ENUM(EMarked);\n'
-                              'class UShared : public UObject { public: FShared S; EShared E; FMarked M; EMarked K; };\n',
+                              'class UShared : public UObject { public: FShared S; EShared E; FMarked M; EMarked K; };\n'
+                              'namespace Core { class UInit : public UObject { public: int32 A; };\n'
+                              'struct FPair { int32 A; }; enum class EKind : uint8 { One, Two };\n'
+                              'class UCoreUser : public UObject { public: FPair P; EKind K; }; }\n',
             'Owner/Owner.cpp': '#include "Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Owner");\n',
             'User/User.cpp': '#include "../Owner/Shared.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/User");\n'
-                             'class AUser : public AActor { FShared S; EShared E; FMarked M; EMarked K; UShared *D; };\n',
+                             'class AUser : public AActor { FShared S; EShared E; FMarked M; EMarked K; UShared *D; };\n'
+                             'namespace Spawn { class UInit : public UObject { public: int32 B; };\n'
+                             'struct FPair { int32 B; }; enum class EKind : uint8 { Three, Four }; }\n'
+                             'class ATwo : public AActor { Core::UInit *Theirs; Spawn::UInit *Mine; Core::FPair TP; Spawn::FPair MP;\n'
+                             '  Core::EKind TK; Spawn::EKind MK; };\n',
             'Mixed/Mixed.h': '#pragma once\n' + head + 'struct FMixed { int32 A; };\n',
             'Mixed/A.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixA");\nclass AMixA : public AActor { FMixed M; };\n',
             'Mixed/B.cpp': '#include "Mixed.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MixB");\nclass AMixB : public AActor {};\n'}
@@ -7979,13 +8238,22 @@ def infer_meta():
         proves('sharing-a-class.include-turrets-turrets-h')
         assert {'EShared.uasset', 'FShared.uasset', 'UShared.uasset', 'FMarked.uasset', 'EMarked.uasset'} \
             <= set(os.listdir(out('Owner'))), os.listdir(out('Owner'))
-        assert {f for f in os.listdir(out('User')) if f.endswith('.uasset')} == {'AUser.uasset'}, os.listdir(out('User'))
+        assert {f for f in os.listdir(out('User')) if f.endswith('.uasset')} == {'AUser.uasset', 'ATwo.uasset'}, os.listdir(out('User'))
         imports = set(import_paths(os.path.join(out('User'), 'AUser')))
         assert {'/Game/_ElytrasMods/Owner/FShared.FShared', '/Game/_ElytrasMods/Owner/EShared.EShared',
                 '/Game/_ElytrasMods/Owner/UShared.UShared_C'} <= imports, sorted(imports)
         # Its UE_STRUCT and UE_ENUM too, never cooked again here:
         proves('sharing-a-class.include-marked')
         assert {'/Game/_ElytrasMods/Owner/FMarked.FMarked', '/Game/_ElytrasMods/Owner/EMarked.EMarked'} <= imports, sorted(imports)
+        # Two mods' types of one name, each in its own namespace: each is its own file's mod's.
+        proves('sharing-a-class.two-mods-one-name')
+        made = lambda mod, ns: {f for f in os.listdir(os.path.join(out(mod), ns)) if f.endswith('.uasset')}
+        assert made('Owner', 'Core') >= {'UInit.uasset', 'FPair.uasset', 'EKind.uasset'}, made('Owner', 'Core')
+        assert made('User', 'Spawn') == {'UInit.uasset', 'FPair.uasset', 'EKind.uasset'}, made('User', 'Spawn')
+        assert not os.path.exists(os.path.join(out('User'), 'Core')), os.listdir(os.path.join(out('User'), 'Core'))
+        imports = set(import_paths(os.path.join(out('User'), 'ATwo')))
+        assert {'/Game/_ElytrasMods/%s/%s' % (mod, leaf) for mod in ('Owner/Core', 'User/Spawn')
+                for leaf in ('UInit.UInit_C', 'FPair.FPair', 'EKind.EKind')} <= imports, sorted(imports)
         proves('sharing-a-class.a-header-in-a-folder')
         proc = assetgen_compile([os.path.join(tmp, 'Mixed/A.cpp'), UEAPI, out('MixA')])
         assert proc.returncode != 0 and 'unimplemented property M: FMixed' in proc.stdout, proc.stdout
@@ -8263,6 +8531,24 @@ subobject_chain()
 print('ok  InstancedDefaults: an instanced object is an export under its outer, its tag that export, its archetype the '
       'outer archetype\'s object of its name or its class\'s CDO; %s' % instanced_defaults())
 self_ref_import()
+
+
+def import_case():
+    """ImportCase: a package's and an object's name is an FName, which compares without case, so one asset named in two
+    spellings is one package row and one object row; two would be two imports of one object."""
+    b = asset('ImportCase')
+    paths = [p.lower() for p in import_paths(b)]
+    proves('ue-asset-at.two-spellings')
+    assert len(paths) == len(set(paths)), sorted(p for p in set(paths) if paths.count(p) > 1)
+    assert '/game/enemies/spider/grunt/ed_spider_grunt.ed_spider_grunt' in paths, paths
+    mine = {}
+    run(b, 'Keep', self_vars=mine)
+    assert mine['A'] and mine['A'] == mine['B'], mine
+    keeps_invariants(b)
+    print('ok  ImportCase: an asset named in two spellings is one import of its package and one of the object')
+
+
+import_case()
 abstract_instances()
 proves('declaring-components.ue-component-ucharges-ammo')
 refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP)
@@ -8429,6 +8715,53 @@ def instanced_refs():
           'the class HasInstancedReference')
 
 
+OWN_INSTANCED = (
+    '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/OwnInstanced");\n'
+    'class OwnProbe : public UObject {\npublic:\n  int32 V = 1;\n};\n'
+    'class OwnInstanced : public AActor {\npublic:\n  TArray<UObject *> Probes;\n  UObject *One;\n'
+    '  OwnInstanced() {\n    OwnProbe *L = NewObject<OwnProbe>(this, "lower");\n    L->V = 7;\n'
+    '    Probes = {L, NewObject<OwnProbe>(this, "Upper")};\n  }\n'
+    '  UE_DEFAULTS { One = UE_INSTANCED(OwnProbe, this, "Single"); }\n};\n')
+
+
+def own_instanced():
+    """OwnInstanced: an own member, or an array of them, pointed at named instanced objects - in the constructor,
+    through a local, or in UE_DEFAULTS - holds exports under the CDO and is CPF_InstancedReference (an array, its inner;
+    the array CPF_ContainsInstancedReference), so a spawned actor gets copies of its own (CoreNative.cpp:265-282
+    instances an object of a class not DefaultToInstanced only for a flagged property). A member initializer is refused,
+    naming the two places that take one."""
+    tmp, out, _ = compile_to(OWN_INSTANCED, 'OwnInstanced')
+    base = os.path.join(out, 'OwnInstanced')
+    p = invariants.Package(base)
+    cdo = p.find('Default__OwnInstanced_C')
+
+    def points(tag):
+        t = p.tag(cdo, tag)
+        v = bytes(t['value'])
+        refs = ([struct.unpack_from('<i', v, 4 + 4 * j)[0] for j in range(struct.unpack_from('<i', v)[0])]
+                if t['type'] == 'ArrayProperty' else [struct.unpack('<i', v)[0]])
+        for x in refs:
+            assert x > 0 and p.exports[x - 1]['outer'] == cdo + 1, (tag, p.path(x))
+        return [p.path(x).rsplit(':', 1)[-1] for x in refs]
+    proves('instanced-objects.own-member-instanced')
+    assert points('Probes') == ['lower', 'Upper'] and points('One') == ['Single'], (points('Probes'), points('One'))
+    assert 'V' in {t['name'] for t in p.tags(p.find('lower'))}, 'lower lost its V'
+    st = class_tail(base)[2]
+    props = {q.name: q for q in st.props}
+    need = [('Probes', props['Probes'].flags, 0x8000000000), ('Probes inner', props['Probes'].subs[0].flags, 0x80000),
+            ('One', props['One'].flags, 0x80000)]
+    missing = ['%s %#x lacks %#x' % (n, f, bit) for n, f, bit in need if not f & bit]
+    assert not missing, '; '.join(missing)
+    assert st.class_flags & 0x800000, hex(st.class_flags)
+    keeps_invariants(base)
+    shutil.rmtree(tmp, ignore_errors=True)
+    proves('instanced-objects.ue-instanced-5')
+    refused('OwnInstancedInit', '  TArray<UObject *> Probes = {NewObject<UDamageImpulse>(this, "x")};\n',
+            'set in its UE_DEFAULTS or constructor')
+    print('ok  OwnInstanced: own members point at exports under the CDO, flagged instanced; a member initializer is '
+          'refused')
+
+
 def run_fname(chain, fn, fields, **parms):
     """run_as without its exact-case name match: fn is run on an object of class chain[0] (mod ancestors chain[1:]),
     and every call by name - the first included - finds the most derived function of that FName, case-insensitively,
@@ -8507,6 +8840,7 @@ for _name, (_parent, _bits, _within, _config) in TAIL_META.items():
 walker_config()
 print('ok  OverrideTest Walker: ClassConfigName Game, ACharacter\'s')
 instanced_refs()
+own_instanced()
 for _mod, (_src, _member, _oracle, _what) in SHADOWS.items():
     refused_or_distinct(_mod, _src, _member, _oracle)
 print('ok  member names: one per FName, overloads and case twins included, none reused from an ancestor (%d cases)'
@@ -10805,6 +11139,53 @@ print('ok  Names: a member, a UE_STRUCT member, a function, a component or an in
       'case, is refused')
 
 
+def none_locals():
+    """A local or a parameter named None, in any case, is NAME_None: the bytecode names a local by its FName, and
+    FindFProperty returns null for None, so every read and write of it would be dead in game. The editor names a
+    variable it makes unique `<Base>_<N>`, N from 0 (FBlueprintEditorUtils::FindUniqueKismetName), and so does the
+    compiler here: None_0, or None_1 past a member None_0, with every reference, and a warning once naming the function,
+    the variable, its line and the new name. In a method, an event, an out-of-class definition and a free function, as
+    a local and as a parameter; the renamed one is read and written, and the function returns what C++ does."""
+    def compiled(tmp, mod, body, why, top='', after=''):
+        src = os.path.join(tmp, mod + '.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
+                    'class %s : public AActor {\npublic:\n%s};\n%s' % (mod, top, mod, body, after))
+        proc = assetgen_compile([src, UEAPI, tmp])
+        lines = [l for l in proc.stdout.splitlines() if 'warning: ' + why in l]
+        assert proc.returncode == 0 and len(lines) == 1, (mod, proc.stdout)
+        return os.path.join(tmp, mod)
+    with tempfile.TemporaryDirectory() as tmp:
+        proves('overloading.none-local')
+        base = compiled(tmp, 'NoneLocal', '  int32 Sum(int32 V) {\n    int32 None = V + 1;\n    None = None * 2;\n'
+                        '    return None;\n  }\n',
+                        'NoneLocal::Sum: the local None (NoneLocal.cpp:7) is UE\'s empty name, in any case, whose every '
+                        'read and write would be dead in game: renamed None_0')
+        props = runscript.props_of(base, 'Sum')
+        assert 'None_0' in props and 'None' not in props, props
+        for v in (-3, 0, 5):
+            assert run(base, 'Sum', V=v)[0] == (v + 1) * 2, v
+        base = compiled(tmp, 'NoneTaken', '  int32 None_0 = 5;\n  int32 Add(int32 V) { int32 None = V; None = None + 1; return None + None_0; }\n',
+                        'NoneTaken::Add: the local None (NoneTaken.cpp:7) is UE\'s empty name, in any case, whose every '
+                        'read and write would be dead in game: renamed None_1')
+        assert 'None_1' in runscript.props_of(base, 'Add'), runscript.props_of(base, 'Add')
+        assert run(base, 'Add', {'None_0': 5}, V=3)[0] == 9
+        base = compiled(tmp, 'NoneParm', '  int32 Twice(int32 none) { return none * 2; }\n',
+                        'NoneParm::Twice: the parameter none (NoneParm.cpp:6) is UE\'s empty name, in any case, whose '
+                        'every read and write would be dead in game: renamed none_0')
+        assert run(base, 'Twice', None_0=4)[0] == 8     # none_0 is FName (none, 1), stored as the package's "None"
+        compiled(tmp, 'NoneEvent', '  int32 Count = 0;\n  void ReceiveBeginPlay();\n',
+                 'NoneEvent::ReceiveBeginPlay: the local NONE (NoneEvent.cpp:10) is UE\'s empty name',
+                 after='void NoneEvent::ReceiveBeginPlay() {\n  int32 NONE = 2;\n  Count = NONE;\n}\n')
+        compiled(tmp, 'NoneFree', '  int32 Count = 0;\n  void Bump() { Count = Half(Count); }\n',
+                 'Half: the local None (NoneFree.cpp:4) is UE\'s empty name',
+                 top='inline int32 Half(int32 X) { int32 None = X / 2; return None; }\n')
+
+
+none_locals()
+print('ok  Names: a local or a parameter named None, in any case, is renamed None_0 as the editor names it, with a warning')
+
+
 # ---- DELEG: delegates and event dispatchers - signatures, binds, broadcasts, timers by name (invariant_rules/delegates.py)
 
 import invariants
@@ -12707,6 +13088,32 @@ def prop_set_delta():
           'parent\'s elements it drops as removed, and loads as its own value, not the union')
 
 
+def comp_set_delta():
+    """UE_DEFAULTS on a component's TSet / TMap is what the template loads: read as the loader reads each tag on top of
+    its archetype's loaded value (loaded_container), the component class's default object for a class's own component
+    and the parent's template for an inherited one. Any encoding that loads the value the source says passes."""
+    import invariants
+    folder = os.path.dirname(asset('CompSetDelta'))
+    part, base, kid = (invariants.Package(os.path.join(folder, n)) for n in ('UCsdHolder', 'CsdBase', 'CompSetDelta'))
+    cdo = part.find('Default__UCsdHolder_C')
+    cls = {('Ids',): loaded_container(part, cdo, 'Ids', 'set', set()), ('Score',): loaded_container(part, cdo, 'Score', 'map', {}),
+           ('Held', 'Ids'): loaded_container(part, cdo, ('Held', 'Ids'), 'set', set())}
+    assert cls == {('Ids',): {1, 2}, ('Score',): {'a': 1, 'c': 3}, ('Held', 'Ids'): {1, 2}}, cls
+    kinds = {('Ids',): 'set', ('Score',): 'map', ('Held', 'Ids'): 'set'}
+    over = lambda pkg, name, start: {k: loaded_container(pkg, pkg.find(name), k, kinds[k], start[k]) for k in kinds}
+    proves('ue-defaults.holder-ids-2-3')
+    holder = over(base, 'Holder_GEN_VARIABLE', cls)
+    assert holder == {('Ids',): {2, 3}, ('Score',): {'a': 5, 'b': 2}, ('Held', 'Ids'): {2, 4}}, 'CsdBase.Holder loads %s' % holder
+    assert over(base, 'Plain_GEN_VARIABLE', cls) == cls
+    kid_holder = over(kid, 'Holder_GEN_VARIABLE', holder)
+    assert kid_holder == {('Ids',): {3, 9}, ('Score',): {'a': 5, 'b': 2}, ('Held', 'Ids'): {2, 4}}, 'CompSetDelta.Holder loads %s' % kid_holder
+    kid_plain = over(kid, 'Plain_GEN_VARIABLE', cls)
+    assert kid_plain == {('Ids',): {7}, ('Score',): {'a': 1, 'c': 3}, ('Held', 'Ids'): {1, 2}}, 'CompSetDelta.Plain loads %s' % kid_plain
+    for n in ('UCsdHolder', 'CsdBase', 'CompSetDelta'): keeps_invariants(os.path.join(folder, n))
+    print('ok  CompSetDelta: a component\'s TSet / TMap default, the class\'s own component or an inherited one, lists its '
+          'archetype\'s elements it drops as removed, and loads as the braces say, not the union')
+
+
 def prop_enum_class():
     """A property of a native `enum class : uint8` is an EnumProperty over a ByteProperty, as the editor makes it
     (KismetCompilerMisc.cpp 1071-1094; every EnumProperty of the game's Blueprints is over a ByteProperty): a variable, a
@@ -12801,6 +13208,7 @@ prop_flag_predicates()
 prop_hash_keys()
 prop_enum_casts()
 prop_set_delta()
+comp_set_delta()
 prop_enum_class()
 
 
@@ -13422,6 +13830,12 @@ def tag_values(pkg, i, tags):
         elif ty == 'ObjectProperty': x = pkg.path(struct.unpack('<i', v)[0])
         elif ty == 'ArrayProperty' and t['inner'] == 'ObjectProperty':
             x = [pkg.path(r) for r in struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4)]
+        elif ty == 'ArrayProperty' and t['inner'] == 'StructProperty':    # count, the inner tag (49 bytes), each element's tags
+            x, at = [], t['at'] + 4 + 49
+            for _ in range(struct.unpack_from('<i', v)[0]):
+                tl = pkg.tags(i, at)
+                x.append(tag_values(pkg, i, tl))
+                at = tl.end
         elif ty == 'FloatProperty': x = struct.unpack('<f', v)[0]
         elif ty == 'BoolProperty': x = bool(t['bool'])
         elif ty == 'NameProperty' or ty in ('ByteProperty', 'EnumProperty') and t['size'] == 8:
@@ -13483,6 +13897,7 @@ print('ok  DefaultsOwnNest: braces in a value that starts as a struct\'s default
       'leaves out, and are refused at what it gives')
 asset_defaults()
 asset_defaults_refusals()
+material_instance()
 particle_bake()
 particle_lod_validity()
 particle_starts()
@@ -14191,7 +14606,36 @@ def widget_tree():
     refused('WtBindFar', widgets + '  WtBindFar() { Root->AddChildToCanvas(Title); UE_BIND(Title, Text, &UWtOther::Get); }\n',
             'is a function of this class or of a class above it',
             top='class UWtOther : public UUserWidget {\npublic:\n  FText Get() const { return FText("x"); }\n};\n', base='UUserWidget')
-    print('ok  WidgetTree: a widget class\'s constructor cooks its tree, slots and their layout, as the engine walks it')
+
+    # A class spelled through a namespace alias, which clang keeps as written (`Kt::UPane *`): another mod's widget, the
+    # game's, through an alias of an alias, and another mod's component, each the class its namespace holds.
+    with tempfile.TemporaryDirectory() as tmp:
+        head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\n#include "UeApi/UMG.h"\n'
+        files = {
+            'Owner/Panes.h': '#pragma once\n' + head + 'namespace Kit { namespace Ui {\n'
+                             'class UPane : public UUserWidget {};\nclass UPart : public USceneComponent {}; } }\n',
+            'Owner/Owner.cpp': '#include "Panes.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Owner");\n',
+            'User/User.cpp': '#include "../Owner/Panes.h"\n#include "UeApi/Game/UI_CurvedCanvas.h"\n'
+                             'UE_MOD_PACKAGE("/Game/_ElytrasMods/User");\n'
+                             'namespace Kt = ::Kit::Ui;\nnamespace Gui = ::Game::UI::Global_UI_Elements;\nnamespace Gui2 = Gui;\n'
+                             'class UWtAliased : public UUserWidget {\npublic:\n  UE_WIDGET(UCanvasPanel, Root);\n'
+                             '  UE_WIDGET(Kt::UPane, Pane);\n  UE_WIDGET(Gui2::UI_CurvedCanvas, Curve);\n'
+                             '  UWtAliased() { Root->AddChildToCanvas(Pane); Root->AddChildToCanvas(Curve); }\n};\n'
+                             'class AAliased : public AActor {\npublic:\n  UE_COMPONENT(Kt::UPart, Part);\n};\n'}
+        for name, text in files.items():
+            os.makedirs(os.path.join(tmp, os.path.dirname(name)), exist_ok=True)
+            with open(os.path.join(tmp, name), 'w', encoding='utf-8') as f: f.write(text)
+        out = lambda mod: os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
+        for mod in ('Owner', 'User'):
+            proc = assetgen_compile([os.path.join(tmp, mod, mod + '.cpp'), UEAPI, out(mod)])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        ap, aci = class_pkg(os.path.join(out('User'), 'UWtAliased'))
+        proves('names.namespace-alias')
+        assert {pr.name: ap.path(pr.ref) for pr in ap.struct(aci).props if pr.type == 'ObjectProperty'} == {
+            'Root': '/Script/UMG.CanvasPanel', 'Pane': '/Game/_ElytrasMods/Owner/Kit/Ui/UPane.UPane_C',
+            'Curve': '/Game/UI/Global_UI_Elements/UI_CurvedCanvas.UI_CurvedCanvas_C'}
+        assert '/Game/_ElytrasMods/Owner/Kit/Ui/UPart.UPart_C' in import_paths(os.path.join(out('User'), 'AAliased'))
+    print('ok  WidgetTree:a widget class\'s constructor cooks its tree, slots and their layout, as the engine walks it')
 
 
 def widget_event_flags():
@@ -14387,7 +14831,32 @@ def widget_animation():
     assert [(t['name'], struct.unpack('<f', bytes(t['value']))[0]) for t in pad] == [('Top', 6.0)], pad
     keeps_invariants(base)
 
-    widgets = '  UE_WIDGET(UCanvasPanel, Root);\n  UE_WIDGET(UTextBlock, Title);\n  UE_ANIMATION(Pop);\n'
+    # The same assignment where the slot is made, through the untyped call's cast and through the typed adder's result.
+    cp, _ = class_pkg(os.path.join(ROOT, 'WidgetTree', 'FSD', 'Content', '_ElytrasMods', 'WidgetTree', 'UWtChain'))
+    slots = {cp.path(i + 1).split('.')[-1]: i for i in range(len(cp.exports)) if cp.class_of(i + 1) == 'OverlaySlot'}
+    assert len(slots) == 2, slots
+    by_child = {}
+    for i in slots.values():
+        child = [t for t in cp.tags(i) if t['name'] == 'Content'][0]
+        by_child[cp.path(struct.unpack('<i', bytes(child['value'])[:4])[0])] = i
+    left, right = (next(i for k, i in by_child.items() if k.endswith(n)) for n in ('Left', 'Right'))
+    assert [(t['name'], struct.unpack('<f', bytes(t['value']))[0]) for t in cp.tags(left, cp.tag(left, 'Padding')['at'])] == [('Top', 6.0)]
+    hal = cp.tag(right, 'HorizontalAlignment')
+    assert cp.names[struct.unpack_from('<i', bytes(hal['value']))[0]].endswith('HAlign_Center'), hal
+    proves('widget-layouts.cast-uoverlayslot-box-addchild-a')
+
+    # An inline helper called in the constructor reads as its statements, each parameter its argument.
+    hp, _ = class_pkg(os.path.join(ROOT, 'WidgetTree', 'FSD', 'Content', '_ElytrasMods', 'WidgetTree', 'UWtHelper'))
+    padded = {}
+    for i in range(len(hp.exports)):
+        if hp.class_of(i + 1) != 'OverlaySlot': continue
+        child = [t for t in hp.tags(i) if t['name'] == 'Content'][0]
+        top, = [struct.unpack('<f', bytes(t['value']))[0] for t in hp.tags(i, hp.tag(i, 'Padding')['at'])]
+        padded[hp.path(struct.unpack('<i', bytes(child['value'])[:4])[0]).split(':')[-1]] = top
+    assert padded == {'Left': 6.0, 'Right': 2.0}, padded
+    proves('widget-layouts.put-left-6-0f')
+
+    widgets ='  UE_WIDGET(UCanvasPanel, Root);\n  UE_WIDGET(UTextBlock, Title);\n  UE_ANIMATION(Pop);\n'
     proves('widget-layouts.ue-keys')
     refused('WaNoKeys', widgets + '  WaNoKeys() { Root->AddChildToCanvas(Title); }\n', 'keys nothing and has no length',
             base='UUserWidget')
@@ -15334,17 +15803,26 @@ def proxy_frame_held():
         for n in invariants.statements(pkg, i)[0]:
             if n.op in (0x0F, 0x5F) and factory(n.kids[1]): held.append(holder(i, n.kids[0]))
             elif n.op == 0x64 and factory(n.kids[0]): held.append('the frame')
-    assert len(held) == 1, held
-    assert held[0] in ('a member', 'the frame'), 'the montage proxy is kept in %s' % held[0]
-    made = []
-    vm = VM(base, {'CreateProxyObjectForPlayMontage': lambda vm, ctx, *a: made.append(Obj('PlayMontageCallbackProxy')) or made[-1]},
-            Mesh='mesh', Montage='montage', Last='None')
-    vm.call('Play')
-    assert any(v is made[-1] for v in vm.self.vars.values()), 'nothing of the object holds the proxy: %s' % vm.self.vars
-    vm.broadcast(made[-1], 'OnCompleted', 'End')
-    assert vm.self.vars['Last'] == 'End', vm.self.vars
+    # Play's, and PlayChained's, which the source gives no local: `Create(...)->OnCompleted.Add(...)`.
+    assert len(held) == 2, held
+    assert all(h in ('a member', 'the frame') for h in held), 'the montage proxy is kept in %s' % held
+    for play in ('Play', 'PlayChained'):
+        made = []
+        vm = VM(base, {'CreateProxyObjectForPlayMontage': lambda vm, ctx, *a: made.append(Obj('PlayMontageCallbackProxy')) or made[-1]},
+                Mesh='mesh', Montage='montage', Last='None')
+        vm.call(play)
+        assert len(made) == 1 and any(v is made[-1] for v in vm.self.vars.values()), \
+            '%s: nothing of the object holds the proxy: %s' % (play, vm.self.vars)
+        vm.broadcast(made[-1], 'OnCompleted', 'End')
+        assert vm.self.vars['Last'] == 'End', (play, vm.self.vars)
     keeps_invariants(base)
-    print('ok  ProxyLocalHeld.Play: a callback proxy bound in a plain function is kept in a member, where the GC sees it')
+    # Beside another call of its statement the proxy's call cannot move in front: refused, saying what to write.
+    refused('ProxyBeside', '  USkeletalMeshComponent *Mesh;\n  UAnimMontage *Montage;\n  int32 N = 0;\n'
+            '  int32 Bump() { return ++N; }\n  void Take(int32 A, UObject *P) {}\n'
+            '  void F() { Take(Bump(), UPlayMontageCallbackProxy::CreateProxyObjectForPlayMontage(Mesh, Montage, 1.0f, 0.0f, FName())); }\n',
+            'put it in a local of its own first', top='#include "UeApi/AnimGraphRuntime.h"\n')
+    print('ok  ProxyLocalHeld.Play: a callback proxy bound in a plain function, held in a local or made in the middle of the '
+          'bind, is kept in a member, where the GC sees it')
 
 
 def deferred_left():
@@ -15548,11 +16026,18 @@ def struct_slices():
                              'class StructSlice : public AActor {\npublic:\n'
                              '  bool Native(const FPointerEvent &E) { return UKismetInputLibrary::InputEvent_IsControlDown(E); }\n'
                              '  bool Sugar(const FPointerEvent &E) { return E.InputEvent_IsControlDown(); }\n'
-                             '  void Take(FInputEvent In) {}\n  void ByValue(const FKeyEvent &K) { Take(K); }\n};\n', 'StructSlice')
+                             '  void Take(FInputEvent In) {}\n  void ByValue(const FKeyEvent &K) { Take(K); }\n'
+                             '  FInputEvent Held;\n'
+                             '  FInputEvent Returned(const FPointerEvent &M) { return M; }\n'
+                             '  void Assigned(const FPointerEvent &M) { Held = M; }\n'
+                             '  void Initialised(const FPointerEvent &M) { FInputEvent E = M; Take(E); }\n};\n', 'StructSlice')
     base = os.path.join(out, 'StructSlice')
     for fn, conv, arg, callee in (('Native', 'GetInputEventFromPointerEvent', 'E', "Function'InputEvent_IsControlDown'"),
                                   ('Sugar', 'GetInputEventFromPointerEvent', 'E', "Function'InputEvent_IsControlDown'"),
-                                  ('ByValue', 'GetInputEventFromKeyEvent', 'K', r'LocalVirtualFunction\s+Take')):
+                                  ('ByValue', 'GetInputEventFromKeyEvent', 'K', r'LocalVirtualFunction\s+Take'),
+                                  ('Returned', 'GetInputEventFromPointerEvent', 'M', r'Return'),
+                                  ('Assigned', 'GetInputEventFromPointerEvent', 'M', r'Let'),
+                                  ('Initialised', 'GetInputEventFromPointerEvent', 'M', r'Let')):
         text = dump('walkscript.py', base, export_index(base, fn))
         assert re.search(r"Function'%s'\s*\n.*LocalOutVariable\s+%s@" % (conv, arg), text), (fn, text)
         assert not re.search(r"%s\s*\n.*Local\w*Variable\s+%s@" % (callee, arg), text), (fn, text)
@@ -15560,6 +16045,10 @@ def struct_slices():
     proves('struct-conversions.take-motion')
     refused('SliceNoConv', '  void Take(const FInputEvent &E) {}\n  void F(const FMotionEvent &M) { Take(M); }\n',
             'Take argument 1 is an FMotionEvent where an FInputEvent is wanted', top='#include "UeApi/SlateCore.h"\n')
+    for mod, body in (('SliceRet', '  FInputEvent F(const FMotionEvent &M) { return M; }\n'),
+                      ('SliceSet', '  FInputEvent H;\n  void F(const FMotionEvent &M) { H = M; }\n'),
+                      ('SliceInit', '  void F(const FMotionEvent &M) { FInputEvent E = M; }\n')):
+        refused(mod, body, 'this copy is an FMotionEvent where an FInputEvent is wanted', top='#include "UeApi/SlateCore.h"\n')
 
 
 def input_key_names():
@@ -15729,10 +16218,17 @@ def timelines():
     assert [(props[n].type, props[n].flags) for n in ('Alpha', 'Lift', 'Tint', 'Beat')] == [
         ('FloatProperty', 0), ('StructProperty', 0), ('StructProperty', 0), ('FloatProperty', 0)]
 
+    lamp_base = os.path.join(ROOT, 'FadingLamp', 'FSD', 'Content', '_AssetGenExamples', 'FadingLamp', 'FadingLamp')
     kid = timelines_of(child)
     assert list(kid) == ['Spin'] and kid['Spin']['UpdateFunctionName'] == 'OnSpin' and 'FinishedFunctionName' not in kid['Spin'], kid
     assert timelines_of(plain) == {}
-    lamp = os.path.join(ROOT, 'FadingLamp', 'FSD', 'Content', '_AssetGenExamples', 'FadingLamp', 'FadingLamp')
+    # A replicated timeline's component replicates only with its actor: the class's CDO replicates, and a subclass inherits it.
+    cdo_of = lambda b: dump('dumptags.py', b, [e['name'] for e in dumpexp.load(b)[5]].index('Default__%s_C' % os.path.basename(b)))
+    proves('declaring-a-timeline.ue-timeline-fade-2-0f-2')
+    assert re.search(r'bReplicates \[0\] BoolProperty size=0 value=1', cdo_of(base)), cdo_of(base)
+    assert 'bReplicates' not in cdo_of(child) and 'bReplicates' not in cdo_of(plain)
+    assert 'bReplicates' not in cdo_of(lamp_base), cdo_of(lamp_base)      # no Replicated option: the actor is left as it was
+    lamp = lamp_base
     assert os.path.exists(lamp + '.uasset'), 'the examples are not built under ' + ROOT
     lit = timelines_of(lamp)
     assert list(lit) == ['Fade'] and (lit['Fade']['UpdateFunctionName'], lit['Fade']['FinishedFunctionName']) == ('OnFade', 'OnFaded'), lit
@@ -16654,6 +17150,8 @@ def lambdas():
         ('InitCapture', lambda V: (V + 1) * 7),
         ('InitCaptures', lambda V: ((V * 10 + V * 2) + (V + V * 2)) * 100 + V + 2),
         ('InitUnused', lambda V: V * 3 + 1),
+        ('InitLambda', lambda V: (3 + V) * 2 + (V + V) * 2),
+        ('InitLambdaInPlace', lambda V: 4 * V + 1),
         ('Immediate', lambda V: V * 5),
         ('ImmediateInCondition', lambda V: 1 if V > 3 else 0),
         ('ToTemplate', lambda V: (V + 5) * 2 + 1 + V + 5),
@@ -16681,7 +17179,7 @@ def lambdas():
     ]
     proves('other-declarations.auto-inc-int32-v-return', 'lambdas.auto-l-int32-a-x', 'lambdas-function.auto-l-x-int32-y',
            'lambdas.c-int32-a-mutable-c', 'lambdas.z-x-1-int32-a', 'lambdas.const-int32-r-return-v', 'lambdas.apply-5-int32-a-x',
-           'lambdas.auto-a-auto-b-return', 'lambdas.a-lambda-calling-or-capturing')
+           'lambdas.auto-a-auto-b-return', 'lambdas.a-lambda-calling-or-capturing', 'lambdas.g-l-int32-b')
     for fn, want in forms:
         for v in (-5, 0, 3, 8):
             got = run(base, fn, V=v)[0]
@@ -16732,6 +17230,8 @@ def lambda_refusals():
          'takes a mutable lambda by value, which copies its state'),
         ('LamCaptureMutable', '', 'int32 F(int32 V) { %s auto K = [=](int32 A) mutable { return L(A); }; return K(1); }' % src,
          'which would fork its state: capture it by reference'),
+        ('LamInitMutable', '', 'int32 F(int32 V) { %s auto K = [G = L](int32 A) mutable { return G(A); }; return K(1); }' % src,
+         'which would fork its state: capture it by reference'),
         ('LamStatic', '', 'int32 F(int32 V) { auto L = [](int32 A) { static int32 N = 0; N += A; return N; }; return L(V); }',
          "static N lives in the ubergraph's frame"),
         ('LamInlineStatic', 'inline int32 G(int32 A) { static int32 N = 0; N += A; return N; }', 'int32 F(int32 V) { auto L = [&](int32 A) { return G(A); }; return L(V); }',
@@ -16754,6 +17254,748 @@ def lambda_refusals():
 
 
 lambda_refusals()
+
+
+
+# ---- The refusals and warnings REFERENCE.md rows name, each from the smallest source that earns it. A row is a tuple
+# (row id, mod, class body, message, text before the class[, the class's bases]); a body that starts with `#include` is the
+# whole source. The compile must fail (or, in ROW_WARNINGS, succeed with a `warning:` line) saying the message.
+
+ROW_HEAD = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
+ROW_INTRIN = '#include "%s"\n' % os.path.join(AG, 'include', 'Intrin.h').replace('\\', '/')
+ROW_IAIM = 'class IAimable {\npublic:\n  UE_INTERFACE;\n  void Aim();\n};\n'
+ROW_IMARK = 'class IMarkable {\npublic:\n  UE_INTERFACE;\n  int32 Marks = 0;\n  void Mark();\n};\n'
+ROW_FNV = 'consteval int32 Fnv(int32 X) { return (X * 31 + 7) % 1000003; }\n'
+ROW_TWICE = 'constexpr int32 Twice(int32 X) { return X * 2; }\n'
+ROW_NEVER = 'int32 NotC(int32 X) { return X; }\nconstexpr int32 Bad(int32 X) { return NotC(X); }\n'
+ROW_FMATH = '#include "%s"\n' % os.path.join(AG, 'include', 'FMath.h').replace('\\', '/')
+ROW_REFUSALS = [
+    ('the-mod-package.ue-mod-package', 'NoPkg', '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nclass NoPkg : public AActor {\npublic:\n  int32 X;\n};\n',
+     'the source declares no UE_MOD_PACKAGE', ''),
+    ('the-mod-package.ue-mod-package-2', 'TwoPkg', ROW_HEAD % 'TwoPkg' + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/Other");\nclass TwoPkg : public AActor {\npublic:\n  int32 X;\n};\n',
+     "redefinition of 'UeModPackage'", ''),
+    ('the-mod-package.a-source-with-nothing-to', 'Nothing', ROW_HEAD % 'Nothing' + 'class Helper {\npublic:\n  int32 X;\n};\n',
+     'the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit', ''),
+    ('blueprint-classes.class-x-public-anotincluded', 'NotIncl', ROW_HEAD % 'NotIncl' + 'class NotIncl : public ANotIncluded {};\n', 'expected class name', ''),
+    ('namespaces-and-folders.class-pistol-public-rifle', 'NsAmb', '  int32 F() { return 1; }\n', 'derives from an undeclared class: Rifle',
+     'namespace Weapons { class Rifle : public AActor { public: int32 X; }; }\nnamespace Other { class Rifle : public AActor { public: int32 Y; }; }\n'
+     'namespace Weapons { class Pistol : public Rifle { public: int32 Z; }; }\n'),
+    ('sharing-a-class.ue-class-game-mymods-turrets-2', 'UcBad', '  UE_CLASS("/Game/_MyMods/Turrets", "UTurretDef_C");\n  int32 X;\n',
+     'does not end in the asset that declares UTurretDef_C', ''),
+    ('sharing-a-class.ue-class-game-mymods-turrets-3', 'UcBad2', '  UE_CLASS("/Game/_ElytrasMods/UcBad2/UcBad2", "UcBad2");\n  int32 X;\n',
+     'cooking it here requires', ''),
+    ('member-variables.uint16-w', 'U16', '  uint16 W;\n', 'unimplemented property W: uint16', ''),
+    ('member-variables.uint16-w', 'Dbl', '  double D;\n', 'unimplemented property D: double', ''),
+    ('variable-types.uint32-mask', 'U32', '  uint32 Mask;\n', 'unimplemented property Mask: uint32', ''),
+    ('variable-types.double-d', 'Dbl2', '  double D;\n', 'unimplemented property D: double', ''),
+    ('member-variables.a-member-whose-type-is', 'FwdMem', '  class BP_Nothing_C *P;\n', 'is only forward-declared here - #include "UeApi/Game/', 'class BP_Nothing_C;\n'),
+    ('defaults.embedfile-missing-bin', 'EmbMiss', '  TArray<uint8> P = __EmbedFile__("missing.bin");\n', 'cannot read (or empty)', ROW_INTRIN),
+    ('defaults.embedfile-missing-bin', 'EmbVar', '  TArray<uint8> P = __EmbedFile__(kPath);\n', 'the path must be a string literal', ROW_INTRIN + 'constexpr const char *kPath = "x.bin";\n'),
+    ('namespace-scope.umooddef-globaldef', 'GlobDef', '  int32 F() { return GlobalDef.Mood; }\n', 'is an asset, not a value',
+     'class UMoodDef : public UDataAsset {\npublic:\n  int32 Mood;\n};\nUMoodDef GlobalDef;\n'),
+    ('namespace-scope.extern-int32-shared', 'ExtG', '  int32 F() { return Shared; }\n', 'declared extern but not defined in this source', 'extern int32 Shared;\n'),
+    ('globals-across-sources.extern-int32-counter', 'ExtC', '  int32 F() { return Counter + 1; }\n', 'declared extern but not defined in this source', 'extern int32 Counter;\n'),
+    ('casts-and-class.a-b', 'ObjLt', '  bool F(AActor *A, AActor *B) { return A < B; }\n', 'unimplemented binary operator < on ObjectObject', ''),
+    ('number-conversions.uint8-x', 'F2U8', '  uint8 F(float X) { return (uint8)X; }\n', 'no Kismet conversion from float to uint8', ''),
+    ('joining-strings.a-n-b', 'StrJoin', '  FString F(int32 N) { return "a" + N + "b"; }\n', 'invalid operands to binary expression', ''),
+    ('converting-strings.fname-n-big', 'NameBig', '  FName F(int64 Big) { FName N = Big; return N; }\n', "conversion from 'int64' (aka 'long long') to 'FName' is ambiguous", ''),
+    ('comparing-and-testing.a-b-3', 'StrLt', '  bool F(FString A, FString B) { return A < B; }\n', 'invalid operands to binary expression', ''),
+    ('constants-and-constant.tarray-int32-rolls', 'RollDef', '  TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};\n',
+     'a default is a value known when the mod is built', ''),
+    ('copies-and-braced.tarray-int32-rolls', 'RollDef2', '  TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};\n',
+     'a default is a value known when the mod is built', ''),
+    ('consteval-functions.fnv-name', 'FnvRun', '  int32 F(int32 N) { return Fnv(N); }\n', 'is not a constant expression', ROW_FNV),
+    ('constexpr-and-consteval.runtime-only', 'CxRandom', '  int32 R = UKismetMathLibrary::RandomInteger(3);\n',
+     '(`RandomInteger` is not constexpr, so it runs only in the game)', ''),
+    ('constexpr-and-consteval.runtime-only', 'CxFRand', '  int32 R = FMath::RandRange(1, 6);\n',
+     '(`RandRange` is not constexpr, so it runs only in the game)', ROW_FMATH),
+    ('constexpr-and-consteval.not-a-constant', 'CxArg', '  int32 A = 1;\n  int32 C = Twice(A);\n',
+     '(argument 1 (`A`) of `Twice` is not a constant)', ROW_TWICE),
+    ('constexpr-and-consteval.clang-cannot', 'CxMaybe', '  int32 B = Maybe(2);\n',
+     "(clang could not run `Maybe` when the mod is built: non-constexpr function 'NotC' cannot be used in a constant expression (CxMaybe.cpp:",
+     'int32 NotC(int32 X) { return X; }\nconstexpr int32 Maybe(int32 X) { return X > 0 ? NotC(X) : 1; }\n'),
+    ('constexpr-and-consteval.never-constexpr', 'CxNeverDef', '  int32 B = Bad(2);\n',
+     '(`Bad` can never be worked out when the mod is built: every call of it calls `NotC`, which is not constexpr)', ROW_NEVER),
+    ('constexpr-and-consteval.clang-cannot', 'CxOver', '  int32 O = Twice(0x7FFFFFFF);\n',
+     "(clang could not run `Twice` when the mod is built: value 4294967294 is outside the range of representable values", ROW_TWICE),
+    ('inline-class-variables.khold-1-0f', 'ConstAssign', '  static inline const float kHold = 1.0f;\n  void F() { kHold = 2.0f; }\n',
+     "cannot assign to variable 'kHold' with const-qualified type", ''),
+    ('game-enums.ecreaturesize-size', 'EnumU32', '  ECreatureSize Size;\n', 'a uint8, int32 or int64 enum only', ''),
+    ('mod-enums-ue.ue-enum-emissing', 'EnumMiss', '  int32 X;\n', 'names no enum with enumerators', 'UE_ENUM(EMissing);\n'),
+    ('struct-operators.home-w', 'VecPlusEq', '  FVector Home;\n  void F(FVector W) { Home += W; }\n', "no viable overloaded '+='", ''),
+    ('struct-operators.v', 'VecNeg', '  FVector F(FVector V) { return -V; }\n', "invalid argument type 'FVector' to unary expression", ''),
+    ('struct-operators.a-b', 'RotPlus', '  FRotator F(FRotator A, FRotator B) { return A + B; }\n',
+     "no viable conversion from returned value of type 'FString' to function return type 'FRotator'", ''),
+    ('struct-operators.a-b-2', 'StructEq', '  bool F(FPt A, FPt B) { return A == B; }\n', 'invalid operands to binary expression', 'struct FPt {\n  UE_STRUCT;\n  int32 X;\n};\n'),
+    ('struct-conversions.fvector-v-facing', 'RotToVec', '  FVector F(FRotator Facing) { FVector V = Facing; return V; }\n',
+     "no viable conversion from 'FRotator' to 'FVector'", ''),
+    ('container-methods.items-empty', 'ArrEmpty', '  TArray<int32> Items;\n  void F() { Items.Empty(); }\n', 'no member named', ''),
+    ('container-methods.items-empty', 'ArrSort', '  TArray<int32> Items;\n  void F() { Items.Sort(); }\n', 'no member named', ''),
+    ('container-methods.items-empty', 'ArrPop', '  TArray<int32> Items;\n  void F() { Items.Pop(); }\n', 'no member named', ''),
+    ('container-methods.seen-0', 'SetIdx', '  TSet<int32> Seen;\n  bool F() { return Seen[0]; }\n', 'does not provide a subscript operator', ''),
+    ('container-methods.getitems-add-3', 'TempAdd', '  TArray<int32> Items;\n  TArray<int32> GetItems() { return Items; }\n  void F() { GetItems().Add(3); }\n',
+     'a container operation needs a variable, not a computed value', ''),
+    ('arithmetic.id-count', 'I64Mod', '  int64 F(int64 Id, int64 Count) { return Id % Count; }\n', 'unimplemented binary operator % on Int64Int64', ''),
+    ('comparisons.a-b', 'ObjLt2', '  bool F(AActor *A, AActor *B) { return A < B; }\n', 'unimplemented binary operator < on ObjectObject', ''),
+    ('validity-and-comparison.a-b', 'ObjLt3', '  bool F(AActor *A, AActor *B) { return A >= B; }\n', 'unimplemented binary operator >= on ObjectObject', ''),
+    ('logical-operators-and.c-left-right-5', 'CondAssign', '  int32 Left;\n  int32 Right;\n  void F(bool C) { (C ? Left : Right) = 5; }\n',
+     'assignment to ConditionalOperator', ''),
+    ('switch.case-1-3', 'CaseRange', '  int32 F(int32 X) { switch (X) { case 1 ... 3: return 1; default: return 0; } }\n', 'unimplemented statement IntegerLiteral', ''),
+    ('switch.switch-x-case-1-return', 'SwNoBrace', '  int32 F(int32 X) { switch (X) case 1: return 1; return 0; }\n', 'needs a braced body', ''),
+    ('switch.case-0-r-1-case', 'CaseNested', '  int32 F(int32 X) { int32 R = 0; switch (X) { case 0: { R = 1; case 1: R += 2; } } return R; }\n',
+     'unimplemented statement CaseStmt', ''),
+    ('statements-and-blocks.c-open-close', 'CondStmt', '  void Open() {}\n  void Close() {}\n  void F(bool C) { C ? Open() : Close(); }\n',
+     'unimplemented statement ConditionalOperator', ''),
+    ('statements-and-blocks.c-open-close', 'BinStmt', '  int32 F(int32 X) { X + 1; return X; }\n', 'unimplemented statement BinaryOperator', ''),
+    ('statements-and-blocks.void-unused', 'VoidUnused', '  void F(int32 Unused) { (void)Unused; }\n', 'unimplemented statement DeclRefExpr', ''),
+    ('statements-and-blocks.try-risky-catch-recover', 'TryCatch', '  void Risky() {}\n  void F() { try { Risky(); } catch (...) { } }\n',
+     'unimplemented statement CXXTryStmt', ''),
+    ('range-for-over.for-auto-x-y-points', 'BindArr', '  TArray<FIntPoint> Points;\n  int32 F() { int32 S = 0; for (auto [X, Y] : Points) S += X; return S; }\n',
+     'a structured binding over a TArray', ''),
+    ('what-a-range.for-int32-x-1-2', 'RangeList', '  int32 F() { int32 S = 0; for (int32 X : {1, 2, 3}) S += X; return S; }\n',
+     'range-for over std::initializer_list<int>', ''),
+    ('other-declarations.auto-a-b-point', 'BindDecl', '  int32 F(FIntPoint Point) { auto [A, B] = Point; return A; }\n',
+     'a declaration statement declares nothing usable', ''),
+    ('overloading.int32-ov-int32-a', 'OvTwo', '  int32 Ov(int32 A) { return A; }\n  int32 Ov(int32 A, int32 B) { return A + B; }\n', 'a second function of that name', ''),
+    ('lambdas-function.auto-p-inc1-return-p', 'FnPtr', '  int32 F(int32 X) { auto *P = &Inc1; return P(X); }\n', 'unimplemented local', 'int32 Inc1(int32 X) { return X + 1; }\n'),
+    ('lambdas-function.inline-fpairx-operator-fpairx-l', 'OpOver', '  FPairX F(FPairX A, FPairX B) { return A + B; }\n', 'unimplemented operator overload',
+     'struct FPairX {\n  UE_STRUCT;\n  int32 A;\n  int32 B;\n};\ninline FPairX operator+(FPairX L, FPairX R) { return {L.A + R.A, L.B + R.B}; }\n'),
+    ('math-and-utility.fmath-clamp-v-0-10', 'FMathUse', '  int32 F(int32 V) { return FMath::Clamp(V, 0, 10); }\n', "use of undeclared identifier 'FMath'", ''),
+    ('inline-functions.an-inline-function-that-calls', 'InlRec', '  inline int32 Loop(int32 X) { return X > 0 ? 1 + Loop(X - 1) : 0; }\n  int32 F(int32 X) { return Loop(X); }\n',
+     'calls itself', ''),
+    ('inline-functions.inline-int32-nope-int32-x', 'InlNoBody', '  inline int32 Nope(int32 X);\n  int32 F(int32 X) { return Nope(X); }\n', 'has no body', ''),
+    ('inline-functions.other-twice-3', 'InlOther', '  inline int32 Twice(int32 X) { return X * 2; }\n  int32 F(InlOther *Other) { return Other->Twice(3); }\n',
+     'called on another object (only this)', ''),
+    ('declaring-components.ue-component-utexture2d-icon', 'CompTex', '  UE_COMPONENT(UTexture2D, Icon);\n', 'is not a UActorComponent', ''),
+    ('declaring-components.ue-component-3', 'CompNonActor', '  UE_COMPONENT(UStaticMeshComponent, Hull);\n', 'only an actor has a construction script', '', 'UActorComponent'),
+    ('declaring-components.ue-component-4', 'CompIface', '', 'an interface cannot declare a UE_COMPONENT',
+     'class ICompIface {\npublic:\n  UE_INTERFACE;\n  UE_COMPONENT(UStaticMeshComponent, Hull);\n};\n'),
+    ('declaring-an-interface.ue-component', 'CompIface2', '', 'an interface cannot declare a UE_COMPONENT',
+     'class ICompIface2 {\npublic:\n  UE_INTERFACE;\n  UE_COMPONENT(UStaticMeshComponent, Hull);\n};\n'),
+    ('widget-layouts.grid-addchildtogrid-cell-1-2', 'GridAdd', '  UE_WIDGET(UGridPanel, Grid);\n  UE_WIDGET(UButton, Cell);\n  GridAdd() { Grid->AddChildToGrid(Cell, 1, 2); }\n',
+     "the slot's other values are its setters'", '', 'UUserWidget'),
+    ('widget-layouts.ue-widget-3', 'WidgetActor', '  UE_WIDGET(UVerticalBox, Box);\n', "a UE_WIDGET is a widget of a UUserWidget's tree", ''),
+    ('ue-defaults.home-z-5-0f', 'DefVecMember', '  FVector Home;\n  UE_DEFAULTS { Home.Z = 5.0f; }\n', 'is declared here - give it an initializer instead', ''),
+    ('ue-defaults.int32-charges', 'DefIntMember', '  int32 Charges;\n  UE_DEFAULTS { Charges = 3; }\n', 'is declared here - give it an initializer instead', ''),
+    ('ue-defaults.extra-bvisible-false', 'DefPlainPtr', '  UStaticMeshComponent *Extra;\n  UE_DEFAULTS { Extra->bVisible = false; }\n', 'is not a UE_COMPONENT', ''),
+    ('ue-defaults.lamp-intensity-100-0f', 'DefPlusEq', '  UE_COMPONENT(UPointLightComponent, Lamp);\n  UE_DEFAULTS { Lamp->Intensity += 100.0f; }\n', 'every statement is', ''),
+    ('ue-defaults.lamp-intensity', 'DefCall', '  UE_COMPONENT(UPointLightComponent, Lamp);\n  UE_DEFAULTS { Lamp->Intensity = UKismetMathLibrary::RandomFloat(); }\n',
+     'a default is a value known when the mod is built', ''),
+    ('constructors.lantern-charges-max-1', 'Lantern', '  int32 Max = 3;\n  int32 Charges;\n  Lantern() { Charges = Max + 1; }\n', 'a default is a value known when the mod is built', ''),
+    ('components-a-parent.controller-battachtopawn-true', 'PawnCtl', '  UE_DEFAULTS { Controller->bAttachToPawn = true; }\n',
+     'UeApi does not say which default subobject Controller is', '', 'APawn'),
+    ('objects-and-widgets.newobject-aactor-this', 'NewObjActor', '  AActor *F() { return NewObject<AActor>(this); }\n', 'no matching function', ''),
+    ('uobject-helpers.obj-class', 'ObjClass', '  void F(UObject *Obj) { auto C = Obj->Class; }\n', "no member named 'Class' in 'UObject'", ''),
+    ('pointing-at-data.float-h-md-big-health', 'AssetRead', '  float F() { float H = MD_Big.Health; return H; }\n', 'is an asset, not a value',
+     'class UMoodDef : public UPrimaryDataAsset {\npublic:\n  float Health = 1.0f;\n};\nUMoodDef MD_Big = {.Health = 5.0f};\n'),
+    ('declaring-a-dispatcher.tmulticastinlinedelegate-void', 'DispInline', '  TMulticastInlineDelegate<void(int32 Points)> OnHit;\n',
+     'a dispatcher is declared with UE_DISPATCHER', ''),
+    ('declaring-a-dispatcher.tmulticastsparsedelegate-void', 'DispSparse', '  TMulticastSparseDelegate<void(int32 Points)> OnHit;\n', 'unimplemented property', ''),
+    ('declaring-a-dispatcher.ue-dispatcher', 'DispIface', '', 'an interface cannot declare a UE_DISPATCHER',
+     'class IDispIface {\npublic:\n  UE_INTERFACE;\n  UE_DISPATCHER(OnHit, int32 N);\n};\n'),
+    ('binding-handlers.onhit-isbound', 'DispIsBound', '  UE_DISPATCHER(OnHit, int32 N);\n  bool F() { return OnHit.IsBound(); }\n', "no member named 'IsBound'", ''),
+    ('handler-functions.const', 'HandlerConst', '  UE_DISPATCHER(OnHit, int32 N);\n  void Handler(int32 N) const {}\n  void F() { OnHit.Add(this, &HandlerConst::Handler); }\n',
+     "no matching member function for call to 'Add'", ''),
+    ('delegate-values.k2-cleartimerdelegate', 'ClearEmpty', '  void F() { UKismetSystemLibrary::K2_ClearTimerDelegate({}); }\n', 'a delegate value is {this, &Class::Function}', ''),
+    ('reacting-to-input.pc-wasinputkeyjustpressed-f5', 'KeyStr', '  bool F(APlayerController *PC) { return PC->WasInputKeyJustPressed("F5"); }\n',
+     "no viable conversion from 'const char[3]' to 'FKey'", ''),
+    ('reacting-to-input.inputcomponent-bindkey', 'BindKey', '  void F(UInputComponent *InputComponent) { InputComponent->BindKey(1, 2, this, 3); }\n',
+     "no member named 'BindKey' in 'UInputComponent'", ''),
+    ('interface-values.cast-iaimable-other', 'CastIface', '  void F(AActor *Other) { auto *I = Cast<IAimable>(Other); }\n', 'Cast<> to an unknown class', ROW_IAIM),
+    ('implementing-an.listing-an-interface-a-mod', 'KidBeacon', '  void Aim() {}\n', 'which its parent Beacon already implements',
+     ROW_IAIM + 'class Beacon : public AActor, public IAimable {\npublic:\n  void Aim() {}\n};\n', 'Beacon, public IAimable'),
+    ('implementing-an.class-twoshare-public-aactor', 'TwoShare', '  void Aim() {}\n', 'which both extend IAimable',
+     ROW_IAIM + 'class IMarkable : public IAimable {\npublic:\n  UE_INTERFACE;\n  int32 Marks = 0;\n};\n', 'AActor, public IAimable, public IMarkable'),
+    ('implementing-an.a-base-after-the-parent', 'PlainBase', '  void Aim() {}\n', 'which is not an interface', 'class Plain {\npublic:\n  int32 X;\n};\n', 'AActor, public Plain'),
+    ('declaring-an-interface.tscriptinterface-imarkable-m', 'IfaceVarRead', '  int32 F(AActor *Other) { TScriptInterface<IMarkable> M = Other; return M->Marks; }\n',
+     'Marks is a variable of the interface IMarkable, which holds no state itself', ROW_IMARK),
+    ('declaring-an-interface.class-iboth-public-iaimable', 'IBoth', ROW_HEAD % 'IBoth' + ROW_IAIM + ROW_IMARK + 'class IBoth : public IAimable, public IMarkable {\npublic:\n  UE_INTERFACE;\n};\n',
+     'an interface extends one interface at most', ''),
+    ('declaring-an-interface.class-iactorish-public-aactor', 'IActorish', ROW_HEAD % 'IActorish' + 'class IActorish : public AActor {\npublic:\n  UE_INTERFACE;\n};\n',
+     'IActorish extends AActor, which is not an interface', ''),
+    ('raw-pointers-and.aactor-a-other', 'DerefObj', '  void F(AActor *Other) { AActor &A = *Other; }\n', 'which is not a raw pointer', ''),
+    ('reading-and-writing.uint32-addr-5', 'WriteU32', '  void F(int64 Addr) { *(uint32 *)Addr = 5; }\n', 'no Kismet conversion from int to uint32', ''),
+    ('taking-an-address.makearr-0', 'AddrTemp', '  TArray<int32> MakeArr() { TArray<int32> A; return A; }\n  int64 F() { return (int64)&MakeArr()[0]; }\n',
+     'the address of an element needs an array variable', ''),
+    ('taking-an-address.this-k', 'AddrStatic', '  static inline int32 K = 3;\n  int64 F() { return (int64)&this->K; }\n', 'a static variable has no address', ''),
+    ('objects-and-addresses.aactor-n', 'IntToPtr', '  AActor *F(int32 N) { return (AActor *)N; }\n', 'an int becomes a pointer through int64', ''),
+    ('sizeof-and-alignof.sizeof-aactor', 'SizeofObj', '  int32 F() { return sizeof(AActor); }\n', 'unimplemented struct member type: AActor', ''),
+    ('ptrcast.ptrcast-int64-r-2', 'PtrCastRef', '  int64 F() { int32 Local = 1; int32 &R = Local; return __PtrCast__<int64>(R); }\n',
+     'a reference to a Blueprint variable, which has no address', ROW_INTRIN),
+    ('classof.classof-obj-field', 'ClassOfField', '  FName F(AActor *Obj) { return __ClassOf__(Obj->bHidden); }\n', 'argument must be a bare parameter or local reference', ROW_INTRIN),
+    ('declaring-an-interface.int32-marks', 'IfaceVarTwice', '  int32 Marks;\n  void Mark() {}\n', 'a second member of that name', ROW_IMARK, 'AActor, public IMarkable'),
+    ('jumps.goto', 'GotoWriteBack', '  TMap<FVector4, TArray<int32>> M;\n  int32 F() { for (auto &[K, V] : M) { V.Add(1); goto done; } done: return 0; }\n',
+     'a goto inside a TMap range-for that writes its value back would skip the write', ''),
+    ('range-for-over.goto', 'GotoWriteBack2', '  TMap<FVector4, TArray<int32>> M;\n  int32 F() { for (auto &[K, V] : M) { V.Add(1); if (V.Num() > 3) goto done; } done: return 0; }\n',
+     'a goto inside a TMap range-for that writes its value back would skip the write', ''),
+    ('reading-and-writing.tarray-int32-a-pa', 'WholeSet', '  int32 F(TSet<int32> *Ps) { TSet<int32> S = *Ps; return S.Num(); }\n', 'a whole TSet<int32> through a pointer', ''),
+    ('reading-and-writing.tarray-int32-a-pa', 'WholeMap', '  int32 F(TMap<int32, int32> *Pm) { TMap<int32, int32> M = *Pm; return M.Num(); }\n',
+     'a whole TMap<int32, int32> through a pointer', ''),
+    ('math-and-utility.std-min-a-b', 'StdSqrt', '  float F(float X) { return std::sqrt(X); }\n', 'call to an unknown function', '#include <cmath>\n'),
+    ('math-and-utility.std-min-a-b', 'BiSqrt', '  float F(float X) { return __builtin_sqrtf(X); }\n', 'call to an unknown function', ''),
+]
+ROW_WARNINGS = [
+    ('constexpr-and-consteval.never-constexpr', 'CxNever', '  int32 F(int32 V) { return Bad(V); }\n',
+     'Bad is constexpr, but it can never be worked out when the mod is built: every call of it calls `NotC`, which is not '
+     'constexpr. Its calls run in the game', ROW_NEVER),
+    ('constexpr-and-consteval.never-constexpr', 'CxNeverChain', '  int32 F(int32 V) { return Chain(V); }\n',
+     'Chain is constexpr, but it can never be worked out when the mod is built: every call of it calls `Bad`, which can '
+     'never be worked out either', ROW_NEVER + 'constexpr int32 Chain(int32 X) { int32 Y = X + 1; return Bad(Y); }\n'),
+    ('number-conversions.float-big', 'I64F', '  float F(int64 Big) { return (float)Big; }\n', 'int64 -> float goes through int32', ''),
+    ('the-root-s.body-relativescale3d-fvector-2', 'RootScale',
+     '  UE_COMPONENT(UStaticMeshComponent, Body);\n  UE_DEFAULTS { Body->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f); }\n',
+     "is the actor's root, which the engine puts at the spawn transform", ''),
+    ('declaring-rpcs.ue-server-void-serverbump-int32', 'RpcRef', '  UE_SERVER void ServerBump(int32 &Count) { Count += 1; }\n',
+     'reaches the caller only when the call runs locally', ''),
+]
+
+
+def row_sources(rows):
+    """Each row as (mod, the source it compiles, the message), a body that starts with #include being the source itself."""
+    for rid, mod, body, why, top, *base in rows:
+        text = body if body.startswith('#include') else (
+            ROW_HEAD % mod + '%sclass %s : public %s {\npublic:\n%s};\n' % (top, mod, (base or ['AActor'])[0], body))
+        yield rid, mod, text, why
+
+
+def row_compile(mod, text):
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, mod + '.cpp')
+        with open(src, 'w', encoding='utf-8') as f: f.write(text)
+        return assetgen_compile([src, UEAPI, tmp])
+
+
+def row_refusals():
+    for rid, mod, text, why in row_sources(ROW_REFUSALS):
+        proc = row_compile(mod, text)
+        out = proc.stdout + proc.stderr           # clang's diagnostics are on stderr
+        assert proc.returncode != 0 and why in out, (rid, mod, out)
+    for rid, mod, text, why in row_sources(ROW_WARNINGS):
+        proc = row_compile(mod, text)
+        warned = [l for l in proc.stdout.splitlines() if 'warning:' in l and why in l]
+        assert proc.returncode == 0 and warned, (rid, mod, proc.stdout)
+    print('ok  %d REFERENCE rows name a refusal or a warning: each source is refused (or built, warning) with the row\'s message'
+          % len({r[0] for r in ROW_REFUSALS + ROW_WARNINGS}))
+
+
+proves('arithmetic.id-count', 'binding-handlers.onhit-isbound', 'blueprint-classes.class-x-public-anotincluded',
+       'casts-and-class.a-b', 'classof.classof-obj-field', 'comparing-and-testing.a-b-3', 'comparisons.a-b',
+       'components-a-parent.controller-battachtopawn-true', 'constants-and-constant.tarray-int32-rolls',
+       'consteval-functions.fnv-name', 'constexpr-and-consteval.runtime-only', 'constexpr-and-consteval.not-a-constant',
+       'constexpr-and-consteval.clang-cannot',
+       'constructors.lantern-charges-max-1', 'container-methods.getitems-add-3', 'container-methods.items-empty',
+       'container-methods.seen-0', 'converting-strings.fname-n-big', 'copies-and-braced.tarray-int32-rolls',
+       'declaring-a-dispatcher.tmulticastinlinedelegate-void',
+       'declaring-a-dispatcher.tmulticastsparsedelegate-void', 'declaring-a-dispatcher.ue-dispatcher',
+       'declaring-an-interface.class-iactorish-public-aactor', 'declaring-an-interface.class-iboth-public-iaimable',
+       'declaring-an-interface.tscriptinterface-imarkable-m', 'declaring-an-interface.ue-component',
+       'declaring-components.ue-component-3', 'declaring-components.ue-component-4',
+       'declaring-components.ue-component-utexture2d-icon', 'declaring-rpcs.ue-server-void-serverbump-int32',
+       'defaults.embedfile-missing-bin', 'delegate-values.k2-cleartimerdelegate', 'game-enums.ecreaturesize-size',
+       'globals-across-sources.extern-int32-counter', 'handler-functions.const',
+       'implementing-an.a-base-after-the-parent', 'implementing-an.class-twoshare-public-aactor',
+       'implementing-an.listing-an-interface-a-mod', 'inline-class-variables.khold-1-0f',
+       'inline-functions.an-inline-function-that-calls', 'inline-functions.inline-int32-nope-int32-x',
+       'inline-functions.other-twice-3', 'interface-values.cast-iaimable-other', 'joining-strings.a-n-b',
+       'lambdas-function.auto-p-inc1-return-p', 'lambdas-function.inline-fpairx-operator-fpairx-l',
+       'logical-operators-and.c-left-right-5', 'math-and-utility.fmath-clamp-v-0-10',
+       'member-variables.a-member-whose-type-is', 'member-variables.uint16-w', 'mod-enums-ue.ue-enum-emissing',
+       'namespace-scope.extern-int32-shared', 'namespace-scope.umooddef-globaldef',
+       'namespaces-and-folders.class-pistol-public-rifle', 'number-conversions.float-big',
+       'number-conversions.uint8-x', 'objects-and-addresses.aactor-n', 'objects-and-widgets.newobject-aactor-this',
+       'other-declarations.auto-a-b-point', 'overloading.int32-ov-int32-a', 'pointing-at-data.float-h-md-big-health',
+       'ptrcast.ptrcast-int64-r-2', 'range-for-over.for-auto-x-y-points', 'raw-pointers-and.aactor-a-other',
+       'reacting-to-input.inputcomponent-bindkey', 'reacting-to-input.pc-wasinputkeyjustpressed-f5',
+       'reading-and-writing.uint32-addr-5', 'sharing-a-class.ue-class-game-mymods-turrets-2',
+       'sharing-a-class.ue-class-game-mymods-turrets-3', 'sizeof-and-alignof.sizeof-aactor',
+       'statements-and-blocks.c-open-close', 'statements-and-blocks.try-risky-catch-recover',
+       'statements-and-blocks.void-unused', 'struct-conversions.fvector-v-facing', 'struct-operators.a-b',
+       'struct-operators.a-b-2', 'struct-operators.home-w', 'struct-operators.v', 'switch.case-0-r-1-case',
+       'switch.case-1-3', 'switch.switch-x-case-1-return', 'taking-an-address.makearr-0', 'taking-an-address.this-k',
+       'the-mod-package.a-source-with-nothing-to', 'the-mod-package.ue-mod-package',
+       'the-mod-package.ue-mod-package-2', 'the-root-s.body-relativescale3d-fvector-2',
+       'ue-defaults.extra-bvisible-false', 'ue-defaults.home-z-5-0f', 'ue-defaults.int32-charges',
+       'ue-defaults.lamp-intensity', 'ue-defaults.lamp-intensity-100-0f', 'uobject-helpers.obj-class',
+       'validity-and-comparison.a-b', 'variable-types.double-d', 'variable-types.uint32-mask',
+       'what-a-range.for-int32-x-1-2', 'widget-layouts.grid-addchildtogrid-cell-1-2', 'widget-layouts.ue-widget-3')
+proves('declaring-an-interface.int32-marks', 'jumps.goto', 'range-for-over.goto', 'math-and-utility.std-min-a-b',
+       'reading-and-writing.tarray-int32-a-pa')
+row_refusals()
+
+
+def constexpr_never_quiet():
+    """The other side of the never-constexpr warning: a function whose run-time-only action is behind a branch, the
+    right side of `&&`, a loop or the game's arm of `__builtin_is_constant_evaluated()` (every FMath.h function) can
+    still be worked out for some arguments, so it draws no warning."""
+    text = (ROW_HEAD % 'CxQuiet' + ROW_FMATH + 'int32 NotC(int32 X) { return X; }\n'
+            'constexpr int32 Maybe(int32 X) { return X > 0 ? NotC(X) : 1; }\n'
+            'constexpr int32 IfSo(int32 X) { if (X > 9) return NotC(X); return X; }\n'
+            'constexpr bool Both(int32 X) { return X > 0 && NotC(X) > 1; }\n'
+            'constexpr int32 Loop(int32 X) { for (int32 I = 0; I < X; ++I) NotC(I); return X; }\n'
+            'constexpr int32 Guard(int32 X) { if (__builtin_is_constant_evaluated()) return X; return NotC(X); }\n'
+            'class CxQuiet : public AActor {\npublic:\n'
+            '  int32 M = Maybe(-1) + IfSo(3) + Both(0) + Loop(0) + Guard(4) + FMath::Max(1, 2);\n'
+            '  int32 F(int32 V) { return Maybe(V) + IfSo(V) + Both(V) + Loop(V) + Guard(V) + FMath::Abs(V); }\n};\n')
+    proc = row_compile('CxQuiet', text)
+    proves('constexpr-and-consteval.never-constexpr')
+    assert proc.returncode == 0 and 'warning:' not in proc.stdout, proc.stdout + proc.stderr
+    print('ok  CxQuiet: a constexpr function whose run-time-only call is not reached on every call draws no warning, '
+          'and its constant calls are worked out')
+
+
+constexpr_never_quiet()
+
+
+
+# ---- Rows whose answer the interpreter can run: tests/RowRuns.cpp has one small function per row, and each is run here
+# against the answer the row gives, written as plain Python.
+
+def row_runs():
+    def check_row(fn, oracle, cases, me=None):
+        for parms in cases:
+            got = run(asset('RowRuns'), fn, self_vars=dict(me or {}), **parms)[0]
+            want = oracle(**parms)
+            assert got == want and type(got) is type(want), 'RowRuns.%s(%s) = %r, want %r' % (fn, parms, got, want)
+    ints = (-7, -1, 0, 1, 5, 6, 300)
+    check_row('HalfLiteral', lambda: 0.75, [{}])
+    check_row('WidenToFloat', lambda N: N / 4, [dict(N=n) for n in (-6, 0, 6, 10)])
+    check_row('WidenToInt64', lambda N: N * 2**32, [dict(N=n) for n in (-3, 0, 3, 2**30)])
+    check_row('ByteWraps', lambda Start: (Start + 200) % 256, [dict(Start=s) for s in (0, 55, 56, 100, 255)])
+    check_row('IntOverFloat', lambda A, B: A / B, [dict(A=7, B=2.0), dict(A=-9, B=4.0), dict(A=0, B=8.0)])
+    check_row('EmptyLen', lambda: 0, [{}])
+    check_row('WideLen', lambda: 4, [{}])
+    check_row('IsGold', lambda S: S.lower() == 'gold', [dict(S=s) for s in ('gold', 'GOLD', 'Gold', 'silver', '')])
+    check_row('NamesDiffer', lambda A, B: A.lower() != B.lower(), [dict(A=a, B=b) for a, b in (('Rock', 'rock'), ('Rock', 'Ore'), ('', ''))])
+    check_row('StrLen', lambda S: len(S), [dict(S=s) for s in ('', 'a', 'hello there')])
+    check_row('InRangeConst', lambda: True, [{}])
+    check_row('ShiftConst', lambda: 16, [{}])
+    check_row('FoldMix', lambda N: N * 4 + 3 * 2 + (1 << 4 | 4), [dict(N=n) for n in ints])
+    check_row('FoldShortCircuit', lambda X: 2, [dict(X=x) for x in (0, 1)])
+    check_row('FoldLeft', lambda N: N * 3 + 8 + 19, [dict(N=n) for n in ints])
+    check_row('FoldIdentity', lambda X: 6 * X, [dict(X=x) for x in ints])
+    check_row('ConstLocal', lambda: 6, [{}])
+    check_row('ConstBranch', lambda N: 0, [dict(N=n) for n in (0, 1, 4)])
+    check_row('WhileFalse', lambda X: X, [dict(X=x) for x in ints])
+    check_row('NegGreater', lambda Ammo: 1 if not Ammo > 0 else 2, [dict(Ammo=a) for a in (-1, 0, 1)])
+    check_row('NegEqual', lambda A, B: 1 if A != B else 2, [dict(A=a, B=b) for a, b in ((1, 1), (1, 2), (0, 0))])
+    check_row('NegStrEqual', lambda S, T: 1 if S.lower() != T.lower() else 2, [dict(S=s, T=t) for s, t in (('a', 'A'), ('a', 'b'))])
+    check_row('NegStrValue', lambda S, T: S.lower() != T.lower(), [dict(S=s, T=t) for s, t in (('a', 'A'), ('a', 'b'))])
+    check_row('NegNeg', lambda X: 1 if X else 2, [dict(X=x) for x in (True, False)])
+    check_row('NegElse', lambda X: 20 if X else 10, [dict(X=x) for x in (True, False)])
+    check_row('DropsUnused', lambda A: A + 1, [dict(A=a) for a in ints])
+    check_row('InlineBoolJump', lambda Item: 10 if Item > 3 else 20, [dict(Item=i) for i in (0, 3, 4, 9)])
+    check_row('UnaryPlus', lambda X: X, [dict(X=x) for x in ints])
+    check_row('BitMix', lambda A, B: (A & 0xFF) | (B ^ 1), [dict(A=a, B=b) for a in (0, 0x1F3, -2) for b in (0, 1, 6)])
+    check_row('FloatTruth', lambda F: 1 if F else 0, [dict(F=f) for f in (0.0, 0.5, -2.0)])
+    check_row('ByteTruth', lambda B: 1 if B else 0, [dict(B=b) for b in (0, 1, 255)])
+    check_row('Int64Truth', lambda I: 1 if I else 0, [dict(I=i) for i in (0, 1, 2**40)])
+    check_row('VoidCall', lambda: 3, [{}], me=dict(Count=2))
+    check_row('DoOnce', lambda X: 1 if X > 0 else 2, [dict(X=x) for x in (-1, 0, 1)])
+    check_row('CondDecl', lambda V: V % 3 + 100 if V % 3 else 0, [dict(V=v) for v in (3, 4, 5, 6)])
+    check_row('AliasMember', lambda By: 5 + By, [dict(By=b) for b in (0, 2, -9)], me=dict(Count=5))
+    proves('references-to-memory.int32-alias-local')
+    check_row('AliasLocal', lambda By: 1 + By, [dict(By=b) for b in (0, 2, -9)])
+    check_row('GetCharges', lambda: 7, [{}], me=dict(Count=7))
+    check_row('Clamp01', lambda V: min(max(V, 0), 1), [dict(V=v) for v in (-3, 0, 1, 9)])
+    check_row('Half', lambda V: cdiv(V, 2), [dict(V=v) for v in (-5, -4, 0, 7, 8)])
+    check_row('CallByVal', lambda: 1, [{}])
+    check_row('AddIndex', lambda: 1, [{}])
+    check_row('SetAt', lambda: 9 * 10 + 2, [{}])
+    # The interpreter has no Remove, RemoveItem, Insert or Identical, but each row's claim is which node the method is:
+    base = asset('RowRuns')
+    paths = import_paths(base)
+
+    def nodes(fn):
+        w = dump('walkscript.py', base, exports_of(base).index(fn))
+        return {paths[int(i)].rsplit(':', 1)[-1] for i in re.findall(r'FinalFunction\s+imp\[(\d+)\]', w)}
+    for fn, node, absent in (('RemoveAt', 'Array_Remove', 'Array_RemoveItem'), ('RemoveEqual', 'Array_RemoveItem', 'Array_Remove'),
+                             ('InsertAt', 'Array_Insert', None), ('SameElements', 'Array_Identical', None)):
+        assert node in nodes(fn) and absent not in nodes(fn), (fn, nodes(fn))
+    # What each rule leaves out is read off the disassembly: the nodes a function calls (the optimizer rows keep the
+    # answer and drop the work).
+    def calls(fn):
+        return set(re.findall(r"Function'(\w+)'", dump('walkscript.py', base, exports_of(base).index(fn))))
+    assert 'Abs_Int' in calls('KeepsUsed')
+    assert not {'Abs_Int', 'Multiply_IntInt'} & calls('DropsUnused'), calls('DropsUnused')
+    assert 'LessEqual_IntInt' in calls('NegGreater') and 'Not_PreBool' not in calls('NegGreater')
+    assert 'NotEqual_IntInt' in calls('NegEqual') and 'Not_PreBool' not in calls('NegEqual')
+    assert 'Not_PreBool' in calls('NegStrValue'), calls('NegStrValue')
+    assert not calls('NegNeg') and not calls('NegElse'), (calls('NegNeg'), calls('NegElse'))
+    assert not calls('ConstLocal') and not calls('InRangeConst') and not calls('ShiftConst')
+    assert 'Greater_IntInt' not in calls('ConstBranch') and 'ReadyBit' not in str(calls('InlineBoolJump'))
+    print('ok  RowRuns: %s' % 'literals and widening, strings and names, folding and negations, the unused-code rules, '
+          'byte wrap, references, by-value containers and the array methods give the answer their rows state')
+
+
+proves('number-literals.float-y-0-5', 'number-conversions.ratio-count', 'number-conversions.big-count',
+       'number-conversions.charges-200', 'number-conversions.a-b', 'string-literals.fstring',
+       'string-literals.fstring-wide-l-wide', 'comparing-and-testing.s-gold', 'comparing-and-testing.a-b',
+       'string-functions.ukismetstringlibrary-len-s', 'constants-and-constant.bool-ready-kstep-2-kstep',
+       'bitwise-operators-and.1-kshift', 'constant-folding.n-kstep-kslots-2-1', 'constant-folding.false-x',
+       'constant-folding.n-3-8-19', 'constant-folding.x-0', 'constant-locals-and.const-int32-three-3',
+       'declaring-locals.const-int32-three-3', 'constant-locals-and.if-lim-3-break',
+       'constant-locals-and.while-false', 'negations.ammo-0', 'negations.a-b', 'negations.x',
+       'what-the-optimizer.ukismetmathlibrary-abs-int-a', 'what-the-optimizer.int32-unused-a-3', 'arithmetic.x-2',
+       'bitwise-operators-and.a-0xff-b-1', 'conditions.if-f', 'statements-and-blocks.void-compute',
+       'while-and-do.do-r-1-if-x', 'names-and-scope.if-int32-rest-v-3', 'reference-locals.int32-alias-count',
+       'parameters-and-return.auto-half-int32-v-return', 'parameters-and-return.int32-byval-tarray-int32-a',
+       'container-methods.scores-add-7', 'container-methods.items-remove-2', 'container-methods.items-removeitem-2',
+       'container-methods.items-insert-9-0', 'container-methods.items-set-0-9-true',
+       'container-methods.a-identical-b')
+row_runs()
+
+
+
+# ---- The memory rows of the same class, run on runscript's stand-in memory (what PointerTest and PointerMore do).
+
+def row_memory_runs():
+    import struct
+    base, A = asset('RowRuns'), 0x7FF600001000
+
+    def put(a, fmt, *v):
+        for i, b in enumerate(struct.pack(fmt, *v)): runscript.MEM[a + i] = b
+
+    def get(a, fmt): return struct.unpack(fmt, bytes(runscript.MEM.get(a + i, 0) for i in range(struct.calcsize(fmt))))
+    runscript.MEM.clear()
+    # The game's layout: FVector is three floats, FTransform is 16-aligned.
+    assert [run(base, fn)[0] for fn in ('SizeOfVector', 'AlignOfTransform')] == [12, 16]
+    assert run(base, 'SizeOfDeref', P=A)[0] == 12
+    # Reads of raw memory, each at the width and type it names.
+    put(A, '<q', -(2**40) - 5)
+    assert run(base, 'Read64At', A=A)[0] == -(2**40) - 5
+    put(A, '<f', 2.5)
+    assert run(base, 'ReadFloatAt', A=A)[0] == 2.5
+    put(A, '<B', 200)
+    assert run(base, 'ReadByteAt', A=A)[0] == 200
+    put(A, '<i', -77)
+    assert run(base, 'Read32Via', P=A)[0] == -77
+    # Pointer arithmetic is in elements of the pointee: difference, steps, the value a post-increment yields.
+    assert run(base, 'PtrDiff', P=A + 40, Q=A + 8)[0] == 8
+    assert run(base, 'PtrDiff', P=A, Q=A + 12)[0] == -3
+    for n in (-2, 0, 3):
+        assert run(base, 'StepAll', P=A, N=n)[0] == A + 4 * (n - 1), n      # +n +1 +1 -1 -1 -1 nets n - 1
+    assert run(base, 'PostStep', P=A)[0] == A * 1000 + 4
+    assert run(base, 'AddrIndexed', P=A, I=5)[0] == A + 20
+    assert run(base, 'AddrDeref', P=A)[0] == A
+    assert [run(base, 'NonNull', P=p)[0] for p in (0, A)] == [0, 1]
+    # A condition that reads memory is read again before each iteration.
+    put(A, '<iiiii', 5, 6, 7, 0, 9)
+    assert run(base, 'CountToZero', Q=A)[0] == 3
+    # A write through a reference parameter lands in the memory behind the pointer.
+    put(A, '<i', 41)
+    assert run(base, 'BumpThrough', P=A)[0] == 42 and get(A, '<i') == (42,)
+    # __PtrCast__: an address as a pointer, as a reference to read and write, and a reference as its address.
+    put(A, '<i', 13)
+    assert run(base, 'PtrCastRead', Addr=A)[0] == 13
+    assert run(base, 'PtrCastRef', Addr=A)[0] == 14 and get(A, '<i') == (14,)
+    assert run(base, 'PtrCastAddr', P=A + 8)[0] == A + 8
+    runscript.MEM.clear()
+    print('ok  RowRuns: sizes in the game\'s layout, raw reads, pointer arithmetic, a memory-reading loop, a reference through '
+          'a pointer and __PtrCast__ behave as their rows say')
+
+
+proves('sizeof-and-alignof.sizeof-fvector', 'sizeof-and-alignof.alignof-ftransform',
+       'constants-and-constant.sizeof-fvector', 'reading-memory.read64-a', 'reading-memory.readfloat-a',
+       'reading-memory.readbyte-a', 'reading-memory.read32-p', 'pointer-arithmetic.p-q', 'pointer-arithmetic.p-n-2',
+       'taking-an-address.p', 'where-pointer-code.while-q-0-q', 'raw-pointers-and.if-p',
+       'references-to-memory.bump-p', 'reference-parameters-and.bump-p', 'ptrcast.ptrcast-int32-addr',
+       'ptrcast.ptrcast-int32-addr-2', 'ptrcast.ptrcast-int64-r')
+row_memory_runs()
+
+
+
+# ---- The class defaults the rows describe: tests/RowDefaults.cpp, read back off the cooked default object.
+
+def row_defaults():
+    folder = os.path.dirname(asset('RowDefaults'))
+    assert global_default(folder, 'RowDefaults', 'Kind') == '/Game/A/BP_A.BP_A_C'
+    assert global_default(folder, 'RowDefaults', 'Kinds') == ['/Game/A/BP_A.BP_A_C', '/Game/B/BP_B.BP_B_C']
+    assert global_default(folder, 'RowDefaults', 'Slow') == '0.75'
+    base = asset('RowDefaults')
+    tags = dump('dumptags.py', base, exports_of(base).index('Default__RowDefaults_C'))
+    assert re.search(r'^  Delay \[0\] StructProperty size=\d+ struct=FloatInterval', tags, re.M), tags
+    assert re.search(r'^    Min \[0\] FloatProperty size=4: 1\.0$', tags, re.M) and re.search(r'^    Max \[0\] FloatProperty size=4: 5\.0$', tags, re.M), tags
+    print('ok  RowDefaults: a soft class path and a list of them, a struct constructor and a float literal are written into Class Defaults as given')
+
+
+proves('soft-references.tsoftclassptr-aactor-kind-game-a', 'soft-references.tarray-tsoftclassptr-aactor',
+       'container-variables.tarray-tsoftclassptr-aactor', 'struct-defaults.ffloatinterval-delay')
+row_defaults()
+
+
+# ---- ConstObjects: a constant of a plain C++ struct is its braces (REFERENCE.md, Constant objects)
+
+def const_objects():
+    base = asset('ConstObjects')
+    folder = os.path.dirname(base)
+    # No Blueprint struct stands for FTable or a handle: the class is all the mod cooks.
+    assert sorted(os.listdir(folder)) == ['ConstObjects.uasset', 'ConstObjects.uexp'], os.listdir(folder)
+    proves('constant-objects.constexpr-ftable-ktable-5-2')
+    assert run(base, 'Members')[0] == 5 * 100 - 3 + 9
+    for v in (0.0, 2.0, -1.5):
+        assert run(base, 'Real', V=v)[0] == f32(v * 2.5), v
+    assert run(base, 'Label')[0] == 'table'
+    check('ConstObjects', 'Shift', lambda V: wrap(V << 5), [dict(V=v) for v in (0, 1, -3, 2**27)])
+    assert global_default(folder, 'ConstObjects', 'Seed') == '18', global_default(folder, 'ConstObjects', 'Seed')
+    proves('constant-objects.static-constexpr-finthandle')
+    check('ConstObjects', 'Handle', lambda Stored: (Stored or 12) + (Stored or 12) * 2000, [dict(Stored=s) for s in (0, 1, 40)])
+    check('ConstObjects', 'Statics', lambda Stored: (Stored or 3) * 10 + 3 + 1100, [dict(Stored=s) for s in (0, 5)])
+    proves('constant-objects.method-below')
+    check('ConstObjects', 'Below', lambda Stored: (Stored or 12) * 2 + 12 + ((Stored or 3) * 2 + 3) * 1000,
+          [dict(Stored=s) for s in (0, 1, 40)])
+    proves('constant-objects.static-constexpr-thandle-float')
+    check('ConstObjects', 'Templated', lambda Stored, bHas: Stored if bHas else 7,
+          [dict(Stored=s, bHas=h) for s in (0, 9) for h in (False, True)])
+    check('ConstObjects', 'TemplatedReal', lambda Stored, bHas: Stored if bHas else 0.5,
+          [dict(Stored=s, bHas=h) for s in (0.0, 0.25) for h in (False, True)])
+    proves('constant-objects.fname-key-const-return-name')
+    check('ConstObjects', 'Keys', lambda Which: ('Waves.Max', 'Audio.Volume', 'Count')[Which], [dict(Which=w) for w in (0, 1, 2)])
+    proves('constant-objects.this')
+    refused('ConstThis', '  int32 F() { return kH.Reg(); }\n', 'the constant has no address',
+            top='inline int32 Take(const void *P) { return 1; }\n'
+                'struct FH {\n  int32 D;\n  int32 Reg() const { return Take(this) + D; }\n};\nconstexpr FH kH = {4};\n')
+    print('ok  ConstObjects: a member of a plain struct constant is what its braces gave it, in code, a default and '
+          "another constant; a method called on one reads that constant's members, a template's too; no struct is cooked")
+
+
+const_objects()
+
+
+# ---- Two leftovers of the bug-class audit: warnings about constants come in the order the source writes them, and the
+# one int64 division with no int64 quotient is left for the game to run instead of trapping in the compiler.
+
+def audit_leftovers():
+    import tempfile
+    names = ['Zed', 'Alpha', 'Mid', 'Beta', 'Yaw', 'Cee', 'Xi', 'Dee']
+    head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'KeyOrder.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(head % 'KeyOrder' + ''.join('const FKey k%s = FKey{"LeftShfit"};\n' % n for n in names)
+                    + 'class KeyOrder : public AActor {\npublic:\n  int32 F() { return 1; }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout
+        assert re.findall(r'warning: k(\w+): FKey\{"LeftShfit"\}', proc.stdout) == names, proc.stdout
+        src = os.path.join(tmp, 'LowestOverMinusOne.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(head % 'LowestOverMinusOne' + 'class LowestOverMinusOne : public AActor {\npublic:\n'
+                    '  int64 Quot() { return (-9223372036854775807LL - 1) / -1; }\n'
+                    '  int64 Near() { return (-9223372036854775807LL) / -1; }\n};\n')       # folds: the largest int64
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, (proc.returncode, proc.stdout)
+        assert run(os.path.join(tmp, 'LowestOverMinusOne'), 'Near')[0] == 2**63 - 1
+    print('ok  AuditLeftovers: FKey warnings of constants come in source order; the lowest int64 over -1 compiles, unfolded')
+
+
+audit_leftovers()
+
+
+# ---- MapArrays: a store to an element of an array a map holds reaches the map (REFERENCE.md, Assignment and updates)
+
+def map_arrays():
+    proves('assignment-and-updates.lists-k-0-7')
+    check('MapArrays', 'Store', lambda V: V * 1000 + 20 + 300000, [dict(V=v) for v in (7, 0, -4)])
+    check('MapArrays', 'StoreMember', lambda V: V * 100 + 10 + 300000, [dict(V=v) for v in (7, -1)])
+    check('MapArrays', 'Update', lambda V: (20 + V) * 10000 + 31 * 100 + 4, [dict(V=v) for v in (1, 5, 0)])
+    check('MapArrays', 'Bound', lambda V: 10 + V, [dict(V=v) for v in (1, 90)])
+    check('MapArrays', 'Pairs', lambda V: V * 100 + 2 * V, [dict(V=v) for v in (3, 41)])
+    check('MapArrays', 'Others', lambda V: 5 * 10000 + 10 * 100 + 30, [dict(V=v) for v in (9, 77)])
+    check('MapArrays', 'KeyOnce', lambda V: V * 10 + 1, [dict(V=v) for v in (6, 2)])
+    assert "Grow's reference parameter V is bound to an element of a map element's array" in LOGS['MapArrays'], LOGS['MapArrays']
+    proves('reference-locals.auto-l-lists-k')
+    check('MapArrays', 'Named', lambda V: V * 10000 + (V + 1) * 100 + V + 2 + 4000000, [dict(V=v) for v in (7, 40)])
+    check('MapArrays', 'NamedBag', lambda V: (3 + V) * 1000 + V, [dict(V=v) for v in (7, 0)])
+    check('MapArrays', 'NamedElem', lambda V: 30 + 2 * V, [dict(V=v) for v in (7, -3)])
+    check('MapArrays', 'NamedPinned', lambda V: V * 100 + 5, [dict(V=v) for v in (7, 12)])
+    check('MapArrays', 'NamedScore', lambda V: (10 + V) * 2, [dict(V=v) for v in (7, -10)])
+    check('MapArrays', 'NamedRead', lambda V: V, [dict(V=v) for v in (7, 99)])
+    check('MapArrays', 'NamedKeyOnce', lambda V: 1000 + 2 * V, [dict(V=v) for v in (7, 3)])
+    refused('RefPick', '  int32 X = 0, Y = 0;\n  void F(bool B) {\n    int32 &R = B ? X : Y;\n    R = 1;\n  }\n',
+            'reference R: TODO: the address of ConditionalOperator')
+    proves('range-for-over.for-int32-x-lists-k')
+    check('MapArrays', 'Walk', lambda V: wrap(60 * V), [dict(V=v) for v in (7, 0, -2)])
+    check('MapArrays', 'WalkMember', lambda V: (10 + V) * 10000 + (20 + V) * 100 + 30 + V, [dict(V=v) for v in (7, 1)])
+    check('MapArrays', 'WalkReturn', lambda V: V, [dict(V=v) for v in (7, 99)])
+    check('MapArrays', 'WalkBreak', lambda V: (10 + V) * 100 + 20, [dict(V=v) for v in (7, 3)])
+    assert run(asset('MapArrays'), 'WalkRead')[0] == 65
+    refused('MapWalkGoto', '  TMap<int32, TArray<int32>> Lists;\n'
+            '  void F() {\n    for (int32 &X : Lists[1]) {\n      X = 1;\n      if (X == 1) goto Out;\n    }\n  Out:\n    return;\n  }\n',
+            'a copy stored back when the loop is left')
+    print('ok  MapArrays: a store, an update, a T& bound to an element of an array under a map value, and a range-for by '
+          'reference over one, change the map: the value is copied out, changed and stored back under its key, found once')
+
+
+map_arrays()
+
+
+# ---- MathEdges: where Blueprint's arithmetic leaves C++ (REFERENCE.md, Arithmetic)
+
+def math_edges():
+    s = lambda x: (x + 2**63) % 2**64 - 2**63
+    ints = [dict(A=a, B=b) for a in (-7, 0, 7, 2**31 - 1, -2**31) for b in (0, 3, -2)]
+    proves('arithmetic.hits-shots')
+    check('MathEdges', 'Div', lambda A, B: cdiv(A, B) if B else 0, ints)
+    check('MathEdges', 'Mod', lambda A, B: cmod(A, B) if B else 0, ints)
+    check('MathEdges', 'Div64', lambda A, B: cdiv(A, B) if B else 0, ints + [dict(A=2**62, B=0), dict(A=-2**40, B=7)])
+    check('MathEdges', 'DivF', lambda A, B: A / B if B else 0.0, [dict(A=a, B=b) for a in (-1.5, 0.0, 8.0) for b in (0.0, 0.5, -4.0)])
+    check('MathEdges', 'Guarded', lambda A, B: 1 if B != 0 and cdiv(A, B) > 2 else 0, ints)
+    proves('arithmetic.x-1')
+    wide = [dict(A=a, B=b) for a in (2**63 - 1, -2**63, 2**62, -5, 3) for b in (1, -1, 2**62, 2**63 - 1, -2**63)]
+    check('MathEdges', 'Add64', lambda A, B: s(A + B), wide)
+    check('MathEdges', 'Sub64', lambda A, B: s(A - B), wide)
+    check('MathEdges', 'Mul64', lambda A, B: s(A * B), wide)
+
+
+math_edges()
+
+
+# ---- Unsigned64: a uint64 value shifts right and orders as unsigned (REFERENCE.md, Bitwise operators and shifts)
+
+def unsigned64():
+    u = lambda x: x % 2**64
+    s = lambda x: (x + 2**63) % 2**64 - 2**63
+    vals = (0, 1, 5, 6, 16, 2**62, 2**63 - 1, -1, -2, -16, -2**63, -2**62)
+    pairs = [dict(A=a, B=b) for a in vals for b in vals]
+    proves('bitwise-operators-and.uint64-x-4')
+    check('Unsigned64', 'Shr', lambda X: s(u(X) >> 4), [dict(X=x) for x in vals])
+    check('Unsigned64', 'Top', lambda X: u(X) >> 63, [dict(X=x) for x in vals])
+    check('Unsigned64', 'Shr0', lambda X: X, [dict(X=x) for x in vals])
+    check('Unsigned64', 'Signed', lambda X: X >> 4, [dict(X=x) for x in vals])
+    proves('bitwise-operators-and.uint64-a-uint64-b')
+    check('Unsigned64', 'Less', lambda A, B: u(A) < u(B), pairs)
+    check('Unsigned64', 'Greater', lambda A, B: u(A) > u(B), pairs)
+    check('Unsigned64', 'LessEq', lambda A, B: u(A) <= u(B), pairs)
+    check('Unsigned64', 'GreaterEq', lambda A, B: u(A) >= u(B), pairs)
+    check('Unsigned64', 'Same', lambda A, B: A == B, pairs)
+    check('Unsigned64', 'Past', lambda A: u(A) > 5, [dict(A=a) for a in vals])
+    proves('bitwise-operators-and.uint64-a-3')
+    check('Unsigned64', 'Div', lambda A: A // 3, [dict(A=a) for a in (0, 9, 10, 2**62)])
+    assert 'Unsigned64::Div: an unsigned 64-bit `/` runs as a signed division' in LOGS['Unsigned64'], LOGS['Unsigned64']
+    print('ok  Unsigned64: a uint64 value shifts zeros in from the top and orders above every smaller one, past INT64_MAX '
+          'too; its division runs signed and says so')
+
+
+unsigned64()
+
+
+# ---- TmplStaticClass: `T::StaticClass()` in a template names the class it was instantiated with (REFERENCE.md,
+# StaticClass on the mod's classes)
+
+def tmpl_static_class():
+    base = asset('TmplStaticClass')
+    proves('staticclass-on-the.t-staticclass')
+    for fn, want in (('Direct', 'Lexer_C'), ('Free', 'Lexer_C'), ('FreeOther', 'Parser_C'), ('Member', 'Lexer_C'),
+                     ('MemberOther', 'Parser_C'), ('Pair', 'Parser_C'), ('PairSwapped', 'Lexer_C'), ('OfStruct', 'Parser_C'),
+                     ('Engine', 'Actor')):
+        assert run(base, fn)[0] == want, (fn, run(base, fn)[0], want)
+    assert run(base, 'Nested', bFirst=True)[0] == 'Lexer_C' and run(base, 'Nested', bFirst=False)[0] == 'Parser_C'
+    print('ok  TmplStaticClass: T::StaticClass() in a free, a member and a class template names each instantiation\'s own '
+          'class, by the parameter\'s place, an inner template\'s too')
+
+
+tmpl_static_class()
+
+
+
+# ---- Rows that said "refused" and are not: tests/RowStd.cpp. std::min is built into the source's function library, a
+# whole TArray is copied out through a pointer, and a goto in a TMap loop whose value is no container leaves after the
+# write has reached the map.
+
+def row_std():
+    import struct
+    base, A = asset('RowStd'), 0x7FF600001000
+    for a, b in ((3, 9), (9, 3), (-4, -4), (-7, 2)):
+        assert run(base, 'MinOf', A=a, B=b)[0] == min(a, b), (a, b)
+    assert 'BPL_RowStd::std__min__int32 returns const int&: a Blueprint function returns a copy' in LOGS['RowStd'], LOGS['RowStd']
+
+    def put(a, fmt, *v):
+        for i, b in enumerate(struct.pack(fmt, *v)): runscript.MEM[a + i] = b
+    runscript.MEM.clear()
+    put(A, '<qii', A + 64, 3, 4)                         # a TArray: data pointer, count, capacity
+    put(A + 64, '<iiii', 5, 7, 9, 0)
+    assert run(base, 'SumThrough', Pa=A)[0] == 21 * 100 + 3
+    runscript.MEM.clear()
+    w = dump('walkscript.py', base, exports_of(base).index('BumpAndLeave'))
+    first_jump = re.search(r'^\s*\+\s*\d+\s.*\sJump\s', w, re.M)
+    assert first_jump and 0 <= w.index('Map_Add') < first_jump.start(), w
+    print('ok  RowStd: std::min builds and answers right, a whole TArray is read through a pointer, a goto out of a TMap loop '
+          'follows the write into the map')
+
+
+proves('math-and-utility.std-min-a-b-2', 'reading-and-writing.tarray-int32-a-pa-2')
+row_std()
+
+
+
+# ---- Two silent drops that cost EMM's materials port two drgq runs: a method declared in a cooked class and defined
+# nowhere this build compiles (its .cpp missing from the unity source) cooks the class without the function, and a
+# UE_CLASS path under the mod's own root that is not the path the class would get makes it an import, cooked nowhere.
+# Each now says so with a warning; a method defined out of line, an interface's and a path under another mod's root do not.
+
+def silent_drops():
+    def built(mod, text):
+        proc = row_compile(mod, text)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return [l for l in proc.stdout.splitlines() if 'warning:' in l]
+    body = 'class %s : public AActor {\npublic:\n  int32 Used() { return 1; }\n  int32 Helper(int32 X);\n};\n'
+    lost = built('DropUndef', ROW_HEAD % 'DropUndef' + body % 'DropUndef')
+    assert any('DropUndef::Helper' in l and 'defined nowhere this build compiles' in l for l in lost), lost
+    assert not built('DropDefined', ROW_HEAD % 'DropDefined' + body % 'DropDefined' + 'int32 DropDefined::Helper(int32 X) { return X; }\n')
+    assert not built('DropIface', ROW_HEAD % 'DropIface' + 'class IDropIface {\npublic:\n  UE_INTERFACE;\n  void Aim();\n};\n'
+                     'class DropIface : public AActor, public IDropIface {\npublic:\n  void Aim() {}\n};\n')
+    real = 'class Real : public AActor {\npublic:\n  int32 X;\n};\n'
+    moved = 'class Moved : public AActor {\npublic:\n  UE_CLASS("%s", "Moved_C");\n  int32 Y;\n};\n'
+    warned = built('Moved', ROW_HEAD % 'Moved' + real + moved % '/Game/_ElytrasMods/Moved/Sub/Moved')
+    assert any('UE_CLASS' in l and "this mod's own" in l and '/Game/_ElytrasMods/Moved/Moved' in l for l in warned), warned
+    assert not built('Moved', ROW_HEAD % 'Moved' + real + moved % '/Game/_ElytrasMods/OtherMod/Moved')
+    # Another mod's static member template: its instantiation is that package's function only if its own mod made it.
+    proves('templates.static-member-template')
+    lib = ('class StTplLib : public UBlueprintFunctionLibrary {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/StTplOwner/StTplLib", "StTplLib_C");\n'
+           '  template <class T> static T Get(T V) { return V + V; }\n};\n')
+    user = 'class StTplUser : public AActor {\npublic:\n  int32 F() { return StTplLib::Get<int32>(3); }\n};\n'
+    warned = built('StTplUser', ROW_HEAD % 'StTplUser' + lib + user)
+    assert any('StTplLib::Get__int32' in l and 'only if a source of that mod instantiates it' in l for l in warned), warned
+    # A text read's view struct is made in the mod's own package, as FDeref is: no warning, no other mod's pak.
+    proves('helper-code-you.ftext-addr')
+    proc = row_compile('ReadTextMod', ROW_HEAD % 'ReadTextMod' + ROW_INTRIN
+                       + 'class ReadTextMod : public AActor {\npublic:\n  FText F(int64 A) { return __ReadText__(A); }\n};\n')
+    assert proc.returncode == 0 and 'FDerefTextView' in proc.stdout and 'warning:' not in proc.stdout, proc.stdout
+    assert 'ReadProperty/FDerefTextView' not in proc.stdout, proc.stdout
+    print('ok  a method no compiled source defines, and a UE_CLASS path under the mod\'s own root that is not the class\'s, are warned about')
+
+
+proves('blueprint-classes.int32-helper-int32-x', 'sharing-a-class.ue-class-game-mymods-turrets-4')
+silent_drops()
+
+
+def foreign_game_namespace():
+    """A class in an absolute `Game::` namespace, in a header of another mod's folder, is that mod's: imported at the path
+    its namespace gives, never cooked into the mod that includes the header (the path is the same whoever cooks it, so
+    it used to read as this mod's own). The owner's own compile still cooks it."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        for d in ('ModA', 'ModB'): os.makedirs(os.path.join(tmp, d))
+        head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\n'
+        a_cls = ('namespace Game::_ElytrasMods::ModA_lib {\nclass UOtherThing : public UObject {\npublic:\n  int32 Count;\n'
+                 '  int32 Bump(int32 N) { return N + Count; }\n};\n}\n')
+        files = {'ModA/A.h': '#pragma once\n' + head + a_cls,
+                 'ModA/A.cpp': '#include "A.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ModA");\n'
+                               'class AModA : public AActor {\npublic:\n  int32 G(Game::_ElytrasMods::ModA_lib::UOtherThing *T) { return T->Bump(1); }\n};\n',
+                 'ModB/B.cpp': head + '#include "../ModA/A.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ModB");\n'
+                               'class AModB : public AActor {\npublic:\n  int32 F(Game::_ElytrasMods::ModA_lib::UOtherThing *T) { return T->Bump(2); }\n};\n'}
+        for rel, text in files.items():
+            with open(os.path.join(tmp, rel), 'w', encoding='utf-8') as f: f.write(text)
+        for mod, cooks in (('ModB', False), ('ModA', True)):
+            out = os.path.join(tmp, 'out' + mod, 'FSD', 'Content', '_ElytrasMods', mod)
+            os.makedirs(out)
+            proc = assetgen_compile([os.path.join(tmp, mod, mod[-1] + '.cpp'), UEAPI, out])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            assert ('Game::_ElytrasMods::ModA_lib::UOtherThing ->' in proc.stdout) == cooks, (mod, proc.stdout)
+    proves('sharing-a-class.include-turrets-turrets-h')
+
+
+foreign_game_namespace()
 
 
 PREFETCH.finish()

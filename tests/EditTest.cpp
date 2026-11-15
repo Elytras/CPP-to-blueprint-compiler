@@ -18,8 +18,9 @@ UE_ASSET_AT(UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_Ass
 /* Replaced in place: VeteranClasses, SpawnSpread, and the bool, now false. Added: EnemySignificance. The array's new
    element is an object the package did not import yet. */
 UE_ASSET_EDIT(ED_AssetTest) {.VeteranClasses = {&ED_Spider_Grunt, &ED_Spider_Exploder},
-                             .EnemySignificance = EEnemySignificance::Critical, .SpawnSpread = 800.0f,
-                             .CanBeUsedForConstantPressure = false};
+                             .EnemySignificance = EEnemySignificance::Critical,
+                             .CreatureSize = ECreatureSize::Large,      // a uint32 enum member: its tag is the enumerator's name
+                             .SpawnSpread = 800.0f, .CanBeUsedForConstantPressure = false};
 
 class UMoodDef : public UPrimaryDataAsset {
 public:

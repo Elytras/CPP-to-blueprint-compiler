@@ -64,6 +64,19 @@ private:
 void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
          const std::function<void(FArc&)>& Value, const std::string& StructName = "", int32 ArrayIndex = 0);
 
+/* 5.6 (PROPERTY_TAG_COMPLETE_TYPE_NAME): a property's type as the pre-order FPropertyTypeName tree a tag carries -
+   ArrayProperty(1) -> StructProperty(1) -> <Struct>(0) for an array of structs, a map's key and value trees for a map. */
+struct FTypeTree
+{
+    std::string Name;
+    std::vector<FTypeTree> Kids;
+};
+/* A tag by its type tree (UE5 only; Tag builds the tree of a property it knows only by its names). */
+void TagTree(FArc& Ar, const std::string& Name, const FTypeTree& Type,
+             const std::function<void(FArc&)>& Value, int32 ArrayIndex = 0);
+/* The type name a tag carries for a property class: its GetID(), not the class (a class property is an ObjectProperty). */
+std::string TagId(const std::string& Type);
+
 /* A bool's value lives in the tag (BoolVal) with zero payload; writing one via Tag() loads as false. */
 void TagBool(FArc& Ar, const std::string& Name, bool Value);
 

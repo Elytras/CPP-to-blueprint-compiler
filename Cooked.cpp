@@ -960,13 +960,45 @@ bool ReadEncodedString(FReader& R, std::string& Out, std::string& Why)
     return true;
 }
 
-/* An FText in a form the encoder writes: culture-invariant (flags 2, no history, the string), or empty (all 0). */
-bool ReadEncodedText(FReader& R, std::string& Out, std::string& Why)
+/* A string of a localized text: an empty one may be written as a lone terminator (length 1), which the text form keeps in
+   Terminator (1: the next four bytes are 1 and 0), as the engine saves an FString it never filled. */
+bool ReadTextString(FReader& R, std::string& Out, double& Terminator, std::string& Why)
 {
+    const size_t At = R.P;
+    if (R.I32() == 1 && R.Get<uint8>() == 0 && !R.bBad) { Out.clear(); Terminator = 1; return true; }
+    R.P = At;
+    Terminator = 0;
+    return ReadEncodedString(R, Out, Why);
+}
+
+/* An FText in a form the encoder writes: culture-invariant (flags 2, no history, the string), or empty (all 0). */
+bool ReadEncodedText(const FCookedPackage& P, FReader& R, FDefaultValue& D, std::string& Why)
+{
+    std::string& Out = D.S;
     const uint32 Flags = R.U32();
     const int8 History = R.Get<int8>();
+    if (History == 0 || History == 11)       // a localized text (namespace, key, source) or a string table entry (table, key)
+    {
+        D.TextHistory = History;
+        D.I = Flags;
+        D.Items.resize(2);
+        for (FDefaultValue& Part : D.Items) Part.K = FDefaultValue::Str;
+        Out.clear();
+        if (History == 0)
+        {
+            if (!ReadTextString(R, D.Items[0].S, D.Items[0].F, Why) || !ReadTextString(R, D.Items[1].S, D.Items[1].F, Why)
+                || !ReadTextString(R, Out, D.F, Why))
+                return false;
+        }
+        else
+        {
+            D.Items[0].S = P.NameOf(R.Name());
+            if (!ReadTextString(R, D.Items[1].S, D.Items[1].F, Why)) return false;
+        }
+        return !R.bBad;
+    }
     if (History != -1)
-    { Why = "a text of history " + std::to_string(History) + " (the encoder writes culture-invariant literals)"; return false; }
+    { Why = "a text of history " + std::to_string(History) + " (the encoder writes culture-invariant literals and history 0 and 11)"; return false; }
     const int32 bInvariant = R.I32();
     Out.clear();
     if (bInvariant && !ReadEncodedString(R, Out, Why)) return false;
@@ -982,6 +1014,40 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     const std::string& Ty = T.Type;
     if (Ty == "IntProperty") { D.K = FDefaultValue::Int; D.I = R.I32(); }
     else if (Ty == "Int64Property") { D.K = FDefaultValue::Int; D.I = R.I64(); }
+    else if (Ty == "UInt32Property") { D.K = FDefaultValue::Int; D.I = R.Get<uint32>(); }     // WriteValue: V.U32(uint32(D.I))
+    else if (Ty == "UInt16Property") { D.K = FDefaultValue::Int; D.I = R.Get<uint16>(); }
+    else if (Ty == "Int16Property") { D.K = FDefaultValue::Int; D.I = R.Get<int16>(); }
+    else if (Ty == "UInt64Property") { D.K = FDefaultValue::Int; D.I = int64(R.Get<uint64>()); }     // its bits: Int64Property's writer
+    else if (Ty == "DelegateProperty")                      // FScriptDelegate: the object, the function's name; the encoder writes it unbound
+    {
+        const int32 Object = R.I32();
+        const std::string Fn = P.NameOf(R.Name());
+        if (Object != 0 || Fn != "None") { Why = "a bound delegate (the encoder writes it unbound)"; return false; }
+        D.K = FDefaultValue::None;
+    }
+    else if (Ty == "FieldPathProperty")
+    {
+        /* FFieldPath: the path's names (a count, then each name), then the owner's package index (WriteValue). */
+        const int32 Count = R.I32();
+        if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / 8) { Why = "a field path's count past its value"; return false; }
+        for (int32 I = 0; I < Count; ++I) { FDefaultValue& N = D.Items.emplace_back(); N.K = FDefaultValue::Str; N.S = P.NameOf(R.Name()); }
+        D.Object = FIndex{ R.I32() };
+        D.K = FDefaultValue::Array;
+    }
+    else if (Ty == "MulticastInlineDelegateProperty" || Ty == "MulticastSparseDelegateProperty")
+    {
+        /* FMulticastScriptDelegate: a count of FScriptDelegates, each its object then its function's name (WriteValue). */
+        const int32 Count = R.I32();
+        if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / 12) { Why = "a delegate list past its value"; return false; }
+        for (int32 I = 0; I < Count; ++I)
+        {
+            FDefaultValue& Bound = D.Items.emplace_back();
+            Bound.K = FDefaultValue::Str;
+            Bound.Object = FIndex{ R.I32() };
+            Bound.S = P.NameOf(R.Name());
+        }
+        D.K = FDefaultValue::Array;
+    }
     else if (Ty == "FloatProperty") { D.K = FDefaultValue::Float; D.F = R.Get<float>(); }
     else if (Ty == "DoubleProperty") { D.K = FDefaultValue::Float; D.F = R.Get<double>(); }     // a UE5 real (S40)
     else if (Ty == "BoolProperty")
@@ -993,10 +1059,7 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     else if (Ty == "ByteProperty" && T.StructName.empty()) { D.K = FDefaultValue::Int; D.I = R.Get<uint8>(); }
     else if (Ty == "ByteProperty" || Ty == "EnumProperty" || Ty == "NameProperty") { D.K = FDefaultValue::Str; D.S = P.NameOf(R.Name()); }
     else if (Ty == "ObjectProperty") { D.K = FDefaultValue::Obj; D.Object = FIndex{ R.I32() }; }
-    else if (Ty == "InterfaceProperty")
-    {
-        if (R.I32() != 0) { Why = "an interface value that is not null (the encoder writes null)"; return false; }
-    }
+    else if (Ty == "InterfaceProperty") { D.K = FDefaultValue::Obj; D.Object = FIndex{ R.I32() }; }     // the object alone, as an ObjectProperty
     else if (Ty == "StrProperty")
     {
         if (!ReadEncodedString(R, D.S, Why)) return false;
@@ -1004,7 +1067,7 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     }
     else if (Ty == "TextProperty")
     {
-        if (!ReadEncodedText(R, D.S, Why)) return false;
+        if (!ReadEncodedText(P, R, D, Why)) return false;
         D.K = FDefaultValue::Str;
     }
     else if (Ty == "SoftObjectProperty")                           // FSoftObjectPath: AssetPathName, SubPathString
@@ -1019,7 +1082,150 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     else if (Ty == "StructProperty")
     {
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
-        if (const int32 Native = NativeStructSize(T.StructName))
+        if (T.StructName == "PerPlatformFloat" || T.StructName == "PerPlatformInt" || T.StructName == "PerPlatformBool")
+        {
+            /* bCooked, then Default (WriteNativeForm): a value with bCooked unset would hold a per-platform map after it. */
+            if (R.U32() != 1) { Why = "a " + T.StructName + " with bCooked unset (the encoder writes it set)"; return false; }
+            FPropertyDef& Def = Members->emplace_back();
+            Def.Name = "Default";
+            if (T.StructName == "PerPlatformFloat") { Def.Type = "FloatProperty"; Def.Default.K = FDefaultValue::Float; Def.Default.F = R.Get<float>(); }
+            else { Def.Type = T.StructName == "PerPlatformInt" ? "IntProperty" : "BoolProperty"; Def.Default.K = FDefaultValue::Int; Def.Default.I = R.U32(); }
+        }
+        else if (T.StructName == "GameplayTagContainer")
+        {
+            /* FGameplayTagContainer::Serialize: a count, then each tag's name (WriteNativeForm). */
+            const int32 Count = R.I32();
+            if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / 8) { Why = "a tag container's count past its value"; return false; }
+            FPropertyDef& Tags = Members->emplace_back();
+            Tags.Name = "GameplayTags"; Tags.Type = "ArrayProperty"; Tags.Default.K = FDefaultValue::Array;
+            for (int32 I = 0; I < Count; ++I)
+            {
+                FDefaultValue& Tag = Tags.Default.Items.emplace_back();
+                Tag.K = FDefaultValue::Struct;
+                Tag.Members = std::make_shared<std::vector<FPropertyDef>>();
+                FPropertyDef& Name = Tag.Members->emplace_back();
+                Name.Name = "TagName"; Name.Type = "NameProperty"; Name.Default.K = FDefaultValue::Str; Name.Default.S = P.NameOf(R.Name());
+            }
+        }
+        else if (T.StructName == "SkeletalMeshSamplingLODBuiltData")
+        {
+            /* FWeightedRandomSampler's three: Prob (floats) and Alias (ints), each a count then the words, then TotalWeight. */
+            for (const char* Name : { "Prob", "Alias" })
+            {
+                const int32 Count = R.I32();
+                if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / 4) { Why = std::string("a sampler's ") + Name + " past its value"; return false; }
+                FPropertyDef& M = Members->emplace_back();
+                M.Name = Name; M.Type = "ArrayProperty"; M.Default.K = FDefaultValue::Array;
+                for (int32 I = 0; I < Count; ++I) { FDefaultValue& W = M.Default.Items.emplace_back(); W.K = FDefaultValue::Int; W.I = R.I32(); }
+            }
+            FPropertyDef& Total = Members->emplace_back();
+            Total.Name = "TotalWeight"; Total.Type = "IntProperty"; Total.Default.K = FDefaultValue::Int; Total.Default.I = R.I32();
+        }
+        else if (T.StructName == "NiagaraDataInterfaceGPUParamInfo")
+        {
+            /* The HLSL symbol and the class name (strings), then the generated functions: each a definition name (a name), an
+               instance name (a string) and its specifiers (a count, then a pair of names each). */
+            auto Str = [&](const char* Name) {
+                FPropertyDef& M = Members->emplace_back();
+                M.Name = Name; M.Type = "StrProperty"; M.Default.K = FDefaultValue::Str;
+                return ReadEncodedString(R, M.Default.S, Why);
+            };
+            if (!Str("DataInterfaceHLSLSymbol") || !Str("DIClassName")) return false;
+            const int32 Count = R.I32();
+            if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / 12) { Why = "a GPU param info's functions past its value"; return false; }
+            FPropertyDef& Functions = Members->emplace_back();
+            Functions.Name = "GeneratedFunctions"; Functions.Type = "ArrayProperty"; Functions.Default.K = FDefaultValue::Array;
+            for (int32 I = 0; I < Count; ++I)
+            {
+                FDefaultValue& Item = Functions.Default.Items.emplace_back();
+                Item.K = FDefaultValue::Struct;
+                Item.Members = std::make_shared<std::vector<FPropertyDef>>();
+                FPropertyDef& Def = Item.Members->emplace_back();
+                Def.Name = "DefinitionName"; Def.Type = "NameProperty"; Def.Default.K = FDefaultValue::Str; Def.Default.S = P.NameOf(R.Name());
+                FPropertyDef& Instance = Item.Members->emplace_back();
+                Instance.Name = "InstanceName"; Instance.Type = "StrProperty"; Instance.Default.K = FDefaultValue::Str;
+                if (!ReadEncodedString(R, Instance.Default.S, Why)) return false;
+                const int32 Specifiers = R.I32();
+                if (Specifiers < 0 || R.bBad || size_t(Specifiers) > R.B.size() / 16) { Why = "a GPU function's specifiers past its value"; return false; }
+                FPropertyDef& Spec = Item.Members->emplace_back();
+                Spec.Name = "Specifiers"; Spec.Type = "ArrayProperty"; Spec.Default.K = FDefaultValue::Array;
+                for (int32 S = 0; S < Specifiers * 2; ++S)
+                { FDefaultValue& N = Spec.Default.Items.emplace_back(); N.K = FDefaultValue::Str; N.S = P.NameOf(R.Name()); }
+            }
+        }
+        else if (T.StructName == "MovieSceneFrameRange")
+        {
+            /* TRange<FFrameNumber>: the lower bound's type and value, then the upper's (a byte and an int each). */
+            for (const char* Part : { "LowerType", "LowerValue", "UpperType", "UpperValue" })
+            {
+                FPropertyDef& M = Members->emplace_back();
+                M.Name = Part;
+                M.Default.K = FDefaultValue::Int;
+                if (std::string(Part).find("Type") != std::string::npos) { M.Type = "ByteProperty"; M.Default.I = R.Get<uint8>(); }
+                else { M.Type = "IntProperty"; M.Default.I = R.I32(); }
+            }
+        }
+        else if (T.StructName == "MovieSceneFloatChannel")
+        {
+            /* FMovieSceneFloatChannel::Serialize: the two extrapolation bytes, the times (a bulk array of 4-byte frames:
+               element size, count, the frames), the values (28 bytes each, kept as 7 words), the default value, whether it
+               is set (a 4-byte bool) and the tick resolution (two ints). */
+            auto Word = [&](const char* Name, bool bByte) {
+                FPropertyDef& M = Members->emplace_back();
+                M.Name = Name; M.Type = bByte ? "ByteProperty" : "IntProperty";
+                M.Default.K = FDefaultValue::Int; M.Default.I = bByte ? R.Get<uint8>() : R.I32();
+            };
+            auto Bulk = [&](const char* Name, int32 Size, int32 Words) {
+                if (R.I32() != Size) { Why = std::string("a MovieSceneFloatChannel's ") + Name + " element size other than the encoder's"; return false; }
+                const int32 Count = R.I32();
+                if (Count < 0 || R.bBad || size_t(Count) > R.B.size() / size_t(Size)) { Why = std::string("a MovieSceneFloatChannel's ") + Name + " past its value"; return false; }
+                FPropertyDef& M = Members->emplace_back();
+                M.Name = Name; M.Type = "ArrayProperty";
+                M.Default.K = FDefaultValue::Array;
+                for (int32 I = 0; I < Count * Words; ++I) { FDefaultValue& W = M.Default.Items.emplace_back(); W.K = FDefaultValue::Int; W.I = R.I32(); }
+                return true;
+            };
+            Word("PreInfinityExtrap", true); Word("PostInfinityExtrap", true);
+            if (!Bulk("Times", 4, 1) || !Bulk("Values", 28, 7)) return false;
+            Word("DefaultValue", false); Word("bHasDefaultValue", false); Word("TickNumerator", false); Word("TickDenominator", false);
+        }
+        else if (T.StructName == "NiagaraVariableBase" || T.StructName == "NiagaraVariable" || T.StructName == "NiagaraVariableWithOffset")
+        {
+            /* The Name, the type definition's handle (tags), then VarData's bytes or the Offset (WriteNativeForm). */
+            FPropertyDef& Name = Members->emplace_back();
+            Name.Type = "NameProperty"; Name.Name = "Name";
+            Name.Default.K = FDefaultValue::Str; Name.Default.S = P.NameOf(R.Name());
+            FPropertyDef& Handle = Members->emplace_back();
+            Handle.Type = "StructProperty"; Handle.Name = "TypeDefHandle"; Handle.StructName = "NiagaraTypeDefinitionHandle";
+            if (!ReadValueOf(P, R, Handle, Handle.Default, Why)) return false;
+            if (T.StructName == "NiagaraVariable")
+            {
+                const int32 Count = R.I32();
+                if (Count < 0 || size_t(Count) > R.B.size() - std::min(R.P, R.B.size())) { Why = "a NiagaraVariable's VarData past its value"; return false; }
+                FPropertyDef& Data = Members->emplace_back();
+                Data.Type = "ArrayProperty"; Data.Name = "VarData";
+                Data.Default.K = FDefaultValue::Array;
+                for (int32 I = 0; I < Count; ++I) { FDefaultValue& B = Data.Default.Items.emplace_back(); B.K = FDefaultValue::Int; B.I = R.Get<uint8>(); }
+            }
+            else if (T.StructName == "NiagaraVariableWithOffset")
+            {
+                FPropertyDef& Offset = Members->emplace_back();
+                Offset.Type = "IntProperty"; Offset.Name = "Offset";
+                Offset.Default.K = FDefaultValue::Int; Offset.Default.I = R.I32();
+            }
+        }
+        else if (T.StructName == "SoftObjectPath" || T.StructName == "SoftClassPath")      // AssetPathName, SubPathString
+        {
+            FPropertyDef& Asset = Members->emplace_back();
+            Asset.Type = "NameProperty"; Asset.Name = "AssetPathName";
+            Asset.Default.K = FDefaultValue::Str; Asset.Default.S = P.NameOf(R.Name());
+            FPropertyDef& Sub = Members->emplace_back();
+            Sub.Type = "StrProperty"; Sub.Name = "SubPathString";
+            Sub.Default.K = FDefaultValue::Str;
+            if (!ReadEncodedString(R, Sub.Default.S, Why)) return false;
+            if (Asset.Default.S == "None") Asset.Default.S.clear();
+        }
+        else if (const int32 Native = NativeStructSize(T.StructName))
         {
             /* The struct's bytes as they are: 4-byte chunks, then single bytes, which WriteValue writes back raw. */
             for (int32 At = 0; At < Native;)
@@ -1044,7 +1250,6 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
             for (const FTag& M : Tags)
             {
                 /* The encoder writes a member's tag with index 0 and no guids: anything else changes the struct's bytes. */
-                if (M.ArrayIndex) { Why = "a struct member of a C array (the encoder writes each at index 0)"; return false; }
                 if (M.HasPropertyGuid) { Why = "a struct member with a property guid"; return false; }
                 if (std::any_of(std::begin(M.StructGuid), std::end(M.StructGuid), [](uint32 G) { return G != 0; }))
                 { Why = "a struct member of a struct with a guid (a user-defined struct)"; return false; }
@@ -1133,6 +1338,7 @@ bool ReadTagValue(const FCookedPackage& P, const FTag& Tag, FPropertyDef& Out, s
     Out = FPropertyDef{};
     Out.Name = P.NameOf(Tag.Name);
     Out.Type = P.NameOf(Tag.Type);
+    Out.ArrayIndex = Tag.ArrayIndex;        // a C array's element is its own tag, written at its index
     const std::string& Ty = Out.Type;
     if (Ty == "StructProperty") Out.StructName = P.NameOf(Tag.StructName);
     else if (Ty == "ByteProperty" || Ty == "EnumProperty")
@@ -1155,6 +1361,7 @@ bool ReadTagValue(const FCookedPackage& P, const FTag& Tag, FPropertyDef& Out, s
     {
         Out.Default.K = FDefaultValue::Bool;
         Out.Default.I = Tag.BoolVal;
+        if (Tag.ArrayIndex) { *Why = "a bool element of a C array (a bool's tag carries no index here)"; return false; }
         if (Tag.Value.empty() && Tag.BoolVal <= 1) return true;
         *Why = "a bool tag with a value, or other than 0 or 1";
         return false;
