@@ -15,7 +15,7 @@ and a compiler message in [Diagnostics](#diagnostics).
 | Types | [Types](#types), [Literals and conversions](#literals-and-conversions), [Strings and text](#strings-and-text), [Constants](#constants), [Enums](#enums), [Structs](#structs), [Containers](#containers) |
 | Code | [Operators](#operators), [Statements and control flow](#statements-and-control-flow), [Loops](#loops), [Locals](#locals), [The optimizer](#the-optimizer) |
 | Functions | [Functions](#functions), [Calling engine and game functions](#calling-engine-and-game-functions), [Overrides and parent calls](#overrides-and-parent-calls), [Inline functions and templates](#inline-functions-and-templates) |
-| Objects | [Components](#components), [Widget layouts](#widget-layouts), [Class defaults](#class-defaults), [Creating objects](#creating-objects), [Working with other objects](#working-with-other-objects), [Data assets](#data-assets), [Game assets](#game-assets), [Editing game packages](#editing-game-packages) |
+| Objects | [Components](#components), [Widget layouts](#widget-layouts), [Anim Blueprints](#anim-blueprints), [Class defaults](#class-defaults), [Creating objects](#creating-objects), [Working with other objects](#working-with-other-objects), [Data assets](#data-assets), [Game assets](#game-assets), [Editing game packages](#editing-game-packages) |
 | Events and waiting | [Event dispatchers](#event-dispatchers), [Latent calls](#latent-calls), [Waiting on events](#waiting-on-events), [Timers and input](#timers-and-input), [Timelines](#timelines), [Interfaces](#interfaces) |
 | Network | [Replication](#replication), [RPCs](#rpcs) |
 | Low level | [Pointers and memory](#pointers-and-memory), [Intrinsics](#intrinsics) |
@@ -3311,6 +3311,83 @@ Notes:
   resized, with its old box; when the compile fails, it prints clang's error and the last good picture stays.
   `--open` shows the PNG in the browser, on a page that reloads it as it changes. Without `--watch` it runs one turn
   and prints every box.
+
+## Anim Blueprints
+
+A `UAnimInstance` class that names its skeleton with `UE_SKELETON` is an Anim Blueprint. Its anim graph is made of
+members: each `FAnimNode_*` struct member is a node (`#include "UeApi/AnimGraphRuntime.h"` for the blend nodes), its
+settings are set in the constructor, and `UE_LINK` wires one node's pose into another's. State machines are declared
+with `UE_STATE` and `UE_TRANSITION` in the constructor. The constructor never runs: AssetGen cooks the graph as the
+editor's compiler bakes it. What changes per frame is written in `BlueprintUpdateAnimation`, ordinary script that sets
+the nodes' members (a play rate, a blend space's X, a blend's bool, a transition's rule) before the graph updates. The
+rule to remember: one `FAnimNode_Root` is the output pose, and every other node reaches it through links.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="anim-blueprints.ue-skeleton"></a>`UE_SKELETON("/Game/_MyMods/Critter/SK_Critter_Skeleton");` in a `UAnimInstance` class | Cooks the class as an Anim Blueprint's class (AnimBlueprintGeneratedClass) whose target skeleton is the one named, with an `AnimGraph` function, as the editor's compiler makes them. A mesh of that skeleton plays it once its `AnimClass` is the class and its `AnimationMode` is `AnimationBlueprint`. Without `UE_SKELETON` an anim instance class with no anim nodes is an ordinary Blueprint class. | Yes |
+| <a id="anim-blueprints.fanimnode-sequenceplayer-idle"></a>`FAnimNode_SequencePlayer Idle;` in the class, `Idle.Sequence = &Anim_Idle;` in the constructor | An anim node: any `FAnimNode_*` struct, a sequence player, a blend space player, a blend by bool or int, a layered blend per bone, an apply additive, a slot. Its parts set in the constructor are its settings, written as the cook writes them; the rest keep the node's engine defaults (a sequence player plays at rate 1 and loops). | Yes |
+| <a id="anim-blueprints.ue-link-idle"></a>`IdleState.Result = UE_LINK(Idle);`, `Blend.BlendPose = {UE_LINK(Walk), UE_LINK(Hurt)};` | A pose link: the node's pose goes into that input of the other, as a wire in the anim graph does. It names a node of this class by its member name. | Yes |
+| <a id="anim-blueprints.fanimnode-root-output"></a>`FAnimNode_Root Output;` and `Output.Result = UE_LINK(Slot);` | The output pose, the graph's end the engine evaluates from. | Yes |
+| <a id="anim-blueprints.ue-state-locomotion-idlestate"></a>`UE_STATE(Locomotion, IdleState);` in the constructor | Adds a state to the state machine `Locomotion` (an `FAnimNode_StateMachine` member): the state is the `FAnimNode_StateResult` member named, whose `Result` link is its pose. The first state is the machine's entry. The asset players its pose reaches are the state's, as the editor lists them. | Yes |
+| <a id="anim-blueprints.ue-transition-locomotion"></a>`UE_TRANSITION(Locomotion, IdleState, MoveState, ToMove, 0.2f);`, `UE_TRANSITION_AUTO(...)` | A transition between two states of the machine, crossfaded over the seconds given. Its rule is the `FAnimNode_TransitionResult` member named: the transition is taken once its `bCanEnterTransition` is true. `UE_TRANSITION_AUTO` takes it as the editor's automatic rule does, when the state's player is near its end. | Yes |
+| <a id="anim-blueprints.blueprintupdateanimation"></a>`void BlueprintUpdateAnimation(float DeltaTimeX) { ToMove.bCanEnterTransition = bMoving; Move.X = Speed; }` | Sets the nodes' inputs each frame: script that writes the anim instance's own node members, run on the game thread before the graph updates. It stands in for the editor's pin bindings and transition rule graphs. | Yes |
+| <a id="anim-blueprints.ue-skeleton-2"></a>anim nodes in a `UAnimInstance` class with no `UE_SKELETON`, `UE_SKELETON` in a class that is no `UAnimInstance`, no `FAnimNode_Root` or two, `UE_LINK` of anything but a node member, a node with an initializer whose constructor sets parts of it too | Refused: "an Anim Blueprint names its skeleton", "this class is no UAnimInstance", "an Anim Blueprint has one FAnimNode_Root", "UE_LINK names an anim node of this class", "give its value one way". | Refused |
+| <a id="anim-blueprints.ue-state"></a>a state in two machines, a transition from or to a state no `UE_STATE` above it adds, a crossfade that is not a constant, a machine with no states | Refused: "is a state of ... already", "is no UE_STATE of", "a transition's crossfade is a constant", "has no UE_STATE". | Refused |
+| <a id="anim-blueprints.ue-skeleton-3"></a>an Anim Blueprint below another of the mod's | Refused: "TODO: an Anim Blueprint below another of this mod's". Derive from `UAnimInstance` or a game anim instance class. | Not yet |
+
+```cpp
+#include "UeApi/AnimGraphRuntime.h"
+
+UE_ASSET_AT(UAnimSequence, Anim_Idle, "/Game/_MyMods/Critter/ANIM_Critter_Idle");
+UE_ASSET_AT(UAnimSequence, Anim_Run, "/Game/_MyMods/Critter/ANIM_Critter_Run");
+
+class ABP_Critter : public UAnimInstance {
+public:
+  UE_SKELETON("/Game/_MyMods/Critter/SK_Critter_Skeleton");
+  bool bMoving = false;
+  float Speed = 0.0f;
+
+  FAnimNode_SequencePlayer Idle;
+  FAnimNode_SequencePlayer Run;
+  FAnimNode_StateResult IdleState;
+  FAnimNode_StateResult RunState;
+  FAnimNode_TransitionResult ToRun;
+  FAnimNode_TransitionResult ToIdle;
+  FAnimNode_StateMachine Locomotion;
+  FAnimNode_Slot Slot;                               // where montages play
+  FAnimNode_Root Output;
+
+  ABP_Critter() {
+    Idle.Sequence = &Anim_Idle;
+    Run.Sequence = &Anim_Run;
+    IdleState.Result = UE_LINK(Idle);
+    RunState.Result = UE_LINK(Run);
+    UE_STATE(Locomotion, IdleState);                 // the entry state
+    UE_STATE(Locomotion, RunState);
+    UE_TRANSITION(Locomotion, IdleState, RunState, ToRun, 0.2f);
+    UE_TRANSITION(Locomotion, RunState, IdleState, ToIdle, 0.25f);
+    Slot.slotName = FName("DefaultSlot");
+    Slot.Source = UE_LINK(Locomotion);
+    Output.Result = UE_LINK(Slot);
+  }
+
+  void BlueprintUpdateAnimation(float DeltaTimeX) {
+    ToRun.bCanEnterTransition = bMoving;
+    ToIdle.bCanEnterTransition = !bMoving;
+    Run.PlayRate = Speed / 600.0f;
+  }
+};
+```
+
+Notes:
+
+- The editor binds a node's pins with property access, which the cook writes as copy records; AssetGen writes none,
+  and `BlueprintUpdateAnimation` sets the same members instead.
+- Not written yet: sync groups, cached poses, linked anim graphs and layers, notifies on states and transitions, and
+  Anim Blueprints for UE5 games (refused: "TODO: an Anim Blueprint is cooked for UE 4.27 only").
+- A layered blend's per-bone weights are left out: the engine builds them from `LayerSetup` against the mesh's
+  skeleton when it first runs the node.
+- The slot's member is spelled `slotName` in UeApi.
 
 ## Class defaults
 

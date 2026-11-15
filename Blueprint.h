@@ -291,6 +291,19 @@ public:
     };
     void AddAnimation(const FAnimation& Animation) { Animations.push_back(Animation); }
 
+    /* An Anim Blueprint's class: exported as an AnimBlueprintGeneratedClass with TargetSkeleton, the skeleton import,
+       and an AnimGraph function, whose PoseLink out parameter makes the class's one FAnimNode_Root the graph's output
+       (UAnimBlueprintGeneratedClass::GenerateAnimationBlueprintFunctions / LinkFunctionsToDefaultObjectNodes). Its anim
+       nodes are its FAnimNode_* variables, numbered in ChildProperties order (Link); a UE_LINK default names one, and
+       Finish writes its number. */
+    void SetAnimClass(FIndex Skeleton) { bAnimClass = true; TargetSkeleton = Skeleton; }
+    /* One baked state machine, BakedStateMachines[i], run by the FAnimNode_StateMachine variable Node. A state is its
+       FAnimNode_StateResult variable, its name too; a transition's Rule is an FAnimNode_TransitionResult variable whose
+       bCanEnterTransition takes it, or, bAutomatic, the time left in the state's animation. */
+    struct FAnimTransition { std::string From, To, Rule; float Crossfade = 0.2f; bool bAutomatic = false; };
+    struct FStateMachine { std::string Node; std::vector<std::string> States; std::vector<FAnimTransition> Transitions; };
+    void AddStateMachine(const FStateMachine& Machine) { StateMachines.push_back(Machine); }
+
     /* The actor has a root before this class's SCS runs: a Blueprint parent's SCS leaves one, and a native parent's
        constructor sets one or ExecuteConstruction takes its first native scene component. Then the DefaultSceneRoot
        node is in neither RootNodes nor AllNodes, as the editor saves it (ValidateSceneRootNodes). */
@@ -427,6 +440,10 @@ private:
     std::vector<FComponentBinding> ComponentBindings;
     std::vector<FPropertyBinding> PropertyBindings;
     std::vector<FAnimation> Animations;
+    bool bAnimClass = false;
+    FIndex TargetSkeleton;
+    std::vector<FStateMachine> StateMachines;
+    void FinishAnimGraph();
 
     int32 ClassRow = 0;
 };

@@ -446,6 +446,16 @@ std::string LayoutHelperCall(const Json& S)
     return Name == "UeSlot__" || Name == "UeBind__" || Name == "UeKeys__" ? Name : std::string();
 }
 
+/* UE_STATE's and UE_TRANSITION's call (UeMeta.h), "UeState__" or "UeTransition__", or "" for any other statement. */
+std::string AnimHelperCall(const Json& S)
+{
+    const Json* N = Strip(&S);
+    const Json* Fn = N && Kind(*N) == "CallExpr" ? Strip(First(*N)) : nullptr;
+    const std::string Name = Fn && Kind(*Fn) == "DeclRefExpr" ? Fn->value("referencedDecl", Json::object()).value("name", std::string())
+                                                               : std::string();
+    return Name == "UeState__" || Name == "UeTransition__" ? Name : std::string();
+}
+
 /* S39: a statement of a widget class's layout by its shape alone, `Root->AddChildToCanvas(Title)->SetPosition(...);`,
    `Title->SetText(...);`, `Play->OnClicked.Add(this, &UMyCard::OnPlay);`, `UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);`
    or a UE_SLOT or UE_BIND: a method call, a local or a layout helper. Generate reads what it means and refuses what it
@@ -1173,6 +1183,7 @@ struct FRecord
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
     std::vector<std::string> Widgets;               // UE_WIDGET, in declaration order: variables that are also widgets of the tree, the first its root
     std::vector<std::pair<std::string, std::string>> Animations;   // UE_ANIMATION: its variable -> its length as written, or ""
+    std::string Skeleton;                           // UE_SKELETON: an Anim Blueprint's target skeleton, by path
     /* genueapi's `<X>__UeName`: the engine's name of a member or function Dumper-7 had to respell (`Name_0` is
        `Name`, `Audio_Flying` is `Audio Flying`). C++ keeps its spelling; everything cooked goes through UeNameOf. */
     std::map<std::string, std::string> UeNames;
@@ -3986,6 +3997,8 @@ bool FCompiler::Collect(std::string* Err)
             {
                 R.Widgets.push_back(Name(C).substr(0, Name(C).size() - 10));
             }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeSkeleton__")
+                FindLiteral(C, R.Skeleton);
             else if (Kind(C) == "VarDecl" && Name(C).size() > 13 && Name(C).compare(Name(C).size() - 13, 13, "__UeAnimation") == 0)
             {
                 std::string Spec;
@@ -4620,7 +4633,7 @@ bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
         if (!bAssign && !AttachmentCall(S, Callee, Child, Parent, Socket) && !R.bIsPatch     // a patch's may set part of one
             && !(!R.Widgets.empty() && (WidgetLayoutStatement(S) || LocalMemberAssignment(S, Lhs, Rhs, SlotPart)))
             && !CallsInstanced(S) && !LocalMemberAssignment(S, Lhs, Rhs, SlotPart)     // UE_INSTANCED, its local's
-            && !(R.Widgets.empty() && ComponentEventCall(S)))
+            && !(R.Widgets.empty() && ComponentEventCall(S)) && AnimHelperCall(S).empty())
         {
             *Err = Where + ": a constructor never runs in the game, so its statements are read as the class's defaults: each "
                    "is `Field = value;`, `Component->Field = value;`, `Component->SetupAttachment(Parent);` or "
@@ -18629,6 +18642,24 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     }
     if (bBraced) return LowerDefault(F, PD, BP, Err, First(*Init), bKeepZero);
 
+    /* UE_LINK(Walk): a pose link reading the anim node Walk, a variable of this Anim Blueprint. Its LinkID is Walk's number
+       among the class's anim nodes, which FBlueprintClass::Finish knows once the variables are in their final order. */
+    if (const Json* Callee = !bNeg && PD.Type == "StructProperty" && K == "CallExpr" ? Strip(First(*Init)) : nullptr;
+        Callee && Kind(*Callee) == "DeclRefExpr" && Name((*Callee)["referencedDecl"]) == "UeLink__")
+    {
+        const Json* Node = Strip(Nth(*Init, 1));
+        if (!Node || Kind(*Node) != "MemberExpr" || !First(*Node) || Kind(*Strip(First(*Node))) != "CXXThisExpr"
+            || StripTypeKeywords(TypeOf(*Node)).compare(0, 10, "FAnimNode_") != 0)
+        { *Err = Name(F) + ": UE_LINK names an anim node of this class, by its member name: `UE_LINK(Walk)`"; return false; }
+        FPropertyDef Link = IntParam("LinkID");
+        Link.PropertyFlags = 0;
+        Link.Default.K = FDefaultValue::Int;
+        Link.Default.AnimNode = Name(*Node);
+        PD.Members = std::make_shared<std::vector<FPropertyDef>>(std::vector<FPropertyDef>{ Link });
+        PD.Default.K = FDefaultValue::Struct;
+        return true;
+    }
+
     /* A struct value: `FFloatInterval(1, 5)` or `{1, 5}`, one argument per member in declaration
        order. The members go on the property, each with its own default, and the writer turns them
        into nested tags - or into raw bytes when the struct has a native Serialize. */
@@ -22226,6 +22257,25 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (!R.Widgets.empty() && !bIsWidget)
     { *Err = R.CppName + "::" + R.Widgets.front() + ": a UE_WIDGET is a widget of a UUserWidget's tree; this class is none"; return false; }
     BP.SetWidgetClass(bIsWidget && HasWidgetTree(R));
+    /* An Anim Blueprint: a UAnimInstance class that names its skeleton. Its FAnimNode_* variables are its anim graph, wired by
+       UE_LINK defaults; its exported kind, AnimBlueprintGeneratedClass, is the one IAnimClassInterface::GetFromClass
+       answers for, so without it the mesh runs no graph. */
+    const bool bIsAnim = !R.bIsPatch && !R.Skeleton.empty();
+    if (bIsAnim)
+    {
+        if (std::find(Ancestry.begin(), Ancestry.end(), "AnimInstance") == Ancestry.end())
+        { *Err = R.CppName + ": UE_SKELETON names an Anim Blueprint's skeleton, and this class is no UAnimInstance"; return false; }
+        if (IsUE5()) { *Err = R.CppName + ": TODO: an Anim Blueprint is cooked for UE 4.27 only"; return false; }
+        for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (!A->IsNative() && !A->Skeleton.empty())
+            { *Err = R.CppName + ": TODO: an Anim Blueprint below another of this mod's (" + A->CppName + ")"; return false; }
+        const std::string& Sk = R.Skeleton;
+        const size_t Dot = Sk.find('.', Sk.rfind('/') + 1);
+        const std::string SkPkg = Sk.substr(0, Dot), SkName = Dot == std::string::npos ? Sk.substr(Sk.rfind('/') + 1) : Sk.substr(Dot + 1);
+        if (Sk.compare(0, 6, "/Game/") != 0)
+        { *Err = R.CppName + ": UE_SKELETON takes the skeleton asset's path, \"/Game/...\""; return false; }
+        BP.SetAnimClass(BP.Asset("/Script/Engine", "Skeleton", SkPkg, SkName));
+    }
     if (bIsWidget && !HasWidgetTree(R))
     {
         bool bDraws = OwnEvent(R, "OnPaint");
@@ -22349,6 +22399,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     /* UE_DEFAULTS' default for a variable of this class's own: one an implemented interface declares, or an own member
        pointed at a UE_INSTANCED object. */
     std::map<std::string, FPropertyDef> OwnVarDefaults;
+    /* An Anim Blueprint's own anim nodes set in parts by its constructor, `Walk.Sequence = &Anim_Walk;`, and its state
+       machines' UE_STATE and UE_TRANSITION lines, in the order written. */
+    std::vector<FPropertyDef> OwnParts;
+    std::vector<FBlueprintClass::FStateMachine> Machines;
     std::map<std::string, FBlueprintClass::FAttachment> Attachments;    // a UE_COMPONENT -> where SetupAttachment puts it
     /* S39: a UE_WIDGET's defaults, and the slots the layout's AddChild calls make, in the order written. A canvas slot's
        setters each set part of its LayoutData, kept per member path ("Offsets.Left", "Anchors.Minimum.X") until the tag
@@ -22851,6 +22905,43 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     bOk = Layout(S);
                     return;
                 }
+                /* UE_STATE(Machine, State), UE_TRANSITION(Machine, From, To, Rule, Crossfade[, automatic]): each an own anim
+                   node by its member name, which clang has held to its node type (UeMeta.h). */
+                if (const std::string Helper = AnimHelperCall(S); !Helper.empty())
+                {
+                    const Json* N = Strip(&S);
+                    const bool bState = Helper == "UeState__";
+                    auto Own = [&](int32 I) {
+                        const Json* E = Strip(Nth(*N, I));
+                        return E && Kind(*E) == "MemberExpr" && First(*E) && Kind(*Strip(First(*E))) == "CXXThisExpr"
+                                   && OwnerOf(*E) == R.CppName ? Name(*E) : std::string();
+                    };
+                    const char* const Form = bState ? "`UE_STATE(Locomotion, Idle)`" : "`UE_TRANSITION(Locomotion, Idle, Walk, ToWalk, 0.2f)`";
+                    const std::string Machine = Own(1);
+                    std::vector<std::string> Args;
+                    for (int32 I = 2; I <= (bState ? 2 : 4); ++I) Args.push_back(Own(I));
+                    if (Machine.empty() || std::find(Args.begin(), Args.end(), std::string()) != Args.end())
+                    { *Err = Where + ": " + Form + " names anim nodes this class declares, by their member names"; bOk = false; return; }
+                    auto M = std::find_if(Machines.begin(), Machines.end(), [&](const FBlueprintClass::FStateMachine& X) { return X.Node == Machine; });
+                    if (M == Machines.end()) { Machines.push_back({ Machine, {}, {} }); M = Machines.end() - 1; }
+                    auto Has = [&](const std::string& St) { return std::find(M->States.begin(), M->States.end(), St) != M->States.end(); };
+                    if (bState)
+                    {
+                        for (const auto& O : Machines)
+                            if (std::find(O.States.begin(), O.States.end(), Args[0]) != O.States.end())
+                            { *Err = Where + ": " + Args[0] + " is a state of " + O.Node + " already; a state's result node is its own"; bOk = false; return; }
+                        M->States.push_back(Args[0]);
+                        return;
+                    }
+                    for (const std::string& St : { Args[0], Args[1] })
+                        if (!Has(St))
+                        { *Err = Where + ": " + St + " is no UE_STATE of " + Machine + " above this line"; bOk = false; return; }
+                    FConstVal Fade, Auto;
+                    if (!FoldConst(*Nth(*N, 5), Fade) || !FoldConst(*Nth(*N, 6), Auto))
+                    { *Err = Where + ": a transition's crossfade is a constant, in seconds"; bOk = false; return; }
+                    M->Transitions.push_back({ Args[0], Args[1], Args[2], float(Fade.bFloat ? Fade.F : double(Fade.I)), Auto.I != 0 });
+                    return;
+                }
                 if (bool bHandled = false; R.Widgets.empty())
                     if (const bool bBound = ComponentEvent(S, bHandled); bHandled) { bOk = bBound; return; }
                 const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
@@ -22909,7 +23000,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 for (const FInstSpec& I : Insts) if (!I.Local.empty()) Held.insert(I.Local);
                 const bool bOwnInstanced = !bThroughComponent && DR == &R && Part.empty() && !Element && Rhs
                                         && PointsAtInstanced(*Rhs, Held);
-                if (!bThroughComponent && DR == &R && !bOwnInstanced)
+                /* A part of an own anim node is that node's default, member by member (OwnParts). */
+                const bool bOwnPart = !bThroughComponent && DR == &R && !Part.empty() && !Element
+                                   && StripTypeKeywords(TypeOf(*Lhs)).compare(0, 10, "FAnimNode_") == 0;
+                if (!bThroughComponent && DR == &R && !bOwnInstanced && !bOwnPart)
                 { *Err = Where + ": " + Name(*Lhs) + " is declared here - give it an initializer instead"; bOk = false; return; }
                 /* An interface's variable is this class's own property when this class is the one implementing
                    it; below a parent that does, it is one more inherited property. */
@@ -23018,6 +23112,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 };
                 if (SlotOf) { Put(SlotOf->Defaults); return; }      // a tag of the slot's export, as its setter's
                 if (InstOf) { Put(*InstOf); return; }               // a tag of the instanced object's export
+                if (bOwnPart) { Put(OwnParts); return; }
                 /* A widget's event flags are the compiler's, set below from the class's own events (kWidgetEvents). A line
                    that says the same changes nothing, and this reference long asked for one beside a Tick override, so it
                    warns; one that says otherwise would be undone, as the editor's compile undoes it, so it is refused. */
@@ -23301,6 +23396,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         /* UE_DEFAULTS naming an interface's variable, or an own one it points at a UE_INSTANCED object, is this class's
            own default for it. */
         bool bInstancedDefault = false;
+        if (auto Part = std::find_if(OwnParts.begin(), OwnParts.end(), [&](const FPropertyDef& P) { return P.Name == PD.Name; });
+            &Decl == &R && Part != OwnParts.end())
+        {
+            if (First(*F))
+            { *Err = R.CppName + "::" + FieldName + " has an initializer and its constructor sets parts of it: give its value one way"; return false; }
+            PD.Default = Part->Default;
+            PD.Members = Part->Members;
+        }
         if (auto Own = OwnVarDefaults.find(FieldName); Own != OwnVarDefaults.end())
         {
             PD.Default = Own->second.Default;
@@ -23493,6 +23596,47 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
     for (const auto& V : ClassVars) BP.AddVariable(V.second);
+    /* The anim graph holds together: one output root, each UE_LINK on a node of this class, each machine's states. */
+    std::set<std::string> AnimNodes;
+    int32 Roots = 0;
+    for (const auto& V : ClassVars)
+        if (V.second.Type == "StructProperty" && V.second.StructName.compare(0, 9, "AnimNode_") == 0)
+        {
+            AnimNodes.insert(V.second.Name);
+            Roots += V.second.StructName == "AnimNode_Root";
+        }
+    if (!bIsAnim && (!AnimNodes.empty() || !Machines.empty()) && std::find(Ancestry.begin(), Ancestry.end(), "AnimInstance") != Ancestry.end())
+    { *Err = R.CppName + ": an Anim Blueprint names its skeleton, `UE_SKELETON(\"/Game/.../SK_Name_Skeleton\");`"; return false; }
+    if (bIsAnim)
+    {
+        if (Roots != 1)
+        { *Err = R.CppName + ": an Anim Blueprint has one FAnimNode_Root, its output pose, and this one has " + std::to_string(Roots); return false; }
+        std::function<bool(const FDefaultValue&)> LinksOk = [&](const FDefaultValue& D) {
+            if (!D.AnimNode.empty() && !AnimNodes.count(D.AnimNode))
+            { *Err = R.CppName + ": UE_LINK(" + D.AnimNode + ") names no anim node of this class"; return false; }
+            for (const FDefaultValue& I : D.Items) if (!LinksOk(I)) return false;
+            if (D.Members) for (const FPropertyDef& M : *D.Members) if (!LinksOk(M.Default)) return false;
+            return true;
+        };
+        std::function<bool(const FPropertyDef&)> DefOk = [&](const FPropertyDef& P) {
+            if (!LinksOk(P.Default)) return false;
+            if (P.Members) for (const FPropertyDef& M : *P.Members) if (!DefOk(M)) return false;
+            return true;
+        };
+        for (const auto& V : ClassVars) if (!DefOk(V.second)) return false;
+        for (const auto& V : ClassVars)     // a machine node no UE_STATE names would index no baked machine
+            if (V.second.Type == "StructProperty" && V.second.StructName == "AnimNode_StateMachine"
+                && std::none_of(Machines.begin(), Machines.end(), [&](const auto& M) { return M.Node == V.second.Name; }))
+            { *Err = R.CppName + ": the state machine " + V.second.Name + " has no UE_STATE"; return false; }
+        for (const FBlueprintClass::FStateMachine& M : Machines)
+        {
+            if (M.States.empty())
+            { *Err = R.CppName + ": the state machine " + M.Node + " has no UE_STATE"; return false; }
+            BP.AddStateMachine(M);
+        }
+    }
+    else if (!Machines.empty())
+    { *Err = R.CppName + ": UE_STATE and UE_TRANSITION wire an Anim Blueprint's state machine; this class is none"; return false; }
     if (R.bIsPatch)     // its own and its interfaces' variables, not a DefaultSceneRoot the game's class already has
         for (const auto& V : ClassVars)
             if (std::any_of(OwnedFields.begin(), OwnedFields.end(), [&](const FOwnedField& O) { return Name(*O.F) == V.second.Name; }))
@@ -24796,7 +24940,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
         Err->clear();
     }
-    RegistryRows.push_back({ PackageName, ClassOf(R), HasWidgetTree(R) ? "WidgetBlueprintGeneratedClass" : "BlueprintGeneratedClass",
+    RegistryRows.push_back({ PackageName, ClassOf(R), HasWidgetTree(R) ? "WidgetBlueprintGeneratedClass"
+                                                     : bIsAnim ? "AnimBlueprintGeneratedClass" : "BlueprintGeneratedClass",
                              ClassTags(PackageName, PackageOf(*B), ClassOf(*B), B, BP.NumReplicatedVars()) });
     printf("  %-14s -> %s.uasset  (%s %s)\n", R.CppName.c_str(), Shown(PackageName).c_str(),
            B->IsNative() ? "extends" : "extends BP", R.Base.c_str());
@@ -26186,6 +26331,10 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     for (const auto& Entry : Records)
         if (!Entry.second.IsNative() && !Entry.second.bIsStruct && HasWidgetTree(Entry.second))
             GameClassKinds[PackageOf(Entry.second) + "." + ClassOf(Entry.second)] = { "/Script/UMG", "WidgetBlueprintGeneratedClass" };
+    /* And a mod's Anim Blueprint (UE_SKELETON). */
+    for (const auto& Entry : Records)
+        if (!Entry.second.IsNative() && !Entry.second.bIsStruct && !Entry.second.bIsPatch && !Entry.second.Skeleton.empty())
+            GameClassKinds[PackageOf(Entry.second) + "." + ClassOf(Entry.second)] = { "/Script/Engine", "AnimBlueprintGeneratedClass" };
 
     GAg.Mark("package-name + asset checks");
     int32 Generated = 0;

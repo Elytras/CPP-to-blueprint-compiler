@@ -5772,6 +5772,112 @@ def behaviour_tree_refusals():
     print('ok  BehaviorTree refusals')
 
 
+def anim_blueprints():
+    """AnimBlueprint: an anim instance class with UE_SKELETON is cooked as the editor's compiler bakes an Anim Blueprint.
+    Its FAnimNode_* members are the nodes, in declaration order; a UE_LINK is the forward index of the node it names, the
+    way UAnimBlueprintGeneratedClass::Link numbers AnimNodeProperties. The baked state machines name nodes by the
+    reversed index (Num - 1 - i, GetNodeFromPropertyIndex), as every cooked DRG anim class does (ABP_Crawler,
+    ABP_Spider_Grunt)."""
+    import invariants
+    folder = os.path.dirname(asset('AnimBlueprint'))
+    base = os.path.join(folder, 'ABP_Critter')
+    keeps_invariants(base)
+    keeps_invariants(os.path.join(folder, 'AnimBlueprint'))
+    p = invariants.Package(base)
+    cls = p.find('ABP_Critter_C')
+    nodes = ['Idle', 'Move', 'IdleState', 'MoveState', 'ToMove', 'ToIdle', 'Locomotion', 'Hurt', 'HurtBlend', 'Lean',
+             'Leaning', 'Bite', 'Upper', 'Slot', 'Output']
+    fwd, rev = nodes.index, lambda n: len(nodes) - 1 - nodes.index(n)
+    proves('anim-blueprints.ue-skeleton')
+    assert p.class_of(cls + 1) == 'AnimBlueprintGeneratedClass', p.class_of(cls + 1)
+    top = tag_values(p, cls, p.tags(cls))
+    assert top['TargetSkeleton'] == '/Game/_MyMods/Critter/SK_Critter_Skeleton.SK_Critter_Skeleton', top
+    graph = p.find('AnimGraph')
+    assert p.struct(graph).function_flags == 0xC400000, hex(p.struct(graph).function_flags)  # BlueprintCallable|Event|HasOutParms
+    rows = registry_rows(registry_of('AnimBlueprint'))
+    assert ('/Game/_ElytrasMods/AnimBlueprint/ABP_Critter.ABP_Critter_C', 'AnimBlueprintGeneratedClass') in rows, rows
+
+    cdo = tag_values(p, p.find('Default__ABP_Critter_C'), p.tags(p.find('Default__ABP_Critter_C')))
+    link = lambda v: v['LinkID']
+    proves('anim-blueprints.fanimnode-sequenceplayer-idle')
+    assert cdo['Idle'] == {'Sequence': '/Game/_MyMods/Critter/Animations/ANIM_Critter_Idle.ANIM_Critter_Idle'}, cdo['Idle']
+    assert cdo['Move'] == {'BlendSpace': '/Game/_MyMods/Critter/Animations/BS_Critter_Move.BS_Critter_Move'}, cdo['Move']
+    assert cdo['Leaning']['alpha'] == 1.0 and cdo['Upper']['BlendWeights'] == [1.0], (cdo['Leaning'], cdo['Upper'])
+    assert cdo['Upper']['LayerSetup'] == [{'BranchFilters': [{'BoneName': 'spine_01', 'BlendDepth': 0}]}], cdo['Upper']
+    assert cdo['Slot']['slotName'] == 'DefaultSlot', cdo['Slot']
+    proves('anim-blueprints.ue-link-idle')
+    assert link(cdo['IdleState']['Result']) == fwd('Idle') and link(cdo['MoveState']['Result']) == fwd('Move')
+    assert [link(l) for l in cdo['HurtBlend']['BlendPose']] == [fwd('Locomotion'), fwd('Hurt')], cdo['HurtBlend']
+    assert (link(cdo['Leaning']['Base']), link(cdo['Leaning']['Additive'])) == (fwd('HurtBlend'), fwd('Lean'))
+    assert (link(cdo['Upper']['BasePose']), [link(l) for l in cdo['Upper']['BlendPoses']]) == (fwd('Leaning'), [fwd('Bite')])
+    assert link(cdo['Slot']['Source']) == fwd('Upper')
+    proves('anim-blueprints.fanimnode-root-output')
+    assert cdo['Output'] == {'Result': {'LinkID': fwd('Slot')}, 'Name': 'AnimGraph'}, cdo['Output']   # the root of AnimGraph
+    assert cdo['Locomotion'] == {'StateMachineIndexInClass': 0}, cdo['Locomotion']
+
+    proves('anim-blueprints.ue-state-locomotion-idlestate')
+    [machine] = top['BakedStateMachines']
+    assert (machine['MachineName'], machine['InitialState']) == ('Locomotion', 0), machine
+    states = [(s['StateName'], s['StateRootNodeIndex'], s['PlayerNodeIndices'], s['bIsAConduit']) for s in machine['States']]
+    assert states == [('IdleState', rev('IdleState'), [rev('Idle')], False),
+                      ('MoveState', rev('MoveState'), [rev('Move')], False)], states
+    proves('anim-blueprints.ue-transition-locomotion')
+    exits = [[(t['TransitionIndex'], t['CanTakeDelegateIndex'], t['CustomResultNodeIndex'], t['bDesiredTransitionReturnValue'],
+               t['bAutomaticRemainingTimeRule']) for t in s['Transitions']] for s in machine['States']]
+    assert exits == [[(0, rev('ToMove'), -1, True, False)], [(1, rev('ToIdle'), -1, True, True)]], exits
+    between = [(t['PreviousState'], t['NextState'], round(t['CrossfadeDuration'], 3), t['BlendMode'], t['LogicType'])
+               for t in machine['Transitions']]
+    assert between == [(0, 1, 0.2, 'HermiteCubic', 'TLT_StandardBlend'), (1, 0, 0.3, 'HermiteCubic', 'TLT_StandardBlend')], between
+
+    proves('anim-blueprints.blueprintupdateanimation')
+    text = dump('walkscript.py', base, export_index(base, 'BlueprintUpdateAnimation'))
+    for member, struct_, node, var in (('bCanEnterTransition', 'AnimNode_TransitionResult', 'ToMove', 'bMoving'),
+                                       ('X', 'AnimNode_BlendSpacePlayer', 'Move', 'Speed'),
+                                       ('bActiveValue', 'AnimNode_BlendListByBool', 'HurtBlend', 'bHurt')):
+        assert re.search(r"StructMemberContext\s+%s@imp\[\d+\]:ScriptStruct'%s'\s*\n.*InstanceVariable\s+%s@.*\n"
+                         r".*InstanceVariable\s+%s@" % (member, struct_, node, var), text), (member, text)
+    actor = tag_values(*(lambda q: (q, q.find('Mesh_GEN_VARIABLE'), q.tags(q.find('Mesh_GEN_VARIABLE'))))(
+        invariants.Package(os.path.join(folder, 'AnimBlueprint'))))
+    assert actor['AnimClass'] == '/Game/_ElytrasMods/AnimBlueprint/ABP_Critter.ABP_Critter_C', actor
+    print('ok  AnimBlueprint: nodes, links, a baked state machine and its rules, and a mesh that plays it')
+
+
+def anim_blueprint_refusals():
+    """What the engine would misread: nodes with no skeleton to play on, not one output pose, a link to something that
+    is no node of the class, a node given its value two ways; a state machine's states and transitions declared out of
+    shape; and an Anim Blueprint below another of the mod's, whose node indexes would have to count the parent's."""
+    top = '#include "UeApi/AnimGraphRuntime.h"\n'
+    sk = '  UE_SKELETON("/Game/_MyMods/Critter/SK_Critter_Skeleton");\n'
+    out = '  FAnimNode_SequencePlayer Idle;\n  FAnimNode_Root Output;\n'
+    ctor = lambda mod, body: '  %s() {\n%s  }\n' % (mod, body)
+    proves('anim-blueprints.ue-skeleton-2')
+    refused('AnimNoSkeleton', out, 'an Anim Blueprint names its skeleton', top=top, base='UAnimInstance')
+    refused('AnimNotAnim', sk, 'this class is no UAnimInstance', top=top)
+    refused('AnimTwoRoots', sk + out + '  FAnimNode_Root Other;\n', 'an Anim Blueprint has one FAnimNode_Root, its output pose, and this one has 2',
+            top=top, base='UAnimInstance')
+    refused('AnimNoRoot', sk + '  FAnimNode_SequencePlayer Idle;\n', 'an Anim Blueprint has one FAnimNode_Root', top=top, base='UAnimInstance')
+    refused('AnimLinkOther', sk + out + '  AnimLinkOther *Other;\n' + ctor('AnimLinkOther', '    Output.Result = UE_LINK(Other->Idle);\n'),
+            'UE_LINK names an anim node of this class', top=top, base='UAnimInstance')
+    refused('AnimTwoWays', sk + '  FAnimNode_SequencePlayer Idle{};\n  FAnimNode_Root Output;\n'
+            + ctor('AnimTwoWays', '    Idle.PlayRate = 2.0f;\n    Output.Result = UE_LINK(Idle);\n'),
+            'has an initializer and its constructor sets parts of it: give its value one way', top=top, base='UAnimInstance')
+    proves('anim-blueprints.ue-state')
+    sm = sk + out + '  FAnimNode_StateResult A;\n  FAnimNode_StateResult B;\n  FAnimNode_TransitionResult T;\n' \
+                    '  FAnimNode_StateMachine M;\n  FAnimNode_StateMachine N;\n  float Fade = 0.2f;\n'
+    refused('AnimStateTwice', sm + ctor('AnimStateTwice', '    UE_STATE(M, A);\n    UE_STATE(N, A);\n'),
+            'A is a state of M already', top=top, base='UAnimInstance')
+    refused('AnimNoState', sm + ctor('AnimNoState', '    UE_STATE(M, A);\n    UE_TRANSITION(M, A, B, T, 0.2f);\n'),
+            'B is no UE_STATE of M above this line', top=top, base='UAnimInstance')
+    refused('AnimFadeVar', sm + ctor('AnimFadeVar', '    UE_STATE(M, A);\n    UE_STATE(M, B);\n    UE_TRANSITION(M, A, B, T, Fade);\n'),
+            "a transition's crossfade is a constant, in seconds", top=top, base='UAnimInstance')
+    refused('AnimEmptyMachine', sm + ctor('AnimEmptyMachine', '    UE_STATE(M, A);\n'),
+            'the state machine N has no UE_STATE', top=top, base='UAnimInstance')
+    proves('anim-blueprints.ue-skeleton-3')
+    refused('AnimBelow', sk, 'TODO: an Anim Blueprint below another of this mod\'s (ABP_Above)',
+            top=top + 'class ABP_Above : public UAnimInstance {\npublic:\n' + sk + out + '};\n', base='ABP_Above')
+    print('ok  AnimBlueprint refusals')
+
+
 def ue_assets():
     """genueassets names each asset a registry lists by its content path, one header per class; a mod reaching one
     through that header imports exactly that object. The registry here is AssetTest's, the game's in real use."""
@@ -13904,6 +14010,8 @@ particle_starts()
 particle_curves()
 behaviour_trees()
 behaviour_tree_refusals()
+anim_blueprints()
+anim_blueprint_refusals()
 particle_refusals()
 particle_events()
 niagara_compiled()
