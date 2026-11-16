@@ -43,6 +43,9 @@ struct FDefaultValue
        namespace and Items[1] its key (as S), I its flags. 11 a string table entry: Items[0] the table id (a name, as S),
        Items[1] the key, I its flags. */
     int8 TextHistory = -1;
+    /* Int, a pose link's LinkID (UE_LINK): the class variable of the anim node it reads. FBlueprintClass::Finish makes I
+       that node's index, which only the final order of the class's variables says. */
+    std::string AnimNode;
 };
 
 /* One ChildProperties entry. ElementSize must equal the type's runtime size; the engine lays the struct out from it. */
