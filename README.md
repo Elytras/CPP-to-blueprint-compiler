@@ -7,7 +7,7 @@ the editor, and you don't ship a DLL.
 
 The only target so far is Deep Rock Galactic (UE 4.27, cooked, unversioned, tagged properties).
 
-Start with [GUIDE.md](GUIDE.md): how your C++ maps onto Blueprint, a first mod, and a tour of what a mod can do.
+New? Skip to [GUIDE.md](GUIDE.md#your-first-mod) for a first mod, and its ["I want to..."](GUIDE.md#i-want-to) table once you have one. This page only says how to build the compiler. The guide: how your C++ maps onto Blueprint, a first mod, and a tour of what a mod can do.
 [REFERENCE.md](REFERENCE.md) lists every construct the compiler accepts, warns about or refuses, and every message it
 prints. [examples/](examples/) holds complete mods that build as they are.
 
@@ -59,7 +59,7 @@ One source file:
 assetgen compile <Mod.cpp> <UeApi dir> <out dir> --api <UeApi dir>
 ```
 
-The out dir has to exist already. A mod declares its package and derives from a game class:
+The out dir is created if it is missing. `--api` is optional ([GUIDE](GUIDE.md#compile-it-once) leaves it out). A mod declares its package and derives from a game class:
 
 ```cpp
 #include "UeApi/Types.h"
