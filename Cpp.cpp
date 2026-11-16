@@ -2058,6 +2058,10 @@ static const FReadViewSpec kReadViews[] = {
     { "__Read64__",     "__DerefReadI64__", "int64",           "/Script/Engine", "MaterialCachedParameterEntry" },
     { "__Read32__",     "__DerefReadI32__", "int32",           "/Script/Engine", "LODMappingData"               },
     { "__ReadFloat__",  "__DerefReadF__",   "float",           "/Script/Engine", "CustomPrimitiveData"          },
+    /* __ReadDouble__ shares the int64 8-byte-memcpy view (like __ReadObject__): the copy is Int64Property's,
+       and ResultType "double" only decides the DoubleProperty local the 8 bytes land in. This is the exact
+       8-byte read __ReadFloat__ (4-byte) is not - for UE5's Blueprint real, a DoubleProperty. */
+    { "__ReadDouble__", "__DerefReadI64__", "double",          "/Script/Engine", "MaterialCachedParameterEntry" },
     { "__ReadByte__",   "__DerefReadU8__",  "uint8",           "/Script/Engine", "BandwidthTestItem"            },
     { "__ReadObject__", "__DerefReadI64__", "class UObject *", "/Script/Engine", "MaterialCachedParameterEntry" },
     { "__ReadName__",   "__DerefReadI64__", "FName",           "/Script/Engine", "MaterialCachedParameterEntry" },

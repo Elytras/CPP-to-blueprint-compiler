@@ -28,6 +28,7 @@ int64          __AddrOf__(class UObject *Ref); // Ref reinterpreted as int64 (it
 int64          __Read64__(int64 Addr);         // *(int64*)Addr        - 8-byte deref
 int32          __Read32__(int64 Addr);         // *(int32*)Addr        - 4-byte int deref
 float          __ReadFloat__(int64 Addr);      // *(float*)Addr        - 4-byte float deref
+double         __ReadDouble__(int64 Addr);     // *(double*)Addr       - 8-byte double deref (UE5's Blueprint real)
 uint8          __ReadByte__(int64 Addr);       // *(uint8*)Addr        - 1-byte deref
 class UObject *__ReadObject__(int64 Addr);     // *(UObject**)Addr     - 8-byte pointer deref
 FName          __ReadName__(int64 Addr);       // *(FName*)Addr        - 8-byte FName deref
@@ -44,6 +45,7 @@ int64 __RefAt__(int64 Addr);
 template <class T> int64          __Read64__(const T *Addr);
 template <class T> int32          __Read32__(const T *Addr);
 template <class T> float          __ReadFloat__(const T *Addr);
+template <class T> double         __ReadDouble__(const T *Addr);
 template <class T> uint8          __ReadByte__(const T *Addr);
 template <class T> class UObject *__ReadObject__(const T *Addr);
 template <class T> FName          __ReadName__(const T *Addr);
