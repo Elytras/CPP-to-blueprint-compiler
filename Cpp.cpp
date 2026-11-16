@@ -25522,12 +25522,37 @@ std::string ClangCommand(const std::string& SourcePath, const std::string& Inclu
         "template <class... T> struct disjunction : bool_constant<disjunction_v<T...>> {};\n"
         "}\n";
     static const char ForwardText[] = "#pragma once\n#include <initializer_list>\n";
+    /* std::min / std::max, which a mod may take from <algorithm> (tests/RowStd). The body is built into the mod's
+       function library, so these are MSVC's own, parameter names and attributes included: the asset must not depend on
+       the host. */
+    static const char AlgorithmText[] =
+        "#pragma once\n"
+        "#include <initializer_list>\n"
+        "namespace std {\n"
+        "template <class _Ty, class _Pr>\n"
+        "[[nodiscard]] constexpr const _Ty&(max)(const _Ty& _Left [[clang::lifetimebound]], const _Ty& _Right [[clang::lifetimebound]], _Pr _Pred) noexcept(noexcept(_Pred(_Left, _Right))) {\n"
+        "    return _Pred(_Left, _Right) ? _Right : _Left;\n"
+        "}\n"
+        "template <class _Ty>\n"
+        "[[nodiscard]] constexpr const _Ty&(max)(const _Ty& _Left [[clang::lifetimebound]], const _Ty& _Right [[clang::lifetimebound]]) noexcept(noexcept(_Left < _Right)) {\n"
+        "    return _Left < _Right ? _Right : _Left;\n"
+        "}\n"
+        "template <class _Ty, class _Pr>\n"
+        "[[nodiscard]] constexpr const _Ty&(min)(const _Ty& _Left [[clang::lifetimebound]], const _Ty& _Right [[clang::lifetimebound]], _Pr _Pred) noexcept(noexcept(_Pred(_Right, _Left))) {\n"
+        "    return _Pred(_Right, _Left) ? _Right : _Left;\n"
+        "}\n"
+        "template <class _Ty>\n"
+        "[[nodiscard]] constexpr const _Ty&(min)(const _Ty& _Left [[clang::lifetimebound]], const _Ty& _Right [[clang::lifetimebound]]) noexcept(noexcept(_Right < _Left)) {\n"
+        "    return _Right < _Left ? _Right : _Left;\n"
+        "}\n"
+        "}\n";
     /* Parallel compiles share these files, and one compile's clang may be reading one as the next compile starts. So
        none is truncated in place: it is rewritten only when it differs, whole, into a temp file named for this
        process, which is then renamed over it (POSIX replaces the name atomically). A write or rename that fails
        leaves no temp file and stays silent, as before; clang then reports the missing header. */
     for (const auto& [Name, Text] : { std::pair<const char*, const char*>{ "initializer_list", InitListText },
-                                      { "type_traits", ForwardText }, { "cstddef", ForwardText } })
+                                      { "type_traits", ForwardText }, { "cstddef", ForwardText },
+                                      { "algorithm", AlgorithmText } })
     {
         const std::filesystem::path Shim = ShimDir / Name;
         if (ReadText(Shim.string()) == Text) continue;
