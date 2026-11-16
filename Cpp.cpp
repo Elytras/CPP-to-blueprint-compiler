@@ -25546,13 +25546,28 @@ std::string ClangCommand(const std::string& SourcePath, const std::string& Inclu
         "    return _Right < _Left ? _Right : _Left;\n"
         "}\n"
         "}\n";
+    /* std::sqrt as MSVC's <cmath> has it: an inline float overload over the CRT's sqrtf, and the CRT's own sqrt. Neither
+       CRT function has a body, so a call is refused at the same name it is on Windows ("inline sqrt: call to an unknown
+       function: sqrtf").
+       ponytail: sqrt only, what the suite reaches. A mod using the rest of <cmath> is refused on both hosts, here by
+       clang's "no member" instead; add the function here if that message ever matters. */
+    static const char CmathText[] =
+        "#pragma once\n"
+        "extern \"C\" float sqrtf(float _X);\n"
+        "extern \"C\" double sqrt(double _X);\n"
+        "namespace std {\n"
+        "using ::sqrt;\n"
+        "[[nodiscard]] inline float sqrt(float _Xx) noexcept {\n"
+        "    return ::sqrtf(_Xx);\n"
+        "}\n"
+        "}\n";
     /* Parallel compiles share these files, and one compile's clang may be reading one as the next compile starts. So
        none is truncated in place: it is rewritten only when it differs, whole, into a temp file named for this
        process, which is then renamed over it (POSIX replaces the name atomically). A write or rename that fails
        leaves no temp file and stays silent, as before; clang then reports the missing header. */
     for (const auto& [Name, Text] : { std::pair<const char*, const char*>{ "initializer_list", InitListText },
                                       { "type_traits", ForwardText }, { "cstddef", ForwardText },
-                                      { "algorithm", AlgorithmText } })
+                                      { "algorithm", AlgorithmText }, { "cmath", CmathText } })
     {
         const std::filesystem::path Shim = ShimDir / Name;
         if (ReadText(Shim.string()) == Text) continue;
