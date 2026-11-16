@@ -285,7 +285,7 @@ If nothing appears, [Running in the game](#running-in-the-game) says what to che
 | change a game Blueprint or enemy | [Extending a game Blueprint](#extending-a-game-blueprint), [Editing the game's assets](#editing-the-games-assets-and-blueprints) |
 | see that my mod ran | [When nothing happens](#when-nothing-happens) |
 | understand an error or warning | [Warnings, refusals and compiler bugs](#warnings-refusals-and-compiler-bugs) |
-| know whether the compiler supports a construct | [REFERENCE.md](REFERENCE.md), or `python tools/docq.py <words>` |
+| know whether the compiler supports a construct | [REFERENCE.md](REFERENCE.md): its topic table, or the macro index |
 
 ## Writing mods
 
