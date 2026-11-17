@@ -106,13 +106,13 @@ std::string ModFieldName(const std::string& StructPkg, const std::string& Field)
     return Field + "_" + std::to_string(H % 1000000u) + "_" + Guid;
 }
 
-/* FDeref and FDerefTextView are the compiler's own read-hoist plumbing, and FMapSlot_* / FMapSlots_* its view of a
+/* FDeref, FDerefTextView and FDerefI64View are the compiler's own read-hoist plumbing, and FMapSlot_* / FMapSlots_* its view of a
    TMap or TSet walked in place: their fields are referenced by fixed names from hardcoded emit sites (ViewFieldOf, the
    __DerefScratch__ prologue, LowerRangeFor), never through user field access, so they must keep their plain C++ names
    on both the cooked layout and every reference. */
 bool IsInternalViewStruct(const std::string& CppName)
 {
-    return CppName == "FDeref" || CppName == "FDerefTextView" || CppName.compare(0, 9, "FMapSlot_") == 0
+    return CppName == "FDeref" || CppName == "FDerefTextView" || CppName == "FDerefI64View" || CppName.compare(0, 9, "FMapSlot_") == 0
         || CppName.compare(0, 10, "FMapSlots_") == 0 || CppName.compare(0, 11, "FDerefView_") == 0;
 }
 
@@ -2066,20 +2066,29 @@ struct FReadViewSpec
     const char* ViewField = nullptr;    // that TArray member, when ViewFieldOf(DerefIntrinsic) does not name it
 };
 
-/* __ReadObject__ / __ReadName__ share the int64 view: both are 8-byte scalars whose
-   CopySingleValue is a plain 8-byte memcpy, which is exactly what UInt64Property.CopySingleValue
-   does through ArrayGetByRef. */
+/* The 8-byte lane (__Read64__ and the four that share its int64 memcpy view) reads through the mod-owned
+   FDerefI64View { TArray<int64> NameHashes; }, cooked in the mod's package like FDerefTextView (ViewStruct ->
+   HasI64ViewStruct). It used to borrow engine ScriptStruct MaterialCachedParameterEntry.NameHashes (a
+   TArray<uint64> at offset 0), but that field exists only in UE4.27 - UE5.6 replaced the struct's body with
+   a TSet, so the NameHashes import resolved null and every 8-byte read null-dereffed the member's
+   Offset_Internal at +0x44 in RC. A mod-owned int64 view is engine-version-proof for DRG(4.27) and RC(5.6).
+   __ReadObject__ / __ReadName__ / __ReadClass__ share it: each is an 8-byte scalar whose CopySingleValue is a
+   plain 8-byte memcpy, exactly what UInt64Property.CopySingleValue does through ArrayGetByRef. */
 static const FReadViewSpec kReadViews[] = {
-    { "__Read64__",     "__DerefReadI64__", "int64",           "/Script/Engine", "MaterialCachedParameterEntry" },
-    { "__Read32__",     "__DerefReadI32__", "int32",           "/Script/Engine", "LODMappingData"               },
-    { "__ReadFloat__",  "__DerefReadF__",   "float",           "/Script/Engine", "CustomPrimitiveData"          },
-    { "__ReadByte__",   "__DerefReadU8__",  "uint8",           "/Script/Engine", "BandwidthTestItem"            },
-    { "__ReadObject__", "__DerefReadI64__", "class UObject *", "/Script/Engine", "MaterialCachedParameterEntry" },
-    { "__ReadName__",   "__DerefReadI64__", "FName",           "/Script/Engine", "MaterialCachedParameterEntry" },
+    { "__Read64__",     "__DerefReadI64__", "int64",           "/Game/_ElytrasMods/ReadProperty/FDerefI64View", "FDerefI64View" },
+    { "__Read32__",     "__DerefReadI32__", "int32",           "/Script/Engine",                                "LODMappingData" },
+    { "__ReadFloat__",  "__DerefReadF__",   "float",           "/Script/Engine",                                "CustomPrimitiveData" },
+    /* __ReadDouble__ shares the int64 8-byte-memcpy view (like __ReadObject__): the copy is Int64Property's,
+       and ResultType "double" only decides the DoubleProperty local the 8 bytes land in. This is the exact
+       8-byte read __ReadFloat__ (4-byte) is not - for UE5's Blueprint real, a DoubleProperty. */
+    { "__ReadDouble__", "__DerefReadI64__", "double",          "/Game/_ElytrasMods/ReadProperty/FDerefI64View", "FDerefI64View" },
+    { "__ReadByte__",   "__DerefReadU8__",  "uint8",           "/Script/Engine",                                "BandwidthTestItem" },
+    { "__ReadObject__", "__DerefReadI64__", "class UObject *", "/Game/_ElytrasMods/ReadProperty/FDerefI64View", "FDerefI64View" },
+    { "__ReadName__",   "__DerefReadI64__", "FName",           "/Game/_ElytrasMods/ReadProperty/FDerefI64View", "FDerefI64View" },
     /* __ReadClass__ shares the int64 view: CopySingleValue on the InnerProp only cares about
        ElementSize (an 8-byte memcpy), so the tmp's type just decides the FField class the
        assign lands in - which is what __ClassOf__(Out) checks against at each Get<T>PropertyByName. */
-    { "__ReadClass__",  "__DerefReadI64__", "class UClass *",  "/Script/Engine", "MaterialCachedParameterEntry" },
+    { "__ReadClass__",  "__DerefReadI64__", "class UClass *",  "/Game/_ElytrasMods/ReadProperty/FDerefI64View", "FDerefI64View" },
     /* FString view: FStrProperty::CopySingleValue does a deep FString operator= (allocates a
        fresh TArray<TCHAR>), so ArrayGetByRef of the FString at *(FString*)Addr into an
        FString local produces an owned copy that DestroyStruct cleans up on return. */
@@ -2586,9 +2595,10 @@ private:
     bool HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                        std::vector<FStmtIR>& OutPre, std::string* Err);
     bool HasDerefStruct(std::string* Err) const;
-    /* A read's view struct as an import: FDerefTextView is the mod's own, made on first use like FDeref (HasTextViewStruct). */
+    /* A read's view struct as an import: FDerefTextView / FDerefI64View are the mod's own, made on first use like FDeref. */
     FIndex ViewStruct(const FReadViewSpec& V, FBlueprintClass& BP);
     void HasTextViewStruct() const;
+    void HasI64ViewStruct() const;
     bool LowerPtrCastSource(const Json& Call, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     std::map<std::string, std::string> RefAddr;     // VarDecl id -> pointee: `T& R = *P` keeps the address in an int64 local R
     std::map<std::string, std::string> ArrayView;   // such an R's local -> the FDeref scratch its declaration points at a TArray
@@ -2995,6 +3005,9 @@ private:
     mutable Json    TextViewAst;     // the one FieldDecl SynthTextView's Data points at
     mutable FRecord SynthTextView;
     mutable bool    bSynthTextView = false;
+    mutable Json    I64ViewAst;      // the one FieldDecl SynthI64View's Data points at
+    mutable FRecord SynthI64View;
+    mutable bool    bSynthI64View = false;
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::pair<std::string, std::string>> GameClassKinds;   // FBlueprintClass's, filled by Run
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
@@ -6641,11 +6654,39 @@ void FCompiler::HasTextViewStruct() const
     bSynthTextView = true;
 }
 
+/* `struct FDerefI64View { TArray<int64> NameHashes; }`, the mod-owned 8-byte read view (see kReadViews). UE5.6 removed
+   the engine TArray<uint64>@0 the lane used to borrow (MaterialCachedParameterEntry.NameHashes), so each 8-byte read
+   (__Read64__/__ReadDouble__/__ReadObject__/__ReadName__/__ReadClass__) now reads through this, cooked in the mod's own
+   package as FDeref/FDerefTextView are. A mod that declares its own wins (Find sees it first).
+   The field keeps the name NameHashes - the compiler's canonical name for the 8-byte lane's TArray (ViewFieldOf
+   __DerefReadI64__), which the read simulator (runscript.VIEWS) and ViewFieldOf already key on - so only the engine
+   struct it borrowed moved into the mod; nothing downstream of the field name changes. */
+void FCompiler::HasI64ViewStruct() const
+{
+    const FRecord* D = Find("FDerefI64View");
+    if ((D && D->bIsStruct && !D->IsNative()) || bSynthI64View) return;
+    I64ViewAst = Json::array();
+    /* Int64Property element: the read is Int64Property's 8-byte memcpy; kReadViews ResultType decides the local the
+       bytes land in. The reads through this view reinterpret those 8 bytes as an object/FName/UClass* on purpose;
+       invariants.py's view_struct() exempts that pun for FDerefI64View, as it does for FDeref/FDerefTextView. */
+    I64ViewAst.push_back(Json{ { "kind", "FieldDecl" }, { "name", "NameHashes" }, { "type", Json{ { "qualType", "TArray<int64>" } } } });
+    SynthI64View = FRecord();
+    SynthI64View.CppName   = "FDerefI64View";
+    SynthI64View.UeName    = "FDerefI64View";
+    SynthI64View.UePackage = ModPackage + "/FDerefI64View";
+    SynthI64View.bIsStruct = true;
+    SynthI64View.bIsLocal  = true;
+    for (const Json& F : I64ViewAst) SynthI64View.Fields.push_back(&F);
+    bSynthI64View = true;
+}
+
 FIndex FCompiler::ViewStruct(const FReadViewSpec& V, FBlueprintClass& BP)
 {
     const bool bText = std::strcmp(V.ViewStructName, "FDerefTextView") == 0;
+    const bool bI64  = std::strcmp(V.ViewStructName, "FDerefI64View") == 0;
     if (bText) HasTextViewStruct();
-    const std::string Pkg = bText ? ModPackage + "/FDerefTextView" : std::string(V.ViewStructPkg);
+    if (bI64)  HasI64ViewStruct();
+    const std::string Pkg = (bText || bI64) ? ModPackage + "/" + V.ViewStructName : std::string(V.ViewStructPkg);
     const FIndex S = BP.ScriptStruct(Pkg, V.ViewStructName);
     if (Pkg.compare(0, 6, "/Game/") == 0) KeepStructLoaded(S, V.ViewStructName, 16);     // ponytail: a mod-owned view is { TArray<T> Data; }, 16 bytes
     return S;
@@ -25686,12 +25727,52 @@ std::string ClangCommand(const std::string& SourcePath, const std::string& Inclu
         "template <class... T> struct disjunction : bool_constant<disjunction_v<T...>> {};\n"
         "}\n";
     static const char ForwardText[] = "#pragma once\n#include <initializer_list>\n";
+    /* std::min / std::max, which a mod may take from <algorithm> (tests/RowStd). The body is built into the mod's
+       function library, so these are MSVC's own, parameter names and attributes included: the asset must not depend on
+       the host. */
+    static const char AlgorithmText[] =
+        "#pragma once\n"
+        "#include <initializer_list>\n"
+        "namespace std {\n"
+        "template <class _Ty, class _Pr>\n"
+        "[[nodiscard]] constexpr const _Ty&(max)(const _Ty& _Left [[clang::lifetimebound]], const _Ty& _Right [[clang::lifetimebound]], _Pr _Pred) noexcept(noexcept(_Pred(_Left, _Right))) {\n"
+        "    return _Pred(_Left, _Right) ? _Right : _Left;\n"
+        "}\n"
+        "template <class _Ty>\n"
+        "[[nodiscard]] constexpr const _Ty&(max)(const _Ty& _Left [[clang::lifetimebound]], const _Ty& _Right [[clang::lifetimebound]]) noexcept(noexcept(_Left < _Right)) {\n"
+        "    return _Left < _Right ? _Right : _Left;\n"
+        "}\n"
+        "template <class _Ty, class _Pr>\n"
+        "[[nodiscard]] constexpr const _Ty&(min)(const _Ty& _Left [[clang::lifetimebound]], const _Ty& _Right [[clang::lifetimebound]], _Pr _Pred) noexcept(noexcept(_Pred(_Right, _Left))) {\n"
+        "    return _Pred(_Right, _Left) ? _Right : _Left;\n"
+        "}\n"
+        "template <class _Ty>\n"
+        "[[nodiscard]] constexpr const _Ty&(min)(const _Ty& _Left [[clang::lifetimebound]], const _Ty& _Right [[clang::lifetimebound]]) noexcept(noexcept(_Right < _Left)) {\n"
+        "    return _Right < _Left ? _Right : _Left;\n"
+        "}\n"
+        "}\n";
+    /* std::sqrt as MSVC's <cmath> has it: an inline float overload over the CRT's sqrtf, and the CRT's own sqrt. Neither
+       CRT function has a body, so a call is refused at the same name it is on Windows ("inline sqrt: call to an unknown
+       function: sqrtf").
+       ponytail: sqrt only, what the suite reaches. A mod using the rest of <cmath> is refused on both hosts, here by
+       clang's "no member" instead; add the function here if that message ever matters. */
+    static const char CmathText[] =
+        "#pragma once\n"
+        "extern \"C\" float sqrtf(float _X);\n"
+        "extern \"C\" double sqrt(double _X);\n"
+        "namespace std {\n"
+        "using ::sqrt;\n"
+        "[[nodiscard]] inline float sqrt(float _Xx) noexcept {\n"
+        "    return ::sqrtf(_Xx);\n"
+        "}\n"
+        "}\n";
     /* Parallel compiles share these files, and one compile's clang may be reading one as the next compile starts. So
        none is truncated in place: it is rewritten only when it differs, whole, into a temp file named for this
        process, which is then renamed over it (POSIX replaces the name atomically). A write or rename that fails
        leaves no temp file and stays silent, as before; clang then reports the missing header. */
     for (const auto& [Name, Text] : { std::pair<const char*, const char*>{ "initializer_list", InitListText },
-                                      { "type_traits", ForwardText }, { "cstddef", ForwardText } })
+                                      { "type_traits", ForwardText }, { "cstddef", ForwardText },
+                                      { "algorithm", AlgorithmText }, { "cmath", CmathText } })
     {
         const std::filesystem::path Shim = ShimDir / Name;
         if (ReadText(Shim.string()) == Text) continue;
@@ -26398,6 +26479,11 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (bSynthTextView)
     {
         if (!GenerateStruct(SynthTextView, OutDir, Err)) return false;
+        ++Generated;
+    }
+    if (bSynthI64View)
+    {
+        if (!GenerateStruct(SynthI64View, OutDir, Err)) return false;
         ++Generated;
     }
     for (const auto& Entry : SlotStructs)       // the TMap / TSet walks lowering made; see SlotView

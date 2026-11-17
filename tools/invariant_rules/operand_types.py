@@ -649,7 +649,8 @@ def is_call(n): return n.op in CALLS or (n.op in (0x19, 0x1A) and is_call(n.kids
 # ScreenMessageString.Key (the first 8 bytes of any value: an object's pointer, an array's data), __NameIndex__
 # IntPoint.X, __AsObject__ DebugDisplayProperty.obj (an int64 read back as a UObject*) (Cpp.cpp 822-841, 2481-2496,
 # 4926-4930), __FloatBits__ IntPoint.X over a float and __AsFloat__ Vector.X over an int32 (float_pun); the kReadViews, a TArray<T> at offset 0 read over an FDeref scratch whose Data is a raw address (1030-1062,
-# ViewFieldOf 705-713, HoistRefAt 8009-8064); and its own view structs - FDeref, FDerefTextView, FMapSlot_* /
+# ViewFieldOf 705-713, HoistRefAt 8009-8064); and its own view structs - FDeref, FDerefTextView, FDerefI64View (the
+# mod-owned 8-byte lane, replacing engine MaterialCachedParameterEntry.NameHashes which UE5.6 dropped), FMapSlot_* /
 # FMapSlots_* (a TMap's storage read as a TArray), FNC_* (a one-member struct wrapping a nested container) (58-66,
 # 1466-1475). The VM applies a member's offset and copies a value with no type check (ScriptCore.cpp
 # execStructMemberContext 2957-2995, execLet 2647-2686, ProcessScriptFunction 873-900), so it needs only that a view
@@ -666,7 +667,7 @@ VIEW_MEMBERS = {('/script/engine.screenmessagestring', 'key'), ('/script/coreuob
 def view_struct(path):
     """One of AssetGen's own view structs, by its lower-case path (IsInternalViewStruct, NestedWrapper)."""
     name = (path or '').split('.')[-1]
-    return name in ('fderef', 'fdereftextview') or name.startswith(('fmapslot_', 'fmapslots_', 'fnc_'))
+    return name in ('fderef', 'fdereftextview', 'fderefi64view') or name.startswith(('fmapslot_', 'fmapslots_', 'fnc_'))
 
 
 def _member_expr(n):
