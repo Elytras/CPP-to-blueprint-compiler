@@ -8282,8 +8282,16 @@ def instanced_defaults():
             '"DotStatusEffectItem_0")};\n  }\n', 'make it that class',
             top='#include "UeApi/Game/STE_Spider_Shooter_Acid_C.h"\n',
             base='Game::Enemies::Spider::Shooter::STE_Spider_Shooter_Acid_C')
+    # A copy no default points at leaves the parent's property on the parent's object, which a cooked game never
+    # re-points per actor: refused, under the CDO and (below) under a component template.
+    proves('instanced-objects.a-copy-no-default-points-at')
+    refused('InstancedOrphan', '  UE_DEFAULTS {\n    UDotStatusEffectItem *Acid = UE_INSTANCED(UDotStatusEffectItem, this, '
+            '"DotStatusEffectItem_0");\n    Acid->damageAmount = FRandRange{1.0f, 2.0f};\n  }\n',
+            'no default of InstancedOrphan points at the copy',
+            top='#include "UeApi/Game/STE_Spider_Shooter_Acid_C.h"\n',
+            base='Game::Enemies::Spider::Shooter::STE_Spider_Shooter_Acid_C')
 
-    stamp = json.load(open(os.path.join(UEAPI, 'Version.json'), encoding='utf-8')).get('genueapi', 0)
+    stamp =json.load(open(os.path.join(UEAPI, 'Version.json'), encoding='utf-8')).get('genueapi', 0)
     if stamp < 4:
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, 'InstancedPlant.cpp')
@@ -8291,6 +8299,11 @@ def instanced_defaults():
             proc = assetgen_compile([src, UEAPI, tmp])
         assert proc.returncode != 0 and 'genueapi' in proc.stdout and 'regenerate' in proc.stdout, proc.stdout[-500:]
         return 'InstancedPlant refused, as this UeApi predates genueapi 4'
+    proves('instanced-objects.a-copy-no-default-points-at')
+    refused('InstancedPlantOrphan', '  UE_DEFAULTS {\n    UNormalProjectileAttack *Shot = UE_INSTANCED(UNormalProjectileAttack, '
+            'ProjectileAttack, "NormalProjectileAttack_0");\n    Shot->RandomAngle = 5.0f;\n  }\n',
+            'no default of InstancedPlantOrphan points at the copy',
+            top='#include "UeApi/Game/ENE_ShootingPlant_C.h"\n', base='Game::Enemies::ShootingPlant::ENE_ShootingPlant_C')
     tmp, out, _ = compile_to(INSTANCED_PLANT, 'InstancedPlant')
     b = os.path.join(out, 'InstancedPlant')
     comp = '/Game/_ElytrasMods/InstancedPlant/InstancedPlant.InstancedPlant_C:ProjectileAttack_GEN_VARIABLE'
