@@ -17,6 +17,8 @@ or a static caller's own world context parameter. Write more helpers the same wa
   UStaticMeshComponent* C = AddComponentByType<UStaticMeshComponent>(this);
   UMyComp* D = AddComponentDeferred<UMyComp>(this);           // set properties, then:
   FinishComponent(this, D);
+  AMyActor* E = SpawnActorWith<AMyActor>(Class, Where, &AMyActor::Health, 100.f);  // the same in one call:
+  UMyComp* F = AddComponentWith<UMyComp>(this, &UMyComp::Charges, 3);              // fields and values in pairs
   AttachToComponent(C, GetRootComponent());
   AMyActor* Owner = GetTypedOuter<AMyActor>(this);           // the nearest outer that is one, or null
   UMyGame* Game = GetOutermostTypedOuter<UMyGame>(this);     // the farthest
@@ -81,6 +83,63 @@ inline T *AddComponentDeferred(AActor *Owner, TSubclassOf<T> Class = T::StaticCl
 
 inline void FinishComponent(AActor *Owner, UActorComponent *Component, bool bManualAttachment = false) {
   Owner->FinishAddComponent(Component, bManualAttachment, FVector(0.0f, 0.0f, 0.0f));
+}
+
+/* Sets fields of Obj in the order written: SetFields(Obj, &T::Health, 100.f, &T::Team, 2) is `Obj->Health = 100.f;
+   Obj->Team = 2;`. Each field is a member pointer, T's own or a parent's, named where it is passed; each value is
+   checked against its field as an assignment is. AssetGen reads `Obj->*Field` as the member it names, so this costs
+   the sets alone. */
+template <class T> inline void SetFields(T *) {}
+
+template <class T, class C, class M, class V, class... More>
+inline void SetFields(T *Obj, M C::*Field, V Value, More... Rest) {
+  static_assert(__is_base_of(C, T), "SetFields: the field is not a member of the object's class or of a parent of it");
+  static_assert(__is_convertible(V, M), "SetFields: the value does not convert to the field's type");
+  Obj->*Field = Value;
+  SetFields(Obj, Rest...);
+}
+
+/* The deferred forms in one call, each the two-step form written out (the same bytecode): begin, one set per field
+   in the order written, then finish. The values are the call's arguments, so they are evaluated before the object
+   is made, as any call's are.
+     AMyActor* A = SpawnActorWith<AMyActor>(Class, Where, &AMyActor::Health, 100.f, &AMyActor::Team, 2);
+     UMyComp* C = AddComponentWith<UMyComp>(this, &UMyComp::Charges, 3);
+     UMyWidget* W = CreateWidgetWith<UMyWidget>(PlayerController, &UMyWidget::Score, 5);   // then AddToViewport
+     UMyObject* O = NewObjectWith<UMyObject>(this, &UMyObject::Seen, 1);
+*/
+template <Derives<AActor> T, class... P>
+inline T *SpawnActorWith(TSubclassOf<T> Class, const FTransform &Transform, P... Fields) {
+  static_assert(sizeof...(P) % 2 == 0, "SpawnActorWith: give each field with its value: &T::Field, Value, ...");
+  T *Actor = SpawnActorDeferred<T>(Class, Transform);
+  SetFields(Actor, Fields...);
+  FinishSpawning(Actor, Transform);
+  return Actor;
+}
+
+template <Derives<UActorComponent> T, class... P>
+inline T *AddComponentWith(AActor *Owner, P... Fields) {
+  static_assert(sizeof...(P) % 2 == 0, "AddComponentWith: give each field with its value: &T::Field, Value, ...");
+  T *Component = AddComponentDeferred<T>(Owner);
+  SetFields(Component, Fields...);
+  FinishComponent(Owner, Component);
+  return Component;
+}
+
+template <Derives<UUserWidget> T, class... P>
+inline T *CreateWidgetWith(APlayerController *OwningPlayer, P... Fields) {
+  static_assert(sizeof...(P) % 2 == 0, "CreateWidgetWith: give each field with its value: &T::Field, Value, ...");
+  T *Widget = CreateWidget<T>(OwningPlayer);
+  SetFields(Widget, Fields...);
+  return Widget;
+}
+
+template <Derives<UObject> T, class... P>
+  requires(!Derives<T, AActor> && !Derives<T, UActorComponent>)
+inline T *NewObjectWith(UObject *Outer, P... Fields) {
+  static_assert(sizeof...(P) % 2 == 0, "NewObjectWith: give each field with its value: &T::Field, Value, ...");
+  T *Object = NewObject<T>(Outer);
+  SetFields(Object, Fields...);
+  return Object;
 }
 
 /* UObject::GetTypedOuter, as a walk up GetOuter(): the nearest outer that is a T, or null. Each step is one

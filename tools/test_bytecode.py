@@ -7564,6 +7564,52 @@ def spawn_runs():
     print('ok  SpawnTest: spawn / construct / add-component calls, their classes and the deferred-set order')
 
 
+def spawn_with():
+    """SpawnWith: each one-call deferred form (SpawnActorWith, AddComponentWith, CreateWidgetWith, NewObjectWith) is
+    its two-step form written out. The one place this suite compares bytecode: the form is promised to cost nothing,
+    so each pair must be the same code, the compiler's own temps aside (named here by where each first appears). Run
+    with the engine faked, the sets land between the begin and the finish, in the order written."""
+    base = asset('SpawnWith')
+
+    def code(fn):
+        temps = {}
+
+        def go(n):
+            v = n.val
+            if isinstance(v, str) and v.startswith('__'): v = temps.setdefault(v, '__t%d' % len(temps))
+            return n.op, v, [go(k) for k in n.kids]
+        return [go(s) for s in runscript.script_of(base, fn)]
+    for kind, row in (('Actor', 'spawning-actors.spawnactorwith'), ('Component', 'adding-components-at.addcomponentwith'),
+                      ('Widget', 'objects-and-widgets.createwidgetwith'), ('Object', 'objects-and-widgets.newobjectwith')):
+        proves(row, 'templates.member-pointer-argument')
+        assert code(kind + 'With') == code(kind + 'Hand'), kind
+
+    made = lambda k: (lambda vm, ctx, *a: Obj(a[k], args=a))
+    vm = VM(base, {'BeginDeferredActorSpawnFromClass': made(1), 'FinishSpawningActor': lambda vm, ctx, a, xf: a,
+                   'AddComponentByClass': made(0), 'SpawnObject': made(0), 'Create': made(1),
+                   'Conv_VectorToTransform': lambda vm, ctx, v: ('xf', tuple(v))})
+    me = vm.self
+    for fn, args in (('ActorWith', dict(Where='xf')), ('ComponentWith', {}), ('WidgetWith', dict(Player=None)), ('ObjectWith', {})):
+        vm.call(fn, **args)
+    twin, comp, hud, probe = (me.vars[k] for k in ('Last', 'Charges', 'Hud', 'Probe'))
+    zero = ('xf', (0.0, 0.0, 0.0))
+    proves('spawning-actors.spawnactorwith', 'adding-components-at.addcomponentwith',
+           'objects-and-widgets.createwidgetwith', 'objects-and-widgets.newobjectwith')
+    assert [l for l in vm.log if l[0] != 'Conv_VectorToTransform'] == [
+        ('BeginDeferredActorSpawnFromClass', me, [me, 'SpawnWith_C', 'xf', 0, None]),
+        ('set', twin, 'Health'), ('set', twin, 'Tag'), ('set', twin, 'Team'),       # as written, a parent's Team too
+        ('FinishSpawningActor', me, [twin, 'xf']), ('set', me, 'Last'),
+        ('AddComponentByClass', me, ['UWithCharges_C', False, zero, True]),           # held back ...
+        ('set', comp, 'Left'), ('set', comp, 'Rate'), ('FinishAddComponent', me, [comp, False, zero]),  # ... until set
+        ('set', me, 'Charges'),
+        ('Create', 'Default__WidgetBlueprintLibrary', [me, 'UWithHud_C', None]), ('set', hud, 'Score'), ('set', me, 'Hud'),
+        ('SpawnObject', me, ['UWithProbe_C', me]), ('set', probe, 'Seen'), ('set', probe, 'Label'), ('set', me, 'Probe'),
+    ], vm.log
+    assert (twin.vars['Health'], twin.vars['Tag'], twin.vars['Team']) == (100.0, 7, 2), twin.vars
+    assert (comp.vars['Left'], comp.vars['Rate'], hud.vars['Score'], probe.vars['Seen'], probe.vars['Label']) == (5, 0.5, 42, 9, 'made')
+    print('ok  SpawnWith: the one-call spawn / add / create / construct forms are their two-step forms, sets in order')
+
+
 def spawn_relative():
     """Compiled from its own folder as a bare "SpawnTest.cpp": `SpawnTest::StaticClass()` still names the mod class
     (the qualifier is read back from the mod's sources, which a bare path's empty parent once hid)."""
@@ -7671,6 +7717,7 @@ await_runs()
 await_values()
 delegate_targets()
 spawn_runs()
+spawn_with()
 spawn_relative()
 spawn_unity()
 outer_runs()
@@ -17590,6 +17637,16 @@ ROW_REFUSALS = [
     ('components-a-parent.controller-battachtopawn-true', 'PawnCtl', '  UE_DEFAULTS { Controller->bAttachToPawn = true; }\n',
      'UeApi does not say which default subobject Controller is', '', 'APawn'),
     ('objects-and-widgets.newobject-aactor-this', 'NewObjActor', '  AActor *F() { return NewObject<AActor>(this); }\n', 'no matching function', ''),
+    ('spawning-actors.spawnactorwith-wrong', 'WithType', '  int32 Tag;\n  void F(FTransform W) { SpawnActorWith<WithType>(WithType::StaticClass(), W, &WithType::Tag, FVector()); }\n',
+     "the value does not convert to the field's type", OBJECTS),
+    ('spawning-actors.spawnactorwith-wrong', 'WithNone', '  void F(FTransform W) { SpawnActorWith<WithNone>(WithNone::StaticClass(), W, &WithNone::Nope, 1); }\n',
+     "no member named 'Nope' in 'WithNone'", OBJECTS),
+    ('spawning-actors.spawnactorwith-wrong', 'WithOdd', '  int32 Tag;\n  void F(FTransform W) { SpawnActorWith<WithOdd>(WithOdd::StaticClass(), W, &WithOdd::Tag); }\n',
+     'give each field with its value', OBJECTS),
+    ('spawning-actors.spawnactorwith-wrong', 'WithOther', '  void F(FTransform W) { SpawnActorWith<WithOther>(WithOther::StaticClass(), W, &AOther::Tag, 1); }\n',
+     "the field is not a member of the object's class", OBJECTS + 'class AOther : public AActor {\npublic:\n  int32 Tag;\n};\n'),
+    ('templates.member-pointer-variable', 'WithVar', '  int32 Tag;\n  int32 Other;\n  void F(bool B) { SetFields(this, B ? &WithVar::Tag : &WithVar::Other, 1); }\n',
+     'takes a member pointer, which can only be a field named where it is passed', OBJECTS),
     ('uobject-helpers.obj-class', 'ObjClass', '  void F(UObject *Obj) { auto C = Obj->Class; }\n', "no member named 'Class' in 'UObject'", ''),
     ('pointing-at-data.float-h-md-big-health', 'AssetRead', '  float F() { float H = MD_Big.Health; return H; }\n', 'is an asset, not a value',
      'class UMoodDef : public UPrimaryDataAsset {\npublic:\n  float Health = 1.0f;\n};\nUMoodDef MD_Big = {.Health = 5.0f};\n'),
@@ -17726,6 +17783,7 @@ proves('arithmetic.id-count', 'binding-handlers.onhit-isbound', 'blueprint-class
        'what-a-range.for-int32-x-1-2', 'widget-layouts.grid-addchildtogrid-cell-1-2', 'widget-layouts.ue-widget-3')
 proves('declaring-an-interface.int32-marks', 'jumps.goto', 'range-for-over.goto', 'math-and-utility.std-min-a-b',
        'reading-and-writing.tarray-int32-a-pa')
+proves('spawning-actors.spawnactorwith-wrong', 'templates.member-pointer-variable')
 row_refusals()
 
 

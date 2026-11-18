@@ -12976,6 +12976,8 @@ bool HidesReads(const FArgIR& E)
    one, that E neither names nor may store to, and runs nothing; when E acts, S also reads nothing E could change. */
 bool MayPass(const FStmtIR& S, const FArgIR& E, bool bActs)
 {
+    /* A literal reads nothing, so nothing S runs can change it: `X = "made"` waits past a spawn to `O->Label = X`. */
+    if (IsVmConstant(E)) return true;
     if (!(S.K == FStmtIR::Assign || (S.K == FStmtIR::Decl && S.bHasValue)) || HidesReads(E)) return false;
     const FArgIR* Root = &S.Var;
     while (Root->K == FArgIR::Member && Root->Base) Root = Root->Base.get();
@@ -13059,6 +13061,34 @@ where it was cannot be seen. What S evaluates before the read, its destination i
 statement: E moves past stores to frame locals that it does not read and that run nothing (MayPass), which is what
 a pointer store puts between a value and its use (`__Upd = V; Scratch.Num = 1; Scratch.Data = P; *view = __Upd`).
 */
+/* Every mention of local From in St becomes To: each place Mentions counts. */
+static void RenameLocal(FStmtIR& St, const std::string& From, const std::string& To)
+{
+    std::function<void(FArgIR&)> Arg;
+    std::function<void(FCallIR&)> Call = [&](FCallIR& C) {
+        if (C.InlineResult == From) C.InlineResult = To;
+        if (C.View == From) C.View = To;
+        if (C.Inline) for (FStmtIR& S : *C.Inline) RenameLocal(S, From, To);
+        if (C.Target) Arg(*C.Target);
+        for (FArgIR& A : C.Args) Arg(A);
+    };
+    Arg = [&](FArgIR& A) {
+        if ((A.K == FArgIR::Local || A.K == FArgIR::LocalOut) && A.S == From) A.S = To;
+        if (A.Sub) Call(*A.Sub);
+        if (A.Base) Arg(*A.Base);
+    };
+    Call(St.Target);
+    Call(St.Call);
+    for (FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) Arg(*A);
+    for (FArgIR& A : St.CaseConsts) Arg(A);
+    for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+        if (*L)
+        {
+            *L = std::make_shared<std::vector<FStmtIR>>(**L);
+            for (FStmtIR& S : **L) RenameLocal(S, From, To);
+        }
+}
+
 void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<FStmtIR>& All)
 {
     for (FStmtIR& St : Stmts)
@@ -13068,6 +13098,11 @@ void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<
                 *L = std::make_shared<std::vector<FStmtIR>>(**L);
                 ForwardSingleUse(**L, All);
             }
+    auto FindLocal = [&](const std::string& N) -> const FPropertyDef* {
+        if (!CurLocals) return nullptr;
+        const auto It = std::find_if(CurLocals->begin(), CurLocals->end(), [&](const FPropertyDef& L) { return L.Name == N; });
+        return It == CurLocals->end() ? nullptr : &*It;
+    };
     /* Last to first, so `A = ..; B = ..; S(A, B)` forwards B, then A into what S has become. */
     for (size_t D = Stmts.size(); D-- > 0;)
     {
@@ -13076,8 +13111,26 @@ void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<
         if (!((Def.K == FStmtIR::Decl && Def.bHasValue) || (Def.K == FStmtIR::Assign && Def.bAssignLocal))
             || Def.Var.K != FArgIR::Local || Def.Var.Base || !CurLocals
             || std::none_of(CurLocals->begin(), CurLocals->end(), [&](const FPropertyDef& L) { return L.Name == Name; })
-            || Mentions(All, Name) != 2 || Mentions(Def.Value, Name) != 0)
+            || Mentions(Def.Value, Name) != 0)
             continue;
+        /* `T *Twin = <an inline's local>`, every mention of that local before the copy and none of Twin's: the local
+           becomes Twin instead, so the source's name survives rather than the helper's, and the code is what the
+           helper's body written out by hand gives (`T *Twin = SpawnActorWith<T>(...)` is SpawnActorDeferred's). */
+        if (const FPropertyDef* Src = FindLocal(Name), *Tmp = Def.Value.K == FArgIR::Local && !Def.Value.Base ? FindLocal(Def.Value.S) : nullptr;
+            Tmp && Name.compare(0, 2, "__") != 0 && Tmp->Name.compare(0, 5, "__Inl") == 0 && PropKey(*Src) == PropKey(*Tmp))
+        {
+            int32 TmpBefore = 0, NameAfter = 0;
+            for (size_t I = 0; I < Stmts.size(); ++I)
+                (I <= D ? TmpBefore : NameAfter) += Mentions(Stmts[I], I <= D ? Tmp->Name : Name);
+            if (TmpBefore == Mentions(All, Tmp->Name) && NameAfter + 1 == Mentions(All, Name))
+            {
+                const std::string From = Tmp->Name, To = Name;     // Name is Def's, which the erase destroys
+                Stmts.erase(Stmts.begin() + D);
+                for (size_t I = 0; I < D; ++I) RenameLocal(Stmts[I], From, To);
+                continue;
+            }
+        }
+        if (Mentions(All, Name) != 2) continue;
         const FArgIR& E = Def.Value;
         const bool bActs = CallsImpure(E);
         size_t U = D + 1;
@@ -15148,6 +15201,50 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     std::vector<bool> WcoDefault(Args.size());
     for (size_t I = 0; I < Args.size(); ++I) WcoDefault[I] = Kind(*Args[I]) == "CXXDefaultArgExpr" && IsWcoName(Name(*Parms[I]));
     for (size_t I = 0; I < Args.size(); ++I) Args[I] = DefaultedArg(*Args[I], Parms[I]);
+    /* A member pointer argument (`&AMyActor::Health`) is no value either: the parameter names that field. The body is
+       copied with each use of the parameter replaced by the `&C::F` itself, and `O->*F` / `O.*F` becomes `O->Health` /
+       `O.Health`, as if written so; a body that passes it on (`SetFields(O, Rest...)`) hands its callee the same
+       `&C::F`. So `O->*F = V` compiles to what `O->Health = V` does. */
+    std::vector<bool> MemPtr(Parms.size());
+    Json MemPtrBody;
+    {
+        std::map<std::string, const Json*> FieldOf;     // a parameter's id -> the `&C::F` it is bound to
+        for (size_t I = 0; I < Parms.size(); ++I)
+        {
+            if (TypeOf(*Parms[I]).find("::*") == std::string::npos) continue;
+            const Json* A = Strip(Args[I]);
+            const Json* F = A && Kind(*A) == "UnaryOperator" && A->value("opcode", std::string()) == "&" ? Strip(First(*A)) : nullptr;
+            if (!F || Kind(*F) != "DeclRefExpr" || !F->contains("referencedDecl") || (*F)["referencedDecl"].value("kind", std::string()) != "FieldDecl")
+            {
+                *Err = "TODO: " + Method + " takes a member pointer, which can only be a field named where it is passed "
+                       "(`&AMyActor::Health`), not a variable or a method";
+                return false;
+            }
+            MemPtr[I] = true;
+            FieldOf[Parms[I]->value("id", std::string())] = A;
+        }
+        std::function<void(Json&)> Sub = [&](Json& N) {
+            if (N.is_array()) { for (Json& C : N) Sub(C); return; }
+            if (!N.is_object()) return;
+            if (Kind(N) == "DeclRefExpr" && N.contains("referencedDecl"))
+                if (const auto It = FieldOf.find(N["referencedDecl"].value("id", std::string())); It != FieldOf.end())
+                { N = *It->second; return; }
+            if (const auto In = N.find("inner"); In != N.end()) Sub(*In);
+            const std::string Op = Kind(N) == "BinaryOperator" ? N.value("opcode", std::string()) : std::string();
+            if (Op != "->*" && Op != ".*") return;
+            const Json* R = Strip(&N["inner"][1]);
+            const Json* F = R && Kind(*R) == "UnaryOperator" && R->value("opcode", std::string()) == "&" ? Strip(First(*R)) : nullptr;
+            if (!F || Kind(*F) != "DeclRefExpr" || !F->contains("referencedDecl")) return;     // left for LowerArg to refuse
+            const Json& Field = (*F)["referencedDecl"];
+            Json M = { {"id", N.value("id", std::string())}, {"kind", "MemberExpr"}, {"type", N["type"]},
+                       {"valueCategory", N.value("valueCategory", std::string("lvalue"))}, {"name", Field.value("name", std::string())},
+                       {"isArrow", Op == "->*"}, {"referencedMemberDecl", Field.value("id", std::string())},
+                       {"inner", Json::array({ N["inner"][0] })} };
+            if (N.contains("range")) M["range"] = N["range"];
+            N = std::move(M);
+        };
+        if (!FieldOf.empty()) { MemPtrBody = *Body; Sub(MemPtrBody); Body = &MemPtrBody; }
+    }
     /* A lambda being called is the object `lambdaObj` (RewriteLambdaCalls). A closure passed as an argument is no
        value either: the parameter it binds is that lambda, with no local and no copy, and each call of the parameter
        expands the lambda's body (a closure type is only ever a template's or an `auto` parameter, which expand). */
@@ -15205,7 +15302,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
             const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
             if (!LowerBody(Wrap, BP, Pins[I], Locals, Err)) return false;
         }
-        else if (LamArg[I]) {}
+        else if (LamArg[I] || MemPtr[I]) {}
         else if (WcoDefault[I]) { if (!CurrentWco.empty()) { Values[I].K = FArgIR::Local; Values[I].S = CurrentWco; } }
         else if (!LowerArg(*Args[I], BP, Values[I], Err)) return false;
     /* The caller's own local can stand in for a parameter the body only reads, as a constant does, when nothing could
@@ -15250,6 +15347,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         ParmConst.erase(Id);
         LambdaOf.erase(Id);
         if (LamArg[I]) { LambdaOf[Id] = LamArg[I]; continue; }
+        if (MemPtr[I]) continue;
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
         Type = StripTypeKeywords(Type);
         /* A pack's parameters all have the pack's name (`const A&... Args`): each gets its own local, by position. */

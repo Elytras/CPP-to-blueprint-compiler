@@ -520,6 +520,12 @@ node with Expose on Spawn pins, `NewObject<T>(Outer)` is Construct Object from C
 only the engine calls inside it. The wrong kind of class for a helper, such as `NewObject<AActor>`, fails in clang on
 the calling line.
 
+To set fields before a deferred actor or component starts, name them in the call:
+`SpawnActorWith<ATurret>(ATurret::StaticClass(), Where, &ATurret::Ammo, 30, &ATurret::Team, 2)` spawns
+deferred, sets each field in the order written, then finishes, and compiles to the same code as those three steps
+written out. `AddComponentWith`, `CreateWidgetWith` and `NewObjectWith` do the same for the other nodes. Each value is
+checked against its field, so a wrong type, a missing value or an unknown field fails in clang on the calling line.
+
 ```cpp
 #include "../AssetGen/include/Objects.h"   // from mymods/: SpawnActor, NewObject, AddComponentByType, ...
 
