@@ -901,6 +901,12 @@ def main():
         if mod.get("net_contract") and not net_contract_holds(stage_content, os.path.join(bp, mod["net_contract"]), name):
             failed.append(name)
             continue
+        # After the embed: an API's packages may come from a dep it ships (EMM's EnemyTemplates).
+        if mod.get("api_contract"):
+            import apisurface
+            if not apisurface.run(bp, mod, os.path.join(stage_fsd, "Content")):
+                failed.append(name)
+                continue
         stage_bundle(bundle, stage_fsd)
         if mod.get("kept"):     # after the deps: a kept package wins over a rebuilt one of the same path
             print("%-16s kept     %d files" % (name, place_kept(mod, bp, stage_fsd)))
