@@ -2,7 +2,7 @@
 
     python apisurface.py <mods dir> <mod> [--write] [--check]
 
-A mod with an `api_contract` in mods.yaml (ElytrasModManager: API.md "Versions") publishes APIs, each a set of package
+A mod with an `api_contract` in mods.yaml publishes APIs, each a set of package
 prefixes (its `manifest` `apis`, the longest prefix wins, the `frozen` packages left out) with a Major.Minor in a header
 (`api_contract.versions`, `static constexpr int32 <Api>Major = N;`). An API's surface is what another mod may use of
 its packages, read off the cooked build: each class's parent and interfaces, its functions but the private ones
@@ -16,7 +16,11 @@ bpbuild runs --check for such a mod and packs no pak that fails it. --write reco
 
 Each run also writes build/<mod>/apiindex.jsonl: one JSON object a line, sorted by id, for every class, struct, enum,
 function, event, variable and cvar of the mod's packages (and `api_contract.index_with`'s), with its source line
-(index()). Generated, never edited: docq's EMM API index reads it."""
+(index()). Generated, never edited: a tool that lists the mod's API reads it.
+
+`api_contract.visibility` maps package prefixes to a label for the index (`{/Game/MyMod/Public/: public, /Game/MyMod/:
+internal}`, the longest prefix wins); a package under none is left out of the index (another mod's, embedded in the pak).
+Without it, every package is "public"."""
 import json, os, re, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -179,9 +183,6 @@ def check(baseline, now, numbers):
     return problems
 
 
-VISIBLE = {'/Game/_Interop/': 'public', '/Game/_ElytrasMods/': 'internal'}
-
-
 def source_lines(dirs):
     """Every C++ class, struct and enum definition under dirs: name -> [(file, line, its body's lines, its C++ parent)],
     file relative to the mods dir. A body runs to the first `};` at the start of a line; forward declarations (with a
@@ -226,13 +227,14 @@ def cvars(dirs, rel):
     return out
 
 
-def index(whole, spec, decls, cvar_map):
-    """One row per symbol of whole (surface()), sorted by id, for docq's EMM API index: id (the cooked path, a member
-    after ':'), kind (class / struct / enum / function / event / property / cvar), owner, signature, visibility (public
-    under /Game/_Interop, internal under /Game/_ElytrasMods), api (the manifest's, or null) and source (file:line, or
-    null when no definition of that name was found: an enemy template's members are the game Blueprint's own, which no
-    C++ declares)."""
+def index(whole, spec, decls, cvar_map, visible=None):
+    """One row per symbol of whole (surface()), sorted by id: id (the cooked path, a member after ':'), kind (class /
+    struct / enum / function / event / property / cvar), owner, signature, visibility (visible's label for the package's
+    longest prefix; packages under none left out; all "public" without visible), api (the manifest's, or null) and
+    source (file:line, or null when no definition of that name was found: a member a Blueprint subclass of a game class
+    inherits from the game's Blueprint has no C++ declaration)."""
     prefixes = sorted(((p.rstrip('/'), api) for api, ps in spec['apis'].items() for p in ps), key=lambda x: -len(x[0]))
+    visible = sorted((visible or {'/Game/': 'public'}).items(), key=lambda x: -len(x[0]))
 
     def located(path, name):
         # The definition of name, the one whose file sits under the package's folder when there are several.
@@ -245,9 +247,9 @@ def index(whole, spec, decls, cvar_map):
     for part, items in whole.items():
         for path, value in items.items():
             package = path.split('.')[0]
-            visibility = next((v for pre, v in VISIBLE.items() if package.startswith(pre)), None)
+            visibility = next((v for pre, v in visible if package.startswith(pre)), None)
             if visibility is None:
-                continue                        # another mod's packages EMM embeds (_ModHub)
+                continue                        # under no listed prefix: another mod's, embedded
             api = next((a for pre, a in prefixes if package == pre or package.startswith(pre + '/')), None)
             name = path.rsplit('.', 1)[-1]
             name = name[:-2] if name.endswith('_C') else name
@@ -265,8 +267,8 @@ def index(whole, spec, decls, cvar_map):
             rows.append(dict(base, id=path, kind='class', owner=package.rsplit('/', 2)[-2], source=source,
                              signature=' : '.join([name, ', '.join([value['super']] + value['interfaces'])])))
             def member(m, at=where, depth=0):
-                # In the class's body, else up its C++ parents (an enemy template's members are the game class's, in
-                # UeApi), a few levels.
+                # In the class's body, else up its C++ parents (a subclass of a game class finds the game class's
+                # members in UeApi), a few levels.
                 if at is None or depth > 4:
                     return None
                 n = next((k for k, line in enumerate(at[2]) if re.search(r'\b%s\b' % re.escape(m), line)
@@ -306,7 +308,8 @@ def write_index(bp, mod, whole):
                 whole[part].update(items)
         else:
             print('%-16s apisurface: no build of %s for the index (bpbuild.py --only %s)' % (mod['name'], other, other))
-    rows = index(whole, mod['manifest'], source_lines([(d, bp) for d in dirs]), cvars(own, bp))
+    rows = index(whole, mod['manifest'], source_lines([(d, bp) for d in dirs]), cvars(own, bp),
+                 mod['api_contract'].get('visibility'))
     out = os.path.join(bp, 'build', mod['name'], 'apiindex.jsonl')
     with open(out, 'w', encoding='utf-8', newline='\n') as f:
         f.writelines(json.dumps(r, sort_keys=True, ensure_ascii=False) + '\n' for r in rows)
