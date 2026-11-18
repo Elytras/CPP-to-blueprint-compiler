@@ -4961,8 +4961,15 @@ def api_stub_library():
         assert signature_graphs(actor) == {'Call_2'}, 'Pending is a variable only, and that one is left out'
         assert 'Pending' not in actor.names
         assert 'Pending        skipped: a Blueprint variable cannot hold a delegate' in proc.stdout, proc.stdout
+
+        # A class with nothing callable gets no stub, unless another class derives from it: ApiChild's stub names it.
+        proves('methods-as-blueprint.generate-api-base')
+        assert not os.path.exists(os.path.join(api, 'ApiHidden.uasset')), 'ApiHidden: nothing callable, no parent'
+        child = Package(os.path.join(api, 'ApiChild'))
+        assert child.path(child.struct(child.find('ApiChild_C')).super).endswith('/ApiEmptyBase.ApiEmptyBase_C')
+        assert Package(os.path.join(api, 'ApiEmptyBase')).find('ApiEmptyBase_C') is not None
     print('ok  ApiLibrary: public static getter and interface result; ApiActor: editor stub keeps its interface, '
-          'pure through it, delegate parameters')
+          'pure through it, delegate parameters; an empty base gets its stub')
 
 
 def output_param_refusals():

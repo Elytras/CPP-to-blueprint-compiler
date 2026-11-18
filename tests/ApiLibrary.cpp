@@ -27,6 +27,14 @@ public:
 
 class ApiHidden : public UObject {};
 
+// Nothing callable either, but ApiChild derives from it: an editor Blueprint names it as ApiChild's parent.
+class ApiEmptyBase : public AActor {};
+
+class ApiChild : public ApiEmptyBase {
+public:
+    int32 Count = 0;
+};
+
 class ApiLibrary : public UBlueprintFunctionLibrary {
 public:
     static TScriptInterface<IApiProbe> GetComponent(UObject* WorldContextObject) { return nullptr; }

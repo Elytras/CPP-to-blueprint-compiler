@@ -16,7 +16,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from uasset_io import load as load_package
-from pakkit import UNREALPAK, drive_path, mount as pak_mount  # noqa: F401  BpMods/ElytrasModManager/check_icons.py reads UNREALPAK
+from pakkit import UNREALPAK, drive_path, mount as pak_mount  # noqa: F401  re-exported: other tools read UNREALPAK from here
 import pakkit
 import mintcache
 from mintcache import MINT_CACHE, MODIO_URL   # MINT's download cache: what a mod.io `game_content` names
@@ -223,8 +223,8 @@ def net_contract_holds(stage_content, baseline, name):
 
 
 def manifest_misses(stage_content, owners):
-    """What this build lacks of each owner's manifest contract (a mod's `manifest` in mods.yaml: {class, frozen, apis},
-    ElytrasModManager/API.md "Versions"). The owner reads a dependent's manifest before loading anything of it, so a
+    """What this build lacks of each owner's manifest contract (a mod's `manifest` in mods.yaml: {class, frozen, apis}).
+    The owner reads a dependent's manifest before loading anything of it, so a
     mod that imports any of the owner's `apis` packages (but the `frozen` ones) must ship one package named `class`
     that imports nothing but the engine and `frozen` (the mod's own classes by soft path only), whose defaults name
     every API the mod imports with as many majors and minors; and no InitCave / InitSpacerig of its may reach the
@@ -516,7 +516,7 @@ def check_mod_imports(staged, mod_packages, external=None):
         return sorted(os.path.relpath(f, content).replace(os.sep, "/")
                       for f in cooked_assets(content) if f.endswith(".uasset"))
 
-    # A mod may cook under a second root (`namespace Game::...`, as EEE does), beside its package's folder: look at
+    # A mod may cook under a second root (`namespace Game::...`), beside its package's folder: look at
     # its whole Content folder, which holds what it ships, kept packages included.
     staged = [(mod, os.path.normpath(os.path.join(content, *[".."] * (package.count("/") - 1))), "/Game")
               for mod, content, package in staged]
@@ -553,9 +553,9 @@ VS_FILTERS = (("Mods", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b01"), ("Tests", "5b1f0
 def vs_namespace_filter(path, folder_name):
     """The sub-filter a mod's source goes under in Visual Studio: its first namespace, which is its package folder
     in game (Manager::Core::Services::Logger gives Manager\\Core\\Services\\Logger), so a mod of hundreds of files in
-    one folder (EMM, EEE) shows as its package tree rather than one alphabetical list. A leading Game:: (a child of a
+    one folder shows as its package tree rather than one alphabetical list. A leading Game:: (a child of a
     game Blueprint) is dropped. None for a file with no namespace and for the mod's own umbrella files, named after
-    its folder (ElytrasModManager.h / .cpp), which stay at the top."""
+    its folder (<Folder>.h / .cpp), which stay at the top."""
     if os.path.splitext(os.path.basename(path))[0].lower() == folder_name.lower():
         return None
     m = re.search(r"^namespace ([\w:]+) \{", io.open(path, encoding="utf-8-sig", errors="replace").read(), re.M)
@@ -888,7 +888,7 @@ def main():
             continue
         if no_pak:
             continue
-        # Every root the mod compiled (EEE's entries are in a second one), before its deps are embedded beside them.
+        # Every root the mod compiled (a Game:: mod's are in a second one), before its deps are embedded beside them.
         misses = manifest_misses(os.path.join(stage_fsd, "Content"), [o for o in owners if o[0] not in owned[name]])
         for line in misses:
             print("%-16s %s" % (name, line))
@@ -901,6 +901,12 @@ def main():
         if mod.get("net_contract") and not net_contract_holds(stage_content, os.path.join(bp, mod["net_contract"]), name):
             failed.append(name)
             continue
+        # After the embed: an API's packages may come from a dep it ships.
+        if mod.get("api_contract"):
+            import apisurface
+            if not apisurface.run(bp, mod, os.path.join(stage_fsd, "Content")):
+                failed.append(name)
+                continue
         stage_bundle(bundle, stage_fsd)
         if mod.get("kept"):     # after the deps: a kept package wins over a rebuilt one of the same path
             print("%-16s kept     %d files" % (name, place_kept(mod, bp, stage_fsd)))
