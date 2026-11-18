@@ -61,6 +61,22 @@ class Unity(unittest.TestCase):
                              ["/Script/Engine.SceneComponent Root", "/Script/Engine.SceneComponent temperature"])
             self.assertEqual(genueapi.GAME_ICH_RECORDS["/Game/A.A_C"], ["particle_Trail", "Terrain scanner mesh"])
 
+    def test_dead_subobjects_left_out(self):
+        subs = ["/Script/AIModule.PathFollowingComponent PathFollowingComponent", "/Script/Engine.SceneComponent Root",
+                "/Script/Engine.SceneComponent Old"]
+        game = dict(GAME, enum_props={}, member_subobjects=[], functions={}, containers=[], overrides=[], self_calls=[],
+                    unread=[], subobjects={"/Game/A.A_C": subs}, ich={"/Game/A.A_C": []}, templates={"/Game/A.A_C": []},
+                    subobject_info={"/Game/A.A_C": [[0x40021, 0, 1 << 29], [0x2c0021, 1, 0], [0x2c0021, 1, 1 << 21]]})
+        for ue, kept in (("4.27", subs[1:]), ("5.6", subs[:2])):   # 4.27's PendingKill; 5.x's Garbage (1 << 29 is RefCounted)
+            with patch.object(genueapi, "GAME_SUBOBJECTS", {}), patch.object(genueapi, "GAME_INTERFACES", {}), \
+                    patch.object(genueapi, "GAME_ICH_RECORDS", {}), patch.object(genueapi, "GAME_TEMPLATE_SUBOBJECTS", {}):
+                genueapi.game_section(game, {}, ue)
+                self.assertEqual(genueapi.GAME_SUBOBJECTS["/Game/A.A_C"], kept, ue)
+        del game["subobject_info"]                                  # a dump from before the flags: all kept
+        with patch.object(genueapi, "GAME_SUBOBJECTS", {}):
+            genueapi.game_section(game, {})
+            self.assertEqual(genueapi.GAME_SUBOBJECTS["/Game/A.A_C"], subs)
+
     def test_no_unity(self):
         with tempfile.TemporaryDirectory() as dump:
             self.assertIsNone(genueapi.open_unity(dump))

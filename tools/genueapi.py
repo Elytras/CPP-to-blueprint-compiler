@@ -28,6 +28,7 @@ the compiler refuses a UeApi older than it needs, and a class deriving from a ga
 The SDK dir must sit in its Dumper-7 dump, two levels under GObjects-Dump-WithProperties.txt (see read_real_fields);
 a copy elsewhere (DrgMods/SDK/SDK) has no object dump beside it."""
 import collections
+import functools
 import io
 import json
 import os
@@ -1850,16 +1851,21 @@ OBJECT_PATH = "/Script/CoreUObject.Object"
 DEFAULT_TAIL = (0, OBJECT_PATH, "Engine")   # UObject's: Object.h:57-60
 
 
-def game_section(game, container_members):
+def game_section(game, container_members, ue="4.27"):
     """scan_game off the unity dump's game section (Dumper-7's UnityGenerator.cpp), which holds the same facts read off
-    the live objects: the same maps filled, the same return."""
+    the live objects: the same maps filled, the same return. A default subobject the class's constructor destroyed
+    stays under the CDO in memory, dead, and the cook leaves it out: every FSD AI controller's PathFollowingComponent
+    (AFSDAIController's constructor calls DestroyComponent on it, FSD 0x141621D10). Its internal flags (subobject_info's
+    third element) say so: PendingKill in 4.27, Garbage in 5.x, where 1 << 29 is RefCounted (ObjectMacros.h)."""
+    dead = 1 << 29 if ue.startswith("4.") else 1 << 21
     classes, enums = {}, dict((path, set(kinds)) for path, kinds in game["enum_props"].items())
     for path, (flags, within, config, sup, interfaces) in game["classes"].items():
         GAME_INTERFACES[path] = interfaces
         if flags & 0x4000:
             GAME_INTERFACE_TYPES.add(path)
         classes[path] = (flags & SCRIPT_INHERIT, within, config, sup)
-        GAME_SUBOBJECTS[path] = game["subobjects"][path]
+        info = game.get("subobject_info", {}).get(path) or [[]] * len(game["subobjects"][path])
+        GAME_SUBOBJECTS[path] = [n for n, i in zip(game["subobjects"][path], info) if not (i[2:] and i[2] & dead)]
         GAME_ICH_RECORDS[path] = game["ich"][path]
         GAME_TEMPLATE_SUBOBJECTS[path] = game["templates"][path]
     for sup, member, name in game["member_subobjects"]:
@@ -2328,7 +2334,7 @@ def main():
     old_unique = set(n for n, c in old_count.items() if c == 1 and n not in natives and n not in bp_names)
 
     by_name = dict((k.cpp, k) for k in classes)
-    scan = game_section if isinstance(game_src, dict) else scan_game
+    scan = functools.partial(game_section, ue=dump_identity(sdk_dir)[0]) if isinstance(game_src, dict) else scan_game
     game, overrides, game_enums, self_calls = scan(game_src, container_enum_members(classes, by_name)) if game_src \
         else ({}, set(), {}, set())
     settle_subobjects(sdk_dir, game_src and scan is scan_game)
