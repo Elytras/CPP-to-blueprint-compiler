@@ -778,7 +778,7 @@ def pending(name, test):
 
 def proves(*ids):
     """Names the REFERENCE.md rows (their `<a id>`) that the check after this line proves. It does nothing at run time:
-    tools/docq.py reads these calls, and the run's last step fails if a row has neither a proof nor a line in
+    the maintainers' row checker reads these calls, and fails a row that has neither a proof nor a line in
     tools/unproved.txt."""
 
 dump = runscript.tool_output   # what `python <tool> <args>` prints, without the process
@@ -18187,7 +18187,14 @@ PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
 
-import docq
-problems = docq.check()
-assert not problems, 'docq --check:\n' + '\n'.join(problems[:40])
-print('ok  docq: every REFERENCE row is proved by a proves() above or listed in tools/unproved.txt, and every doc link resolves')
+try:
+    # The maintainers' row checker, beside this file in a scratch copy or in the tools/ next to AssetGen's folder; it is
+    # not in the public repo.
+    sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'tools'))
+    import docq
+except ImportError:
+    print('skip  docq: not in this checkout (the maintainers run it)')
+else:
+    problems = docq.check()
+    assert not problems, 'docq --check:\n' + '\n'.join(problems[:40])
+    print('ok  docq: every REFERENCE row is proved by a proves() above or listed in tools/unproved.txt, and every doc link resolves')

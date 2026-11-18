@@ -27,9 +27,8 @@ Most sections open with what they cover and the one rule most worth remembering.
 what you write, what it does, and its status. Snippets and notes come after the tables.
 
 Every row has an id, such as `switch.switch-code`, which is also its link anchor (`REFERENCE.md#switch.switch-code`).
-Each row is proved by a test in `tools/test_bytecode.py`, whose `proves('<id>')` line names it. The suite fails when a
-row has no proving test and is not listed in `tools/unproved.txt`, a list that only shrinks. `tools/docq.py <words>` is
-the maintainers' exact-word lookup from a row to its test; to find a construct, use the table above.
+Each row is proved by a test in `tools/test_bytecode.py`, whose `proves('<id>')` line names it. A row with no proving
+test is listed in `tools/unproved.txt`, a list that only shrinks. To find a construct, use the table above.
 
 ### Status
 
