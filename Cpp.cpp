@@ -22451,6 +22451,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::vector<FPropertyDef> InheritedDefaults;
     std::vector<FInstSpec> Insts;                       // UE_INSTANCED, in the order written
     std::vector<std::vector<FPropertyDef>> InstDefaults;    // each one's tags
+    std::vector<bool> InstPointed;                      // each one has a default of this class pointing at it
     /* UE_DEFAULTS' default for a variable of this class's own: one an implemented interface declares, or an own member
        pointed at a UE_INSTANCED object. */
     std::map<std::string, FPropertyDef> OwnVarDefaults;
@@ -22897,6 +22898,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            else the block says of it: an inherited component's override record, a native subobject's override. */
         if (!ScanInstanced(R, Insts, Err)) return false;
         InstDefaults.assign(Insts.size(), {});
+        InstPointed.assign(Insts.size(), false);
         for (const FInstSpec& S : Insts)
         {
             if (S.Outer == FInstSpec::NativeSubobject && !SubobjectDefaults.count(S.Component))
@@ -22919,6 +22921,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     D = FDefaultValue();
                     D.K = FDefaultValue::Obj;
                     D.Instanced = int32(I + 1);
+                    InstPointed[I] = true;
                     return true;
                 }
             if (bCall) { *Err = Where + ": UE_INSTANCED here is none ScanInstanced read"; bFailed = true; }
@@ -23963,13 +23966,16 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         std::vector<int32> NewOf(Insts.size(), -1);
         for (size_t K = 0; K < Kept.size(); ++K) NewOf[size_t(Kept[K])] = int32(K);
         std::vector<FInstSpec> KeptInsts;
+        std::vector<bool> KeptPointed;
         for (int32 Old : Kept)
         {
             FInstSpec S = Insts[size_t(Old)];
             if (S.Parent >= 0) S.Parent = NewOf[size_t(S.Parent)];
             KeptInsts.push_back(S);
+            KeptPointed.push_back(InstPointed[size_t(Old)]);
         }
         Insts = std::move(KeptInsts);
+        InstPointed = std::move(KeptPointed);
         InstDefaults = std::move(Tags);
     };
     /* A particle system: the cooker's work on its tags (Cascade.cpp), before its objects are exported. A baked
@@ -24131,7 +24137,23 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (const FRecord* A : Ask)
             {
                 if (!ArchetypeIn(*A, Archetype)) return false;
-                if (Archetype.V != 0) break;
+                if (Archetype.V == 0) continue;
+                /* A copy of a parent's object that no default here points at does nothing, or worse: the property that
+                   holds it is inherited, still pointing at the parent's object. A cooked game never re-points it
+                   (UObject::PostLoadSubobjects skips instancing for cooked packages), and spawning instances only what is
+                   inside this class's own template (FObjectInstancingGraph::GetInstancedSubobject), so every actor
+                   shares the parent's object, whose outer chain has no world. */
+                // ponytail: refused, not remapped - a game parent's property values are not in UeApi, so only a mod
+                // parent could be remapped; do that if restating the property becomes a chore.
+                if (!InstPointed[I])
+                {
+                    *Err = S.Where + ": " + S.Name + " copies " + A->UeName + "'s " + S.Path + ", and no default of " + R.CppName
+                         + " points at the copy, so the property holding it stays " + A->UeName + "'s and keeps its object: a "
+                         "cooked game never re-points it, and each actor shares the parent's object (one under a component "
+                         "fires with no world). Set that property to the copies, as `Attack->Projectiles = {Shot0, Shot1};`";
+                    return false;
+                }
+                break;
             }
         }
         FBlueprintClass::FInstanced O;
