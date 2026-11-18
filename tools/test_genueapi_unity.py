@@ -77,6 +77,12 @@ class Unity(unittest.TestCase):
             genueapi.game_section(game, {})
             self.assertEqual(genueapi.GAME_SUBOBJECTS["/Game/A.A_C"], subs)
 
+    def test_dump_identity_ignores_folder_suffix(self):
+        for folder, want in (("4.27.2-158958+main-FSD", ("4.27", "FSD")), ("4.27.2-158958+main-FSD_OLD", ("4.27", "FSD")),
+                             ("4.27.2-158958+main-FSD_vanilla", ("4.27", "FSD")),
+                             ("5.6.1-158178+main-RogueCore", ("5.6", "RogueCore")), ("copy", ("4.27", "FSD"))):
+            self.assertEqual(genueapi.dump_identity(os.path.join("C:/Dumper-7", folder, "SDK", "SDK")), want, folder)
+
     def test_no_unity(self):
         with tempfile.TemporaryDirectory() as dump:
             self.assertIsNone(genueapi.open_unity(dump))

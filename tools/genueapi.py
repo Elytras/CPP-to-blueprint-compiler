@@ -136,9 +136,10 @@ def dump_identity(sdk_dir):
     """The engine ("4.27", "5.6") and project ("FSD", "RogueCore") of a Dumper-7 dump, from the name Dumper-7 gives its
     folder, <engine>.<patch>-<CL>+<branch>-<Project> (C:/Dumper-7/5.6.1-158178+main-RogueCore/SDK/SDK). The compiler
     lays packages out for that engine (DESIGN.md S40) and bpbuild stages them under that project. ponytail: a dump
-    renamed or copied elsewhere reads as DRG's 4.27, which is what every UeApi was before S40."""
-    m = re.match(r"(\d+)\.(\d+)\.\d+-\d+\+[^-]+-(\w+)", os.path.basename(os.path.dirname(os.path.dirname(
-        os.path.abspath(sdk_dir)))).replace("_OLD", ""))
+    renamed or copied elsewhere reads as DRG's 4.27, which is what every UeApi was before S40. A suffix after the
+    project (Dumper-7's own `_OLD`, a hand-made `_vanilla`) is not part of it."""
+    m = re.match(r"(\d+)\.(\d+)\.\d+-\d+\+[^-]+-([A-Za-z0-9]+)", os.path.basename(os.path.dirname(os.path.dirname(
+        os.path.abspath(sdk_dir)))))
     return ("%s.%s" % (m.group(1), m.group(2)), m.group(3)) if m else ("4.27", "FSD")
 
 
