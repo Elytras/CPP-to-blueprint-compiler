@@ -778,7 +778,7 @@ def pending(name, test):
 
 def proves(*ids):
     """Names the REFERENCE.md rows (their `<a id>`) that the check after this line proves. It does nothing at run time:
-    tools/docq.py reads these calls, and the run's last step fails if a row has neither a proof nor a line in
+    the maintainers' row checker reads these calls, and fails a row that has neither a proof nor a line in
     tools/unproved.txt."""
 
 dump = runscript.tool_output   # what `python <tool> <args>` prints, without the process
@@ -5133,6 +5133,47 @@ def asset_defaults_refusals():
     print('ok  AssetDefaults refusals')
 
 
+def ctor_class_assets():
+    """An asset of a mod class that declares a constructor (`= {}` is a constructor call to clang, not braces) cooks
+    with the class defaults, and `&` points at it. A member-path statement writes one member of an engine struct whose
+    UeApi header declares a constructor (FRuntimeFloatCurve), the rest kept as the value already there; the braced and
+    UE_KEEP spellings, refused over a game class's value, name it."""
+    import invariants
+    mod = '/Game/_ElytrasMods/CtorAsset/'
+    tmp, out, log = compile_to(EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/CtorAsset");\n'
+                               'UE_FLOAT_CURVE(Dens, (0, 0), (1, 1));\n'
+                               'class UCeiling : public UDebrisPositioning {\npublic:\n'
+                               '  UCeiling() { MinVerticalAngle = 150.0f; InfluencerDensityCurve.ExternalCurve = &Dens; }\n};\n'
+                               'UCeiling DP_Ceiling = {};\n'
+                               'UEnemyDescriptor ED_Ceiling = {.Positioning = &DP_Ceiling};\n'
+                               'UE_ASSET_DEFAULTS(UDebrisPositioning, DP_Size) { InfluencerSizeCurve.ExternalCurve = &Dens; }\n',
+                               'CtorAsset')
+    proves('declaring-data-assets.class-uceiling-public-udebrispositioning')
+    asset = invariants.Package(os.path.join(out, 'DP_Ceiling'))
+    assert [e['name'] for e in asset.exports] == ['DP_Ceiling'] and asset.class_of(1) == 'UCeiling_C', asset.exports
+    assert tag_values(asset, 0, asset.tags(0)) == {}, asset.tags(0)
+    ed = invariants.Package(os.path.join(out, 'ED_Ceiling'))
+    assert tag_values(ed, 0, ed.tags(0)) == {'Positioning': mod + 'DP_Ceiling.DP_Ceiling'}, ed.tags(0)
+    proves('declaring-data-assets.influencerdensitycurve-externalcurve')
+    cls = invariants.Package(os.path.join(out, 'UCeiling'))
+    cdo = next(i for i, e in enumerate(cls.exports) if e['name'] == 'Default__UCeiling_C')
+    assert tag_values(cls, cdo, cls.tags(cdo)) == {'MinVerticalAngle': 150.0,
+                                                   'InfluencerDensityCurve': {'ExternalCurve': mod + 'Dens.Dens'}}, cls.tags(cdo)
+    size = invariants.Package(os.path.join(out, 'DP_Size'))
+    assert tag_values(size, 0, size.tags(0)) == {'InfluencerSizeCurve': {'ExternalCurve': mod + 'Dens.Dens'}}, size.tags(0)
+    for p in (asset, ed, cls, size): keeps_invariants(p.base)
+    shutil.rmtree(tmp, ignore_errors=True)
+    proves('declaring-data-assets.influencerdensitycurve-externalcurve')
+    curve = '#include "UeApi/Engine.h"\nUE_FLOAT_CURVE(Dens, (0, 0), (1, 1));\n'
+    refused('CtorKeep', '  CtorKeep() { InfluencerDensityCurve = FRuntimeFloatCurve(UE_KEEP, &Dens); }\n',
+            'set only ExternalCurve with a statement (`InfluencerDensityCurve.ExternalCurve = ...;`',
+            top=curve, base='UDebrisPositioning')
+    refused('CtorZero', '  CtorZero() { InfluencerDensityCurve = FRuntimeFloatCurve({}, &Dens); }\n',
+            'or set only the members you mean, one statement each', top=curve, base='UDebrisPositioning')
+    print('ok  CtorAsset: an asset of a mod class with a constructor cooks and is pointed at; one member of a struct '
+          'with a constructor is set by a statement')
+
+
 # M_FireBulkArmor of EEE as DRG's cooker wrote it (BpMods/build/EEE/kept/.../materials), less the two fields the cooker
 # works out from the parent and AssetGen does not write (CachedReferencedTextures, TextureStreamingData) and the
 # BasePropertyOverrides it copies from the parent with no override flag set (UMaterialInstance::UpdateOverridableBaseProperties).
@@ -5770,6 +5811,147 @@ def behaviour_tree_refusals():
     refused('BlockInClass', '  UE_DEFAULTS { { InitialLifeSpan = 2.0f; } }\n',
             'a block `{ ... }` groups the statements of a UE_ASSET_DEFAULTS')
     print('ok  BehaviorTree refusals')
+
+
+def anim_blueprints():
+    """AnimBlueprint: an anim instance class with UE_SKELETON is cooked as the editor's compiler bakes an Anim Blueprint.
+    Its FAnimNode_* members are the nodes, in declaration order; a UE_LINK is the forward index of the node it names, the
+    way UAnimBlueprintGeneratedClass::Link numbers AnimNodeProperties. The baked state machines name nodes by the
+    reversed index (Num - 1 - i, GetNodeFromPropertyIndex), as every cooked DRG anim class does (ABP_Crawler,
+    ABP_Spider_Grunt)."""
+    import invariants
+    folder = os.path.dirname(asset('AnimBlueprint'))
+    base = os.path.join(folder, 'ABP_Critter')
+    keeps_invariants(base)
+    keeps_invariants(os.path.join(folder, 'AnimBlueprint'))
+    p = invariants.Package(base)
+    cls = p.find('ABP_Critter_C')
+    # The nodes in the class's property order, the one the engine numbers them by: declaration order, but the rigid
+    # body (16-byte aligned) first, as the class lays out its members by alignment.
+    nodes = ['Physics', 'Idle', 'Move', 'IdleState', 'MoveState', 'ToMove', 'ToIdle', 'Pick', 'ToPick', 'PickToMove',
+             'Locomotion', 'LocoCache', 'UseLoco', 'Hurt', 'HurtBlend', 'Lean', 'Leaning', 'Bite', 'Upper', 'ToCs', 'Tilt',
+             'ToLocal', 'Slot', 'Output']
+    assert [str(n.name) for n in p.struct(cls).props if str(n.name) in nodes] == nodes, p.struct(cls).props
+    fwd, rev = nodes.index, lambda n: len(nodes) - 1 - nodes.index(n)
+    proves('anim-blueprints.ue-skeleton')
+    assert p.class_of(cls + 1) == 'AnimBlueprintGeneratedClass', p.class_of(cls + 1)
+    top = tag_values(p, cls, p.tags(cls))
+    assert top['TargetSkeleton'] == '/Game/_MyMods/Critter/SK_Critter_Skeleton.SK_Critter_Skeleton', top
+    graph = p.find('AnimGraph')
+    assert p.struct(graph).function_flags == 0xC400000, hex(p.struct(graph).function_flags)  # BlueprintCallable|Event|HasOutParms
+    rows = registry_rows(registry_of('AnimBlueprint'))
+    assert ('/Game/_ElytrasMods/AnimBlueprint/ABP_Critter.ABP_Critter_C', 'AnimBlueprintGeneratedClass') in rows, rows
+
+    cdo = tag_values(p, p.find('Default__ABP_Critter_C'), p.tags(p.find('Default__ABP_Critter_C')))
+    link = lambda v: v['LinkID']
+    proves('anim-blueprints.fanimnode-sequenceplayer-idle')
+    assert cdo['Idle'] == {'Sequence': '/Game/_MyMods/Critter/Animations/ANIM_Critter_Idle.ANIM_Critter_Idle'}, cdo['Idle']
+    assert cdo['Move'] == {'BlendSpace': '/Game/_MyMods/Critter/Animations/BS_Critter_Move.BS_Critter_Move'}, cdo['Move']
+    assert cdo['Leaning']['alpha'] == 1.0 and cdo['Upper']['BlendWeights'] == [1.0], (cdo['Leaning'], cdo['Upper'])
+    assert cdo['Upper']['LayerSetup'] == [{'BranchFilters': [{'BoneName': 'spine_01', 'BlendDepth': 0}]}], cdo['Upper']
+    assert cdo['Slot']['slotName'] == 'DefaultSlot', cdo['Slot']
+    proves('anim-blueprints.ue-link-idle')
+    assert link(cdo['IdleState']['Result']) == fwd('Idle') and link(cdo['MoveState']['Result']) == fwd('Move')
+    assert [link(l) for l in cdo['HurtBlend']['BlendPose']] == [fwd('UseLoco'), fwd('Hurt')], cdo['HurtBlend']
+    assert (link(cdo['Leaning']['Base']), link(cdo['Leaning']['Additive'])) == (fwd('HurtBlend'), fwd('Lean'))
+    assert (link(cdo['Upper']['BasePose']), [link(l) for l in cdo['Upper']['BlendPoses']]) == (fwd('Leaning'), [fwd('Bite')])
+    assert link(cdo['Slot']['Source']) == fwd('ToLocal')
+    proves('anim-blueprints.ue-link-cs')
+    assert (link(cdo['ToCs']['LocalPose']), link(cdo['Tilt']['ComponentPose']), link(cdo['ToLocal']['ComponentPose'])) ==         (fwd('Upper'), fwd('ToCs'), fwd('Physics')), (cdo['ToCs'], cdo['Tilt'], cdo['ToLocal'])
+    assert cdo['Tilt']['BoneToModify'] == {'BoneName': 'spine_01'} and cdo['Tilt']['RotationMode'] == 'BMM_Additive', cdo['Tilt']
+    proves('anim-blueprints.fanimnode-rigidbody')
+    assert cdo['Physics'] == {'ComponentPose': {'LinkID': fwd('Tilt')},
+                              'OverridePhysicsAsset': '/Game/_MyMods/Critter/PA_Critter_Sim.PA_Critter_Sim'}, cdo['Physics']
+    proves('anim-blueprints.fanimnode-root-output')
+    assert cdo['Output'] == {'Result': {'LinkID': fwd('Slot')}, 'Name': 'AnimGraph'}, cdo['Output']   # the root of AnimGraph
+    assert cdo['Locomotion'] == {'StateMachineIndexInClass': 0}, cdo['Locomotion']
+    proves('anim-blueprints.fanimnode-savecachedpose')
+    assert cdo['LocoCache'] == {'pose': {'LinkID': fwd('Locomotion')}, 'CachePoseName': 'Loco'}, cdo['LocoCache']
+    assert cdo['UseLoco'] == {'LinkToCachingNode': {'LinkID': fwd('LocoCache')}, 'CachePoseName': 'Loco'}, cdo['UseLoco']
+    # The proxy reads the AnimGraph entry with FindChecked on every update, so it is there with or without cached poses:
+    # 0 keys to remove, 1 pair, AnimGraph -> {OrderedSavedPoseNodeIndices: the saved poses, by reversed index}.
+    [saved] = [t for t in p.tags(cls) if t['name'] == 'OrderedSavedPoseIndicesMap']
+    v = bytes(saved['value'])
+    assert struct.unpack_from('<ii', v) == (0, 1) and p.names[struct.unpack_from('<i', v, 8)[0]] == 'AnimGraph', v.hex()
+    inner = p.tags(cls, saved['at'] + 16)
+    assert [(t['name'], t['inner']) for t in inner] == [('OrderedSavedPoseNodeIndices', 'IntProperty')], inner
+    assert struct.unpack_from('<2i', bytes(inner[0]['value'])) == (1, rev('LocoCache')), bytes(inner[0]['value']).hex()
+
+    proves('anim-blueprints.ue-state-locomotion-idlestate')
+    [machine] = top['BakedStateMachines']
+    assert (machine['MachineName'], machine['InitialState']) == ('Locomotion', 0), machine
+    states = [(s['StateName'], s['StateRootNodeIndex'], s['PlayerNodeIndices'], s['bIsAConduit'], s['EntryRuleNodeIndex'])
+              for s in machine['States']]
+    proves('anim-blueprints.ue-state-as', 'anim-blueprints.ue-conduit')
+    assert states == [('IdleState', rev('IdleState'), [rev('Idle')], False, -1),
+                      ('Moving', rev('MoveState'), [rev('Move')], False, -1),
+                      ('Pick Next', -1, [], True, rev('Pick'))], states     # a conduit: no pose, its rule its entry
+    proves('anim-blueprints.ue-transition-locomotion')
+    exits = [[(t['TransitionIndex'], t['CanTakeDelegateIndex'], t['CustomResultNodeIndex'], t['bDesiredTransitionReturnValue'],
+               t['bAutomaticRemainingTimeRule']) for t in s['Transitions']] for s in machine['States']]
+    assert exits == [[(0, rev('ToMove'), -1, True, False), (2, rev('ToPick'), -1, True, False)],
+                     [(1, rev('ToIdle'), -1, True, True)], [(3, rev('PickToMove'), -1, True, False)]], exits
+    between = [(t['PreviousState'], t['NextState'], round(t['CrossfadeDuration'], 3), t['BlendMode'], t['LogicType'])
+               for t in machine['Transitions']]
+    assert between == [(0, 1, 0.2, 'HermiteCubic', 'TLT_StandardBlend'), (1, 0, 0.3, 'HermiteCubic', 'TLT_StandardBlend'),
+                       (0, 2, 0.1, 'HermiteCubic', 'TLT_StandardBlend'), (2, 1, 0.15, 'HermiteCubic', 'TLT_StandardBlend')], between
+
+    proves('anim-blueprints.blueprintupdateanimation')
+    text = dump('walkscript.py', base, export_index(base, 'BlueprintUpdateAnimation'))
+    for member, struct_, node, var in (('bCanEnterTransition', 'AnimNode_TransitionResult', 'ToMove', 'bMoving'),
+                                       ('X', 'AnimNode_BlendSpacePlayer', 'Move', 'Speed'),
+                                       ('bActiveValue', 'AnimNode_BlendListByBool', 'HurtBlend', 'bHurt')):
+        assert re.search(r"StructMemberContext\s+%s@imp\[\d+\]:ScriptStruct'%s'\s*\n.*InstanceVariable\s+%s@.*\n"
+                         r".*InstanceVariable\s+%s@" % (member, struct_, node, var), text), (member, text)
+    actor = tag_values(*(lambda q: (q, q.find('Mesh_GEN_VARIABLE'), q.tags(q.find('Mesh_GEN_VARIABLE'))))(
+        invariants.Package(os.path.join(folder, 'AnimBlueprint'))))
+    assert actor['AnimClass'] == '/Game/_ElytrasMods/AnimBlueprint/ABP_Critter.ABP_Critter_C', actor
+    proves('anim-blueprints.ue-class-in-other')
+    tmp, out, _ = compile_to('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/AnimUser");\n'
+                             'class ABP_Other : public UAnimInstance {\npublic:\n  UE_CLASS_IN("/Game/_MyMods/Critters");\n'
+                             '  UE_SKELETON("/Game/_MyMods/Critter/SK_Critter_Skeleton");\n};\n'
+                             'class AnimUser : public AActor {\npublic:\n  UE_COMPONENT(USkeletalMeshComponent, Mesh);\n'
+                             '  UE_DEFAULTS { Mesh->AnimClass = ABP_Other::StaticClass(); }\n};\n', 'AnimUser')
+    kinds = dict(import_paths(os.path.join(out, 'AnimUser'), classes=True))
+    assert kinds['/Game/_MyMods/Critters/ABP_Other.ABP_Other_C'] == '/Script/Engine.AnimBlueprintGeneratedClass', kinds
+    shutil.rmtree(tmp)
+    print('ok  AnimBlueprint: nodes, links, a baked state machine and its rules, and a mesh that plays it')
+
+
+def anim_blueprint_refusals():
+    """What the engine would misread: nodes with no skeleton to play on, not one output pose, a link to something that
+    is no node of the class, a node given its value two ways; a state machine's states and transitions declared out of
+    shape; and an Anim Blueprint below another of the mod's, whose node indexes would have to count the parent's."""
+    top = '#include "UeApi/AnimGraphRuntime.h"\n'
+    sk = '  UE_SKELETON("/Game/_MyMods/Critter/SK_Critter_Skeleton");\n'
+    out = '  FAnimNode_SequencePlayer Idle;\n  FAnimNode_Root Output;\n'
+    ctor = lambda mod, body: '  %s() {\n%s  }\n' % (mod, body)
+    proves('anim-blueprints.ue-skeleton-2')
+    refused('AnimNoSkeleton', out, 'an Anim Blueprint names its skeleton', top=top, base='UAnimInstance')
+    refused('AnimNotAnim', sk, 'this class is no UAnimInstance', top=top)
+    refused('AnimTwoRoots', sk + out + '  FAnimNode_Root Other;\n', 'an Anim Blueprint has one FAnimNode_Root, its output pose, and this one has 2',
+            top=top, base='UAnimInstance')
+    refused('AnimNoRoot', sk + '  FAnimNode_SequencePlayer Idle;\n', 'an Anim Blueprint has one FAnimNode_Root', top=top, base='UAnimInstance')
+    refused('AnimLinkOther', sk + out + '  AnimLinkOther *Other;\n' + ctor('AnimLinkOther', '    Output.Result = UE_LINK(Other->Idle);\n'),
+            'UE_LINK names an anim node of this class', top=top, base='UAnimInstance')
+    refused('AnimTwoWays', sk + '  FAnimNode_SequencePlayer Idle{};\n  FAnimNode_Root Output;\n'
+            + ctor('AnimTwoWays', '    Idle.PlayRate = 2.0f;\n    Output.Result = UE_LINK(Idle);\n'),
+            'has an initializer and its constructor sets parts of it: give its value one way', top=top, base='UAnimInstance')
+    proves('anim-blueprints.ue-state')
+    sm = sk + out + '  FAnimNode_StateResult A;\n  FAnimNode_StateResult B;\n  FAnimNode_TransitionResult T;\n' \
+                    '  FAnimNode_StateMachine M;\n  FAnimNode_StateMachine N;\n  float Fade = 0.2f;\n'
+    refused('AnimStateTwice', sm + ctor('AnimStateTwice', '    UE_STATE(M, A);\n    UE_STATE(N, A);\n'),
+            'A is a state of M already', top=top, base='UAnimInstance')
+    refused('AnimNoState', sm + ctor('AnimNoState', '    UE_STATE(M, A);\n    UE_TRANSITION(M, A, B, T, 0.2f);\n'),
+            'B is no UE_STATE of M above this line', top=top, base='UAnimInstance')
+    refused('AnimFadeVar', sm + ctor('AnimFadeVar', '    UE_STATE(M, A);\n    UE_STATE(M, B);\n    UE_TRANSITION(M, A, B, T, Fade);\n'),
+            "a transition's crossfade is a constant, in seconds", top=top, base='UAnimInstance')
+    refused('AnimEmptyMachine', sm + ctor('AnimEmptyMachine', '    UE_STATE(M, A);\n'),
+            'the state machine N has no UE_STATE', top=top, base='UAnimInstance')
+    proves('anim-blueprints.ue-skeleton-3')
+    refused('AnimBelow', sk, 'TODO: an Anim Blueprint below another of this mod\'s (ABP_Above)',
+            top=top + 'class ABP_Above : public UAnimInstance {\npublic:\n' + sk + out + '};\n', base='ABP_Above')
+    print('ok  AnimBlueprint refusals')
 
 
 def ue_assets():
@@ -13897,6 +14079,7 @@ print('ok  DefaultsOwnNest: braces in a value that starts as a struct\'s default
       'leaves out, and are refused at what it gives')
 asset_defaults()
 asset_defaults_refusals()
+ctor_class_assets()
 material_instance()
 particle_bake()
 particle_lod_validity()
@@ -13904,6 +14087,8 @@ particle_starts()
 particle_curves()
 behaviour_trees()
 behaviour_tree_refusals()
+anim_blueprints()
+anim_blueprint_refusals()
 particle_refusals()
 particle_events()
 niagara_compiled()
@@ -18002,7 +18187,14 @@ PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
 
-import docq
-problems = docq.check()
-assert not problems, 'docq --check:\n' + '\n'.join(problems[:40])
-print('ok  docq: every REFERENCE row is proved by a proves() above or listed in tools/unproved.txt, and every doc link resolves')
+try:
+    # The maintainers' row checker, beside this file in a scratch copy or in the tools/ next to AssetGen's folder; it is
+    # not in the public repo.
+    sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'tools'))
+    import docq
+except ImportError:
+    print('skip  docq: not in this checkout (the maintainers run it)')
+else:
+    problems = docq.check()
+    assert not problems, 'docq --check:\n' + '\n'.join(problems[:40])
+    print('ok  docq: every REFERENCE row is proved by a proves() above or listed in tools/unproved.txt, and every doc link resolves')

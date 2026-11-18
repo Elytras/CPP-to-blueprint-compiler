@@ -81,7 +81,7 @@ packs it into a pak.
 
 Build AssetGen as the [README](README.md) describes. You get `x64\Release\assetgen.exe` on Windows or `build/assetgen`
 on Linux, where `cmake -B build && cmake --build build -j` in the AssetGen folder builds it with GCC or clang. The compiler parses every mod with LLVM's `clang++`, so that has to be on `PATH`. The build driver,
-`tools/bpbuild.py`, needs Python 3 with `pyyaml`, and UE 4.27's UnrealPak to make the pak.
+`tools/bpbuild.py`, needs Python 3 with `pyyaml`, and a packer to make the pak: UE 4.27's UnrealPak, or [repak](https://github.com/trumank/repak), a small download that bpbuild uses when it finds no UnrealPak ([Packing](#packing)).
 
 Then clone the SDK beside the AssetGen folder, and make a folder for your mods beside both:
 
@@ -261,7 +261,9 @@ nothing changed prints `HelloWorld       up to date`. [Building mods](#building-
 
 ### What you should see
 
-Install `HelloWorld_P.pak` the way you install any DRG mod.
+Install `HelloWorld_P.pak` by copying it into `<DRG install>/FSD/Content/Paks/` (Steam: *Browse local files*). The game
+mounts every `_P.pak` there at startup. If you use MINT, add the pak to a profile instead; MINT keeps the first mod listed
+when two hold the same asset.
 
 Enter the Space Rig. The game spawns `InitSpacerig`, and its `ReceiveBeginPlay` posts `Hello from AssetGen`, then
 `HelloWorld counted to 1`, `2` and `3`, two seconds apart. A mission spawns `InitCave`, which does the same. Look for
@@ -270,6 +272,20 @@ the messages in the chat feed, the most likely place; where the game shows poste
 If nothing appears, [Running in the game](#running-in-the-game) says what to check. From here,
 [Writing mods](#writing-mods) goes through what a mod can do, one topic at a time, and
 [examples/WaitForPlayer.cpp](examples/WaitForPlayer.cpp) shows how a mod finds the player.
+
+## I want to...
+
+| I want to | Go to |
+| --- | --- |
+| run something every N seconds, or wait | [Timers, waiting and input](#timers-waiting-and-input): `K2_SetTimerDelegate` for a fixed rate, `Delay` to wait |
+| run something when the game starts my mod | [Running in the game](#running-in-the-game): `InitSpacerig` / `InitCave` |
+| find the player | [examples/WaitForPlayer.cpp](examples/WaitForPlayer.cpp) |
+| react to a key press | [Timers, waiting and input](#timers-waiting-and-input): `UE_INPUT_KEY` |
+| spawn an actor or add a component | [Components and spawning](#components-and-spawning) |
+| change a game Blueprint or enemy | [Extending a game Blueprint](#extending-a-game-blueprint), [Editing the game's assets](#editing-the-games-assets-and-blueprints) |
+| see that my mod ran | [When nothing happens](#when-nothing-happens) |
+| understand an error or warning | [Warnings, refusals and compiler bugs](#warnings-refusals-and-compiler-bugs) |
+| know whether the compiler supports a construct | [REFERENCE.md](REFERENCE.md): its topic table, or the macro index |
 
 ## Writing mods
 

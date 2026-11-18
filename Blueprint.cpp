@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <set>
 
 namespace Uasset
 {
@@ -379,12 +380,104 @@ static void PointAtInstanced(FPropertyDef& P, int32 FirstRow)
     if (P.Members) for (FPropertyDef& M : *P.Members) PointAtInstanced(M, FirstRow);
 }
 
+/* A struct variable's member default, set over what the variable's default already gives. */
+static void SetMember(FPropertyDef& V, const FPropertyDef& M)
+{
+    auto Members = std::make_shared<std::vector<FPropertyDef>>(V.Members ? *V.Members : std::vector<FPropertyDef>());
+    auto At = std::find_if(Members->begin(), Members->end(), [&](const FPropertyDef& X) { return X.Name == M.Name; });
+    if (At == Members->end()) Members->push_back(M);
+    else *At = M;
+    V.Members = Members;
+    V.Default.K = FDefaultValue::Struct;
+}
+
+/* Every anim node a variable's UE_LINK defaults name, in the order they sit in its value. */
+static void LinkedNodes(const FPropertyDef& P, std::vector<std::string>& Out);
+static void LinkedNodes(const FDefaultValue& D, std::vector<std::string>& Out)
+{
+    if (!D.AnimNode.empty()) Out.push_back(D.AnimNode);
+    for (const FDefaultValue& I : D.Items) LinkedNodes(I, Out);
+    if (D.Members) for (const FPropertyDef& M : *D.Members) LinkedNodes(M, Out);
+}
+static void LinkedNodes(const FPropertyDef& P, std::vector<std::string>& Out)
+{
+    LinkedNodes(P.Default, Out);
+    if (P.Members) for (const FPropertyDef& M : *P.Members) LinkedNodes(M, Out);
+}
+
+/* The anim graph's data, measured on DRG's ABP_TipMachine and ABP_Crawler against UE 4.27 (AnimBlueprintGeneratedClass.cpp,
+   AnimNode_StateMachine.cpp). UAnimBlueprintGeneratedClass::Link numbers the class's FAnimNode_* properties in
+   ChildProperties order (AnimNodeProperties); a pose link's LinkID is that number, while a baked state machine's node
+   indices count from the end (GetNodeFromPropertyIndex's Num() - 1 - Index, "Crazysauce"). No node gets an exposed-value
+   handler: a node without one runs the empty default (FAnimNode_Base::GetEvaluateGraphExposedInputs), so its inputs are
+   what BlueprintUpdateAnimation last wrote into the instance's own copy of the node. */
+void FBlueprintClass::FinishAnimGraph()
+{
+    const FIndex PoseLink = ScriptStruct("/Script/Engine", "PoseLink");
+    /* The AnimGraph function: never called, its one PoseLink out parameter is what makes an FAnimBlueprintFunction of it,
+       AnimBlueprintFunctions[0], whose output the proxy roots the graph at (AnimInstanceProxy.cpp 98-102). The cook's
+       flags, BlueprintCallable | BlueprintEvent | HasOutParms, and its parameter's, Parm | OutParm. */
+    FPropertyDef Out = StructParam("AnimGraph", PoseLink, "PoseLink", 24);
+    Out.PropertyFlags = CPF_Parm | CPF_OutParm;
+    AddFunction("AnimGraph", Null(), { Out }, [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
+                FUNC_BlueprintCallable | FUNC_BlueprintEvent | FUNC_HasOutParms);
+
+    std::vector<std::string> Nodes;
+    for (const FPropertyDef& V : Vars)
+        if (V.Type == "StructProperty" && V.StructName.compare(0, 9, "AnimNode_") == 0) Nodes.push_back(V.Name);
+    auto Index = [&](const std::string& Name) {
+        return int32(std::find(Nodes.begin(), Nodes.end(), Name) - Nodes.begin());
+    };
+    auto Reversed = [&](const std::string& Name) { return int32(Nodes.size()) - 1 - Index(Name); };
+    auto VarNamed = [&](const std::string& Name) -> FPropertyDef* {
+        auto It = std::find_if(Vars.begin(), Vars.end(), [&](const FPropertyDef& V) { return V.Name == Name; });
+        return It == Vars.end() ? nullptr : &*It;
+    };
+    std::function<void(FDefaultValue&)> Resolve = [&](FDefaultValue& D) {
+        if (!D.AnimNode.empty()) D.I = Index(D.AnimNode);
+        for (FDefaultValue& I : D.Items) Resolve(I);
+        if (D.Members) for (FPropertyDef& M : *D.Members) { Resolve(M.Default); if (M.Members) for (FPropertyDef& N : *M.Members) Resolve(N.Default); }
+    };
+    std::function<void(FPropertyDef&)> ResolveDef = [&](FPropertyDef& P) {
+        Resolve(P.Default);
+        if (P.Members) for (FPropertyDef& M : *P.Members) ResolveDef(M);
+    };
+    for (FPropertyDef& V : Vars) ResolveDef(V);
+    /* The output node is the root whose Name is the function's (LinkFunctionsToDefaultObjectNodes). */
+    for (FPropertyDef& V : Vars)
+        if (V.Type == "StructProperty" && V.StructName == "AnimNode_Root")
+        {
+            FPropertyDef Name = NameParam("Name");
+            Name.PropertyFlags = 0;
+            Name.Default.K = FDefaultValue::Str;
+            Name.Default.S = "AnimGraph";
+            SetMember(V, Name);
+        }
+    /* Each machine node runs BakedStateMachines[its StateMachineIndexInClass]. */
+    for (size_t I = 0; I < StateMachines.size(); ++I)
+        if (FPropertyDef* M = VarNamed(StateMachines[I].Node))
+        {
+            FPropertyDef At = IntParam("StateMachineIndexInClass");
+            At.PropertyFlags = 0;
+            At.Default.K = FDefaultValue::Int;
+            At.Default.I = int64(I);
+            SetMember(*M, At);
+        }
+}
+
+/* A state's asset players, the nodes its pose reads through (not into a nested machine): PlayerNodeIndices, which a
+   transition's automatic rule takes the time left from (FAnimNode_StateMachine::GetRelevantAnimTimeRemaining). */
+static const std::set<std::string> kAssetPlayers = { "AnimNode_SequencePlayer", "AnimNode_BlendSpacePlayer",
+                                                     "AnimNode_SequenceEvaluator", "AnimNode_BlendSpaceEvaluator" };
+
 void FBlueprintClass::Finish()
 {
+    if (bAnimClass) FinishAnimGraph();
     const std::string CDOName = "Default__" + ClassName;
 
     const FIndex BpgcClass = bWidgetClass ? EngineClass("/Script/UMG", "WidgetBlueprintGeneratedClass")
-                                          : EngineClass("/Script/Engine", "BlueprintGeneratedClass");
+                           : bAnimClass ? EngineClass("/Script/Engine", "AnimBlueprintGeneratedClass")
+                                        : EngineClass("/Script/Engine", "BlueprintGeneratedClass");
     const bool bWithinObject = WithinPackage == "/Script/CoreUObject" && WithinClass == "Object";
     const FIndex ObjectClass = bWithinObject ? EngineClass("/Script/CoreUObject", "Object") : Null();
     const FIndex FunctionClass = EngineClass("/Script/CoreUObject", "Function");
@@ -392,6 +485,8 @@ void FBlueprintClass::Finish()
     const FIndex CorePkg = PackageImport("/Script/CoreUObject");
     const FIndex BpgcCdo = bWidgetClass ? Imp(P.AddImport({ "/Script/UMG", "WidgetBlueprintGeneratedClass", PackageImport("/Script/UMG"),
                                                             "Default__WidgetBlueprintGeneratedClass" }))
+                         : bAnimClass ? Imp(P.AddImport({ "/Script/Engine", "AnimBlueprintGeneratedClass", EnginePkg,
+                                                          "Default__AnimBlueprintGeneratedClass" }))
                                         : Imp(P.AddImport({ "/Script/Engine", "BlueprintGeneratedClass",
                                                             EnginePkg, "Default__BlueprintGeneratedClass" }));
     const FIndex FunctionCdo = Imp(P.AddImport({ "/Script/CoreUObject", "Function",
@@ -623,7 +718,164 @@ void FBlueprintClass::Finish()
     const int32 NumReplicated = NumReplicatedVars();
     const std::vector<FPropertyBinding> WidgetBindings = PropertyBindings;
     const std::vector<std::string> SlotNames = NamedSlots;
+    /* An Anim Blueprint's own class properties, before UBlueprintGeneratedClass's as ABP_Crawler_C's: BakedStateMachines,
+       then TargetSkeleton, which a mesh's AnimClass is checked against before an instance is made
+       (USkeletalMeshComponent::NeedToSpawnAnimScriptInstance). */
+    std::function<void(FArc&)> AnimTags;
+    if (bAnimClass)
+    {
+        Class.CreateBeforeSer.push_back(TargetSkeleton.V);
+        std::vector<std::string> Nodes;
+        std::map<std::string, std::string> NodeStruct;
+        std::map<std::string, std::vector<std::string>> Links;      // node -> the nodes its pose links read
+        for (const FPropertyDef& V : Vars)
+            if (V.Type == "StructProperty" && V.StructName.compare(0, 9, "AnimNode_") == 0)
+            {
+                Nodes.push_back(V.Name);
+                NodeStruct[V.Name] = V.StructName;
+                LinkedNodes(V, Links[V.Name]);
+            }
+        auto Reversed = [Nodes](const std::string& Name) {
+            return int32(Nodes.size()) - 1 - int32(std::find(Nodes.begin(), Nodes.end(), Name) - Nodes.begin());
+        };
+        auto PlayersOf = [&](const std::string& Root) {
+            std::vector<int32> Out;
+            std::set<std::string> Seen;
+            std::vector<std::string> Todo = { Root };
+            while (!Todo.empty())
+            {
+                const std::string N = Todo.back();
+                Todo.pop_back();
+                if (!Seen.insert(N).second) continue;
+                if (kAssetPlayers.count(NodeStruct[N])) Out.push_back(Reversed(N));
+                if (NodeStruct[N] == "AnimNode_StateMachine") continue;
+                for (const std::string& L : Links[N]) Todo.push_back(L);
+            }
+            return Out;
+        };
+        /* Worked out here: the serializer runs after these locals are gone. */
+        std::map<std::string, std::vector<int32>> Players;
+        std::map<std::string, int32> Rev;
+        for (const std::string& N : Nodes) Rev[N] = Reversed(N);
+        for (const FStateMachine& M : StateMachines)
+            for (const std::string& S : M.States) Players[S] = M.Conduits.count(S) ? std::vector<int32>() : PlayersOf(S);
+        /* The cached poses in the order the proxy updates them after the graph (PostGraphUpdate): a saved pose
+           before every saved pose its own source reads, since updating it is what queues theirs. */
+        std::vector<int32> SavedOrder;
+        {
+            std::set<std::string> Done;
+            std::vector<std::string> Post;
+            std::function<void(const std::string&)> Visit = [&](const std::string& Save) {
+                if (!Done.insert(Save).second) return;
+                std::set<std::string> Seen;
+                std::vector<std::string> Todo = Links[Save];
+                while (!Todo.empty())
+                {
+                    const std::string N = Todo.back();
+                    Todo.pop_back();
+                    if (!Seen.insert(N).second) continue;
+                    if (NodeStruct[N] == "AnimNode_SaveCachedPose") { Visit(N); continue; }
+                    for (const std::string& L : Links[N]) Todo.push_back(L);
+                }
+                Post.push_back(Save);
+            };
+            for (const std::string& N : Nodes) if (NodeStruct[N] == "AnimNode_SaveCachedPose") Visit(N);
+            for (auto It = Post.rbegin(); It != Post.rend(); ++It) SavedOrder.push_back(Reversed(*It));
+        }
+        const FIndex Skeleton = TargetSkeleton;
+        const std::vector<FStateMachine> Machines = StateMachines;
+        AnimTags = [=](FArc& Ar) {
+            auto Reversed = [&](const std::string& N) { return Rev.at(N); };
+            auto IntArray = [](FArc& At, const std::string& Name, const std::vector<int32>& Values) {
+                Tag(At, Name, "ArrayProperty", [=](FArc& V) { V.I32(int32(Values.size())); for (int32 X : Values) V.I32(X); }, "IntProperty");
+            };
+            auto Int = [](FArc& At, const std::string& Name, int32 Value) { Tag(At, Name, "IntProperty", [=](FArc& V) { V.I32(Value); }); };
+            if (!Machines.empty())
+                Tag(Ar, "BakedStateMachines", "ArrayProperty", [=](FArc& V) {
+                    FArc MachinesAr(V.Owner());
+                    for (const FStateMachine& M : Machines)
+                    {
+                        auto StateIndex = [&](const std::string& S) {
+                            return int32(std::find(M.States.begin(), M.States.end(), S) - M.States.begin());
+                        };
+                        Tag(MachinesAr, "MachineName", "NameProperty", [=](FArc& E) { E.Name(M.Node); });
+                        Int(MachinesAr, "InitialState", 0);
+                        Tag(MachinesAr, "States", "ArrayProperty", [&](FArc& SV) {
+                            FArc States(SV.Owner());
+                            for (const std::string& S : M.States)
+                            {
+                                const auto Shown = M.Names.find(S);
+                                const std::string StateName = Shown == M.Names.end() ? S : Shown->second;
+                                const bool bConduit = M.Conduits.count(S) != 0;
+                                Tag(States, "StateName", "NameProperty", [=](FArc& E) { E.Name(StateName); });
+                                Tag(States, "Transitions", "ArrayProperty", [&](FArc& TV) {
+                                    FArc Exits(TV.Owner());
+                                    int32 Count = 0;
+                                    for (size_t T = 0; T < M.Transitions.size(); ++T)
+                                    {
+                                        const FAnimTransition& Tr = M.Transitions[T];
+                                        if (Tr.From != S) continue;
+                                        ++Count;
+                                        Int(Exits, "CanTakeDelegateIndex", Reversed(Tr.Rule));
+                                        Int(Exits, "CustomResultNodeIndex", -1);
+                                        Int(Exits, "TransitionIndex", int32(T));
+                                        TagBool(Exits, "bDesiredTransitionReturnValue", true);
+                                        TagBool(Exits, "bAutomaticRemainingTimeRule", Tr.bAutomatic);
+                                        IntArray(Exits, "PoseEvaluatorLinks", {});
+                                        TagEnd(Exits);
+                                    }
+                                    StructArray(TV, "Transitions", "BakedStateExitTransition", Count, Exits);
+                                }, "StructProperty");
+                                Int(States, "StateRootNodeIndex", bConduit ? -1 : Reversed(S));   // a conduit has no pose
+                                Int(States, "StartNotify", -1);
+                                Int(States, "EndNotify", -1);
+                                Int(States, "FullyBlendedNotify", -1);
+                                TagBool(States, "bIsAConduit", bConduit);
+                                Int(States, "EntryRuleNodeIndex", bConduit ? Reversed(S) : -1);
+                                IntArray(States, "PlayerNodeIndices", Players.at(S));
+                                IntArray(States, "LayerNodeIndices", {});
+                                TagBool(States, "bAlwaysResetOnEntry", false);
+                                TagEnd(States);
+                            }
+                            StructArray(SV, "States", "BakedAnimationState", int32(M.States.size()), States);
+                        }, "StructProperty");
+                        Tag(MachinesAr, "Transitions", "ArrayProperty", [&](FArc& TV) {
+                            FArc Between(TV.Owner());
+                            for (const FAnimTransition& Tr : M.Transitions)
+                            {
+                                Int(Between, "PreviousState", StateIndex(Tr.From));
+                                Int(Between, "NextState", StateIndex(Tr.To));
+                                Tag(Between, "CrossfadeDuration", "FloatProperty", [=](FArc& E) { const float F = Tr.Crossfade; E.Raw(&F, 4); });
+                                Int(Between, "StartNotify", -1);
+                                Int(Between, "EndNotify", -1);
+                                Int(Between, "InterruptNotify", -1);
+                                Tag(Between, "BlendMode", "EnumProperty", [](FArc& E) { E.Name("EAlphaBlendOption::HermiteCubic"); }, "EAlphaBlendOption");
+                                Tag(Between, "CustomCurve", "ObjectProperty", [](FArc& E) { E.Idx(Null()); });
+                                Tag(Between, "BlendProfile", "ObjectProperty", [](FArc& E) { E.Idx(Null()); });
+                                Tag(Between, "LogicType", "ByteProperty", [](FArc& E) { E.Name("ETransitionLogicType::TLT_StandardBlend"); }, "ETransitionLogicType");
+                                Tag(Between, "StateName", "NameProperty", [](FArc& E) { E.Name("None"); });
+                                TagEnd(Between);
+                            }
+                            StructArray(TV, "Transitions", "AnimationTransitionBetweenStates", int32(M.Transitions.size()), Between);
+                        }, "StructProperty");
+                        TagEnd(MachinesAr);
+                    }
+                    StructArray(V, "BakedStateMachines", "BakedAnimationStateMachine", int32(Machines.size()), MachinesAr);
+                }, "StructProperty");
+            Tag(Ar, "TargetSkeleton", "ObjectProperty", [=](FArc& V) { V.Idx(Skeleton); });
+            /* Every cooked anim class has the AnimGraph entry, empty without cached poses (ABP_Dice): each update reads
+               it with FindChecked (FAnimInstanceProxy::UpdateAnimationNode_WithRoot), a null read in Shipping. */
+            Tag(Ar, "OrderedSavedPoseIndicesMap", "MapProperty", [=](FArc& M) {
+                M.I32(0);                                   // keys to remove
+                M.I32(1);
+                M.Name("AnimGraph");
+                IntArray(M, "OrderedSavedPoseNodeIndices", SavedOrder);
+                TagEnd(M);
+            }, "NameProperty,StructProperty");
+        };
+    }
     Class.Serialize = [=](FArc& Ar) {
+        if (AnimTags) AnimTags(Ar);
         /* UWidgetBlueprintGeneratedClass's own properties, so before UBlueprintGeneratedClass's, as the cook orders them. */
         if (bHasTree) Tag(Ar, "WidgetTree", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(RowTree)); });
         /* Measured on Basic_DropdownItem_C's: each FDelegateRuntimeBinding written whole, its SourcePath one segment

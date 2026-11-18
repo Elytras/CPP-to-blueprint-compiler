@@ -15,7 +15,7 @@ and a compiler message in [Diagnostics](#diagnostics).
 | Types | [Types](#types), [Literals and conversions](#literals-and-conversions), [Strings and text](#strings-and-text), [Constants](#constants), [Enums](#enums), [Structs](#structs), [Containers](#containers) |
 | Code | [Operators](#operators), [Statements and control flow](#statements-and-control-flow), [Loops](#loops), [Locals](#locals), [The optimizer](#the-optimizer) |
 | Functions | [Functions](#functions), [Calling engine and game functions](#calling-engine-and-game-functions), [Overrides and parent calls](#overrides-and-parent-calls), [Inline functions and templates](#inline-functions-and-templates) |
-| Objects | [Components](#components), [Widget layouts](#widget-layouts), [Class defaults](#class-defaults), [Creating objects](#creating-objects), [Working with other objects](#working-with-other-objects), [Data assets](#data-assets), [Game assets](#game-assets), [Editing game packages](#editing-game-packages) |
+| Objects | [Components](#components), [Widget layouts](#widget-layouts), [Anim Blueprints](#anim-blueprints), [Class defaults](#class-defaults), [Creating objects](#creating-objects), [Working with other objects](#working-with-other-objects), [Data assets](#data-assets), [Game assets](#game-assets), [Editing game packages](#editing-game-packages) |
 | Events and waiting | [Event dispatchers](#event-dispatchers), [Latent calls](#latent-calls), [Waiting on events](#waiting-on-events), [Timers and input](#timers-and-input), [Timelines](#timelines), [Interfaces](#interfaces) |
 | Network | [Replication](#replication), [RPCs](#rpcs) |
 | Low level | [Pointers and memory](#pointers-and-memory), [Intrinsics](#intrinsics) |
@@ -27,9 +27,8 @@ Most sections open with what they cover and the one rule most worth remembering.
 what you write, what it does, and its status. Snippets and notes come after the tables.
 
 Every row has an id, such as `switch.switch-code`, which is also its link anchor (`REFERENCE.md#switch.switch-code`).
-`python tools/docq.py <words>` finds the rows that hold all the words and names, for each, the test in
-`tools/test_bytecode.py` that proves it: that test's `proves('<id>')` line. The suite fails when a row has no proving
-test and is not listed in `tools/unproved.txt`, a list that only shrinks.
+Each row is proved by a test in `tools/test_bytecode.py`, whose `proves('<id>')` line names it. A row with no proving
+test is listed in `tools/unproved.txt`, a list that only shrinks. To find a construct, use the table above.
 
 ### Status
 
@@ -3312,6 +3311,89 @@ Notes:
   `--open` shows the PNG in the browser, on a page that reloads it as it changes. Without `--watch` it runs one turn
   and prints every box.
 
+## Anim Blueprints
+
+A `UAnimInstance` class that names its skeleton with `UE_SKELETON` is an Anim Blueprint. Its anim graph is made of
+members: each `FAnimNode_*` struct member is a node (`#include "UeApi/AnimGraphRuntime.h"` for the blend nodes), its
+settings are set in the constructor, and `UE_LINK` wires one node's pose into another's. State machines are declared
+with `UE_STATE` and `UE_TRANSITION` in the constructor. The constructor never runs: AssetGen cooks the graph as the
+editor's compiler bakes it. What changes per frame is written in `BlueprintUpdateAnimation`, ordinary script that sets
+the nodes' members (a play rate, a blend space's X, a blend's bool, a transition's rule) before the graph updates. The
+rule to remember: one `FAnimNode_Root` is the output pose, and every other node reaches it through links.
+
+| You write | What it does | Status |
+|---|---|---|
+| <a id="anim-blueprints.ue-skeleton"></a>`UE_SKELETON("/Game/_MyMods/Critter/SK_Critter_Skeleton");` in a `UAnimInstance` class | Cooks the class as an Anim Blueprint's class (AnimBlueprintGeneratedClass) whose target skeleton is the one named, with an `AnimGraph` function, as the editor's compiler makes them. A mesh of that skeleton plays it once its `AnimClass` is the class and its `AnimationMode` is `AnimationBlueprint`. Without `UE_SKELETON` an anim instance class with no anim nodes is an ordinary Blueprint class. | Yes |
+| <a id="anim-blueprints.fanimnode-sequenceplayer-idle"></a>`FAnimNode_SequencePlayer Idle;` in the class, `Idle.Sequence = &Anim_Idle;` in the constructor | An anim node: any `FAnimNode_*` struct, a sequence player, a blend space player, a blend by bool or int, a layered blend per bone, an apply additive, a slot. Its parts set in the constructor are its settings, written as the cook writes them; the rest keep the node's engine defaults (a sequence player plays at rate 1 and loops). | Yes |
+| <a id="anim-blueprints.ue-link-idle"></a>`IdleState.Result = UE_LINK(Idle);`, `Blend.BlendPose = {UE_LINK(Walk), UE_LINK(Hurt)};` | A pose link: the node's pose goes into that input of the other, as a wire in the anim graph does. It names a node of this class by its member name. | Yes |
+| <a id="anim-blueprints.ue-link-cs"></a>`Tilt.ComponentPose = UE_LINK_CS(ToCs);`, `ToLocal.ComponentPose = UE_LINK_CS(Tilt);` | A component-space pose link (`FComponentSpacePoseLink`), the input of a bone control (`FAnimNode_ModifyBone` and the other skeletal controls) and of `FAnimNode_ConvertComponentToLocalSpace`. `FAnimNode_ConvertLocalToComponentSpace` takes a local pose with `UE_LINK`. | Yes |
+| <a id="anim-blueprints.fanimnode-rigidbody"></a>`FAnimNode_RigidBody Physics;` with `Physics.ComponentPose = UE_LINK_CS(Tilt); Physics.OverridePhysicsAsset = &PA_Sim;` | A rigid body node: simulates the bodies of a physics asset on the pose in component space, so limbs dangle and trail. With no `OverridePhysicsAsset` it simulates on the mesh's own physics asset, as 4.27's node does. Per-frame inputs such as `ExternalForce` are written in `BlueprintUpdateAnimation`. | Yes |
+| <a id="anim-blueprints.fanimnode-root-output"></a>`FAnimNode_Root Output;` and `Output.Result = UE_LINK(Slot);` | The output pose, the graph's end the engine evaluates from. | Yes |
+| <a id="anim-blueprints.fanimnode-savecachedpose"></a>`FAnimNode_SaveCachedPose Cache;` with `Cache.Pose = UE_LINK(Locomotion); Cache.CachePoseName = FName("Loco");`, read back by `FAnimNode_UseCachedPose` members with `LinkToCachingNode = UE_LINK(Cache)` | A cached pose: worked out once a frame, however many nodes read it. The class lists the cached poses in the order the engine updates them after the graph, each before the cached poses its own source reads, as the editor orders them. | Yes |
+| <a id="anim-blueprints.ue-state-locomotion-idlestate"></a>`UE_STATE(Locomotion, IdleState);` in the constructor | Adds a state to the state machine `Locomotion` (an `FAnimNode_StateMachine` member): the state is the `FAnimNode_StateResult` member named, whose `Result` link is its pose. The first state is the machine's entry. The asset players its pose reaches are the state's, as the editor lists them. | Yes |
+| <a id="anim-blueprints.ue-state-as"></a>`UE_STATE_AS(Locomotion, JumpEnd, "Jump End");` | A state named apart from its node: the name `GetCurrentStateName` returns and the editor shows. | Yes |
+| <a id="anim-blueprints.ue-conduit"></a>`UE_CONDUIT(Locomotion, NotStaggered, "Not Staggered");` | A conduit: a state with no pose of its own that the machine passes through in one frame. Its `FAnimNode_TransitionResult` is its entry rule, read as any transition's; transitions go to and from it as to a state. | Yes |
+| <a id="anim-blueprints.ue-transition-locomotion"></a>`UE_TRANSITION(Locomotion, IdleState, MoveState, ToMove, 0.2f);`, `UE_TRANSITION_AUTO(...)` | A transition between two states of the machine, crossfaded over the seconds given. Its rule is the `FAnimNode_TransitionResult` member named: the transition is taken once its `bCanEnterTransition` is true. `UE_TRANSITION_AUTO` takes it as the editor's automatic rule does, when the state's player is near its end. | Yes |
+| <a id="anim-blueprints.blueprintupdateanimation"></a>`void BlueprintUpdateAnimation(float DeltaTimeX) { ToMove.bCanEnterTransition = bMoving; Move.X = Speed; }` | Sets the nodes' inputs each frame: script that writes the anim instance's own node members, run on the game thread before the graph updates. It stands in for the editor's pin bindings and transition rule graphs. | Yes |
+| <a id="anim-blueprints.ue-class-in-other"></a>`class ABP_Critter : public UAnimInstance { UE_CLASS_IN("/Game/_MyMods/Critters"); UE_SKELETON("..."); };`, then `Mesh->AnimClass = ABP_Critter::StaticClass();` | Another mod's Anim Blueprint: imported as the AnimBlueprintGeneratedClass it is cooked as, which the loader checks the import's class against. Without `UE_SKELETON` the import names a BlueprintGeneratedClass, which is not what that package holds. | Yes |
+| <a id="anim-blueprints.ue-skeleton-2"></a>anim nodes in a `UAnimInstance` class with no `UE_SKELETON`, `UE_SKELETON` in a class that is no `UAnimInstance`, no `FAnimNode_Root` or two, `UE_LINK` of anything but a node member, a node with an initializer whose constructor sets parts of it too | Refused: "an Anim Blueprint names its skeleton", "this class is no UAnimInstance", "an Anim Blueprint has one FAnimNode_Root", "UE_LINK names an anim node of this class", "give its value one way". | Refused |
+| <a id="anim-blueprints.ue-state"></a>a state in two machines, a transition from or to a state no `UE_STATE` above it adds, a crossfade that is not a constant, a machine with no states | Refused: "is a state of ... already", "is no UE_STATE of", "a transition's crossfade is a constant", "has no UE_STATE". | Refused |
+| <a id="anim-blueprints.ue-skeleton-3"></a>an Anim Blueprint below another of the mod's | Refused: "TODO: an Anim Blueprint below another of this mod's". Derive from `UAnimInstance` or a game anim instance class. | Not yet |
+
+```cpp
+#include "UeApi/AnimGraphRuntime.h"
+
+UE_ASSET_AT(UAnimSequence, Anim_Idle, "/Game/_MyMods/Critter/ANIM_Critter_Idle");
+UE_ASSET_AT(UAnimSequence, Anim_Run, "/Game/_MyMods/Critter/ANIM_Critter_Run");
+
+class ABP_Critter : public UAnimInstance {
+public:
+  UE_SKELETON("/Game/_MyMods/Critter/SK_Critter_Skeleton");
+  bool bMoving = false;
+  float Speed = 0.0f;
+
+  FAnimNode_SequencePlayer Idle;
+  FAnimNode_SequencePlayer Run;
+  FAnimNode_StateResult IdleState;
+  FAnimNode_StateResult RunState;
+  FAnimNode_TransitionResult ToRun;
+  FAnimNode_TransitionResult ToIdle;
+  FAnimNode_StateMachine Locomotion;
+  FAnimNode_Slot Slot;                               // where montages play
+  FAnimNode_Root Output;
+
+  ABP_Critter() {
+    Idle.Sequence = &Anim_Idle;
+    Run.Sequence = &Anim_Run;
+    IdleState.Result = UE_LINK(Idle);
+    RunState.Result = UE_LINK(Run);
+    UE_STATE(Locomotion, IdleState);                 // the entry state
+    UE_STATE(Locomotion, RunState);
+    UE_TRANSITION(Locomotion, IdleState, RunState, ToRun, 0.2f);
+    UE_TRANSITION(Locomotion, RunState, IdleState, ToIdle, 0.25f);
+    Slot.slotName = FName("DefaultSlot");
+    Slot.Source = UE_LINK(Locomotion);
+    Output.Result = UE_LINK(Slot);
+  }
+
+  void BlueprintUpdateAnimation(float DeltaTimeX) {
+    ToRun.bCanEnterTransition = bMoving;
+    ToIdle.bCanEnterTransition = !bMoving;
+    Run.PlayRate = Speed / 600.0f;
+  }
+};
+```
+
+Notes:
+
+- The editor binds a node's pins with property access, which the cook writes as copy records; AssetGen writes none,
+  and `BlueprintUpdateAnimation` sets the same members instead.
+- Not written yet: sync groups, linked anim graphs and layers, notifies on states and transitions, and
+  Anim Blueprints for UE5 games (refused: "TODO: an Anim Blueprint is cooked for UE 4.27 only").
+- A layered blend's per-bone weights are left out: the engine builds them from `LayerSetup` against the mesh's
+  skeleton when it first runs the node.
+- The slot's member is spelled `slotName` in UeApi.
+
 ## Class defaults
 
 `UE_DEFAULTS { ... }` sets the defaults a class does not declare itself: those of its components, and those of
@@ -4052,6 +4134,8 @@ not a C++ value, so point at it with `&`.
 |---|---|---|
 | <a id="declaring-data-assets.umooddef-md-big-health-500"></a>`UMoodDef MD_Big = {.Health = -500.5f, .Title = "Big"};` | An asset of the class, cooked as `<mod package>/MD_Big`. Only the members the braces name are written, and the rest keep the class defaults. A member named with a zero value is still written. | Yes |
 | <a id="declaring-data-assets.umooddef-md-plain"></a>`UMoodDef MD_Plain = {};` | An asset with the class defaults only. | Yes |
+| <a id="declaring-data-assets.class-uceiling-public-udebrispositioning"></a>`class UCeiling : public UDebrisPositioning { public: UCeiling() { MinVerticalAngle = 150.0f; } };` then `UCeiling DP_Ceiling = {};` and `.Positioning = &DP_Ceiling` | An asset of the mod's own child of a game data-asset class whose constructor sets its defaults. A class that declares a constructor is no aggregate, so `= {}` is its only braces: the asset holds the class defaults, and `&` points at it, as for any asset of the mod. | Yes |
+| <a id="declaring-data-assets.influencerdensitycurve-externalcurve"></a>`InfluencerDensityCurve.ExternalCurve = &DIC_DefaultDensity;` in the constructor (or a `UE_ASSET_DEFAULTS` block) | One member of a struct whose UeApi header declares a constructor, so that `{.ExternalCurve = ...}` is a clang error and `FRuntimeFloatCurve(UE_KEEP, &C)` or `FRuntimeFloatCurve({}, &C)` is refused over the game class's value. The statement writes `ExternalCurve` alone, and `EditorCurveData` keeps the value already there, as the cook writes DRG's own positionings. | Yes |
 | <a id="declaring-data-assets.umooddef-md-zero-health"></a>`UMoodDef MD_Zero = {.Health = {}};` | `{}` for a member is its zero, written as `.Health = 0` is. A struct, container or name member's `{}` is written too: zeros, an empty container, None, or a `UE_STRUCT`'s own defaults, not the class default. | Yes |
 | <a id="declaring-data-assets.uhitdef-hd-near-h-hit"></a>`UHitDef HD_Near = {.H = {.Hit = {.Distance = 5.0f}}};` | An asset starts as its class's default object, so braces for a struct member are written over the default object's value, as a `UE_DEFAULTS` statement's are over a parent's. A member they leave out that the engine's constructor sets (`FHitResult`'s FaceIndex) stays unwritten where the default object's value of it is the engine's too. Where the class's own braces or a `UE_DEFAULTS` gave it another value (`H = {.Hit = {.FaceIndex = 3}}`), or the class is a game or engine class, whose value no header says, it is refused, naming the member. | Yes |
 | <a id="declaring-data-assets.uenemydescriptor-ed-mine"></a>`UEnemyDescriptor ED_Mine = {.SpawnSpread = 250.0f, .IdealSpawnSize = 4};` | An asset of a game or engine class. | Yes |
@@ -7283,8 +7367,8 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   `FLinearColor`, `FColor` and the `FVector_NetQuantize` types (another mod's `UE_STRUCT_IN` struct is no engine
   struct: its `T()` is its members' initializers). Its values are what the engine's constructor sets
   (`FHitResult::Time` is 1, `FTransform()` is the identity). Fix: leave the statement out to keep the parent's value,
-  or give the members in braces,
-  `Hit = {.Time = 1.0f};`. See [Class defaults](#class-defaults).
+  give the members in braces, `Hit = {.Time = 1.0f};`, or set only the members you mean, one statement each
+  (`Hit.Distance = 5.0f;`). See [Class defaults](#class-defaults).
 - `` <Member>.<Left>, left out of the braces, holds what the engine's <Struct> constructor sets, which its header does
   not say, so AssetGen cannot write it over the value already there ``: braces in UE_DEFAULTS give some members and
   leave `<Left>` out, over a parent's value that is not a fresh one: a member of an engine struct whose header has no
@@ -7299,8 +7383,9 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   gives, of a `UE_STRUCT` or another mod's struct (`UE_STRUCT_IN`): `H = {.Hit = {.Distance = 5.0f}}` names
   `H.Hit.Time`. A mod's own asset's braces say it over the class's default object, which the asset starts as:
   `{.H = {.Hit = {.Distance = 5.0f}}}` where the class's `H = {.Hit = {.FaceIndex = 3}}` names `H.Hit.FaceIndex`.
-  Fix: give that member in the braces, or leave the statement out to keep the parent's value. See
-  [Class defaults](#class-defaults) and [Data assets](#data-assets).
+  Fix: give that member in the braces, set only the member the braces give with a statement (the message names it:
+  `` set only ExternalCurve with a statement (`InfluencerDensityCurve.ExternalCurve = ...;` ...) ``), or leave the
+  statement out to keep the parent's value. See [Class defaults](#class-defaults) and [Data assets](#data-assets).
 - `warning: <Member>: every member of <Struct> is Transient, which the engine never loads from a default: nothing is
   written, and it keeps the parent's value`: `Handle = FTimerHandle();` in UE_DEFAULTS. No tag can set a Transient
   member (the loader skips it), so the default holds the parent's handle. Fix: none needed; drop the statement to

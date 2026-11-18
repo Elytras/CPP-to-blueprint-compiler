@@ -106,13 +106,13 @@ std::string ModFieldName(const std::string& StructPkg, const std::string& Field)
     return Field + "_" + std::to_string(H % 1000000u) + "_" + Guid;
 }
 
-/* FDeref and FDerefTextView are the compiler's own read-hoist plumbing, and FMapSlot_* / FMapSlots_* its view of a
+/* FDeref, FDerefTextView and FDerefI64View are the compiler's own read-hoist plumbing, and FMapSlot_* / FMapSlots_* its view of a
    TMap or TSet walked in place: their fields are referenced by fixed names from hardcoded emit sites (ViewFieldOf, the
    __DerefScratch__ prologue, LowerRangeFor), never through user field access, so they must keep their plain C++ names
    on both the cooked layout and every reference. */
 bool IsInternalViewStruct(const std::string& CppName)
 {
-    return CppName == "FDeref" || CppName == "FDerefTextView" || CppName.compare(0, 9, "FMapSlot_") == 0
+    return CppName == "FDeref" || CppName == "FDerefTextView" || CppName == "FDerefI64View" || CppName.compare(0, 9, "FMapSlot_") == 0
         || CppName.compare(0, 10, "FMapSlots_") == 0 || CppName.compare(0, 11, "FDerefView_") == 0;
 }
 
@@ -444,6 +444,17 @@ std::string LayoutHelperCall(const Json& S)
     const std::string Name = Fn && Kind(*Fn) == "DeclRefExpr" ? Fn->value("referencedDecl", Json::object()).value("name", std::string())
                                                                : std::string();
     return Name == "UeSlot__" || Name == "UeBind__" || Name == "UeKeys__" ? Name : std::string();
+}
+
+/* UE_STATE's, UE_CONDUIT's and UE_TRANSITION's call (UeMeta.h), "UeState__", "UeConduit__" or "UeTransition__", or ""
+   for any other statement. */
+std::string AnimHelperCall(const Json& S)
+{
+    const Json* N = Strip(&S);
+    const Json* Fn = N && Kind(*N) == "CallExpr" ? Strip(First(*N)) : nullptr;
+    const std::string Name = Fn && Kind(*Fn) == "DeclRefExpr" ? Fn->value("referencedDecl", Json::object()).value("name", std::string())
+                                                               : std::string();
+    return Name == "UeState__" || Name == "UeConduit__" || Name == "UeTransition__" ? Name : std::string();
 }
 
 /* S39: a statement of a widget class's layout by its shape alone, `Root->AddChildToCanvas(Title)->SetPosition(...);`,
@@ -820,6 +831,9 @@ const Json* BracedInit(const Json& Var)
 {
     const Json* I = First(Var);
     if (I && Kind(*I) == "ExprWithCleanups") I = First(*I);
+    /* `T X = {};` of a mod class that declares a constructor: no aggregate, so clang calls the constructor, braced and
+       with no argument. It names no member, as empty braces do; the constructor's values are the class's defaults. */
+    if (I && Kind(*I) == "CXXConstructExpr" && I->value("list", false) && !First(*I)) return I;
     return I && Kind(*I) == "InitListExpr" ? I : nullptr;
 }
 
@@ -1173,6 +1187,7 @@ struct FRecord
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
     std::vector<std::string> Widgets;               // UE_WIDGET, in declaration order: variables that are also widgets of the tree, the first its root
     std::vector<std::pair<std::string, std::string>> Animations;   // UE_ANIMATION: its variable -> its length as written, or ""
+    std::string Skeleton;                           // UE_SKELETON: an Anim Blueprint's target skeleton, by path
     /* genueapi's `<X>__UeName`: the engine's name of a member or function Dumper-7 had to respell (`Name_0` is
        `Name`, `Audio_Flying` is `Audio Flying`). C++ keeps its spelling; everything cooked goes through UeNameOf. */
     std::map<std::string, std::string> UeNames;
@@ -2051,20 +2066,29 @@ struct FReadViewSpec
     const char* ViewField = nullptr;    // that TArray member, when ViewFieldOf(DerefIntrinsic) does not name it
 };
 
-/* __ReadObject__ / __ReadName__ share the int64 view: both are 8-byte scalars whose
-   CopySingleValue is a plain 8-byte memcpy, which is exactly what UInt64Property.CopySingleValue
-   does through ArrayGetByRef. */
+/* The 8-byte lane (__Read64__ and the four that share its int64 memcpy view) reads through the mod-owned
+   FDerefI64View { TArray<int64> NameHashes; }, cooked in the mod's package like FDerefTextView (ViewStruct ->
+   HasI64ViewStruct). It used to borrow engine ScriptStruct MaterialCachedParameterEntry.NameHashes (a
+   TArray<uint64> at offset 0), but that field exists only in UE4.27 - UE5.6 replaced the struct's body with
+   a TSet, so the NameHashes import resolved null and every 8-byte read null-dereffed the member's
+   Offset_Internal at +0x44 in RC. A mod-owned int64 view is engine-version-proof for DRG(4.27) and RC(5.6).
+   __ReadObject__ / __ReadName__ / __ReadClass__ share it: each is an 8-byte scalar whose CopySingleValue is a
+   plain 8-byte memcpy, exactly what UInt64Property.CopySingleValue does through ArrayGetByRef. */
 static const FReadViewSpec kReadViews[] = {
-    { "__Read64__",     "__DerefReadI64__", "int64",           "/Script/Engine", "MaterialCachedParameterEntry" },
-    { "__Read32__",     "__DerefReadI32__", "int32",           "/Script/Engine", "LODMappingData"               },
-    { "__ReadFloat__",  "__DerefReadF__",   "float",           "/Script/Engine", "CustomPrimitiveData"          },
-    { "__ReadByte__",   "__DerefReadU8__",  "uint8",           "/Script/Engine", "BandwidthTestItem"            },
-    { "__ReadObject__", "__DerefReadI64__", "class UObject *", "/Script/Engine", "MaterialCachedParameterEntry" },
-    { "__ReadName__",   "__DerefReadI64__", "FName",           "/Script/Engine", "MaterialCachedParameterEntry" },
+    { "__Read64__",     "__DerefReadI64__", "int64",           "/Game/_ElytrasMods/ReadProperty/FDerefI64View", "FDerefI64View" },
+    { "__Read32__",     "__DerefReadI32__", "int32",           "/Script/Engine",                                "LODMappingData" },
+    { "__ReadFloat__",  "__DerefReadF__",   "float",           "/Script/Engine",                                "CustomPrimitiveData" },
+    /* __ReadDouble__ shares the int64 8-byte-memcpy view (like __ReadObject__): the copy is Int64Property's,
+       and ResultType "double" only decides the DoubleProperty local the 8 bytes land in. This is the exact
+       8-byte read __ReadFloat__ (4-byte) is not - for UE5's Blueprint real, a DoubleProperty. */
+    { "__ReadDouble__", "__DerefReadI64__", "double",          "/Game/_ElytrasMods/ReadProperty/FDerefI64View", "FDerefI64View" },
+    { "__ReadByte__",   "__DerefReadU8__",  "uint8",           "/Script/Engine",                                "BandwidthTestItem" },
+    { "__ReadObject__", "__DerefReadI64__", "class UObject *", "/Game/_ElytrasMods/ReadProperty/FDerefI64View", "FDerefI64View" },
+    { "__ReadName__",   "__DerefReadI64__", "FName",           "/Game/_ElytrasMods/ReadProperty/FDerefI64View", "FDerefI64View" },
     /* __ReadClass__ shares the int64 view: CopySingleValue on the InnerProp only cares about
        ElementSize (an 8-byte memcpy), so the tmp's type just decides the FField class the
        assign lands in - which is what __ClassOf__(Out) checks against at each Get<T>PropertyByName. */
-    { "__ReadClass__",  "__DerefReadI64__", "class UClass *",  "/Script/Engine", "MaterialCachedParameterEntry" },
+    { "__ReadClass__",  "__DerefReadI64__", "class UClass *",  "/Game/_ElytrasMods/ReadProperty/FDerefI64View", "FDerefI64View" },
     /* FString view: FStrProperty::CopySingleValue does a deep FString operator= (allocates a
        fresh TArray<TCHAR>), so ArrayGetByRef of the FString at *(FString*)Addr into an
        FString local produces an owned copy that DestroyStruct cleans up on return. */
@@ -2571,9 +2595,10 @@ private:
     bool HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                        std::vector<FStmtIR>& OutPre, std::string* Err);
     bool HasDerefStruct(std::string* Err) const;
-    /* A read's view struct as an import: FDerefTextView is the mod's own, made on first use like FDeref (HasTextViewStruct). */
+    /* A read's view struct as an import: FDerefTextView / FDerefI64View are the mod's own, made on first use like FDeref. */
     FIndex ViewStruct(const FReadViewSpec& V, FBlueprintClass& BP);
     void HasTextViewStruct() const;
+    void HasI64ViewStruct() const;
     bool LowerPtrCastSource(const Json& Call, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     std::map<std::string, std::string> RefAddr;     // VarDecl id -> pointee: `T& R = *P` keeps the address in an int64 local R
     std::map<std::string, std::string> ArrayView;   // such an R's local -> the FDeref scratch its declaration points at a TArray
@@ -2980,6 +3005,9 @@ private:
     mutable Json    TextViewAst;     // the one FieldDecl SynthTextView's Data points at
     mutable FRecord SynthTextView;
     mutable bool    bSynthTextView = false;
+    mutable Json    I64ViewAst;      // the one FieldDecl SynthI64View's Data points at
+    mutable FRecord SynthI64View;
+    mutable bool    bSynthI64View = false;
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::pair<std::string, std::string>> GameClassKinds;   // FBlueprintClass's, filled by Run
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
@@ -3986,6 +4014,8 @@ bool FCompiler::Collect(std::string* Err)
             {
                 R.Widgets.push_back(Name(C).substr(0, Name(C).size() - 10));
             }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeSkeleton__")
+                FindLiteral(C, R.Skeleton);
             else if (Kind(C) == "VarDecl" && Name(C).size() > 13 && Name(C).compare(Name(C).size() - 13, 13, "__UeAnimation") == 0)
             {
                 std::string Spec;
@@ -4620,7 +4650,7 @@ bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
         if (!bAssign && !AttachmentCall(S, Callee, Child, Parent, Socket) && !R.bIsPatch     // a patch's may set part of one
             && !(!R.Widgets.empty() && (WidgetLayoutStatement(S) || LocalMemberAssignment(S, Lhs, Rhs, SlotPart)))
             && !CallsInstanced(S) && !LocalMemberAssignment(S, Lhs, Rhs, SlotPart)     // UE_INSTANCED, its local's
-            && !(R.Widgets.empty() && ComponentEventCall(S)))
+            && !(R.Widgets.empty() && ComponentEventCall(S)) && AnimHelperCall(S).empty())
         {
             *Err = Where + ": a constructor never runs in the game, so its statements are read as the class's defaults: each "
                    "is `Field = value;`, `Component->Field = value;`, `Component->SetupAttachment(Parent);` or "
@@ -6624,11 +6654,39 @@ void FCompiler::HasTextViewStruct() const
     bSynthTextView = true;
 }
 
+/* `struct FDerefI64View { TArray<int64> NameHashes; }`, the mod-owned 8-byte read view (see kReadViews). UE5.6 removed
+   the engine TArray<uint64>@0 the lane used to borrow (MaterialCachedParameterEntry.NameHashes), so each 8-byte read
+   (__Read64__/__ReadDouble__/__ReadObject__/__ReadName__/__ReadClass__) now reads through this, cooked in the mod's own
+   package as FDeref/FDerefTextView are. A mod that declares its own wins (Find sees it first).
+   The field keeps the name NameHashes - the compiler's canonical name for the 8-byte lane's TArray (ViewFieldOf
+   __DerefReadI64__), which the read simulator (runscript.VIEWS) and ViewFieldOf already key on - so only the engine
+   struct it borrowed moved into the mod; nothing downstream of the field name changes. */
+void FCompiler::HasI64ViewStruct() const
+{
+    const FRecord* D = Find("FDerefI64View");
+    if ((D && D->bIsStruct && !D->IsNative()) || bSynthI64View) return;
+    I64ViewAst = Json::array();
+    /* Int64Property element: the read is Int64Property's 8-byte memcpy; kReadViews ResultType decides the local the
+       bytes land in. The reads through this view reinterpret those 8 bytes as an object/FName/UClass* on purpose;
+       invariants.py's view_struct() exempts that pun for FDerefI64View, as it does for FDeref/FDerefTextView. */
+    I64ViewAst.push_back(Json{ { "kind", "FieldDecl" }, { "name", "NameHashes" }, { "type", Json{ { "qualType", "TArray<int64>" } } } });
+    SynthI64View = FRecord();
+    SynthI64View.CppName   = "FDerefI64View";
+    SynthI64View.UeName    = "FDerefI64View";
+    SynthI64View.UePackage = ModPackage + "/FDerefI64View";
+    SynthI64View.bIsStruct = true;
+    SynthI64View.bIsLocal  = true;
+    for (const Json& F : I64ViewAst) SynthI64View.Fields.push_back(&F);
+    bSynthI64View = true;
+}
+
 FIndex FCompiler::ViewStruct(const FReadViewSpec& V, FBlueprintClass& BP)
 {
     const bool bText = std::strcmp(V.ViewStructName, "FDerefTextView") == 0;
+    const bool bI64  = std::strcmp(V.ViewStructName, "FDerefI64View") == 0;
     if (bText) HasTextViewStruct();
-    const std::string Pkg = bText ? ModPackage + "/FDerefTextView" : std::string(V.ViewStructPkg);
+    if (bI64)  HasI64ViewStruct();
+    const std::string Pkg = (bText || bI64) ? ModPackage + "/" + V.ViewStructName : std::string(V.ViewStructPkg);
     const FIndex S = BP.ScriptStruct(Pkg, V.ViewStructName);
     if (Pkg.compare(0, 6, "/Game/") == 0) KeepStructLoaded(S, V.ViewStructName, 16);     // ponytail: a mod-owned view is { TArray<T> Data; }, 16 bytes
     return S;
@@ -18237,7 +18295,8 @@ bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::strin
                "leave the statement out to keep that value"
              : Path + ": `" + SR.CppName + "()` or `{}` holds what the engine's " + SR.CppName + " constructor sets, which "
                "its header does not say, so AssetGen cannot write it over the value already there; leave the statement "
-               "out to keep that value, or give the members in braces, `{.Member = value}`";
+               "out to keep that value, give the members in braces, `{.Member = value}`, or set only the members "
+               "you mean, one statement each (`Value.Member = ...;` in a constructor, UE_DEFAULTS or UE_ASSET_DEFAULTS)";
         return false;
     }
     bZeros = bZeros || bEngine;
@@ -18629,6 +18688,25 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     }
     if (bBraced) return LowerDefault(F, PD, BP, Err, First(*Init), bKeepZero);
 
+    /* UE_LINK(Walk): a pose link reading the anim node Walk, a variable of this Anim Blueprint. Its LinkID is Walk's number
+       among the class's anim nodes, which FBlueprintClass::Finish knows once the variables are in their final order. */
+    if (const Json* Callee = !bNeg && PD.Type == "StructProperty" && K == "CallExpr" ? Strip(First(*Init)) : nullptr;
+        Callee && Kind(*Callee) == "DeclRefExpr"
+        && (Name((*Callee)["referencedDecl"]) == "UeLink__" || Name((*Callee)["referencedDecl"]) == "UeLinkCs__"))
+    {
+        const Json* Node = Strip(Nth(*Init, 1));
+        if (!Node || Kind(*Node) != "MemberExpr" || !First(*Node) || Kind(*Strip(First(*Node))) != "CXXThisExpr"
+            || StripTypeKeywords(TypeOf(*Node)).compare(0, 10, "FAnimNode_") != 0)
+        { *Err = Name(F) + ": UE_LINK names an anim node of this class, by its member name: `UE_LINK(Walk)`"; return false; }
+        FPropertyDef Link = IntParam("LinkID");
+        Link.PropertyFlags = 0;
+        Link.Default.K = FDefaultValue::Int;
+        Link.Default.AnimNode = Name(*Node);
+        PD.Members = std::make_shared<std::vector<FPropertyDef>>(std::vector<FPropertyDef>{ Link });
+        PD.Default.K = FDefaultValue::Struct;
+        return true;
+    }
+
     /* A struct value: `FFloatInterval(1, 5)` or `{1, 5}`, one argument per member in declaration
        order. The members go on the property, each with its own default, and the writer turns them
        into nested tags - or into raw bytes when the struct has a native Serialize. */
@@ -18735,9 +18813,17 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
             {
                 if (!bFreshValue)
                 {
+                    /* A member-path statement writes the given member alone, the rest kept as they are there
+                       (REFERENCE.md#declaring-data-assets.influencerdensitycurve-externalcurve). */
+                    size_t G = 0;
+                    while (G < Args.size() && (IsUnsetInit(*Args[G]) || IsKeepArg(*Args[G]))) ++G;
                     *Err = Name(F) + "." + Name(*Fields[I]) + ", left out of the braces, holds what the engine's "
                          + SR->CppName + " constructor sets, which its header does not say, so AssetGen cannot write it "
-                           "over the value already there; give it in the braces, or leave the statement out to keep that value";
+                           "over the value already there; give it in the braces, "
+                         + (G < Args.size() ? "set only " + Name(*Fields[G]) + " with a statement (`" + Name(F) + "."
+                                              + Name(*Fields[G]) + " = ...;` in a constructor, UE_DEFAULTS or UE_ASSET_DEFAULTS), "
+                                            : std::string())
+                         + "or leave the statement out to keep that value";
                     return false;
                 }
                 continue;
@@ -22226,6 +22312,25 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (!R.Widgets.empty() && !bIsWidget)
     { *Err = R.CppName + "::" + R.Widgets.front() + ": a UE_WIDGET is a widget of a UUserWidget's tree; this class is none"; return false; }
     BP.SetWidgetClass(bIsWidget && HasWidgetTree(R));
+    /* An Anim Blueprint: a UAnimInstance class that names its skeleton. Its FAnimNode_* variables are its anim graph, wired by
+       UE_LINK defaults; its exported kind, AnimBlueprintGeneratedClass, is the one IAnimClassInterface::GetFromClass
+       answers for, so without it the mesh runs no graph. */
+    const bool bIsAnim = !R.bIsPatch && !R.Skeleton.empty();
+    if (bIsAnim)
+    {
+        if (std::find(Ancestry.begin(), Ancestry.end(), "AnimInstance") == Ancestry.end())
+        { *Err = R.CppName + ": UE_SKELETON names an Anim Blueprint's skeleton, and this class is no UAnimInstance"; return false; }
+        if (IsUE5()) { *Err = R.CppName + ": TODO: an Anim Blueprint is cooked for UE 4.27 only"; return false; }
+        for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (!A->IsNative() && !A->Skeleton.empty())
+            { *Err = R.CppName + ": TODO: an Anim Blueprint below another of this mod's (" + A->CppName + ")"; return false; }
+        const std::string& Sk = R.Skeleton;
+        const size_t Dot = Sk.find('.', Sk.rfind('/') + 1);
+        const std::string SkPkg = Sk.substr(0, Dot), SkName = Dot == std::string::npos ? Sk.substr(Sk.rfind('/') + 1) : Sk.substr(Dot + 1);
+        if (Sk.compare(0, 6, "/Game/") != 0)
+        { *Err = R.CppName + ": UE_SKELETON takes the skeleton asset's path, \"/Game/...\""; return false; }
+        BP.SetAnimClass(BP.Asset("/Script/Engine", "Skeleton", SkPkg, SkName));
+    }
     if (bIsWidget && !HasWidgetTree(R))
     {
         bool bDraws = OwnEvent(R, "OnPaint");
@@ -22349,6 +22454,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     /* UE_DEFAULTS' default for a variable of this class's own: one an implemented interface declares, or an own member
        pointed at a UE_INSTANCED object. */
     std::map<std::string, FPropertyDef> OwnVarDefaults;
+    /* An Anim Blueprint's own anim nodes set in parts by its constructor, `Walk.Sequence = &Anim_Walk;`, and its state
+       machines' UE_STATE and UE_TRANSITION lines, in the order written. */
+    std::vector<FPropertyDef> OwnParts;
+    std::vector<FBlueprintClass::FStateMachine> Machines;
     std::map<std::string, FBlueprintClass::FAttachment> Attachments;    // a UE_COMPONENT -> where SetupAttachment puts it
     /* S39: a UE_WIDGET's defaults, and the slots the layout's AddChild calls make, in the order written. A canvas slot's
        setters each set part of its LayoutData, kept per member path ("Offsets.Left", "Anchors.Minimum.X") until the tag
@@ -22851,6 +22960,48 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     bOk = Layout(S);
                     return;
                 }
+                /* UE_STATE(Machine, State[, Name]), UE_CONDUIT(Machine, Rule, Name), UE_TRANSITION(Machine, From, To, Rule,
+                   Crossfade[, automatic]): each an own anim node by its member name, which clang has held to its node type
+                   (UeMeta.h). */
+                if (const std::string Helper = AnimHelperCall(S); !Helper.empty())
+                {
+                    const Json* N = Strip(&S);
+                    const bool bState = Helper == "UeState__" || Helper == "UeConduit__";
+                    auto Own = [&](int32 I) {
+                        const Json* E = Strip(Nth(*N, I));
+                        return E && Kind(*E) == "MemberExpr" && First(*E) && Kind(*Strip(First(*E))) == "CXXThisExpr"
+                                   && OwnerOf(*E) == R.CppName ? Name(*E) : std::string();
+                    };
+                    const char* const Form = Helper == "UeConduit__" ? "`UE_CONDUIT(Locomotion, NotStaggered, \"Not Staggered\")`"
+                                             : bState ? "`UE_STATE(Locomotion, Idle)`" : "`UE_TRANSITION(Locomotion, Idle, Walk, ToWalk, 0.2f)`";
+                    const std::string Machine = Own(1);
+                    std::vector<std::string> Args;
+                    for (int32 I = 2; I <= (bState ? 2 : 4); ++I) Args.push_back(Own(I));
+                    if (Machine.empty() || std::find(Args.begin(), Args.end(), std::string()) != Args.end())
+                    { *Err = Where + ": " + Form + " names anim nodes this class declares, by their member names"; bOk = false; return; }
+                    auto M = std::find_if(Machines.begin(), Machines.end(), [&](const FBlueprintClass::FStateMachine& X) { return X.Node == Machine; });
+                    if (M == Machines.end()) { Machines.push_back({ Machine, {}, {} }); M = Machines.end() - 1; }
+                    auto Has = [&](const std::string& St) { return std::find(M->States.begin(), M->States.end(), St) != M->States.end(); };
+                    if (bState)
+                    {
+                        for (const auto& O : Machines)
+                            if (std::find(O.States.begin(), O.States.end(), Args[0]) != O.States.end())
+                            { *Err = Where + ": " + Args[0] + " is a state of " + O.Node + " already; a state's result node is its own"; bOk = false; return; }
+                        M->States.push_back(Args[0]);
+                        if (Helper == "UeConduit__") M->Conduits.insert(Args[0]);
+                        std::string Shown;
+                        if (const Json* L = Nth(*N, 3); L && FindLiteral(*L, Shown) && !Shown.empty()) M->Names[Args[0]] = Shown;
+                        return;
+                    }
+                    for (const std::string& St : { Args[0], Args[1] })
+                        if (!Has(St))
+                        { *Err = Where + ": " + St + " is no UE_STATE of " + Machine + " above this line"; bOk = false; return; }
+                    FConstVal Fade, Auto;
+                    if (!FoldConst(*Nth(*N, 5), Fade) || !FoldConst(*Nth(*N, 6), Auto))
+                    { *Err = Where + ": a transition's crossfade is a constant, in seconds"; bOk = false; return; }
+                    M->Transitions.push_back({ Args[0], Args[1], Args[2], float(Fade.bFloat ? Fade.F : double(Fade.I)), Auto.I != 0 });
+                    return;
+                }
                 if (bool bHandled = false; R.Widgets.empty())
                     if (const bool bBound = ComponentEvent(S, bHandled); bHandled) { bOk = bBound; return; }
                 const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
@@ -22909,7 +23060,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 for (const FInstSpec& I : Insts) if (!I.Local.empty()) Held.insert(I.Local);
                 const bool bOwnInstanced = !bThroughComponent && DR == &R && Part.empty() && !Element && Rhs
                                         && PointsAtInstanced(*Rhs, Held);
-                if (!bThroughComponent && DR == &R && !bOwnInstanced)
+                /* A part of an own anim node is that node's default, member by member (OwnParts). */
+                const bool bOwnPart = !bThroughComponent && DR == &R && !Part.empty() && !Element
+                                   && StripTypeKeywords(TypeOf(*Lhs)).compare(0, 10, "FAnimNode_") == 0;
+                if (!bThroughComponent && DR == &R && !bOwnInstanced && !bOwnPart)
                 { *Err = Where + ": " + Name(*Lhs) + " is declared here - give it an initializer instead"; bOk = false; return; }
                 /* An interface's variable is this class's own property when this class is the one implementing
                    it; below a parent that does, it is one more inherited property. */
@@ -23018,6 +23172,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 };
                 if (SlotOf) { Put(SlotOf->Defaults); return; }      // a tag of the slot's export, as its setter's
                 if (InstOf) { Put(*InstOf); return; }               // a tag of the instanced object's export
+                if (bOwnPart) { Put(OwnParts); return; }
                 /* A widget's event flags are the compiler's, set below from the class's own events (kWidgetEvents). A line
                    that says the same changes nothing, and this reference long asked for one beside a Tick override, so it
                    warns; one that says otherwise would be undone, as the editor's compile undoes it, so it is refused. */
@@ -23301,6 +23456,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         /* UE_DEFAULTS naming an interface's variable, or an own one it points at a UE_INSTANCED object, is this class's
            own default for it. */
         bool bInstancedDefault = false;
+        if (auto Part = std::find_if(OwnParts.begin(), OwnParts.end(), [&](const FPropertyDef& P) { return P.Name == PD.Name; });
+            &Decl == &R && Part != OwnParts.end())
+        {
+            if (First(*F))
+            { *Err = R.CppName + "::" + FieldName + " has an initializer and its constructor sets parts of it: give its value one way"; return false; }
+            PD.Default = Part->Default;
+            PD.Members = Part->Members;
+        }
         if (auto Own = OwnVarDefaults.find(FieldName); Own != OwnVarDefaults.end())
         {
             PD.Default = Own->second.Default;
@@ -23493,6 +23656,47 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
     for (const auto& V : ClassVars) BP.AddVariable(V.second);
+    /* The anim graph holds together: one output root, each UE_LINK on a node of this class, each machine's states. */
+    std::set<std::string> AnimNodes;
+    int32 Roots = 0;
+    for (const auto& V : ClassVars)
+        if (V.second.Type == "StructProperty" && V.second.StructName.compare(0, 9, "AnimNode_") == 0)
+        {
+            AnimNodes.insert(V.second.Name);
+            Roots += V.second.StructName == "AnimNode_Root";
+        }
+    if (!bIsAnim && (!AnimNodes.empty() || !Machines.empty()) && std::find(Ancestry.begin(), Ancestry.end(), "AnimInstance") != Ancestry.end())
+    { *Err = R.CppName + ": an Anim Blueprint names its skeleton, `UE_SKELETON(\"/Game/.../SK_Name_Skeleton\");`"; return false; }
+    if (bIsAnim)
+    {
+        if (Roots != 1)
+        { *Err = R.CppName + ": an Anim Blueprint has one FAnimNode_Root, its output pose, and this one has " + std::to_string(Roots); return false; }
+        std::function<bool(const FDefaultValue&)> LinksOk = [&](const FDefaultValue& D) {
+            if (!D.AnimNode.empty() && !AnimNodes.count(D.AnimNode))
+            { *Err = R.CppName + ": UE_LINK(" + D.AnimNode + ") names no anim node of this class"; return false; }
+            for (const FDefaultValue& I : D.Items) if (!LinksOk(I)) return false;
+            if (D.Members) for (const FPropertyDef& M : *D.Members) if (!LinksOk(M.Default)) return false;
+            return true;
+        };
+        std::function<bool(const FPropertyDef&)> DefOk = [&](const FPropertyDef& P) {
+            if (!LinksOk(P.Default)) return false;
+            if (P.Members) for (const FPropertyDef& M : *P.Members) if (!DefOk(M)) return false;
+            return true;
+        };
+        for (const auto& V : ClassVars) if (!DefOk(V.second)) return false;
+        for (const auto& V : ClassVars)     // a machine node no UE_STATE names would index no baked machine
+            if (V.second.Type == "StructProperty" && V.second.StructName == "AnimNode_StateMachine"
+                && std::none_of(Machines.begin(), Machines.end(), [&](const auto& M) { return M.Node == V.second.Name; }))
+            { *Err = R.CppName + ": the state machine " + V.second.Name + " has no UE_STATE"; return false; }
+        for (const FBlueprintClass::FStateMachine& M : Machines)
+        {
+            if (M.States.empty())
+            { *Err = R.CppName + ": the state machine " + M.Node + " has no UE_STATE"; return false; }
+            BP.AddStateMachine(M);
+        }
+    }
+    else if (!Machines.empty())
+    { *Err = R.CppName + ": UE_STATE and UE_TRANSITION wire an Anim Blueprint's state machine; this class is none"; return false; }
     if (R.bIsPatch)     // its own and its interfaces' variables, not a DefaultSceneRoot the game's class already has
         for (const auto& V : ClassVars)
             if (std::any_of(OwnedFields.begin(), OwnedFields.end(), [&](const FOwnedField& O) { return Name(*O.F) == V.second.Name; }))
@@ -24796,7 +25000,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
         Err->clear();
     }
-    RegistryRows.push_back({ PackageName, ClassOf(R), HasWidgetTree(R) ? "WidgetBlueprintGeneratedClass" : "BlueprintGeneratedClass",
+    RegistryRows.push_back({ PackageName, ClassOf(R), HasWidgetTree(R) ? "WidgetBlueprintGeneratedClass"
+                                                     : bIsAnim ? "AnimBlueprintGeneratedClass" : "BlueprintGeneratedClass",
                              ClassTags(PackageName, PackageOf(*B), ClassOf(*B), B, BP.NumReplicatedVars()) });
     printf("  %-14s -> %s.uasset  (%s %s)\n", R.CppName.c_str(), Shown(PackageName).c_str(),
            B->IsNative() ? "extends" : "extends BP", R.Base.c_str());
@@ -26226,6 +26431,10 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     for (const auto& Entry : Records)
         if (!Entry.second.IsNative() && !Entry.second.bIsStruct && HasWidgetTree(Entry.second))
             GameClassKinds[PackageOf(Entry.second) + "." + ClassOf(Entry.second)] = { "/Script/UMG", "WidgetBlueprintGeneratedClass" };
+    /* And a mod's Anim Blueprint (UE_SKELETON), this mod's or another's declared with UE_CLASS_IN. */
+    for (const auto& Entry : Records)
+        if (!Entry.second.bIsStruct && !Entry.second.bIsPatch && !Entry.second.Skeleton.empty())
+            GameClassKinds[PackageOf(Entry.second) + "." + ClassOf(Entry.second)] = { "/Script/Engine", "AnimBlueprintGeneratedClass" };
 
     GAg.Mark("package-name + asset checks");
     int32 Generated = 0;
@@ -26270,6 +26479,11 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (bSynthTextView)
     {
         if (!GenerateStruct(SynthTextView, OutDir, Err)) return false;
+        ++Generated;
+    }
+    if (bSynthI64View)
+    {
+        if (!GenerateStruct(SynthI64View, OutDir, Err)) return false;
         ++Generated;
     }
     for (const auto& Entry : SlotStructs)       // the TMap / TSet walks lowering made; see SlotView
