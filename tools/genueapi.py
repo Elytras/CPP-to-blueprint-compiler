@@ -15,6 +15,11 @@ names and defaults from it (game_enum_types, game_structs). --game may repeat: t
 Content folders of the installed mod paks, extracted, for the mods' own types the dump holds; a later one's package
 wins where two have it.
 
+A dump Dumper-7's fork took with PreloadAssets=1 has an SDK.unity beside its SDK folder: every file it generated in
+one, which genueapi reads instead of the files (open_unity), and a game section holding what --game reads, off the
+live objects (game_section). Without --game, that section stands in for it, and no extract of the build is needed;
+--game, where given, wins, and the two must give the same UeApi.
+
 The output's Version.json, written last, says which genueapi wrote it (GENUEAPI_VERSION), whether it had --game, and
 the engine and project the dump is of (dump_identity);
 the compiler refuses a UeApi older than it needs, and a class deriving from a game Blueprint against one without
@@ -23,6 +28,7 @@ the compiler refuses a UeApi older than it needs, and a class deriving from a ga
 The SDK dir must sit in its Dumper-7 dump, two levels under GObjects-Dump-WithProperties.txt (see read_real_fields);
 a copy elsewhere (DrgMods/SDK/SDK) has no object dump beside it."""
 import collections
+import functools
 import io
 import json
 import os
@@ -65,6 +71,65 @@ CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
 # 8: a native class's interfaces are its C++ bases after the first, not UeNativeInterfaces; more of them, from game
 #    Blueprints' calls on self. The compiler still takes 7: there a member call to an interface function does not compile.
 GENUEAPI_VERSION = 8
+
+# Every dump file genueapi reads, read once: by its path (sdk_key) -> its text, or its undecoded bytes from the dump's
+# SDK.unity (open_unity). The passes each read the same headers again (parse_header, read_enum_forms, ...), and on a
+# cold disk opening 7,000 files six times each was most of a run.
+SDK_FILES = {}
+SDK_DIRS = {}       # sdk_key(folder) -> the file names SDK.unity holds in it, as Dumper-7 spelled them
+
+
+def sdk_key(path):
+    return os.path.normcase(os.path.abspath(path))
+
+
+def open_unity(dump_dir):
+    """Indexes <dump>/SDK.unity, if the dump has one: Dumper-7's fork writes every file it generates into it, each after a
+    `//@file <size> <path under the dump>` line, and its game section as the file `@game` (JSON, see game_section).
+    Returns that section, or None without a unity dump or a game section in it."""
+    path = os.path.join(dump_dir, "SDK.unity")
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        blob = f.read()
+    at, game = 0, None
+    while at < len(blob):
+        end = blob.index(b"\n", at)
+        mark, size, name = blob[at:end].split(b" ", 2)
+        if mark != b"//@file":
+            sys.exit("%s: no //@file line at byte %d" % (path, at))
+        body, name = blob[end + 1:end + 1 + int(size)], name.decode("utf-8")
+        if name == "@game":
+            game = json.loads(body)
+        else:
+            full = os.path.join(dump_dir, name)
+            SDK_FILES[sdk_key(full)] = body
+            SDK_DIRS.setdefault(sdk_key(os.path.dirname(full)), []).append(os.path.basename(full))
+        at = end + 1 + int(size)
+    return game
+
+
+def sdk_text(path):
+    """A dump file's text, as io.open(path, encoding="utf-8", errors="replace").read() gives it, read once."""
+    key = sdk_key(path)
+    text = SDK_FILES.get(key)
+    if text is None:
+        with io.open(path, encoding="utf-8", errors="replace") as source:
+            text = source.read()
+    elif isinstance(text, bytes):
+        text = text.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")   # universal newlines
+    SDK_FILES[key] = text
+    return text
+
+
+def sdk_lines(path):
+    """sdk_text's lines with their ends, as iterating the open file gives them (str.splitlines splits on more)."""
+    return io.StringIO(sdk_text(path))
+
+
+def sdk_names(sdk_dir):
+    """The files in the SDK folder, sorted."""
+    return sorted(SDK_DIRS.get(sdk_key(sdk_dir)) or os.listdir(sdk_dir))
 
 
 def dump_identity(sdk_dir):
@@ -295,8 +360,7 @@ TRANSIENT = re.compile(r"[(,]\s*Transient\s*[,)]")     # CPF_Transient, not Dupl
 
 def parse_structs(path, pkg):
     """Collects every native enum and ScriptStruct of one *_structs.hpp into ENUMS / STRUCTS."""
-    with io.open(path, encoding="utf-8", errors="replace") as source:
-        text = source.read()
+    text = sdk_text(path)
     pending, size, cur_struct, cur_enum = None, 0, None, None
     for line in text.splitlines():
         m = ENUM_COMMENT.match(line)
@@ -395,19 +459,13 @@ def game_structs(own, content):
             why = "members"
         if not why:
             st.real = dict((n, r) for (_, n), r in zip(st.fields, names))
-            base = game_package(content, st.path.split(".")[0])
-            p = invariants.Package(base) if base else None
-            ex = [i for i in range(len(p.exports)) if p.class_of(i + 1) == "UserDefinedStruct"] if p else []
-            if not ex:
-                why = "no package"
-            elif p.struct(ex[0]).defaults is None:
-                # ponytail: an unversioned package's default instance is values in the struct's property order, which the
-                # dump does not record (S40); decoding it is the "unversioned" follow-up.
-                why = "unversioned defaults"
+            defaults = struct_defaults(content, st.path.split(".")[0])
+            if isinstance(defaults, str):
+                why = defaults
             else:
                 by_real = dict((r, n) for n, r in st.real.items())
                 types = dict((n, t) for t, n in st.fields)
-                for t in p.struct(ex[0]).defaults:
+                for t in defaults:
                     n, v = by_real.get(t["name"]), bytes(t["value"])
                     if t["type"] == "BoolProperty":
                         if t["bool"]:
@@ -461,6 +519,24 @@ def game_structs(own, content):
         "%s %d" % (w, c) for w, c in collections.Counter(w for _, w in dropped).most_common())))
 
 
+def struct_defaults(content, path):
+    """The default instance's tags of the UserDefinedStruct in the game's package at path, off the extract (--game) or
+    the unity dump's game section (a dict); or why there are none: "no package", "unversioned defaults"."""
+    if isinstance(content, dict):
+        row = content["user_structs"].get(path)
+        return "no package" if row is None else "unversioned defaults" if row["status"] else [
+            dict(name=n, type=t, value=bytes.fromhex(v), bool=b, enum=e) for n, t, v, b, e in row["defaults"]]
+    import invariants
+    base = game_package(content, path)
+    p = invariants.Package(base) if base else None
+    ex = [i for i in range(len(p.exports)) if p.class_of(i + 1) == "UserDefinedStruct"] if p else []
+    if not ex:
+        return "no package"
+    # ponytail: an unversioned package's default instance is values in the struct's property order, which the dump does
+    # not record (S40); decoding it is the "unversioned" follow-up.
+    return "unversioned defaults" if p.struct(ex[0]).defaults is None else p.struct(ex[0]).defaults
+
+
 def game_package(content, path):
     """The file base of the /Game package at path under the content roots (each --game), else None. A later root wins,
     as a mod pak mounted after the game's own replaces its asset."""
@@ -474,6 +550,9 @@ def game_package(content, path):
 def cooked_enum_names(content, path):
     """{value: cooked enumerator name, `NewEnumerator0`} of the UserDefinedEnum in the game's package at path, under
     the content roots (--game), the closing _MAX among them; None when there is no such package."""
+    if isinstance(content, dict):          # the unity dump's game section
+        rows = content["user_enums"].get(path)
+        return None if rows is None else dict((v, n) for v, n in rows)
     import invariants
     base = game_package(content, path)
     p = invariants.Package(base) if base else None
@@ -1074,12 +1153,12 @@ NUMBER_WORDS = ("Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "
 
 def read_real_fields(sdk_dir):
     path = os.path.join(sdk_dir, "..", "..", "GObjects-Dump-WithProperties.txt")
-    if not os.path.exists(path):
+    if sdk_key(path) not in SDK_FILES and not os.path.exists(path):
         # Without it every respelled member (UFSDSaveGame's Index_0) cooks by its C++ name, which the engine does not
         # know: its default and its reads are lost in game, silently. So no UeApi rather than that one.
         sys.exit("no %s: run genueapi on the SDK inside its Dumper-7 dump, not a copy of it" % os.path.normpath(path))
     cur, owner, sig = None, None, None
-    for line in io.open(path, encoding="utf-8", errors="replace"):
+    for line in sdk_lines(path):
         if not line.startswith("["):
             continue
         m = DUMP_PROPERTY.match(line)
@@ -1183,9 +1262,9 @@ def read_enum_forms(sdk_dir, game_forms):
     choice and so the one kept where they disagree. Properties our own mods have in a dump taken with them loaded are
     AssetGen's, and do not count."""
     seen, signatures = {}, set()
-    for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith(("_classes.hpp", "_structs.hpp", "_parameters.hpp"))):
+    for name in [f for f in sdk_names(sdk_dir) if f.endswith(("_classes.hpp", "_structs.hpp", "_parameters.hpp"))]:
         owner = None
-        for line in io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace"):
+        for line in sdk_lines(os.path.join(sdk_dir, name)):
             if line.startswith("// "):
                 m = ENUM_OWNER.match(line)
                 owner = m.group(1) if m else owner
@@ -1251,11 +1330,11 @@ OUT_ARRAYS = {}      # (package leaf, class, engine function name) -> [index amo
 
 
 def read_ref_parms(sdk_dir):
-    for name in os.listdir(sdk_dir):
+    for name in sdk_names(sdk_dir):
         if not name.endswith("_parameters.hpp"):
             continue
         cur, at = None, 0
-        for line in io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace"):
+        for line in sdk_lines(os.path.join(sdk_dir, name)):
             line = line.rstrip("\r\n")
             m = PARAM_FUNC.match(line)
             if m:
@@ -1462,8 +1541,7 @@ def bp_name(k):
 
 
 def parse_header(path):
-    with io.open(path, encoding="utf-8", errors="replace") as source:
-        text = source.read()
+    text = sdk_text(path)
     classes, cur, pending = [], None, None
     skipped = dict((k, 0) for k in KINDS)
     includes = []
@@ -1716,8 +1794,8 @@ def write_events(sdk_dir, out_dir):
     A game Blueprint's function has no row: every one is a BlueprintEvent, and its header marks what else an override
     takes (ACCESS, PURE, MARKS, `const`), which the compiler reads instead. Also collects PURE and NOT_CALLABLE."""
     rows = []
-    for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_functions.cpp")):
-        text = io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace").read()
+    for name in [f for f in sdk_names(sdk_dir) if f.endswith("_functions.cpp")]:
+        text = sdk_text(os.path.join(sdk_dir, name))
         stem = name[: -len("_functions.cpp")]
         # "// Function Pkg.Class.Real Name", its flags, an optional parameter block, then the wrapper Dumper-7 spelled.
         # The real name is everything after the second dot: it may hold spaces, and dots of its own.
@@ -1771,6 +1849,63 @@ GAME_INTERFACE_TYPES = set()        # Blueprint classes flagged CLASS_Interface 
 GAME_FUNCTIONS = {}                 # Blueprint class path -> the names of its own functions and events (scan_game)
 OBJECT_PATH = "/Script/CoreUObject.Object"
 DEFAULT_TAIL = (0, OBJECT_PATH, "Engine")   # UObject's: Object.h:57-60
+
+
+def game_section(game, container_members, ue="4.27"):
+    """scan_game off the unity dump's game section (Dumper-7's UnityGenerator.cpp), which holds the same facts read off
+    the live objects: the same maps filled, the same return. A default subobject the class's constructor destroyed
+    stays under the CDO in memory, dead, and the cook leaves it out: every FSD AI controller's PathFollowingComponent
+    (AFSDAIController's constructor calls DestroyComponent on it, FSD 0x141621D10). Its internal flags (subobject_info's
+    third element) say so: PendingKill in 4.27, Garbage in 5.x, where 1 << 29 is RefCounted (ObjectMacros.h)."""
+    dead = 1 << 29 if ue.startswith("4.") else 1 << 21
+    classes, enums = {}, dict((path, set(kinds)) for path, kinds in game["enum_props"].items())
+    for path, (flags, within, config, sup, interfaces) in game["classes"].items():
+        GAME_INTERFACES[path] = interfaces
+        if flags & 0x4000:
+            GAME_INTERFACE_TYPES.add(path)
+        classes[path] = (flags & SCRIPT_INHERIT, within, config, sup)
+        info = game.get("subobject_info", {}).get(path) or [[]] * len(game["subobjects"][path])
+        GAME_SUBOBJECTS[path] = [n for n, i in zip(game["subobjects"][path], info) if not (i[2:] and i[2] & dead)]
+        GAME_ICH_RECORDS[path] = game["ich"][path]
+        GAME_TEMPLATE_SUBOBJECTS[path] = game["templates"][path]
+    for sup, member, name in game["member_subobjects"]:
+        GAME_MEMBER_SUBOBJECTS.setdefault((sup, member), set()).add(name)
+    for owner, names in game["functions"].items():
+        GAME_FUNCTIONS.setdefault(owner, set()).update(names)
+    for cls, member, slot, kind in game["containers"]:
+        for enum, at in container_members.get(cls, {}).get(member, ()):
+            if at == slot:
+                enums.setdefault(enum, set()).add(kind)
+    overrides, self_calls = set(map(tuple, game["overrides"])), set(map(tuple, game["self_calls"]))
+    print("  game Blueprints off the unity dump: %d classes, %d native-super functions, %d native enums held, %d component "
+          "members named" % (len(classes), len(overrides), len(enums), len(GAME_MEMBER_SUBOBJECTS)))
+    if game["unread"]:
+        print("  game functions whose bytecode could not be read, their calls left out: %d, e.g. %s"
+              % (len(game["unread"]), "; ".join(game["unread"][:3])))
+    return classes, overrides, enums, self_calls
+
+
+def settle_subobjects(sdk_dir, respell):
+    """The three subobject lists in one order and one spelling, whichever route filled them. Order: the cook's export
+    order is lost in a running game (each linker is deleted after load), so both routes sort, case-insensitively.
+    Spelling: a package's name map keeps its own case of a name, the running game one per name for every package; the
+    unity dump can only have the second, so the cooked route (respell) takes it from the dump's object list."""
+    spell = {}
+    if respell:
+        for line in sdk_lines(os.path.join(sdk_dir, "..", "..", "GObjects-Dump-WithProperties.txt")):
+            m = DUMP_OBJECT.match(line)
+            for t in m.group(2).rstrip("\r\n").split(".") if m else ():
+                spell.setdefault(t.lower(), t)
+    word = re.compile(r"[^.:]+")     # a name may hold a space (`Terrain scanner Mesh`)
+
+    def respelled(s):
+        return word.sub(lambda m: spell.get(m.group(0).lower(), m.group(0)), s) if spell else s
+    for lists, tail in ((GAME_SUBOBJECTS, ""), (GAME_TEMPLATE_SUBOBJECTS, ""), (GAME_ICH_RECORDS, "_GEN_VARIABLE")):
+        for path, names in lists.items():
+            # "<class path> <name>", or the ICH's bare `<Var>`, respelled as the `<Var>_GEN_VARIABLE` it names
+            names = [" ".join(map(respelled, n.split(" ", 1))) if not tail else respelled(n + tail)[:len(n)]
+                     for n in names]
+            lists[path] = sorted(names, key=lambda n: (n.lower(), n))
 
 
 def scan_game(content, container_members):
@@ -2059,7 +2194,7 @@ def write_containers(classes, sdk_dir, out_dir):
     A method is const when its function is BlueprintPure, or reads the container into an out parameter: Keys / Values
     / ToArray / the set operations are BlueprintCallable in 4.27 but leave it alone, and a const function calls them."""
     reads = {"Map_Keys", "Map_Values", "Set_ToArray", "Set_Union", "Set_Difference", "Set_Intersection"}
-    text = io.open(os.path.join(sdk_dir, "Engine_functions.cpp"), encoding="utf-8", errors="replace").read()
+    text = sdk_text(os.path.join(sdk_dir, "Engine_functions.cpp"))
     flags = dict(((m.group(1), m.group(2)), m.group(3)) for m in FUNC_FLAGS.finditer(text))
     macros, structs, count = [], set(), 0
     for k in classes:
@@ -2128,7 +2263,12 @@ def main():
                     for n in (name, name[1:]):
                         DECLARED.add("/" + ns.replace("::", "/") + "/" + n)
 
-    for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_structs.hpp")):
+    # The dump's files are read off its SDK.unity where it has one. What the game's Blueprints hold is read off the
+    # extract (--game), else off the unity dump's game section: --game is the fallback, and the check of the section
+    # (both routes must write the same UeApi).
+    game_src = open_unity(os.path.join(sdk_dir, "..", ".."))
+    game_src = game_dir or game_src
+    for name in [f for f in sdk_names(sdk_dir) if f.endswith("_structs.hpp")]:
         parse_structs(os.path.join(sdk_dir, name), name[: -len("_structs.hpp")])
     read_real_fields(sdk_dir)
     # The packages the mods next to UeApi cook (UE_MOD_PACKAGE), not the rest of /Game/_ElytrasMods.
@@ -2136,12 +2276,12 @@ def main():
         m + "/" for f in os.listdir(mod_dir) if f.endswith((".cpp", ".h"))
         for m in re.findall(r'UE_MOD_PACKAGE\("([^"]+)"', io.open(os.path.join(mod_dir, f), encoding="utf-8-sig").read()))))
     # Before the struct members are mapped: a game struct may hold a game enum.
-    game_enum_types(own, game_dir)
+    game_enum_types(own, game_src)
     resolve_structs()
 
-    headers = sorted(f for f in os.listdir(sdk_dir) if f.endswith("_classes.hpp"))
+    headers = [f for f in sdk_names(sdk_dir) if f.endswith("_classes.hpp")]
     classes, totals, pathless = [], dict((k, 0) for k in KINDS), 0
-    game_structs(own, game_dir)
+    game_structs(own, game_src)
     read_ref_parms(sdk_dir)
     for name in headers:
         found, skipped, _ = parse_header(os.path.join(sdk_dir, name))
@@ -2194,8 +2334,10 @@ def main():
     old_unique = set(n for n, c in old_count.items() if c == 1 and n not in natives and n not in bp_names)
 
     by_name = dict((k.cpp, k) for k in classes)
-    game, overrides, game_enums, self_calls = scan_game(game_dir, container_enum_members(classes, by_name)) if game_dir \
+    scan = functools.partial(game_section, ue=dump_identity(sdk_dir)[0]) if isinstance(game_src, dict) else scan_game
+    game, overrides, game_enums, self_calls = scan(game_src, container_enum_members(classes, by_name)) if game_src \
         else ({}, set(), {}, set())
+    settle_subobjects(sdk_dir, game_src and scan is scan_game)
     map_subobjects(classes, by_name)
     read_enum_forms(sdk_dir, game_enums)
     for k in classes:
@@ -2628,10 +2770,10 @@ def main():
                 for is_static, _, fn, _ in k.funcs if is_static and fn.endswith("_DoubleDouble")) if UE5 else {}
     io.open(os.path.join(out_dir, "Version.json"), "w", encoding="utf-8", newline="\n").write(
         '{"genueapi": %d, "game": %s, "ue": "%s", "project": "%s"%s}\n'
-        % ((GENUEAPI_VERSION, "true" if game_dir else "false") + dump_identity(sdk_dir)
+        % ((GENUEAPI_VERSION, "true" if game_src else "false") + dump_identity(sdk_dir)
            + ((', "math": ' + json.dumps(math, sort_keys=True)) if math else "",)))
-    if not game_dir:
-        print("  no --game: no game Blueprint's interfaces, default subobjects or tail, so the compiler refuses a class deriving "
+    if not game_src:
+        print("  no --game and no game section in an SDK.unity: no game Blueprint's interfaces, default subobjects or tail, so the compiler refuses a class deriving "
               "from one")
 
     bp = [k for k in ordered if k.is_bp]
