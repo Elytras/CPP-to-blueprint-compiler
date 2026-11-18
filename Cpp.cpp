@@ -24994,6 +24994,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (R.bIsPatch) return TransplantFunctions(R, *B, P, BP.ClassIndex(), Err);
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     BP.ApiDescription = R.Doc;
+    /* A base with nothing callable of its own is still a type a stub names (a pin, a parent): the editor refuses a
+       stub that names a class it lacks, so a class another one here derives from gets its stub, empty or not. */
+    BP.bApiBase = std::any_of(Records.begin(), Records.end(),
+                              [&](const auto& Other) { return !Other.second.Base.empty() && Find(Other.second.Base) == &R; });
     if (ApiDir && !BP.WriteApi(ApiDirOf(PackageName), Err))
     {
         /* A class with nothing callable is not a build failure; the mod simply has no API surface. */

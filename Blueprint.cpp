@@ -1837,6 +1837,7 @@ bool FBlueprintClass::WriteApi(const std::string& OutDir, std::string* Err) cons
     Api.Categories = ApiCategory;
     Api.Docs = ApiDocs;
     Api.Description = ApiDescription;
+    Api.bBase = bApiBase;
     Api.bInterface = (ClassFlags & CLASS_Interface) != 0;
     Api.Interfaces = Interfaces;
     /* Only what the outside can see. The rest - the UberGraphFrame pointer above all - is

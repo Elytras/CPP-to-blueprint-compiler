@@ -625,7 +625,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
 
     /* A class with neither is not an API surface - most often a pure data holder or a class whose
        whole body is inlined - and an empty Blueprint would only be clutter in someone's project. */
-    if (Graphs.empty() && Vars.empty() && !bWidget && !Class.bOverrides)
+    if (Graphs.empty() && Vars.empty() && !bWidget && !Class.bOverrides && !Class.bBase)
     {
         if (Err) *Err = Class.AssetName + " exposes no callable function or variable";
         return false;
