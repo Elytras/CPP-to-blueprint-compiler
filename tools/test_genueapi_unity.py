@@ -10,7 +10,7 @@ import genueapi
 
 FILES = {"SDK/SDK/Engine_classes.hpp": b"\xef\xbb\xbf// Class /Script/Engine.Actor\r\nclass AActor\r\n{\r\n};\r\n",
          "SDK/SDK/Engine_structs.hpp": "// é \xff\n".encode("utf-8") + b"\xff\xfe tail",
-         "GObjects-Dump-WithProperties.txt": b"[0001] {0x1} Class /Script/Engine.Actor\n"}
+         "GObjects-Dump-WithProperties.txt": b"[00000001] {0x1} Class /Script/Engine.Actor\n"}
 GAME = {"classes": {"/Game/A.A_C": [0, "/Script/CoreUObject.Object", "Engine", "/Script/Engine.Actor", []]}}
 
 
@@ -42,6 +42,24 @@ class Unity(unittest.TestCase):
             for n, text in on_disk.items():
                 self.assertEqual(genueapi.sdk_text(os.path.join(dump, n)), text, n)
             self.assertEqual(list(genueapi.sdk_lines(os.path.join(sdk, "Engine_classes.hpp")))[1], "class AActor\n")
+
+    def test_subobjects_sorted_in_the_dump_spelling(self):
+        dump_list = (b"[00000001] {0x1} Class /Script/Engine.SceneComponent\n"
+                     b"[00000002] {0x2} SceneComponent /Game/A.A_C.particle_Trail_GEN_VARIABLE\n"
+                     b"[00000004] {0x4} SceneComponent /Game/A.A_C.Terrain scanner mesh_GEN_VARIABLE\n"
+                     b"[00000003] {0x3} SceneComponent /Game/A.Default__A_C.temperature\n")
+        cdo = {"/Game/A.A_C": ["/Script/Engine.SceneComponent Temperature", "/Script/Engine.scenecomponent Root"]}
+        ich = {"/Game/A.A_C": ["Particle_Trail", "Terrain scanner Mesh"]}
+        with tempfile.TemporaryDirectory() as dump, patch.object(genueapi, "SDK_FILES", {}), \
+                patch.object(genueapi, "SDK_DIRS", {}), patch.object(genueapi, "GAME_SUBOBJECTS", dict(cdo)), \
+                patch.object(genueapi, "GAME_ICH_RECORDS", dict(ich)), \
+                patch.object(genueapi, "GAME_TEMPLATE_SUBOBJECTS", {}):
+            with open(os.path.join(dump, "GObjects-Dump-WithProperties.txt"), "wb") as f:
+                f.write(dump_list)
+            genueapi.settle_subobjects(os.path.join(dump, "SDK", "SDK"), True)
+            self.assertEqual(genueapi.GAME_SUBOBJECTS["/Game/A.A_C"],
+                             ["/Script/Engine.SceneComponent Root", "/Script/Engine.SceneComponent temperature"])
+            self.assertEqual(genueapi.GAME_ICH_RECORDS["/Game/A.A_C"], ["particle_Trail", "Terrain scanner mesh"])
 
     def test_no_unity(self):
         with tempfile.TemporaryDirectory() as dump:

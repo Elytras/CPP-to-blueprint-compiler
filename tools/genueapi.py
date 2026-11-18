@@ -1879,6 +1879,29 @@ def game_section(game, container_members):
     return classes, overrides, enums, self_calls
 
 
+def settle_subobjects(sdk_dir, respell):
+    """The three subobject lists in one order and one spelling, whichever route filled them. Order: the cook's export
+    order is lost in a running game (each linker is deleted after load), so both routes sort, case-insensitively.
+    Spelling: a package's name map keeps its own case of a name, the running game one per name for every package; the
+    unity dump can only have the second, so the cooked route (respell) takes it from the dump's object list."""
+    spell = {}
+    if respell:
+        for line in sdk_lines(os.path.join(sdk_dir, "..", "..", "GObjects-Dump-WithProperties.txt")):
+            m = DUMP_OBJECT.match(line)
+            for t in m.group(2).rstrip("\r\n").split(".") if m else ():
+                spell.setdefault(t.lower(), t)
+    word = re.compile(r"[^.:]+")     # a name may hold a space (`Terrain scanner Mesh`)
+
+    def respelled(s):
+        return word.sub(lambda m: spell.get(m.group(0).lower(), m.group(0)), s) if spell else s
+    for lists, tail in ((GAME_SUBOBJECTS, ""), (GAME_TEMPLATE_SUBOBJECTS, ""), (GAME_ICH_RECORDS, "_GEN_VARIABLE")):
+        for path, names in lists.items():
+            # "<class path> <name>", or the ICH's bare `<Var>`, respelled as the `<Var>_GEN_VARIABLE` it names
+            names = [" ".join(map(respelled, n.split(" ", 1))) if not tail else respelled(n + tail)[:len(n)]
+                     for n in names]
+            lists[path] = sorted(names, key=lambda n: (n.lower(), n))
+
+
 def scan_game(content, container_members):
     """What the game's cooked Blueprints show that the dump does not: {class path: (its ScriptInherit ClassFlags,
     ClassWithin, ClassConfigName, super path)}, and each (class path, interface path) where a function of the class
@@ -2308,6 +2331,7 @@ def main():
     scan = game_section if isinstance(game_src, dict) else scan_game
     game, overrides, game_enums, self_calls = scan(game_src, container_enum_members(classes, by_name)) if game_src \
         else ({}, set(), {}, set())
+    settle_subobjects(sdk_dir, game_src and scan is scan_game)
     map_subobjects(classes, by_name)
     read_enum_forms(sdk_dir, game_enums)
     for k in classes:
