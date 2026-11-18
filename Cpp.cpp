@@ -15203,18 +15203,55 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     for (size_t I = 0; I < Args.size(); ++I) Args[I] = DefaultedArg(*Args[I], Parms[I]);
     /* A member pointer argument (`&AMyActor::Health`) is no value either: the parameter names that field. The body is
        copied with each use of the parameter replaced by the `&C::F` itself, and `O->*F` / `O.*F` becomes `O->Health` /
-       `O.Health`, as if written so; a body that passes it on (`SetFields(O, Rest...)`) hands its callee the same
-       `&C::F`. So `O->*F = V` compiles to what `O->Health = V` does. */
+       `O.Health`, as if written so. So `O->*F = V` compiles to what `O->Health = V` does.
+       A field-and-value pair, `Assign(&AMyActor::Health, 100.f)` (Objects.h's TAssign), is the same field plus a value:
+       its parameter P has no local either. `P.Field` is the `&C::F`, and `P.Value` reads a parameter made for it here,
+       bound to the value like any other. A body that passes either on (`SetFields(O, Rest...)`) hands its callee the
+       same field, and a pair as an AgAssignPair node holding the field and that value parameter. */
     std::vector<bool> MemPtr(Parms.size());
-    Json MemPtrBody;
+    Json MemPtrBody, MemPtrDef;
+    std::deque<Json> Made;      // the value parameters made for pairs, and their arguments
     {
-        std::map<std::string, const Json*> FieldOf;     // a parameter's id -> the `&C::F` it is bound to
-        for (size_t I = 0; I < Parms.size(); ++I)
-        {
-            if (TypeOf(*Parms[I]).find("::*") == std::string::npos) continue;
-            const Json* A = Strip(Args[I]);
+        struct FPair { const Json* Field; Json ValueRef; };
+        std::map<std::string, const Json*> FieldOf;     // a member pointer parameter's id -> the `&C::F` it is bound to
+        std::map<std::string, FPair> PairOf;            // a pair parameter's id -> its field and its value's parameter
+        auto IsFieldRef = [](const Json* A) {
             const Json* F = A && Kind(*A) == "UnaryOperator" && A->value("opcode", std::string()) == "&" ? Strip(First(*A)) : nullptr;
-            if (!F || Kind(*F) != "DeclRefExpr" || !F->contains("referencedDecl") || (*F)["referencedDecl"].value("kind", std::string()) != "FieldDecl")
+            return F && Kind(*F) == "DeclRefExpr" && F->contains("referencedDecl") && (*F)["referencedDecl"].value("kind", std::string()) == "FieldDecl";
+        };
+        const size_t NumParms = Parms.size();
+        for (size_t I = 0; I < NumParms; ++I)
+        {
+            const std::string Type = StripTypeKeywords(TypeOf(*Parms[I]));
+            if (Type.compare(0, 8, "TAssign<") == 0)
+            {
+                /* `Assign(&C::F, V)` written at the call, or a pair an outer expansion passed on. */
+                const Json* A = Strip(Args[I]);
+                const Json* FieldArg = nullptr, *ValueArg = nullptr;
+                if (A && Kind(*A) == "AgAssignPair") { FieldArg = &(*A)["inner"][0]; ValueArg = &(*A)["inner"][1]; }
+                else if (const Json* Callee = A && Kind(*A) == "CallExpr" ? Strip(First(*A)) : nullptr;
+                         Callee && Kind(*Callee) == "DeclRefExpr" && Name((*Callee)["referencedDecl"]) == "Assign" && (*A)["inner"].size() == 3)
+                { FieldArg = &(*A)["inner"][1]; ValueArg = &(*A)["inner"][2]; }
+                if (!FieldArg || !IsFieldRef(Strip(FieldArg)))
+                {
+                    *Err = "TODO: " + Method + " takes a field and its value, which can only be `Assign(&AMyActor::Health, Value)` "
+                           "written where it is passed, with the field named there";
+                    return false;
+                }
+                const std::string Id = Parms[I]->value("id", std::string());
+                Json& VP = Made.emplace_back(Json{ {"id", Id + ":Value"}, {"kind", "ParmVarDecl"}, {"name", Name(*Parms[I]) + "_Value"},
+                                                   {"type", (*ValueArg)["type"]} });
+                Parms.push_back(&VP);
+                Args.push_back(ValueArg);
+                Json Ref = { {"kind", "DeclRefExpr"}, {"type", (*ValueArg)["type"]}, {"valueCategory", "lvalue"},
+                             {"referencedDecl", { {"id", VP["id"]}, {"kind", "ParmVarDecl"}, {"name", VP["name"]}, {"type", VP["type"]} }} };
+                PairOf[Id] = { Strip(FieldArg), std::move(Ref) };
+                MemPtr[I] = true;
+                continue;
+            }
+            if (Type.find("::*") == std::string::npos) continue;
+            const Json* A = Strip(Args[I]);
+            if (!IsFieldRef(A))
             {
                 *Err = "TODO: " + Method + " takes a member pointer, which can only be a field named where it is passed "
                        "(`&AMyActor::Health`), not a variable or a method";
@@ -15223,12 +15260,36 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
             MemPtr[I] = true;
             FieldOf[Parms[I]->value("id", std::string())] = A;
         }
+        MemPtr.resize(Parms.size());
+        WcoDefault.resize(Parms.size());
+        auto PairParm = [&](const Json* N) -> const FPair* {
+            N = Strip(N);
+            if (!N || Kind(*N) != "DeclRefExpr" || !N->contains("referencedDecl")) return nullptr;
+            const auto It = PairOf.find((*N)["referencedDecl"].value("id", std::string()));
+            return It == PairOf.end() ? nullptr : &It->second;
+        };
         std::function<void(Json&)> Sub = [&](Json& N) {
             if (N.is_array()) { for (Json& C : N) Sub(C); return; }
             if (!N.is_object()) return;
+            if (Kind(N) == "MemberExpr" && N.contains("inner"))
+                if (const FPair* P = PairParm(&N["inner"][0]))
+                {
+                    if (Name(N) == "Field") { N = *P->Field; return; }
+                    if (Name(N) == "Value") { Json R = P->ValueRef; R["id"] = N.value("id", std::string()); N = std::move(R); return; }
+                }
             if (Kind(N) == "DeclRefExpr" && N.contains("referencedDecl"))
-                if (const auto It = FieldOf.find(N["referencedDecl"].value("id", std::string())); It != FieldOf.end())
-                { N = *It->second; return; }
+            {
+                const std::string Id = N["referencedDecl"].value("id", std::string());
+                if (const auto It = FieldOf.find(Id); It != FieldOf.end()) { N = *It->second; return; }
+                if (const auto It = PairOf.find(Id); It != PairOf.end())
+                {
+                    /* The value is read where the pair is passed, as a by-value argument's is (OnlyRead). */
+                    Json Read = { {"kind", "ImplicitCastExpr"}, {"type", It->second.ValueRef["type"]}, {"valueCategory", "prvalue"},
+                                  {"castKind", "LValueToRValue"}, {"inner", Json::array({ It->second.ValueRef })} };
+                    N = { {"kind", "AgAssignPair"}, {"type", N["type"]}, {"inner", Json::array({ *It->second.Field, std::move(Read) })} };
+                    return;
+                }
+            }
             if (const auto In = N.find("inner"); In != N.end()) Sub(*In);
             const std::string Op = Kind(N) == "BinaryOperator" ? N.value("opcode", std::string()) : std::string();
             if (Op != "->*" && Op != ".*") return;
@@ -15243,7 +15304,17 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
             if (N.contains("range")) M["range"] = N["range"];
             N = std::move(M);
         };
-        if (!FieldOf.empty()) { MemPtrBody = *Body; Sub(MemPtrBody); Body = &MemPtrBody; }
+        if (!FieldOf.empty() || !PairOf.empty())
+        {
+            MemPtrBody = *Body;
+            Sub(MemPtrBody);
+            Body = &MemPtrBody;
+            /* What reads how the body uses a parameter (ArgumentsInPlace) reads this body too. */
+            MemPtrDef = *ReadDef;
+            for (Json& C : MemPtrDef["inner"]) if (Kind(C) == "CompoundStmt") C = MemPtrBody;
+            for (const Json& VP : Made) MemPtrDef["inner"].push_back(VP);
+            ReadDef = &MemPtrDef;
+        }
     }
     /* A lambda being called is the object `lambdaObj` (RewriteLambdaCalls). A closure passed as an argument is no
        value either: the parameter it binds is that lambda, with no local and no copy, and each call of the parameter

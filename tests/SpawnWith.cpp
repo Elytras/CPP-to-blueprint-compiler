@@ -7,6 +7,9 @@ UE_MOD_PACKAGE("/Game/_ElytrasMods/SpawnWith");
 /* The one-call deferred forms (SpawnActorWith, AddComponentWith, CreateWidgetWith, NewObjectWith) beside the two-step
    form each is written out as: each pair of functions must compile to the same bytecode. */
 
+/* A member pointer through an inline helper of the mod's own: `O->*F = V` is `O->Tag = V`. */
+template <class C, class M> inline void Put(C *O, M C::*F, M V) { O->*F = V; }
+
 class UWithCharges : public UActorComponent {
 public:
   int32 Left = 3;
@@ -40,8 +43,8 @@ public:
 
   /* Fields set in the order written, a parent's (Team) among them; Last keeps the actor past the spawn. */
   void ActorWith(FTransform Where) {
-    SpawnWith *Twin = SpawnActorWith<SpawnWith>(SpawnWith::StaticClass(), Where, &SpawnWith::Health, 100.f,
-                                                &SpawnWith::Tag, 7, &SpawnWith::Team, 2);
+    SpawnWith *Twin = SpawnActorWith<SpawnWith>(SpawnWith::StaticClass(), Where, Assign(&SpawnWith::Health, 100.f),
+                                                Assign(&SpawnWith::Tag, 7), Assign(&SpawnWith::Team, 2));
     Last = Twin;
   }
   void ActorHand(FTransform Where) {
@@ -54,7 +57,7 @@ public:
   }
 
   void ComponentWith() {
-    UWithCharges *C = AddComponentWith<UWithCharges>(this, &UWithCharges::Left, 5, &UWithCharges::Rate, 0.5f);
+    UWithCharges *C = AddComponentWith<UWithCharges>(this, Assign(&UWithCharges::Left, 5), Assign(&UWithCharges::Rate, 0.5f));
     Charges = C;
   }
   void ComponentHand() {
@@ -66,7 +69,7 @@ public:
   }
 
   void WidgetWith(APlayerController *Player) {
-    UWithHud *W = CreateWidgetWith<UWithHud>(Player, &UWithHud::Score, 42);
+    UWithHud *W = CreateWidgetWith<UWithHud>(Player, Assign(&UWithHud::Score, 42));
     Hud = W;
   }
   void WidgetHand(APlayerController *Player) {
@@ -75,8 +78,10 @@ public:
     Hud = W;
   }
 
+  void PutTag() { Put(this, &SpawnWith::Tag, 3); }
+
   void ObjectWith() {
-    UWithProbe *O = NewObjectWith<UWithProbe>(this, &UWithProbe::Seen, 9, &UWithProbe::Label, FString("made"));
+    UWithProbe *O = NewObjectWith<UWithProbe>(this, Assign(&UWithProbe::Seen, 9), Assign(&UWithProbe::Label, FString("made")));
     Probe = O;
   }
   void ObjectHand() {

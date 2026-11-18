@@ -7607,6 +7607,10 @@ def spawn_with():
     ], vm.log
     assert (twin.vars['Health'], twin.vars['Tag'], twin.vars['Team']) == (100.0, 7, 2), twin.vars
     assert (comp.vars['Left'], comp.vars['Rate'], hud.vars['Score'], probe.vars['Seen'], probe.vars['Label']) == (5, 0.5, 42, 9, 'made')
+    # A member pointer passed to an inline function of the mod's own names its field: `O->*F = V` is `O->Tag = V`.
+    proves('templates.member-pointer-argument')
+    vm.call('PutTag')
+    assert me.vars['Tag'] == 3, me.vars
     print('ok  SpawnWith: the one-call spawn / add / create / construct forms are their two-step forms, sets in order')
 
 
@@ -17637,16 +17641,19 @@ ROW_REFUSALS = [
     ('components-a-parent.controller-battachtopawn-true', 'PawnCtl', '  UE_DEFAULTS { Controller->bAttachToPawn = true; }\n',
      'UeApi does not say which default subobject Controller is', '', 'APawn'),
     ('objects-and-widgets.newobject-aactor-this', 'NewObjActor', '  AActor *F() { return NewObject<AActor>(this); }\n', 'no matching function', ''),
-    ('spawning-actors.spawnactorwith-wrong', 'WithType', '  int32 Tag;\n  void F(FTransform W) { SpawnActorWith<WithType>(WithType::StaticClass(), W, &WithType::Tag, FVector()); }\n',
+    ('spawning-actors.spawnactorwith-wrong', 'WithType', '  int32 Tag;\n  void F(FTransform W) { SpawnActorWith<WithType>(WithType::StaticClass(), W, Assign(&WithType::Tag, FVector())); }\n',
      "the value does not convert to the field's type", OBJECTS),
-    ('spawning-actors.spawnactorwith-wrong', 'WithNone', '  void F(FTransform W) { SpawnActorWith<WithNone>(WithNone::StaticClass(), W, &WithNone::Nope, 1); }\n',
+    ('spawning-actors.spawnactorwith-wrong', 'WithNone', '  void F(FTransform W) { SpawnActorWith<WithNone>(WithNone::StaticClass(), W, Assign(&WithNone::Nope, 1)); }\n',
      "no member named 'Nope' in 'WithNone'", OBJECTS),
-    ('spawning-actors.spawnactorwith-wrong', 'WithOdd', '  int32 Tag;\n  void F(FTransform W) { SpawnActorWith<WithOdd>(WithOdd::StaticClass(), W, &WithOdd::Tag); }\n',
-     'give each field with its value', OBJECTS),
-    ('spawning-actors.spawnactorwith-wrong', 'WithOther', '  void F(FTransform W) { SpawnActorWith<WithOther>(WithOther::StaticClass(), W, &AOther::Tag, 1); }\n',
+    ('spawning-actors.spawnactorwith-wrong', 'WithOdd', '  int32 Tag;\n  void F(FTransform W) { SpawnActorWith<WithOdd>(WithOdd::StaticClass(), W, &WithOdd::Tag, 1); }\n',
+     'give each field and its value as Assign(&T::Field, Value)', OBJECTS),
+    ('spawning-actors.spawnactorwith-wrong', 'WithOther', '  void F(FTransform W) { SpawnActorWith<WithOther>(WithOther::StaticClass(), W, Assign(&AOther::Tag, 1)); }\n',
      "the field is not a member of the object's class", OBJECTS + 'class AOther : public AActor {\npublic:\n  int32 Tag;\n};\n'),
-    ('templates.member-pointer-variable', 'WithVar', '  int32 Tag;\n  int32 Other;\n  void F(bool B) { SetFields(this, B ? &WithVar::Tag : &WithVar::Other, 1); }\n',
-     'takes a member pointer, which can only be a field named where it is passed', OBJECTS),
+    ('templates.member-pointer-variable', 'WithVar', '  int32 Tag;\n  int32 Other;\n  void F(FTransform W, bool B) { SpawnActorWith<WithVar>(WithVar::StaticClass(), W, Assign(B ? &WithVar::Tag : &WithVar::Other, 1)); }\n',
+     'takes a field and its value, which can only be `Assign(', OBJECTS),
+    ('templates.member-pointer-variable', 'WithVarBare', '  int32 Tag;\n  int32 Other;\n  void F(bool B) { Put(this, B ? &WithVarBare::Tag : &WithVarBare::Other, 1); }\n',
+     'takes a member pointer, which can only be a field named where it is passed',
+     'template <class C, class M> inline void Put(C *O, M C::*F, M V) { O->*F = V; }\n'),
     ('uobject-helpers.obj-class', 'ObjClass', '  void F(UObject *Obj) { auto C = Obj->Class; }\n', "no member named 'Class' in 'UObject'", ''),
     ('pointing-at-data.float-h-md-big-health', 'AssetRead', '  float F() { float H = MD_Big.Health; return H; }\n', 'is an asset, not a value',
      'class UMoodDef : public UPrimaryDataAsset {\npublic:\n  float Health = 1.0f;\n};\nUMoodDef MD_Big = {.Health = 5.0f};\n'),
