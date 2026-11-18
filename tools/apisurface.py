@@ -12,7 +12,11 @@ each struct's fields and each enum's entries.
 The baseline (`api_contract.baseline`) is the surface and the versions of the last release. --check compares the build
 with it, per API: anything of the baseline gone or changed (a struct changed at all) needs a higher Major; only
 additions (a class, a function or variable, an enum entry at the end) a higher Minor (or Major); nothing changed, nothing.
-bpbuild runs --check for such a mod and packs no pak that fails it. --write records the build as the release."""
+bpbuild runs --check for such a mod and packs no pak that fails it. --write records the build as the release.
+
+Each run also writes build/<mod>/apiindex.jsonl: one JSON object a line, sorted by id, for every class, struct, enum,
+function, event, variable and cvar of the mod's packages (and `api_contract.index_with`'s), with its source line
+(index()). Generated, never edited: docq's EMM API index reads it."""
 import json, os, re, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -175,12 +179,149 @@ def check(baseline, now, numbers):
     return problems
 
 
+VISIBLE = {'/Game/_Interop/': 'public', '/Game/_ElytrasMods/': 'internal'}
+
+
+def source_lines(dirs):
+    """Every C++ class, struct and enum definition under dirs: name -> [(file, line, its body's lines, its C++ parent)],
+    file relative to the mods dir. A body runs to the first `};` at the start of a line; forward declarations (with a
+    `;`) are left out."""
+    decl = re.compile(r'^(?:class|struct)\s+(\w+)\b[^;]*$|^enum\s+class\s+(\w+)\b[^;]*$')
+    parent = re.compile(r':\s*public\s+(?:::)?(?:\w+::)*(\w+)')
+    out = {}
+    for d, rel in dirs:
+        for root, _dirs, files in os.walk(d):
+            for f in sorted(files):
+                if not f.endswith(('.h', '.cpp')):
+                    continue
+                path = os.path.join(root, f)
+                lines = open(path, encoding='utf-8-sig', errors='replace').read().split('\n')
+                for n, line in enumerate(lines):
+                    m = decl.match(line)
+                    if m:
+                        end = next((k for k in range(n + 1, len(lines)) if lines[k].startswith('};')), len(lines))
+                        name = os.path.relpath(path, rel).replace(os.sep, '/')
+                        up = parent.search(line)
+                        out.setdefault(m.group(1) or m.group(2), []).append((name, n + 1, lines[n + 1:end], up and up.group(1)))
+    return out
+
+
+def cvars(dirs, rel):
+    """Every `GetCvar<T>(ctx, "Name", default)` / SetCvar name under dirs: name -> (type, default, file:line), the first
+    GetCvar's default."""
+    pat = re.compile(r'\b(Get|Set)Cvar<([^>]+)>\(\s*[^,()]+,\s*"([^"]+)"(?:\s*,\s*([^;]*?))?\)\s*[;),]')
+    out = {}
+    for d in dirs:
+        for root, _dirs, files in os.walk(d):
+            for f in sorted(files):
+                if not f.endswith(('.h', '.cpp')):
+                    continue
+                path = os.path.join(root, f)
+                for n, line in enumerate(open(path, encoding='utf-8-sig', errors='replace')):
+                    for verb, t, name, default in pat.findall(line):
+                        where = '%s:%d' % (os.path.relpath(path, rel).replace(os.sep, '/'), n + 1)
+                        have = out.get(name)
+                        if have is None or (verb == 'Get' and have[1] is None):
+                            out[name] = (t.strip(), default.strip() if verb == 'Get' else None, have[2] if have else where)
+    return out
+
+
+def index(whole, spec, decls, cvar_map):
+    """One row per symbol of whole (surface()), sorted by id, for docq's EMM API index: id (the cooked path, a member
+    after ':'), kind (class / struct / enum / function / event / property / cvar), owner, signature, visibility (public
+    under /Game/_Interop, internal under /Game/_ElytrasMods), api (the manifest's, or null) and source (file:line, or
+    null when no definition of that name was found: an enemy template's members are the game Blueprint's own, which no
+    C++ declares)."""
+    prefixes = sorted(((p.rstrip('/'), api) for api, ps in spec['apis'].items() for p in ps), key=lambda x: -len(x[0]))
+
+    def located(path, name):
+        # The definition of name, the one whose file sits under the package's folder when there are several.
+        found = (decls.get(name) or decls.get('F' + name) or decls.get('E' + name)
+                 or decls.get(name[1:] if name[:1] in 'FE' else '') or [])
+        folder = path.split('.')[0].rsplit('/', 2)[-2]
+        return next((x for x in found if '/%s/' % folder in '/' + x[0]), found[0] if found else None)
+
+    rows = []
+    for part, items in whole.items():
+        for path, value in items.items():
+            package = path.split('.')[0]
+            visibility = next((v for pre, v in VISIBLE.items() if package.startswith(pre)), None)
+            if visibility is None:
+                continue                        # another mod's packages EMM embeds (_ModHub)
+            api = next((a for pre, a in prefixes if package == pre or package.startswith(pre + '/')), None)
+            name = path.rsplit('.', 1)[-1]
+            name = name[:-2] if name.endswith('_C') else name
+            where = located(path, name)
+            source = '%s:%d' % where[:2] if where else None
+            base = dict(visibility=visibility, api=api)
+            if part == 'structs':
+                rows.append(dict(base, id=path, kind='struct', owner=package.rsplit('/', 2)[-2], source=source,
+                                 signature='{%s}' % ', '.join('%s %s' % (t, n) for n, t in value.items())))
+                continue
+            if part == 'enums':
+                rows.append(dict(base, id=path, kind='enum', owner=package.rsplit('/', 2)[-2], source=source,
+                                 signature='{%s}' % ', '.join(value)))
+                continue
+            rows.append(dict(base, id=path, kind='class', owner=package.rsplit('/', 2)[-2], source=source,
+                             signature=' : '.join([name, ', '.join([value['super']] + value['interfaces'])])))
+            def member(m, at=where, depth=0):
+                # In the class's body, else up its C++ parents (an enemy template's members are the game class's, in
+                # UeApi), a few levels.
+                if at is None or depth > 4:
+                    return None
+                n = next((k for k, line in enumerate(at[2]) if re.search(r'\b%s\b' % re.escape(m), line)
+                          and not line.lstrip().startswith(('//', '*', '/*'))), None)
+                if n is not None:
+                    return '%s:%d' % (at[0], at[1] + 1 + n)
+                up = (decls.get(at[3]) or [None])[0] if at[3] else None
+                return member(m, up, depth + 1)
+            for fn, f in value['functions'].items():
+                params = ', '.join('%s %s%s' % (t, p, ' out' if rest else '') for p, t, *rest in f['params'])
+                rows.append(dict(base, id='%s:%s' % (path, fn), owner=name, source=member(fn.replace('__DelegateSignature', '')),
+                                 kind='event' if 'Event' in f['flags'] or 'Delegate' in f['flags'] else 'function',
+                                 signature='%s(%s)%s%s' % (fn, params, ' -> ' + ', '.join(f['returns']) if f['returns'] else '',
+                                                            ' [%s]' % ' '.join(f['flags']) if f['flags'] else '')))
+            for pn, t in value['properties'].items():
+                rows.append(dict(base, id='%s:%s' % (path, pn), owner=name, source=member(pn),
+                                 kind='event' if t.startswith('Multicast') else 'property', signature='%s %s' % (t, pn)))
+    for name, (t, default, where) in cvar_map.items():
+        rows.append(dict(id='cvar:' + name, kind='cvar', owner='Savegame', visibility='internal', api=None, source=where,
+                         signature='%s %s%s' % (t, name, ' = ' + default if default else '')))
+    return sorted(rows, key=lambda r: r['id'])
+
+
+def write_index(bp, mod, whole):
+    """The index of mod's symbols at build/<mod>/apiindex.jsonl, a JSON object a line (index()), made anew each build."""
+    import yaml
+    mods = yaml.safe_load(open(os.path.join(bp, 'mods.yaml'), encoding='utf-8-sig'))['mods']
+    dirs = sorted({os.path.join(bp, os.path.dirname(s)) for m in mods for s in m.get('sources') or []} |
+                  {os.path.join(bp, 'UeApi', 'Game')})
+    own = [os.path.join(bp, os.path.dirname(s)) for s in mod['sources']]
+    # Mods whose packages this one's pak carries (api_contract.index_with), read off their own builds when made:
+    whole = json.loads(json.dumps(whole))
+    for other in mod['api_contract'].get('index_with') or []:
+        content = os.path.join(bp, 'build', other, 'FSD', 'Content')
+        if os.path.isdir(content):
+            for part, items in surface(content, None).items():
+                whole[part].update(items)
+        else:
+            print('%-16s apisurface: no build of %s for the index (bpbuild.py --only %s)' % (mod['name'], other, other))
+    rows = index(whole, mod['manifest'], source_lines([(d, bp) for d in dirs]), cvars(own, bp))
+    out = os.path.join(bp, 'build', mod['name'], 'apiindex.jsonl')
+    with open(out, 'w', encoding='utf-8', newline='\n') as f:
+        f.writelines(json.dumps(r, sort_keys=True, ensure_ascii=False) + '\n' for r in rows)
+    return out, rows
+
+
 def run(bp, mod, stage_content, write=False):
     """bpbuild's call, and the CLI's: True when the build may be packed."""
     contract, spec = mod['api_contract'], mod['manifest']
     baseline_path = os.path.join(bp, contract['baseline'])
     stubs = os.path.join(bp, mod['api_dir']) if mod.get('api_dir') else None
-    now = by_api(surface(stage_content, stubs), spec)
+    whole = surface(stage_content, stubs)
+    out, rows = write_index(bp, mod, whole)
+    print('%-16s apisurface: %d symbols -> %s' % (mod['name'], len(rows), os.path.relpath(out, bp)))
+    now = by_api(whole, spec)
     numbers = versions(os.path.join(bp, contract['versions']), spec['apis'])
     if write:
         record = {api: dict(version=numbers[api], surface=now[api]) for api in now}
