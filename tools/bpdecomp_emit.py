@@ -467,7 +467,16 @@ class ClassEmit:
                 if idx > 0 and s.pkg.exports[idx - 1]['outer'] in (s.st.cdo, s.a.export + 1) \
                         and not instanced_export(s.pkg, idx - 1): continue
             v = vals.tag(s.pkg, t, s.class_prop(s.pkg.exports[i]['cls'], t['name']), s.a)
-            if v is not None: s.defaults += field_assigns('%s->%s' % (cpp, ident(t['name'])), v, partial=True)
+            if v is not None: s.defaults += field_assigns('%s->%s' % (cpp, s.field_cpp(i, t['name'])), v, partial=True)
+
+    def field_cpp(s, i, name):
+        """Member `name` of export i's class as its UeApi header spells it: a tag carries the engine's name, which the
+        header may spell in another case (a ResourceReward's Amount, `amount`)."""
+        low = name.lower()
+        for cn in s.run.model.ancestors(s.run.types.cls(s.pkg, s.pkg.exports[i]['cls'], s.a).split('::')[-1]):
+            hit = s.run.api.members(cn).get(low)
+            if hit: return hit
+        return ident(name)
 
     def instanced(s, i):
         """Export i, an object instanced in the defaults, as the constructor's local holding it: its NewObject line and
