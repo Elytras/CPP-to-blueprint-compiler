@@ -154,7 +154,9 @@ def load(base):
     names, irows, erows = tables(ua, sm)
     imports = []
     for i in irows:
-        imports.append(Imp(f"{names[i['class_name'][0]]}'{names[i['name'][0]]}'")); imports[-1].outer = i['outer']
+        nm, num = names[i['name'][0]], i['name'][1]
+        if num: nm = f"{nm}_{num-1}"   # a package named .../CP_Xmas_2025 is the FName (.../CP_Xmas, 2026)
+        imports.append(Imp(f"{names[i['class_name'][0]]}'{nm}'")); imports[-1].outer = i['outer']
     exports = []
     for e in erows:
         nm, num = names[e['name'][0]], e['name'][1]
