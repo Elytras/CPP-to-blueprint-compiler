@@ -13231,34 +13231,33 @@ static void DropEndReturns(std::vector<FStmtIR>& Stmts)
 }
 /* `if (C) { ..; return; } Rest` in an inline body is `if (C) { .. } else { Rest }`: the return jumped past Rest, which
    the else does now. The same code, but a body whose returns all go so is a plain list, which FlattenBlocks splices
-   into its caller, so the passes after it (ReuseCalls) see across it. A return inside a loop or a switch stays. */
+   into its caller, so the passes after it (ReuseCalls) see across it. A return inside a loop or a switch stays.
+   Stmts must end where the body ends: only there is falling off its end what a return does. So a branch is reworked
+   only once it ends there too: one that always returns, or one Rest was appended to. A branch that returns on some
+   paths and falls out on others (`if (A) { if (B) return; .. }`, an `&&` guard) would need Rest copied into both
+   branches; that `if` and everything after it stay as they are, returns and all. */
 static void NestRest(std::vector<FStmtIR>& Stmts)
 {
     for (size_t I = 0; I < Stmts.size(); ++I)
     {
         if (Stmts[I].K == FStmtIR::InlineReturn) { Stmts.resize(I + 1); return; }     // what follows never runs
         if (Stmts[I].K != FStmtIR::If || Stmts[I].bJumpOut) continue;
-        for (auto* B : { &Stmts[I].Then, &Stmts[I].Else })
-            if (*B)
-            {
-                *B = std::make_shared<std::vector<FStmtIR>>(**B);
-                NestRest(**B);
-            }
         const bool bThen = Stmts[I].Then && EndsInInlineReturn(*Stmts[I].Then);
         const bool bElse = Stmts[I].Else && EndsInInlineReturn(*Stmts[I].Else);
+        const bool bThenOther = !bThen && Stmts[I].Then && HasInlineReturn(*Stmts[I].Then);
+        const bool bElseOther = !bElse && Stmts[I].Else && HasInlineReturn(*Stmts[I].Else);
+        if (bThenOther || bElseOther) return;
         if (!bThen && !bElse) continue;
         const std::vector<FStmtIR> Rest(Stmts.begin() + I + 1, Stmts.end());
         Stmts.resize(I + 1);
         FStmtIR& If = Stmts[I];
-        if (bThen) DropEndReturns(*If.Then);
-        if (bElse) DropEndReturns(*If.Else);
         for (auto [B, bReturns] : { std::pair{ &If.Then, bThen }, std::pair{ &If.Else, bElse } })
-            if (!bReturns)
-            {
-                *B = *B ? std::make_shared<std::vector<FStmtIR>>(**B) : std::make_shared<std::vector<FStmtIR>>();
-                (*B)->insert((*B)->end(), Rest.begin(), Rest.end());
-                NestRest(**B);
-            }
+        {
+            *B = *B ? std::make_shared<std::vector<FStmtIR>>(**B) : std::make_shared<std::vector<FStmtIR>>();
+            if (!bReturns) (*B)->insert((*B)->end(), Rest.begin(), Rest.end());
+            NestRest(**B);      // it ends where the body ends now: it always returns, or Rest follows in it
+            if (EndsInInlineReturn(**B)) DropEndReturns(**B);
+        }
         return;
     }
 }

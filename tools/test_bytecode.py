@@ -2801,8 +2801,17 @@ def opt_reuse():
             ran = list(runscript.CONTAINER_CALLS)
             proves('what-the-optimizer.return-x-a-b')
             assert got == want and ran == ([] if fn == 'LookupUnless' and skip else ['Map_Find']), (fn, skip, key, got, ran)
-    print('ok  OptTest.Drop / Reuse / Correlated / NotHoisted: a repeated pure or UE_STABLE call reads the first one\'s '
-          'value where the first surely ran, and runs again where it may not have')
+    # An inline body's early returns under `&&` guards, and one nested in a branch with code after it, each still
+    # leave the body (NestRest once dropped them: EMM's DevKey::Nibble gave -1 for every digit).
+    digit = lambda c: c - 48 if 48 <= c <= 57 else c - 87 if 97 <= c <= 102 else c - 55 if 65 <= c <= 70 else -1
+    sign = lambda x: 2 if x > 100 else 1 if x > 0 else -1 if x < 0 else 0
+    for frm, count in ((40, 80), (95, 10), (59, 3), (150, 4)):
+        want = sum((digit(frm + i) + 2) * (i + 1) + digit(frm + i + 1) * 100 + sign(frm + i - 60) * 10000 for i in range(count))
+        got = run(asset('OptTest'), 'Digits', From=frm, Count=count)[0]
+        proves('what-the-optimizer.return-x-a-b')
+        assert got == i32(want), (frm, count, got, want)
+    print('ok  OptTest.Drop / Reuse / Correlated / NotHoisted / Digits: a repeated pure or UE_STABLE call reads the first '
+          'one\'s value where the first surely ran, and runs again where it may not have; inlined early returns still leave')
 
 
 def opt_raw():

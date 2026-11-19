@@ -213,6 +213,37 @@ public:
     return X + Y + T + Loads * 1000000;
   }
 
+  /* Early returns under `&&` guards, inlined twice in a loop (EMM's DevKey::Nibble): each return still leaves the
+     body, so a later guard never sees a digit and the trailing -1 never overwrites it. */
+  inline int32 Digit(int32 Code) {
+    if (Code >= 48 && Code <= 57)
+      return Code - 48;
+    if (Code >= 97 && Code <= 102)
+      return Code - 87;
+    if (Code >= 65 && Code <= 70)
+      return Code - 55;
+    return -1;
+  }
+  inline int32 Sign(int32 X) {
+    if (X > 0) {
+      if (X > 100)
+        return 2;
+      X = X + 1;
+    }
+    if (X < 0)
+      return -1;
+    return X == 0 ? 0 : 1;
+  }
+  int32 Digits(int32 From, int32 Count) {
+    int32 Sum = 0;
+    for (int32 I = 0; I < Count; ++I) {
+      int32 A = Digit(From + I);
+      int32 B = Digit(From + I + 1);
+      Sum = Sum + (A + 2) * (I + 1) + B * 100 + Sign(From + I - 60) * 10000;
+    }
+    return Sum;
+  }
+
   /* MergeFind: `Map[Key]` where Contains(Key) surely ran is that Contains, made a Map_Find: one map call. Through an
      `||` too, whose temp says Contains ran when it is false. */
   TMap<FName, int32> Scores;
