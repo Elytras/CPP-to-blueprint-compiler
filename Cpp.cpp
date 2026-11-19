@@ -903,6 +903,14 @@ bool IsPureDecl(const Json& Decl)
     return bPure;
 }
 
+/* UE_STABLE: [[clang::annotate]], whose kind is all the JSON dump keeps; clang copies it onto an out-of-line definition. */
+bool IsStableDecl(const Json& Decl)
+{
+    bool bStable = false;
+    ForEach(Decl, [&](const Json& C) { bStable = bStable || Kind(C) == "AnnotateAttr"; });
+    return bStable;
+}
+
 /* A mod method UHT would make BlueprintPure: UE_PURE, or `const` and returning a value (a const BlueprintCallable is
    pure, HeaderParser.cpp). Only the flag: the optimizer drops an unused call of a UE_PURE method alone, the promise of
    no side effects, which `const` does not make (it may log, spawn or call others). */
@@ -1591,6 +1599,11 @@ struct FCallIR
     bool bOnArg0 = false;               // Args[0] is the container or dispatcher worked on: the object holding it goes first
     FIndex Context;                     // CDO a static call runs against; null = self
     bool bPure = false;                 // a function of its arguments (UE_PURE, a Kismet operator or conversion): see DropUnusedPure
+    bool bStable = false;               // UE_STABLE: a later call with the same arguments gives the same values: see ReuseCalls
+    uint64 OutArgs = 0;                 // a UE_STABLE call's: bit I, argument I is an out parameter it only writes
+    bool bArgsOnly = false;             // a Kismet container function: it writes WrittenArgs and nothing else
+    std::string Container;              // ... and its name (Map_Contains, Map_Find): see ReuseCalls
+    bool bNot = false;                  // Not_PreBool, a `!`: see ReuseCalls
     uint64 WrittenArgs = ~uint64(0);    // bit I: argument I must stay its own variable, which the callee may write: see ContainerWrites
     std::vector<std::string> RefParms;  // per argument, the type of the reference parameter it binds, else "": see HoistCallArgs
     bool bRefsTakeConst = false;        // a native's P_GET_PROPERTY_REF: a constant there goes through the thunk's own buffer
@@ -6414,6 +6427,13 @@ uint64 ContainerWrites(const std::string& Fn)
     return W == Writes.end() ? ~uint64(0) : W->second;
 }
 
+void SetContainerWrites(FCallIR& C, const std::string& Fn)
+{
+    C.WrittenArgs = ContainerWrites(Fn);
+    C.bArgsOnly = C.WrittenArgs != ~uint64(0);
+    C.Container = Fn;
+}
+
 bool IsStored(const FArgIR& A)
 {
     return A.K == FArgIR::Local || A.K == FArgIR::LocalOut || A.K == FArgIR::Field || A.K == FArgIR::Member
@@ -7579,7 +7599,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.K = FArgIR::Call;
             Out.Sub = std::make_shared<FCallIR>();
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", Lib, Prefix + Method);
-            Out.Sub->WrittenArgs = ContainerWrites(Prefix + Method);
+            SetContainerWrites(*Out.Sub, Prefix + Method);
             Out.Sub->EmptiedArgs = OutArraysOf("/Script/Engine", Lib, Prefix + Method);    // ToArray, Keys, Values
             Out.Sub->bOnArg0 = true;
             Out.Sub->Args.push_back(Target);
@@ -7723,7 +7743,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             auto Body = std::make_shared<std::vector<FStmtIR>>(1);
             (*Body)[0].K = FStmtIR::StaticCall;
             (*Body)[0].Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintSetLibrary", Fn);
-            (*Body)[0].Call.WrittenArgs = ContainerWrites(Fn);
+            SetContainerWrites((*Body)[0].Call, Fn);
             (*Body)[0].Call.bOnArg0 = true;
             (*Body)[0].Call.Args = { A, B, Into };
             auto Block = std::make_shared<std::vector<FStmtIR>>(1);
@@ -7760,7 +7780,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 Out.K = FArgIR::Call;
                 Out.Sub = std::make_shared<FCallIR>();
                 Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Find");
-                Out.Sub->WrittenArgs = ContainerWrites("Map_Find");
+                SetContainerWrites(*Out.Sub, "Map_Find");
                 Out.Sub->bOnArg0 = true;
                 FArgIR Into;
                 Into.K = FArgIR::Local;
@@ -7788,7 +7808,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             auto Body = std::make_shared<std::vector<FStmtIR>>(1);
             (*Body)[0].K = FStmtIR::StaticCall;
             (*Body)[0].Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Find");
-            (*Body)[0].Call.WrittenArgs = ContainerWrites("Map_Find");
+            SetContainerWrites((*Body)[0].Call, "Map_Find");
             (*Body)[0].Call.bOnArg0 = true;
             (*Body)[0].Call.Args = { Map, Key, Into };
             auto Block = std::make_shared<std::vector<FStmtIR>>(1);
@@ -8186,6 +8206,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         Out.Sub = std::make_shared<FCallIR>();
         Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Not_PreBool");
         Out.Sub->bScript = false;
+        Out.Sub->bPure = true;
+        Out.Sub->bNot = true;
 
         FArgIR A;
         if (!LowerArg(*Operand, BP, A, Err)) return false;
@@ -10070,12 +10092,23 @@ bool FCompiler::LowerCallBody(const Json& CallExprNode, FBlueprintClass& BP, FCa
         {
             auto Def = R->MethodDefs.find(MethodName);
             bool bOutParm = false;
+            uint64 Outs = 0;
+            size_t Parm = 0;
             ForEach(*Decl->second, [&](const Json& C) {
+                if (Kind(C) != "ParmVarDecl") return;
                 const std::string T = TypeOf(C);
-                if (Kind(C) == "ParmVarDecl" && !T.empty() && T.back() == '&' && T.compare(0, 6, "const ") != 0) bOutParm = true;
+                if (!T.empty() && T.back() == '&' && T.compare(0, 6, "const ") != 0)
+                {
+                    bOutParm = true;
+                    Outs |= Parm < 64 ? uint64(1) << Parm : 0;
+                }
+                ++Parm;
             });
             Out.WrittenArgs = bOutParm ? ~uint64(0) : 0;
             Out.bPure = !bOutParm && (IsPureDecl(*Decl->second) || (Def != R->MethodDefs.end() && IsPureDecl(*Def->second)));
+            Out.bStable = !Out.bReceiverIsArg && Parm <= 64
+                       && (IsStableDecl(*Decl->second) || (Def != R->MethodDefs.end() && IsStableDecl(*Def->second)));
+            Out.OutArgs = Out.bStable ? Outs : 0;
         }
         /* The overload called, by its decl id: same-name inline overloads are all legal, none is a UFunction. */
         if (auto Inl = R->Inlines.find(DeclId); Inl != R->Inlines.end())
@@ -12251,7 +12284,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 /* `Map[Key] = v`: Map_Add, which replaces the value of a key already there. */
                 St.K = FStmtIR::StaticCall;
                 St.Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Add");
-                St.Call.WrittenArgs = ContainerWrites("Map_Add");
+                SetContainerWrites(St.Call, "Map_Add");
                 St.Call.bOnArg0 = true;
                 St.Call.Args.resize(3);
                 FSigValueScope SigScope(*this, Declarer ? Strip(Rhs) : nullptr, FieldSig);     // a delegate value's (above)
@@ -13179,6 +13212,57 @@ static bool HasInlineReturn(const std::vector<FStmtIR>& Stmts)
     return false;
 }
 
+/* Whether every path through a list of an inline body ends in a return of that body (not of an inline inside it). */
+static bool EndsInInlineReturn(const std::vector<FStmtIR>& Stmts)
+{
+    if (Stmts.empty()) return false;
+    const FStmtIR& St = Stmts.back();
+    return St.K == FStmtIR::InlineReturn
+        || (St.K == FStmtIR::If && !St.bJumpOut && St.Then && St.Else && EndsInInlineReturn(*St.Then) && EndsInInlineReturn(*St.Else));
+}
+static void DropEndReturns(std::vector<FStmtIR>& Stmts)
+{
+    if (Stmts.back().K == FStmtIR::InlineReturn) { Stmts.pop_back(); return; }
+    for (auto* B : { &Stmts.back().Then, &Stmts.back().Else })
+    {
+        *B = std::make_shared<std::vector<FStmtIR>>(**B);
+        DropEndReturns(**B);
+    }
+}
+/* `if (C) { ..; return; } Rest` in an inline body is `if (C) { .. } else { Rest }`: the return jumped past Rest, which
+   the else does now. The same code, but a body whose returns all go so is a plain list, which FlattenBlocks splices
+   into its caller, so the passes after it (ReuseCalls) see across it. A return inside a loop or a switch stays. */
+static void NestRest(std::vector<FStmtIR>& Stmts)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        if (Stmts[I].K == FStmtIR::InlineReturn) { Stmts.resize(I + 1); return; }     // what follows never runs
+        if (Stmts[I].K != FStmtIR::If || Stmts[I].bJumpOut) continue;
+        for (auto* B : { &Stmts[I].Then, &Stmts[I].Else })
+            if (*B)
+            {
+                *B = std::make_shared<std::vector<FStmtIR>>(**B);
+                NestRest(**B);
+            }
+        const bool bThen = Stmts[I].Then && EndsInInlineReturn(*Stmts[I].Then);
+        const bool bElse = Stmts[I].Else && EndsInInlineReturn(*Stmts[I].Else);
+        if (!bThen && !bElse) continue;
+        const std::vector<FStmtIR> Rest(Stmts.begin() + I + 1, Stmts.end());
+        Stmts.resize(I + 1);
+        FStmtIR& If = Stmts[I];
+        if (bThen) DropEndReturns(*If.Then);
+        if (bElse) DropEndReturns(*If.Else);
+        for (auto [B, bReturns] : { std::pair{ &If.Then, bThen }, std::pair{ &If.Else, bElse } })
+            if (!bReturns)
+            {
+                *B = *B ? std::make_shared<std::vector<FStmtIR>>(**B) : std::make_shared<std::vector<FStmtIR>>();
+                (*B)->insert((*B)->end(), Rest.begin(), Rest.end());
+                NestRest(**B);
+            }
+        return;
+    }
+}
+
 void FCompiler::FlattenBlocks(std::vector<FStmtIR>& Stmts)
 {
     for (size_t I = 0; I < Stmts.size(); ++I)
@@ -13190,6 +13274,16 @@ void FCompiler::FlattenBlocks(std::vector<FStmtIR>& Stmts)
                 *L = std::make_shared<std::vector<FStmtIR>>(**L);
                 FlattenBlocks(**L);
             }
+        /* Not an inline bool body whose value the next `if` tests: ThreadBranches sends its returns to the branches. */
+        const bool bThreads = St.K == FStmtIR::Block && St.Body && !St.Body->empty() && I + 1 < Stmts.size()
+            && Stmts[I + 1].K == FStmtIR::If && Stmts[I + 1].Cond.K == FArgIR::Local && St.Body->back().K == FStmtIR::Assign
+            && St.Body->back().Var.K == FArgIR::Local && St.Body->back().Var.S == Stmts[I + 1].Cond.S;
+        if (St.K == FStmtIR::Block && St.Body && !bThreads && HasInlineReturn(*St.Body))
+        {
+            St.Body = std::make_shared<std::vector<FStmtIR>>(*St.Body);
+            NestRest(*St.Body);
+            if (EndsInInlineReturn(*St.Body)) DropEndReturns(*St.Body);    // its returns jump to where it ends anyway
+        }
         if (St.K != FStmtIR::Block || (St.Body && HasInlineReturn(*St.Body))) continue;
         const std::vector<FStmtIR> Body = St.Body ? *St.Body : std::vector<FStmtIR>();
         Stmts.erase(Stmts.begin() + I);
@@ -13336,6 +13430,553 @@ void FCompiler::DropOverwritten(std::vector<FStmtIR>& Stmts)
             && StoresFirst(std::vector<FStmtIR>(Stmts.begin() + I + 1, Stmts.begin() + I + 2), St.Var.S))
             Stmts.erase(Stmts.begin() + I--);
     }
+}
+
+/*
+ReuseCalls: a pure or UE_STABLE call that an identical earlier call is sure to have run before is that call's value,
+read from the local it was stored in, out parameters and all. A forward walk keeps facts: "local H holds value K", K the
+value's canonical text with each local read replaced by what that local holds. A store to a local forgets the facts
+that hold or read it; any other store, or a call that may act, forgets every fact. An `if` keeps the facts both
+branches end with, and remembers each branch's own under its condition, for a later `if` on the same value: the branch
+taken there is the one taken here, so `if (!Ok) return; Use(Get())` twice reuses Get. Nothing moves: a call that runs
+reads the local only where the call itself stood, so it adds no fault and no side effect. Loops, switches and labels
+start from nothing.
+*/
+namespace {
+struct FReuseFact
+{
+    std::string Key, Holder;
+    std::set<std::string> Uses;     // the locals Key reads
+    bool bMemory = false;           // Key reads memory or calls a pure function, which a UE_STABLE first call may change
+    std::shared_ptr<FCallIR> Has;   // Holder "": this Map_Contains ran with the map and key Key names (MergeFind)
+};
+struct FReuseBranch
+{
+    std::string Cond;
+    std::set<std::string> Uses;
+    bool bMemory = false;
+    std::vector<FReuseFact> Then, Else;
+    bool operator==(const FReuseBranch& O) const
+    {
+        const auto Same = [](const std::vector<FReuseFact>& A, const std::vector<FReuseFact>& B) {
+            return A.size() == B.size() && std::equal(A.begin(), A.end(), B.begin(), [](const FReuseFact& X, const FReuseFact& Y) {
+                return X.Key == Y.Key && X.Holder == Y.Holder; });
+        };
+        return Cond == O.Cond && Same(Then, O.Then) && Same(Else, O.Else);
+    }
+};
+struct FReuseState
+{
+    std::vector<FReuseFact> Facts;
+    std::vector<FReuseBranch> Branches;
+    bool bDead = false;             // no path reaches here (after a return, break or continue)
+    std::vector<std::string> Killed;    // each local a store or call changed, in order: a branch's own are past its fork
+    int32 Flushes = 0, MemoryForgets = 0;
+
+    const FReuseFact* Holding(const std::string& Local) const
+    {
+        for (const FReuseFact& F : Facts) if (F.Holder == Local) return &F;
+        return nullptr;
+    }
+    const FReuseFact* Keyed(const std::string& Key) const
+    {
+        for (auto F = Facts.rbegin(); F != Facts.rend(); ++F) if (F->Key == Key) return &*F;
+        return nullptr;
+    }
+    template <class P> void Drop(P Dead, bool bBranchDead)
+    {
+        Facts.erase(std::remove_if(Facts.begin(), Facts.end(), Dead), Facts.end());
+        Branches.erase(std::remove_if(Branches.begin(), Branches.end(), [&](const FReuseBranch& B) { return bBranchDead && B.bMemory; }),
+                       Branches.end());
+        for (FReuseBranch& B : Branches)
+            for (auto* L : { &B.Then, &B.Else }) L->erase(std::remove_if(L->begin(), L->end(), Dead), L->end());
+    }
+    void Kill(const std::string& Local)
+    {
+        Killed.push_back(Local);
+        Drop([&](const FReuseFact& F) { return F.Holder == Local || F.Uses.count(Local) != 0; }, false);
+        Branches.erase(std::remove_if(Branches.begin(), Branches.end(), [&](const FReuseBranch& B) { return B.Uses.count(Local) != 0; }),
+                       Branches.end());
+    }
+    void ForgetMemory() { ++MemoryForgets; Drop([](const FReuseFact& F) { return F.bMemory; }, true); }
+    void Flush() { ++Flushes; Facts.clear(); Branches.clear(); }
+    void Add(const FReuseFact& F)
+    {
+        if (F.Holder.empty() ? !Keyed(F.Key) : !F.Uses.count(F.Holder) && !Holding(F.Holder)) Facts.push_back(F);
+    }
+    /* What a branch knows of a local is as true as what is known before it, and closer: it takes that one's place. */
+    void Refine(const FReuseFact& F)
+    {
+        if (F.Holder.empty()) { Add(F); return; }
+        if (F.Uses.count(F.Holder)) return;
+        Facts.erase(std::remove_if(Facts.begin(), Facts.end(), [&](const FReuseFact& G) { return G.Holder == F.Holder; }), Facts.end());
+        Facts.push_back(F);
+    }
+};
+
+/* A pure or UE_STABLE call, or a Kismet container read (Contains, Length, ...: it writes none of its arguments). */
+bool Reusable(const FCallIR& C)
+{
+    return (C.bPure || C.bStable || (C.bArgsOnly && C.WrittenArgs == 0)) && C.Intrinsic.empty() && !C.Inline && !C.bSingleResult;
+}
+
+/* The canonical text of a value: bOk false when it acts or cannot be named (an intrinsic, a delegate, a call that
+   is neither pure nor stable, an out-parameter call below the top). bCall: a reusable call is written in it. */
+struct FCanon
+{
+    std::string Key;
+    std::set<std::string> Uses;
+    bool bMemory = false, bCall = false, bOk = true;
+};
+void Canon(const FArgIR& A, const FReuseState& S, FCanon& Out, bool bTop);
+void Canon(const FCallIR& C, const FReuseState& S, FCanon& Out, bool bTop)
+{
+    if (!(Reusable(C) || (IsBranch(C.Intrinsic) && !C.Inline)) || (C.OutArgs && !bTop)) { Out.bOk = false; return; }
+    Out.bCall = Out.bCall || Reusable(C);
+    /* A pure function given an object, or run on one, may read it; one of plain values reads nothing else. */
+    const auto Object = [](const FArgIR& A) {
+        const bool bVariable = A.K == FArgIR::Local || A.K == FArgIR::LocalOut || A.K == FArgIR::Field || A.K == FArgIR::Member
+                            || A.K == FArgIR::Index || A.K == FArgIR::Call;
+        return A.K == FArgIR::Self || A.K == FArgIR::ObjConst || (bVariable && A.InnerType.empty()) || A.InnerType.find('*') != std::string::npos
+            || A.InnerType.find("Interface") != std::string::npos || A.InnerType.find("TSubclassOf") != std::string::npos;
+    };
+    Out.bMemory = Out.bMemory || C.bArgsOnly || (C.bPure && (C.Target || C.bInstance || std::any_of(C.Args.begin(), C.Args.end(), Object)));
+    Out.Key += "C" + std::to_string(C.Fn.V) + C.Intrinsic + "|" + std::to_string(C.Extra.V) + "," + std::to_string(C.Extra2.V)
+             + "," + std::to_string(C.Context.V) + "," + C.VirtualName + "," + C.View + "," + std::to_string(C.bInstance)
+             + std::to_string(C.bOnArg0) + std::to_string(C.bLocal) + std::to_string(C.bScript) + "@";
+    if (C.Target) Canon(*C.Target, S, Out, false);
+    Out.Key += "(";
+    for (size_t I = 0; I < C.Args.size(); ++I)
+    {
+        if (I < 64 && (C.OutArgs >> I & 1)) Out.Key += "_";
+        else Canon(C.Args[I], S, Out, false);
+        Out.Key += ",";
+    }
+    Out.Key += ")";
+}
+void Canon(const FArgIR& A, const FReuseState& S, FCanon& Out, bool bTop)
+{
+    /* A key grows with each local it reads through (`X = X + X` doubles it): past a few pages it names nothing. */
+    if (Out.Key.size() > 4096) Out.bOk = false;
+    if (!Out.bOk) return;
+    uint64 Bits;
+    std::memcpy(&Bits, &A.F, sizeof Bits);
+    Out.Key += "{" + std::to_string(A.K) + "|" + A.InnerType + "|" + std::to_string(A.CastOp) + "|";
+    switch (A.K)
+    {
+    case FArgIR::Local:
+        if (const FReuseFact* F = A.Base ? nullptr : S.Holding(A.S))
+        {
+            Out.Key += "=" + F->Key;
+            Out.Uses.insert(F->Uses.begin(), F->Uses.end());
+            Out.bMemory = Out.bMemory || F->bMemory;
+        }
+        else
+        {
+            Out.Key += A.S;
+            Out.Uses.insert(A.S);
+        }
+        break;
+    case FArgIR::Call:
+        if (!A.Sub) { Out.bOk = false; return; }
+        Canon(*A.Sub, S, Out, bTop);
+        break;
+    case FArgIR::Delegate: case FArgIR::LatentInfo:
+        Out.bOk = false;
+        return;
+    case FArgIR::DynCast:       // a cast neither faults nor acts (None gives None): one of the same value is reused too
+        Out.bCall = true;
+        [[fallthrough]];
+    default:
+        /* A class default's property (`GetDefault<S>()->SaveName`) is taken to stay; any other property may change. */
+        if (A.K == FArgIR::LocalOut || (A.K == FArgIR::Field && !(A.Base && A.Base->K == FArgIR::ClassCtx)))
+            Out.bMemory = true;
+        Out.Key += std::to_string(A.I) + "," + std::to_string(A.I64) + "," + std::to_string(Bits) + "," + std::to_string(A.B)
+                 + std::to_string(A.bWide) + std::to_string(A.bSingle) + "," + std::to_string(A.Owner.V) + ","
+                 + std::to_string(reinterpret_cast<uintptr_t>(A.Class)) + "," + A.S;
+        if (A.Sub)
+            for (const FArgIR& X : A.Sub->Args) { Out.Key += ";"; Canon(X, S, Out, false); }
+        break;
+    }
+    if (A.Base) { Out.Key += "^"; Canon(*A.Base, S, Out, false); }
+    Out.Key += "}";
+}
+
+FArgIR HolderRead(const FArgIR& Was, const std::string& Holder)
+{
+    FArgIR R;
+    R.K = FArgIR::Local;
+    R.S = Holder;
+    R.InnerType = Was.InnerType;
+    R.Class = Was.Class;
+    return R;
+}
+
+/* A store to a local, whole or in part (`L = ..`, `L.X = ..`, `L[I] = ..`), forgets what holds or reads it. A store to
+   a property (a member, another object's, the caller's variable an out parameter is) changes no local: it forgets only
+   what reads memory. A store through anything else (a pointer intrinsic) forgets everything. */
+void Written(const FArgIR& A, FReuseState& S)
+{
+    const FArgIR* R = &A;
+    while ((R->K == FArgIR::Member || R->K == FArgIR::Index) && R->Base) R = R->Base.get();
+    if (R->K == FArgIR::Local && !R->Base) S.Kill(R->S);
+    else if (R->K == FArgIR::Field || R->K == FArgIR::LocalOut) S.ForgetMemory();
+    else S.Flush();
+}
+
+/* What evaluating a value does to the facts, its calls in the order they run. */
+void Effects(const FArgIR& A, FReuseState& S);
+void Effects(const FCallIR& C, FReuseState& S)
+{
+    if (C.Target) Effects(*C.Target, S);
+    for (const FArgIR& A : C.Args) Effects(A, S);
+    if (C.Inline) S.Flush();
+    else if (IsBranch(C.Intrinsic)) {}
+    else if (!C.Intrinsic.empty()) S.Flush();
+    else if (C.bPure) {}
+    else if (C.bStable)
+    {
+        S.ForgetMemory();       // a first call may act, on whatever a pure call or a property read sees
+        for (size_t I = 0; I < C.Args.size() && I < 64; ++I) if (C.OutArgs >> I & 1) Written(C.Args[I], S);
+    }
+    else if (C.bArgsOnly)
+    {
+        for (size_t I = 0; I < C.Args.size(); ++I) if (I >= 64 || (C.WrittenArgs >> I & 1)) Written(C.Args[I], S);
+    }
+    else S.Flush();
+}
+void Effects(const FArgIR& A, FReuseState& S)
+{
+    if (A.K == FArgIR::Call) { if (A.Sub) Effects(*A.Sub, S); else S.Flush(); return; }
+    if (A.K == FArgIR::LatentInfo) { S.Flush(); return; }
+    if (A.Base) Effects(*A.Base, S);
+    if (A.Sub) for (const FArgIR& X : A.Sub->Args) Effects(X, S);
+}
+
+/* Each part of a value that a fact holds becomes a read of that fact's local. A value whose other parts act is left
+   alone: what they do could change what the part would give. */
+void ReplaceIn(FArgIR& A, const FReuseState& S);
+void ReplaceIn(FCallIR& C, const FReuseState& S)
+{
+    if (C.Target) { C.Target = std::make_shared<FArgIR>(*C.Target); ReplaceIn(*C.Target, S); }
+    for (size_t I = 0; I < C.Args.size(); ++I)
+        if (!MayWriteArg(C, I) && !(I < 64 && (C.OutArgs >> I & 1))) ReplaceIn(C.Args[I], S);
+}
+void ReplaceIn(FArgIR& A, const FReuseState& S)
+{
+    if (A.K == FArgIR::Call && (!A.Sub || A.Sub->Inline || (!A.Sub->Intrinsic.empty() && !IsBranch(A.Sub->Intrinsic)))) return;
+    if (!A.bSingle)
+    {
+        FCanon C;
+        Canon(A, S, C, false);
+        if (const FReuseFact* F = C.bOk && C.bCall ? S.Keyed(C.Key) : nullptr) { A = HolderRead(A, F->Holder); return; }
+    }
+    if (A.Base) { A.Base = std::make_shared<FArgIR>(*A.Base); ReplaceIn(*A.Base, S); }
+    if (A.Sub)
+    {
+        A.Sub = std::make_shared<FCallIR>(*A.Sub);
+        if (A.K == FArgIR::Call) ReplaceIn(*A.Sub, S);
+        else for (FArgIR& X : A.Sub->Args) ReplaceIn(X, S);
+    }
+}
+bool ArgsAct(const FArgIR& V)
+{
+    if (V.K != FArgIR::Call || !V.Sub) return CallsImpure(V);
+    return (V.Sub->Target && CallsImpure(*V.Sub->Target))
+        || std::any_of(V.Sub->Args.begin(), V.Sub->Args.end(), [](const FArgIR& A) { return CallsImpure(A); });
+}
+
+FStmtIR CopyInto(const FArgIR& To, const std::string& From)
+{
+    FStmtIR St;
+    St.K = FStmtIR::Assign;
+    St.Var = To;
+    St.Var.LetOp = LetOpFor(StripTypeKeywords(To.InnerType));
+    St.bAssignLocal = true;
+    St.Value = HolderRead(To, From);
+    return St;
+}
+
+/* A statement's whole value V, the value of an assignment, return or `if` (bStmt: a call statement, whose own value
+   nobody reads). A fact holding all of it, and each out parameter its call writes, makes it a read of that local and
+   copies of the out values, put in Copies. Else each part a fact holds is read from it. Returns V's key as it was. */
+FCanon ReplaceValue(FArgIR& V, const FReuseState& S, std::vector<FStmtIR>& Copies, bool bStmt, bool bOuts, bool& bWhole)
+{
+    bWhole = false;
+    FCanon C;
+    Canon(V, S, C, true);
+    if (C.bOk && C.bCall && !V.bSingle)
+    {
+        const FCallIR* Call = V.K == FArgIR::Call ? V.Sub.get() : nullptr;
+        const uint64 Outs = Call ? Call->OutArgs : 0;
+        const FReuseFact* Ret = S.Keyed(C.Key);
+        bool bAll = (bOuts || !Outs) && (bStmt ? (Outs || Ret) : Ret != nullptr);
+        std::vector<FStmtIR> Made;
+        for (size_t I = 0; bAll && Call && I < Call->Args.size() && I < 64; ++I)
+        {
+            if (!(Outs >> I & 1)) continue;
+            const FArgIR& Arg = Call->Args[I];
+            const FReuseFact* O = S.Keyed(C.Key + "#" + std::to_string(I));
+            if (!O || Arg.K != FArgIR::Local || Arg.Base) bAll = false;
+            else if (O->Holder != Arg.S) Made.push_back(CopyInto(Arg, O->Holder));
+        }
+        if (bAll)
+        {
+            if (Ret) V = HolderRead(V, Ret->Holder);
+            Copies = std::move(Made);
+            bWhole = true;
+            return C;
+        }
+    }
+    if (!ArgsAct(V))
+    {
+        if (V.K == FArgIR::Call && V.Sub) { V.Sub = std::make_shared<FCallIR>(*V.Sub); ReplaceIn(*V.Sub, S); }
+        else ReplaceIn(V, S);
+    }
+    return C;
+}
+
+/* After a stable call at the top of a statement runs: each out parameter now holds its out value. */
+void AddOuts(const FArgIR& V, const FCanon& C, FReuseState& S)
+{
+    if (!C.bOk || V.K != FArgIR::Call || !V.Sub || !V.Sub->OutArgs) return;
+    for (size_t I = 0; I < V.Sub->Args.size() && I < 64; ++I)
+        if (V.Sub->OutArgs >> I & 1)
+        {
+            const FArgIR& Arg = V.Sub->Args[I];
+            if (Arg.K != FArgIR::Local || Arg.Base) continue;
+            S.Kill(Arg.S);
+            S.Add({ C.Key + "#" + std::to_string(I), Arg.S, C.Uses, C.bMemory });
+        }
+}
+
+bool SameValueType(const std::string& A, const std::string& B)
+{
+    const std::string X = StripTypeKeywords(A), Y = StripTypeKeywords(B);
+    return X.empty() || Y.empty() || X == Y || (X.back() == '*' && Y.back() == '*');
+}
+
+/* Each Map_Contains a statement surely runs (not one an && / || / ?: may skip) is remembered with its map and key, its
+   own call kept (cloned, so no other statement shares it): a later `Map[Key]` on the same values (MergeFind) makes it
+   a Map_Find, whose bool is the answer Contains gave and whose out value is what the read wants. Stored: the local the
+   statement stores, which the call ran before. */
+void NoteContains(FArgIR& A, FReuseState& S, const std::string& Stored);
+void NoteContains(FCallIR& C, FReuseState& S, const std::string& Stored)
+{
+    if (IsBranch(C.Intrinsic) || C.Inline) return;
+    if (C.Target) { C.Target = std::make_shared<FArgIR>(*C.Target); NoteContains(*C.Target, S, Stored); }
+    for (FArgIR& A : C.Args) NoteContains(A, S, Stored);
+}
+void NoteContains(FArgIR& A, FReuseState& S, const std::string& Stored)
+{
+    if (A.Base) { A.Base = std::make_shared<FArgIR>(*A.Base); NoteContains(*A.Base, S, Stored); }
+    if (!A.Sub) return;
+    A.Sub = std::make_shared<FCallIR>(*A.Sub);
+    if (A.K != FArgIR::Call) { for (FArgIR& X : A.Sub->Args) NoteContains(X, S, Stored); return; }
+    NoteContains(*A.Sub, S, Stored);
+    const FCallIR& C = *A.Sub;
+    if (C.Container != "Map_Contains" || C.Args.size() != 2 || C.Target) return;
+    FCanon K;
+    K.Key = "has:";
+    Canon(C.Args[0], S, K, false);
+    Canon(C.Args[1], S, K, false);
+    if (K.bOk && !K.Uses.count(Stored)) S.Add({ K.Key, "", K.Uses, true, A.Sub });
+}
+
+/* MergeFind: `Map[Key]`'s Map_Find into a compiler temp, where a Map_Contains of the same map and key surely ran with
+   nothing between that could change either: that Contains becomes this Map_Find, which answers the same bool and
+   writes the value (a default one on a miss, which nothing reads), and this one goes. */
+bool MergeFind(const FCallIR& F, FReuseState& S)
+{
+    if (F.Container != "Map_Find" || F.Args.size() != 3 || F.Target || F.EmptiedArgs || F.Args[2].K != FArgIR::Local
+        || F.Args[2].Base || F.Args[2].S.compare(0, 8, "__MapGet") != 0)
+        return false;
+    FCanon K;
+    K.Key = "has:";
+    Canon(F.Args[0], S, K, false);
+    Canon(F.Args[1], S, K, false);
+    const FReuseFact* H = K.bOk ? S.Keyed(K.Key) : nullptr;
+    if (!H || !H->Holder.empty() || !H->Has || H->Has->Container != "Map_Contains") return false;
+    FCallIR Find = F;
+    Find.Args[0] = H->Has->Args[0];
+    Find.Args[1] = H->Has->Args[1];
+    *H->Has = Find;
+    S.Kill(F.Args[2].S);
+    return true;
+}
+
+void ReuseList(std::vector<FStmtIR>& Stmts, FReuseState& S);
+
+/* A list the walk does not follow into (a loop, a switch, a block an inline return leaves): each starts from nothing. */
+void ReuseFresh(std::shared_ptr<std::vector<FStmtIR>>& L)
+{
+    if (!L) return;
+    L = std::make_shared<std::vector<FStmtIR>>(*L);
+    FReuseState Fresh;
+    ReuseList(*L, Fresh);
+}
+
+void ReuseList(std::vector<FStmtIR>& Stmts, FReuseState& S)
+{
+    std::vector<FStmtIR> Out;
+    Out.reserve(Stmts.size());
+    for (FStmtIR& St : Stmts)
+    {
+        std::vector<FStmtIR> Copies;
+        bool bWhole = false;
+        switch (St.K)
+        {
+        case FStmtIR::Assign: case FStmtIR::Decl:
+        {
+            if (St.K == FStmtIR::Decl && !St.bHasValue) { Written(St.Var, S); break; }
+            const FArgIR Was = St.Value;
+            const FCanon C = ReplaceValue(St.Value, S, Copies, false, true, bWhole);
+            Effects(St.Value, S);
+            Effects(St.Var, S);
+            Written(St.Var, S);
+            AddOuts(Was, C, S);
+            if (C.bOk && St.Var.K == FArgIR::Local && !St.Var.Base && SameValueType(St.Var.InnerType, St.Value.InnerType))
+                S.Add({ C.Key, St.Var.S, C.Uses, C.bMemory });
+            NoteContains(St.Value, S, St.Var.K == FArgIR::Local && !St.Var.Base ? St.Var.S : std::string());
+            break;
+        }
+        case FStmtIR::StaticCall:
+        {
+            if (St.Target.Target || !St.Target.Args.empty() || St.Target.Fn.V) { S.Flush(); break; }
+            if (MergeFind(St.Call, S)) continue;
+            FArgIR V;
+            V.K = FArgIR::Call;
+            V.Sub = std::make_shared<FCallIR>(St.Call);
+            const FArgIR Was = V;
+            const FCanon C = ReplaceValue(V, S, Copies, true, true, bWhole);
+            if (bWhole)
+            {
+                AddOuts(Was, C, S);
+                Out.insert(Out.end(), Copies.begin(), Copies.end());
+                continue;
+            }
+            St.Call = *V.Sub;
+            Effects(St.Call, S);
+            AddOuts(Was, C, S);
+            break;
+        }
+        case FStmtIR::Return:
+            if (St.bHasValue) ReplaceValue(St.Value, S, Copies, false, false, bWhole);
+            S.Flush();
+            S.bDead = true;
+            break;
+        case FStmtIR::If:
+        {
+            const FCanon C = ReplaceValue(St.Cond, S, Copies, false, false, bWhole);
+            Effects(St.Cond, S);
+            NoteContains(St.Cond, S, std::string());
+            if (St.bJumpOut) break;     // Then is one break or continue: the walk goes on down the other way
+            const size_t Fork = S.Killed.size();
+            const int32 Flushes = S.Flushes, Forgets = S.MemoryForgets;
+            FReuseState T = S, E = S;
+            if (C.bOk)
+                for (const FReuseBranch& B : S.Branches)
+                    if (B.Cond == C.Key)
+                    {
+                        for (const FReuseFact& F : B.Then) T.Refine(F);
+                        for (const FReuseFact& F : B.Else) E.Refine(F);
+                    }
+            for (auto [L, In] : { std::pair{ &St.Then, &T }, std::pair{ &St.Else, &E } })
+                if (*L)
+                {
+                    *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                    ReuseList(**L, *In);
+                }
+            /* The condition still has the value it was tested with, as a later `if` on its key will: no branch that
+               falls through changed what it reads. */
+            const auto Changed = [&](const FReuseState& X) {
+                if (X.bDead) return false;
+                if (X.Flushes != Flushes || (C.bMemory && X.MemoryForgets != Forgets)) return true;
+                return std::any_of(X.Killed.begin() + Fork, X.Killed.end(), [&](const std::string& L) { return C.Uses.count(L) != 0; });
+            };
+            const bool bCondStays = C.bOk && !Changed(T) && !Changed(E);
+            if (T.bDead) S = E;
+            else if (E.bDead) S = T;
+            else
+            {
+                /* A local the branches leave holding different values holds "Cond ? one : other": two such locals of
+                   two `if`s on one condition are equal. */
+                S.Facts.clear();
+                for (const FReuseFact& F : T.Facts)
+                    if (F.Holder.empty())
+                    {
+                        if (const FReuseFact* G = E.Keyed(F.Key); G && G->Holder.empty() && G->Has == F.Has) S.Facts.push_back(F);
+                    }
+                    else if (const FReuseFact* G = E.Holding(F.Holder); G && G->Key == F.Key) S.Facts.push_back(F);
+                    else if (G && bCondStays)
+                    {
+                        FReuseFact P{ "phi(" + C.Key + "?" + F.Key + ":" + G->Key + ")", F.Holder, C.Uses, C.bMemory || F.bMemory || G->bMemory };
+                        P.Uses.insert(F.Uses.begin(), F.Uses.end());
+                        P.Uses.insert(G->Uses.begin(), G->Uses.end());
+                        if (!P.Uses.count(P.Holder)) S.Facts.push_back(P);
+                    }
+                S.Branches.clear();
+                for (const FReuseBranch& B : T.Branches)
+                    if (std::find(E.Branches.begin(), E.Branches.end(), B) != E.Branches.end()) S.Branches.push_back(B);
+                S.Killed = T.Killed;
+                S.Killed.insert(S.Killed.end(), E.Killed.begin() + Fork, E.Killed.end());
+                S.Flushes = T.Flushes + E.Flushes - Flushes;
+                S.MemoryForgets = T.MemoryForgets + E.MemoryForgets - Forgets;
+            }
+            /* `T = A; if (!T) T = B;`, a lowered `||` (`if (T) T = B;`, an `&&`): one branch alone writes the local the
+               condition tests, so after the `if` a value of it other than the one the other branch kept says the
+               writing branch ran. A later `if` on it starts that side with what the branch knew: in
+               `if (Save == nullptr || !Save->Map.Contains(K)) return; Save->Map[K]` the read is where Contains ran. */
+            const FArgIR* Tested = &St.Cond;
+            const bool bNeg = Tested->K == FArgIR::Call && Tested->Sub && Tested->Sub->bNot && Tested->Sub->Args.size() == 1;
+            if (bNeg) Tested = &Tested->Sub->Args[0];
+            if (!T.bDead && !E.bDead && Tested->K == FArgIR::Local && !Tested->Base)
+            {
+                const auto Wrote = [&](const FReuseState& X) {
+                    return X.Flushes != Flushes || std::find(X.Killed.begin() + Fork, X.Killed.end(), Tested->S) != X.Killed.end();
+                };
+                if (Wrote(T) != Wrote(E))
+                {
+                    const FReuseState& W = Wrote(T) ? T : E;
+                    const bool bKept = Wrote(T) ? bNeg : !bNeg;     // the value the other branch left the local with
+                    FArgIR Read = *Tested;
+                    FCanon K;
+                    Canon(Read, S, K, false);
+                    if (W.Flushes == Flushes && K.bOk)
+                        S.Branches.push_back({ K.Key, K.Uses, K.bMemory, bKept ? std::vector<FReuseFact>() : W.Facts,
+                                               bKept ? W.Facts : std::vector<FReuseFact>() });
+                }
+            }
+            if (bCondStays && !S.bDead)
+            {
+                S.Branches.erase(std::remove_if(S.Branches.begin(), S.Branches.end(), [&](const FReuseBranch& B) { return B.Cond == C.Key; }),
+                                 S.Branches.end());
+                S.Branches.push_back({ C.Key, C.Uses, C.bMemory, T.bDead ? std::vector<FReuseFact>() : T.Facts,
+                                       E.bDead ? std::vector<FReuseFact>() : E.Facts });
+            }
+            break;
+        }
+        case FStmtIR::Break: case FStmtIR::Continue: case FStmtIR::Goto: case FStmtIR::InlineReturn:
+            S.Flush();
+            S.bDead = true;
+            break;
+        default:        // While, Switch, Block, Label, GotoLabel
+            for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) ReuseFresh(*L);
+            S.Flush();
+            S.bDead = false;
+            break;
+        }
+        Out.push_back(std::move(St));
+        Out.insert(Out.end(), Copies.begin(), Copies.end());
+    }
+    Stmts = std::move(Out);
+}
+}
+
+void ReuseCalls(std::vector<FStmtIR>& Stmts)
+{
+    FReuseState S;
+    ReuseList(Stmts, S);
 }
 
 bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) const
@@ -16535,7 +17176,7 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         FStmtIR St;
         St.K = FStmtIR::StaticCall;
         St.Call.Fn = BP.EngineFunction("/Script/Engine", Lib, Fn);
-        St.Call.WrittenArgs = ContainerWrites(Fn);
+        SetContainerWrites(St.Call, Fn);
         St.Call.EmptiedArgs = OutArraysOf("/Script/Engine", Lib, Fn);     // the copy a TSet / TMap walk refills
         St.Call.Args = std::move(CallArgs);
         return St;
@@ -16721,7 +17362,7 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
             C.InnerType = "int32";
             C.Sub = std::make_shared<FCallIR>();
             C.Sub->Fn = BP.EngineFunction("/Script/Engine", Lib, Fn);
-            C.Sub->WrittenArgs = ContainerWrites(Fn);
+            SetContainerWrites(*C.Sub, Fn);
             C.Sub->Args = { std::move(Of) };
             return C;
         };
@@ -16878,7 +17519,7 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
     Length.K = FArgIR::Call;
     Length.Sub = std::make_shared<FCallIR>();
     Length.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetArrayLibrary", "Array_Length");
-    Length.Sub->WrittenArgs = ContainerWrites("Array_Length");
+    SetContainerWrites(*Length.Sub, "Array_Length");
     Length.Sub->Args = { Iter };
     Out.push_back(AssignStmt(Len, "int32", std::move(Length)));
 
@@ -17142,6 +17783,7 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
 FArgIR NotOf(FArgIR V, FBlueprintClass& BP)
 {
     WrapInCall(V, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Not_PreBool"));
+    V.Sub->bNot = true;
     V.InnerType = "bool";
     return V;
 }
@@ -24844,6 +25486,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (!bFnHasGoto && !bMadeLatentCall)
             {
                 FlattenBlocks(Stmts);
+                ReuseCalls(Stmts);
                 DropOverwritten(Stmts);
                 ForwardSingleUse(Stmts, Stmts);
             }

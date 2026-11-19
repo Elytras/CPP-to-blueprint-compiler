@@ -422,6 +422,7 @@ for _k in [k for k in MATH if k.endswith('_FloatFloat')]: MATH[_k[:-len('_FloatF
 MATH.update({'Conv_IntToDouble': float, 'Conv_FloatToDouble': float,
              'Conv_DoubleToFloat': lambda a: struct.unpack('<f', struct.pack('<f', a))[0]})
 CALLS = []     # every library call run, as (name, args): a test can see an impure or kept call happen
+CONTAINER_CALLS = []   # every Kismet container call run (Map_Find, Array_Add, ...), by name: how many map lookups ran
 # The process memory a raw pointer reads and writes, address -> byte (unset bytes read 0). A deref is an
 # ArrayGetByRef of a view struct's TArray field over the FDeref scratch; the field decides the element's size
 # and signedness, as the engine's TArray<uint8> / <int32> / <int64> does.
@@ -826,6 +827,7 @@ def run(base, function, self_vars=None, **parms):
                 if name in outs and a.op in ADDRESSABLE: store(a, callee.get(name, 0))
             return r
         if o in (0x1C, 0x46, 0x68): native_refs(n)
+        if o in (0x1C, 0x46, 0x68) and n.val in CONTAINERS: CONTAINER_CALLS.append(n.val)
         if o in (0x1C, 0x46, 0x68) and n.val == 'Map_Find' and n.kids[2].op in (0, 0x48) and types.get(n.kids[2].val) in BARE_CONTAINERS:
             # execMap_Find writes in place only into the map's value property class, and a container value is its
             # wrapper StructProperty: a bare container local is left as it was.

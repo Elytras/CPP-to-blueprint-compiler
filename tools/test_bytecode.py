@@ -2766,6 +2766,45 @@ def opt_threads():
     print('ok  OptTest.Threads: an if over an inline bool function takes the branch each return picks')
 
 
+def opt_reuse():
+    """ReuseCalls: a repeated pure call reads the earlier one's local (Drop's A * B is multiplied once). A UE_STABLE call
+    (Load, whose counter shows each run) is the earlier one's value and out value when the earlier one surely ran first:
+    on the same path, under a later `if`, or under an earlier `if` on the same value (Correlated's two inlined guards).
+    Not after an `if` that may have skipped it (NotHoisted), nor across a call that may act (Reuse's Tick). Each value is
+    C++'s, the oracle's."""
+    for a, b in ((3, 4), (-4, 5), (0, 7)):
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'Drop', A=a, B=b)[0] == i32(2 * a * b), (a, b)
+        proves('what-the-optimizer.return-x-a-b')
+        assert [c for c in runscript.CALLS if c[0] == 'Multiply_IntInt'] == [('Multiply_IntInt', (a, b))], runscript.CALLS
+    for a, b in itertools.product((3, -1, 4), (5, -2, 4, 0)):
+        me = dict(Loads=0, Kept=0, Calls=0)
+        z = 10 * b + (12 * a if b > 0 else 0)
+        got = run(asset('OptTest'), 'Reuse', self_vars=me, A=a, B=b)[0]
+        proves('what-the-optimizer.return-x-a-b', 'methods-as-blueprint.ue-stable-savegamebase-getsave')
+        assert got == (40 * a + z + 6 * a) * 100 + 3 and me == dict(Loads=3, Kept=b, Calls=1), (a, b, got, me)
+    for a in (3, 1, 0, -2):
+        me = dict(Loads=0)
+        p = 12 * a if a > 0 else -1
+        got = run(asset('OptTest'), 'Correlated', self_vars=me, A=a)[0]
+        proves('what-the-optimizer.return-x-a-b')
+        assert got == p * 1000 + p + int(a > 0) * 1000000 and me == dict(Loads=int(a > 0)), (a, got, me)
+    for a, b in itertools.product((3, -5), (1, 0)):
+        me = dict(Loads=0)
+        got = run(asset('OptTest'), 'NotHoisted', self_vars=me, A=a, B=b)[0]
+        assert got == (10 * a if b > 0 else 0) + 12 * a + (2 if b > 0 else 1) * 1000000, (a, b, got)
+    for skip, key in itertools.product((False, True), ('a', 'b')):
+        maps = lambda: dict(Scores={'a': 7})
+        for fn, want in (('Lookup', 7 if key == 'a' else -1), ('LookupUnless', -1 if skip or key != 'a' else 70)):
+            del runscript.CONTAINER_CALLS[:]
+            got = run(asset('OptTest'), fn, self_vars=maps(), **(dict(Key=key) if fn == 'Lookup' else dict(Skip=skip, Key=key)))[0]
+            ran = list(runscript.CONTAINER_CALLS)
+            proves('what-the-optimizer.return-x-a-b')
+            assert got == want and ran == ([] if fn == 'LookupUnless' and skip else ['Map_Find']), (fn, skip, key, got, ran)
+    print('ok  OptTest.Drop / Reuse / Correlated / NotHoisted: a repeated pure or UE_STABLE call reads the first one\'s '
+          'value where the first surely ran, and runs again where it may not have')
+
+
 def opt_raw():
     """UE_NO_OPTIMIZE / #pragma clang optimize off: what the source says runs, unused pure calls and the
     short-circuit included (an execution trace, not the layout)."""
@@ -2798,6 +2837,7 @@ opt_forward()
 opt_in_place()
 opt_slots()
 opt_threads()
+opt_reuse()
 opt_raw()
 opt_flags()
 
