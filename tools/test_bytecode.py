@@ -2801,6 +2801,15 @@ def opt_reuse():
             ran = list(runscript.CONTAINER_CALLS)
             proves('what-the-optimizer.return-x-a-b')
             assert got == want and ran == ([] if fn == 'LookupUnless' and skip else ['Map_Find']), (fn, skip, key, got, ran)
+    for a, b, c in ((3, 4, 5), (-2, 7, 0)):
+        me = dict(Loads=0, Calls=1)
+        del runscript.CALLS[:]
+        got = run(asset('OptTest'), 'AcrossActs', self_vars=me, A=a, B=b, C=c)[0]
+        proves('what-the-optimizer.return-x-a-b')
+        c2 = c + 2
+        assert got == i32(2 * a * b * 10000 + (a * c + a * c2) * 100 + 20 * a + 2), (a, b, c, got)
+        assert runscript.CALLS.count(('Multiply_IntInt', (a, b))) == 1 and me['Loads'] == 2, (runscript.CALLS, me)
+        assert ('Multiply_IntInt', (a, c2)) in runscript.CALLS, runscript.CALLS
     # An inline body's early returns under `&&` guards, and one nested in a branch with code after it, each still
     # leave the body (NestRest once dropped them: EMM's DevKey::Nibble gave -1 for every digit).
     digit = lambda c: c - 48 if 48 <= c <= 57 else c - 87 if 97 <= c <= 102 else c - 55 if 65 <= c <= 70 else -1
@@ -2812,6 +2821,65 @@ def opt_reuse():
         assert got == i32(want), (frm, count, got, want)
     print('ok  OptTest.Drop / Reuse / Correlated / NotHoisted / Digits: a repeated pure or UE_STABLE call reads the first '
           'one\'s value where the first surely ran, and runs again where it may not have; inlined early returns still leave')
+
+
+def opt_hoist():
+    """HoistInvariants and ShareRepeats: a value is C++'s, the oracle's, and the math the loops repeat runs once.
+    16 * D runs once per call of Hoisted, for any N (a loop of no round too: quiet math has nothing to show); Moved's
+    and Handed's run each round, since a round changes D2 or gives it to a call that may. Divided's division runs only in
+    a round, so a zero D with N = 0 logs nothing. Twice subtracts I * 2 - J once per element; TwiceActs, past a call that acts,
+    and TwiceMaybe, under a `?:`, add theirs where they were. Tail's branches each store
+    their value, its then branch now ending in the return it jumped to."""
+    muls = lambda: sum(1 for c in runscript.CALLS if c[0] == 'Multiply_IntInt' and 16 in c[1])
+    for d, n in itertools.product((3, -2), (0, 1, 4)):
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'Hoisted', D=d, N=n)[0] == i32(sum(16 * d + i * j for i in range(n) for j in range(3)))
+        proves('what-the-optimizer.sum-sum-16-d-i')
+        assert muls() == 1, runscript.CALLS
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'Moved', D=d, N=n)[0] == sum(16 * (d + (i > 1)) + i for i in range(n))
+        proves('what-the-optimizer.sum-sum-16-d-i')
+        assert muls() == n, runscript.CALLS
+        del runscript.CALLS[:]
+        me, want, d2 = dict(Calls=2), 0, d
+        for i in range(n): want, d2 = want + 16 * d2, d2 + 2
+        assert run(asset('OptTest'), 'Handed', self_vars=me, D=d, N=n)[0] == want
+        assert muls() == n, runscript.CALLS
+    for q, d, n in ((7, 2, 3), (7, 0, 0), (-9, 4, 2)):
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'Divided', Q=q, D=d, N=n)[0] == (n and n * cdiv(q, d))
+        proves('what-the-optimizer.sum-sum-16-d-i')
+        assert sum(1 for c in runscript.CALLS if c[0] == 'Divide_IntInt') == n, runscript.CALLS
+    for n in (0, 1, 2, 3):
+        col = [0] * 8
+        for i in range(1, n + 1):
+            for j in range(2): col[i * 2 - j] += i * 10 + j
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'Twice', N=n)[0] == i32(col[1] + col[2] * 100 + col[3] * 10000 + col[4] * 1000000)
+        proves('what-the-optimizer.col-i-2-j-col')
+        assert sum(1 for c in runscript.CALLS if c[0] == 'Subtract_IntInt') == 2 * n, runscript.CALLS
+    for a, b in ((3, 4), (-5, 2)):
+        me = dict(Calls=4)
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'TwiceActs', self_vars=me, A=a, B=b)[0] == (a + b) * 5 + (a + b)
+        proves('what-the-optimizer.col-i-2-j-col')
+        assert runscript.CALLS.count(('Add_IntInt', (a, b))) == 2, runscript.CALLS
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'TwiceMaybe', A=a, B=b)[0] == (a + b) * (2 if a > 0 else 3)
+        assert runscript.CALLS.count(('Add_IntInt', (a, b))) == 1, runscript.CALLS
+    for a, seen in itertools.product((None, {}), (None, {})):
+        del runscript.CALLS[:]
+        got = run(asset('OptTest'), 'Nulls', self_vars=dict(Seen=seen), A=a)[0]
+        proves('comparisons.a-this')
+        assert got == (1 if a is not None else 6) + (8 if seen is not None else 0), (a, seen, got)
+        assert not [c for c in runscript.CALLS if c[0].endswith('_ObjectObject')], runscript.CALLS
+    for a in (1, 0, -3):
+        me = dict(Ends=0)
+        run(asset('OptTest'), 'Tail', self_vars=me, A=a)
+        proves('what-the-optimizer.if-a-0-ends-1')
+        assert me['Ends'] == (1 if a > 0 else 2), me
+    print('ok  OptTest.Hoisted / Moved / Handed / Divided / Twice / TwiceActs / TwiceMaybe / Tail: quiet math a loop or a '
+          'statement repeats runs once, where nothing can change it; a jump to a return is the return')
 
 
 def opt_raw():
@@ -2847,6 +2915,7 @@ opt_in_place()
 opt_slots()
 opt_threads()
 opt_reuse()
+opt_hoist()
 opt_raw()
 opt_flags()
 

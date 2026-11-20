@@ -191,6 +191,18 @@ public:
     int32 U = Load(A, Other);
     return (X + Y + Z + W + U + First + Again + Other) * 100 + Loads;
   }
+  /* Past a call that may act, pure math on locals it is not given keeps its value (A * B), and one on a local it is
+     given runs again (A * C after AddCalls(C)). Load, UE_STABLE, runs again past Tick, as in Reuse. */
+  int32 AcrossActs(int32 A, int32 B, int32 C) {
+    int32 Out = 0;
+    int32 X = A * B;
+    int32 Y = A * C;
+    int32 L = Load(A, Out);
+    Tick();
+    AddCalls(C);
+    int32 M = Load(A, Out);
+    return (X + A * B) * 10000 + (Y + A * C) * 100 + L + M + Loads;
+  }
   /* Two `if`s on one value take the same branch: the second's Load is the first's. */
   inline int32 Guarded(int32 A) {
     if (A <= 0)
@@ -256,6 +268,75 @@ public:
     if (Skip || !Scores.Contains(Key))
       return -1;
     return Scores[Key] * 10;
+  }
+
+  /* HoistInvariants: 16 * D, which no round changes, is multiplied once before both loops, even for a loop that runs
+     no round. Moved stays in the loop: a round changes D2. Handed too: AddCalls may write the D it is given. Q / D is a
+     division, which logs for a zero D, so it stays where it runs. */
+  void AddCalls(int32& V) { V = V + Calls; }
+  int32 Hoisted(int32 D, int32 N) {
+    int32 Sum = 0;
+    for (int32 I = 0; I < N; ++I)
+      for (int32 J = 0; J < 3; ++J)
+        Sum = Sum + 16 * D + I * J;
+    return Sum;
+  }
+  int32 Moved(int32 D, int32 N) {
+    int32 Sum = 0;
+    int32 D2 = D;
+    for (int32 I = 0; I < N; ++I) {
+      Sum = Sum + 16 * D2 + I;
+      if (I == 1) D2 = D2 + 1;
+    }
+    return Sum;
+  }
+  int32 Handed(int32 D, int32 N) {
+    int32 Sum = 0;
+    int32 D2 = D;
+    for (int32 I = 0; I < N; ++I) {
+      Sum = Sum + 16 * D2;
+      AddCalls(D2);
+    }
+    return Sum;
+  }
+  int32 Divided(int32 Q, int32 D, int32 N) {
+    int32 Sum = 0;
+    for (int32 I = 0; I < N; ++I) Sum = Sum + Q / D;
+    return Sum;
+  }
+
+  /* ShareRepeats: I * 2 - J is subtracted once for the element both sides name. Not where something in the statement acts
+     (Tick), nor under a `?:`, which may not run one of the copies. */
+  int32 Twice(int32 N) {
+    TArray<int32> Col;
+    Col.Resize(8);
+    for (int32 I = 1; I <= N; ++I)
+      for (int32 J = 0; J < 2; ++J) Col[I * 2 - J] = Col[I * 2 - J] + I * 10 + J;
+    return Col[1] + Col[2] * 100 + Col[3] * 10000 + Col[4] * 1000000;
+  }
+  int32 TwiceActs(int32 A, int32 B) { return (A + B) * Tick() + (A + B); }
+  int32 TwiceMaybe(int32 A, int32 B) { return A > 0 ? (A + B) * 2 : (A + B) * 3; }
+
+  /* `!= nullptr` and `== nullptr` test the pointer in one cast opcode, no call: NotEqual_ObjectObject's answer. */
+  AActor* Seen;
+  int32 Nulls(AActor* A) {
+    bool bSet = A != nullptr;
+    bool bNone = nullptr == A;
+    int32 R = int32(bSet) + 2 * int32(bNone);
+    if (A == nullptr)
+      R += 4;
+    if (Seen != nullptr)
+      R += 8;
+    return R;
+  }
+
+  /* An `if` / `else` that ends the function: the then branch's jump past the else is the return it lands on. */
+  int32 Ends;
+  void Tail(int32 A) {
+    if (A > 0)
+      Ends = 1;
+    else
+      Ends = 2;
   }
 
   /* UE_NO_OPTIMIZE: the unused pure call, the unread local and the branch all stay. */
