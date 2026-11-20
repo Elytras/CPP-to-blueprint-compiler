@@ -2766,6 +2766,122 @@ def opt_threads():
     print('ok  OptTest.Threads: an if over an inline bool function takes the branch each return picks')
 
 
+def opt_reuse():
+    """ReuseCalls: a repeated pure call reads the earlier one's local (Drop's A * B is multiplied once). A UE_STABLE call
+    (Load, whose counter shows each run) is the earlier one's value and out value when the earlier one surely ran first:
+    on the same path, under a later `if`, or under an earlier `if` on the same value (Correlated's two inlined guards).
+    Not after an `if` that may have skipped it (NotHoisted), nor across a call that may act (Reuse's Tick). Each value is
+    C++'s, the oracle's."""
+    for a, b in ((3, 4), (-4, 5), (0, 7)):
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'Drop', A=a, B=b)[0] == i32(2 * a * b), (a, b)
+        proves('what-the-optimizer.return-x-a-b')
+        assert [c for c in runscript.CALLS if c[0] == 'Multiply_IntInt'] == [('Multiply_IntInt', (a, b))], runscript.CALLS
+    for a, b in itertools.product((3, -1, 4), (5, -2, 4, 0)):
+        me = dict(Loads=0, Kept=0, Calls=0)
+        z = 10 * b + (12 * a if b > 0 else 0)
+        got = run(asset('OptTest'), 'Reuse', self_vars=me, A=a, B=b)[0]
+        proves('what-the-optimizer.return-x-a-b', 'methods-as-blueprint.ue-stable-savegamebase-getsave')
+        assert got == (40 * a + z + 6 * a) * 100 + 3 and me == dict(Loads=3, Kept=b, Calls=1), (a, b, got, me)
+    for a in (3, 1, 0, -2):
+        me = dict(Loads=0)
+        p = 12 * a if a > 0 else -1
+        got = run(asset('OptTest'), 'Correlated', self_vars=me, A=a)[0]
+        proves('what-the-optimizer.return-x-a-b')
+        assert got == p * 1000 + p + int(a > 0) * 1000000 and me == dict(Loads=int(a > 0)), (a, got, me)
+    for a, b in itertools.product((3, -5), (1, 0)):
+        me = dict(Loads=0)
+        got = run(asset('OptTest'), 'NotHoisted', self_vars=me, A=a, B=b)[0]
+        assert got == (10 * a if b > 0 else 0) + 12 * a + (2 if b > 0 else 1) * 1000000, (a, b, got)
+    for skip, key in itertools.product((False, True), ('a', 'b')):
+        maps = lambda: dict(Scores={'a': 7})
+        for fn, want in (('Lookup', 7 if key == 'a' else -1), ('LookupUnless', -1 if skip or key != 'a' else 70)):
+            del runscript.CONTAINER_CALLS[:]
+            got = run(asset('OptTest'), fn, self_vars=maps(), **(dict(Key=key) if fn == 'Lookup' else dict(Skip=skip, Key=key)))[0]
+            ran = list(runscript.CONTAINER_CALLS)
+            proves('what-the-optimizer.return-x-a-b')
+            assert got == want and ran == ([] if fn == 'LookupUnless' and skip else ['Map_Find']), (fn, skip, key, got, ran)
+    for a, b, c in ((3, 4, 5), (-2, 7, 0)):
+        me = dict(Loads=0, Calls=1)
+        del runscript.CALLS[:]
+        got = run(asset('OptTest'), 'AcrossActs', self_vars=me, A=a, B=b, C=c)[0]
+        proves('what-the-optimizer.return-x-a-b')
+        c2 = c + 2
+        assert got == i32(2 * a * b * 10000 + (a * c + a * c2) * 100 + 20 * a + 2), (a, b, c, got)
+        assert runscript.CALLS.count(('Multiply_IntInt', (a, b))) == 1 and me['Loads'] == 2, (runscript.CALLS, me)
+        assert ('Multiply_IntInt', (a, c2)) in runscript.CALLS, runscript.CALLS
+    # An inline body's early returns under `&&` guards, and one nested in a branch with code after it, each still
+    # leave the body (NestRest once dropped them: EMM's DevKey::Nibble gave -1 for every digit).
+    digit = lambda c: c - 48 if 48 <= c <= 57 else c - 87 if 97 <= c <= 102 else c - 55 if 65 <= c <= 70 else -1
+    sign = lambda x: 2 if x > 100 else 1 if x > 0 else -1 if x < 0 else 0
+    for frm, count in ((40, 80), (95, 10), (59, 3), (150, 4)):
+        want = sum((digit(frm + i) + 2) * (i + 1) + digit(frm + i + 1) * 100 + sign(frm + i - 60) * 10000 for i in range(count))
+        got = run(asset('OptTest'), 'Digits', From=frm, Count=count)[0]
+        proves('what-the-optimizer.return-x-a-b')
+        assert got == i32(want), (frm, count, got, want)
+    print('ok  OptTest.Drop / Reuse / Correlated / NotHoisted / Digits: a repeated pure or UE_STABLE call reads the first '
+          'one\'s value where the first surely ran, and runs again where it may not have; inlined early returns still leave')
+
+
+def opt_hoist():
+    """HoistInvariants and ShareRepeats: a value is C++'s, the oracle's, and the math the loops repeat runs once.
+    16 * D runs once per call of Hoisted, for any N (a loop of no round too: quiet math has nothing to show); Moved's
+    and Handed's run each round, since a round changes D2 or gives it to a call that may. Divided's division runs only in
+    a round, so a zero D with N = 0 logs nothing. Twice subtracts I * 2 - J once per element; TwiceActs, past a call that acts,
+    and TwiceMaybe, under a `?:`, add theirs where they were. Tail's branches each store
+    their value, its then branch now ending in the return it jumped to."""
+    muls = lambda: sum(1 for c in runscript.CALLS if c[0] == 'Multiply_IntInt' and 16 in c[1])
+    for d, n in itertools.product((3, -2), (0, 1, 4)):
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'Hoisted', D=d, N=n)[0] == i32(sum(16 * d + i * j for i in range(n) for j in range(3)))
+        proves('what-the-optimizer.sum-sum-16-d-i')
+        assert muls() == 1, runscript.CALLS
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'Moved', D=d, N=n)[0] == sum(16 * (d + (i > 1)) + i for i in range(n))
+        proves('what-the-optimizer.sum-sum-16-d-i')
+        assert muls() == n, runscript.CALLS
+        del runscript.CALLS[:]
+        me, want, d2 = dict(Calls=2), 0, d
+        for i in range(n): want, d2 = want + 16 * d2, d2 + 2
+        assert run(asset('OptTest'), 'Handed', self_vars=me, D=d, N=n)[0] == want
+        assert muls() == n, runscript.CALLS
+    for q, d, n in ((7, 2, 3), (7, 0, 0), (-9, 4, 2)):
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'Divided', Q=q, D=d, N=n)[0] == (n and n * cdiv(q, d))
+        proves('what-the-optimizer.sum-sum-16-d-i')
+        assert sum(1 for c in runscript.CALLS if c[0] == 'Divide_IntInt') == n, runscript.CALLS
+    for n in (0, 1, 2, 3):
+        col = [0] * 8
+        for i in range(1, n + 1):
+            for j in range(2): col[i * 2 - j] += i * 10 + j
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'Twice', N=n)[0] == i32(col[1] + col[2] * 100 + col[3] * 10000 + col[4] * 1000000)
+        proves('what-the-optimizer.col-i-2-j-col')
+        assert sum(1 for c in runscript.CALLS if c[0] == 'Subtract_IntInt') == 2 * n, runscript.CALLS
+    for a, b in ((3, 4), (-5, 2)):
+        me = dict(Calls=4)
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'TwiceActs', self_vars=me, A=a, B=b)[0] == (a + b) * 5 + (a + b)
+        proves('what-the-optimizer.col-i-2-j-col')
+        assert runscript.CALLS.count(('Add_IntInt', (a, b))) == 2, runscript.CALLS
+        del runscript.CALLS[:]
+        assert run(asset('OptTest'), 'TwiceMaybe', A=a, B=b)[0] == (a + b) * (2 if a > 0 else 3)
+        assert runscript.CALLS.count(('Add_IntInt', (a, b))) == 1, runscript.CALLS
+    for a, seen in itertools.product((None, {}), (None, {})):
+        del runscript.CALLS[:]
+        got = run(asset('OptTest'), 'Nulls', self_vars=dict(Seen=seen), A=a)[0]
+        proves('comparisons.a-this')
+        assert got == (1 if a is not None else 6) + (8 if seen is not None else 0), (a, seen, got)
+        assert not [c for c in runscript.CALLS if c[0].endswith('_ObjectObject')], runscript.CALLS
+    for a in (1, 0, -3):
+        me = dict(Ends=0)
+        run(asset('OptTest'), 'Tail', self_vars=me, A=a)
+        proves('what-the-optimizer.if-a-0-ends-1')
+        assert me['Ends'] == (1 if a > 0 else 2), me
+    print('ok  OptTest.Hoisted / Moved / Handed / Divided / Twice / TwiceActs / TwiceMaybe / Tail: quiet math a loop or a '
+          'statement repeats runs once, where nothing can change it; a jump to a return is the return')
+
+
 def opt_raw():
     """UE_NO_OPTIMIZE / #pragma clang optimize off: what the source says runs, unused pure calls and the
     short-circuit included (an execution trace, not the layout)."""
@@ -2798,6 +2914,8 @@ opt_forward()
 opt_in_place()
 opt_slots()
 opt_threads()
+opt_reuse()
+opt_hoist()
 opt_raw()
 opt_flags()
 
@@ -7564,6 +7682,56 @@ def spawn_runs():
     print('ok  SpawnTest: spawn / construct / add-component calls, their classes and the deferred-set order')
 
 
+def spawn_with():
+    """SpawnWith: each one-call deferred form (SpawnActorWith, AddComponentWith, CreateWidgetWith, NewObjectWith) is
+    its two-step form written out. The one place this suite compares bytecode: the form is promised to cost nothing,
+    so each pair must be the same code, the compiler's own temps aside (named here by where each first appears). Run
+    with the engine faked, the sets land between the begin and the finish, in the order written."""
+    base = asset('SpawnWith')
+
+    def code(fn):
+        temps = {}
+
+        def go(n):
+            v = n.val
+            if isinstance(v, str) and v.startswith('__'): v = temps.setdefault(v, '__t%d' % len(temps))
+            return n.op, v, [go(k) for k in n.kids]
+        return [go(s) for s in runscript.script_of(base, fn)]
+    for kind, row in (('Actor', 'spawning-actors.spawnactorwith'), ('Component', 'adding-components-at.addcomponentwith'),
+                      ('Widget', 'objects-and-widgets.createwidgetwith'), ('Object', 'objects-and-widgets.newobjectwith')):
+        proves(row, 'templates.member-pointer-argument')
+        assert code(kind + 'With') == code(kind + 'Hand'), kind
+
+    made = lambda k: (lambda vm, ctx, *a: Obj(a[k], args=a))
+    vm = VM(base, {'BeginDeferredActorSpawnFromClass': made(1), 'FinishSpawningActor': lambda vm, ctx, a, xf: a,
+                   'AddComponentByClass': made(0), 'SpawnObject': made(0), 'Create': made(1),
+                   'Conv_VectorToTransform': lambda vm, ctx, v: ('xf', tuple(v))})
+    me = vm.self
+    for fn, args in (('ActorWith', dict(Where='xf')), ('ComponentWith', {}), ('WidgetWith', dict(Player=None)), ('ObjectWith', {})):
+        vm.call(fn, **args)
+    twin, comp, hud, probe = (me.vars[k] for k in ('Last', 'Charges', 'Hud', 'Probe'))
+    zero = ('xf', (0.0, 0.0, 0.0))
+    proves('spawning-actors.spawnactorwith', 'adding-components-at.addcomponentwith',
+           'objects-and-widgets.createwidgetwith', 'objects-and-widgets.newobjectwith')
+    assert [l for l in vm.log if l[0] != 'Conv_VectorToTransform'] == [
+        ('BeginDeferredActorSpawnFromClass', me, [me, 'SpawnWith_C', 'xf', 0, None]),
+        ('set', twin, 'Health'), ('set', twin, 'Tag'), ('set', twin, 'Team'),       # as written, a parent's Team too
+        ('FinishSpawningActor', me, [twin, 'xf']), ('set', me, 'Last'),
+        ('AddComponentByClass', me, ['UWithCharges_C', False, zero, True]),           # held back ...
+        ('set', comp, 'Left'), ('set', comp, 'Rate'), ('FinishAddComponent', me, [comp, False, zero]),  # ... until set
+        ('set', me, 'Charges'),
+        ('Create', 'Default__WidgetBlueprintLibrary', [me, 'UWithHud_C', None]), ('set', hud, 'Score'), ('set', me, 'Hud'),
+        ('SpawnObject', me, ['UWithProbe_C', me]), ('set', probe, 'Seen'), ('set', probe, 'Label'), ('set', me, 'Probe'),
+    ], vm.log
+    assert (twin.vars['Health'], twin.vars['Tag'], twin.vars['Team']) == (100.0, 7, 2), twin.vars
+    assert (comp.vars['Left'], comp.vars['Rate'], hud.vars['Score'], probe.vars['Seen'], probe.vars['Label']) == (5, 0.5, 42, 9, 'made')
+    # A member pointer passed to an inline function of the mod's own names its field: `O->*F = V` is `O->Tag = V`.
+    proves('templates.member-pointer-argument')
+    vm.call('PutTag')
+    assert me.vars['Tag'] == 3, me.vars
+    print('ok  SpawnWith: the one-call spawn / add / create / construct forms are their two-step forms, sets in order')
+
+
 def spawn_relative():
     """Compiled from its own folder as a bare "SpawnTest.cpp": `SpawnTest::StaticClass()` still names the mod class
     (the qualifier is read back from the mod's sources, which a bare path's empty parent once hid)."""
@@ -7671,6 +7839,7 @@ await_runs()
 await_values()
 delegate_targets()
 spawn_runs()
+spawn_with()
 spawn_relative()
 spawn_unity()
 outer_runs()
@@ -17590,6 +17759,19 @@ ROW_REFUSALS = [
     ('components-a-parent.controller-battachtopawn-true', 'PawnCtl', '  UE_DEFAULTS { Controller->bAttachToPawn = true; }\n',
      'UeApi does not say which default subobject Controller is', '', 'APawn'),
     ('objects-and-widgets.newobject-aactor-this', 'NewObjActor', '  AActor *F() { return NewObject<AActor>(this); }\n', 'no matching function', ''),
+    ('spawning-actors.spawnactorwith-wrong', 'WithType', '  int32 Tag;\n  void F(FTransform W) { SpawnActorWith<WithType>(WithType::StaticClass(), W, Assign(&WithType::Tag, FVector())); }\n',
+     "the value does not convert to the field's type", OBJECTS),
+    ('spawning-actors.spawnactorwith-wrong', 'WithNone', '  void F(FTransform W) { SpawnActorWith<WithNone>(WithNone::StaticClass(), W, Assign(&WithNone::Nope, 1)); }\n',
+     "no member named 'Nope' in 'WithNone'", OBJECTS),
+    ('spawning-actors.spawnactorwith-wrong', 'WithOdd', '  int32 Tag;\n  void F(FTransform W) { SpawnActorWith<WithOdd>(WithOdd::StaticClass(), W, &WithOdd::Tag, 1); }\n',
+     'give each field and its value as Assign(&T::Field, Value)', OBJECTS),
+    ('spawning-actors.spawnactorwith-wrong', 'WithOther', '  void F(FTransform W) { SpawnActorWith<WithOther>(WithOther::StaticClass(), W, Assign(&AOther::Tag, 1)); }\n',
+     "the field is not a member of the object's class", OBJECTS + 'class AOther : public AActor {\npublic:\n  int32 Tag;\n};\n'),
+    ('templates.member-pointer-variable', 'WithVar', '  int32 Tag;\n  int32 Other;\n  void F(FTransform W, bool B) { SpawnActorWith<WithVar>(WithVar::StaticClass(), W, Assign(B ? &WithVar::Tag : &WithVar::Other, 1)); }\n',
+     'takes a field and its value, which can only be `Assign(', OBJECTS),
+    ('templates.member-pointer-variable', 'WithVarBare', '  int32 Tag;\n  int32 Other;\n  void F(bool B) { Put(this, B ? &WithVarBare::Tag : &WithVarBare::Other, 1); }\n',
+     'takes a member pointer, which can only be a field named where it is passed',
+     'template <class C, class M> inline void Put(C *O, M C::*F, M V) { O->*F = V; }\n'),
     ('uobject-helpers.obj-class', 'ObjClass', '  void F(UObject *Obj) { auto C = Obj->Class; }\n', "no member named 'Class' in 'UObject'", ''),
     ('pointing-at-data.float-h-md-big-health', 'AssetRead', '  float F() { float H = MD_Big.Health; return H; }\n', 'is an asset, not a value',
      'class UMoodDef : public UPrimaryDataAsset {\npublic:\n  float Health = 1.0f;\n};\nUMoodDef MD_Big = {.Health = 5.0f};\n'),
@@ -17726,6 +17908,7 @@ proves('arithmetic.id-count', 'binding-handlers.onhit-isbound', 'blueprint-class
        'what-a-range.for-int32-x-1-2', 'widget-layouts.grid-addchildtogrid-cell-1-2', 'widget-layouts.ue-widget-3')
 proves('declaring-an-interface.int32-marks', 'jumps.goto', 'range-for-over.goto', 'math-and-utility.std-min-a-b',
        'reading-and-writing.tarray-int32-a-pa')
+proves('spawning-actors.spawnactorwith-wrong', 'templates.member-pointer-variable')
 row_refusals()
 
 

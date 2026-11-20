@@ -3,6 +3,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -198,8 +199,9 @@ public:
     int32 Jump(int32 MemTarget);
     int32 JumpIfNot(int32 MemTarget, const std::function<void(FScript&)>& Cond);
     void PatchJumpTarget(int32 StorageOffset, int32 MemTarget);
-    /* Once every target is patched: a jump that lands on an EX_Jump goes straight to where that one goes. Only
-       operands change, so no offset moves. */
+    /* Once every target is patched: a jump that lands on an EX_Jump goes straight to where that one goes, and an
+       EX_Jump that lands on a bare EX_Return is that return: EX_Return EX_Nothing and three EX_Nothing the VM never
+       reaches (the loader still reads them), the same five bytes, so no offset moves. */
     void ThreadJumps();
     /* EX_ComputedJump: OffsetExpr yields the int32 MEMORY offset to continue at. */
     void ComputedJump(const std::function<void(FScript&)>& OffsetExpr);
@@ -282,6 +284,7 @@ private:
     int32 Memory = 0;
     std::vector<int32> JumpOperands;            // every Jump / JumpIfNot operand, by storage offset
     std::map<int32, int32> PlainJumpAt;         // an EX_Jump's memory offset -> its operand's storage offset
+    std::set<int32> BareReturnAt;               // each `EX_Return EX_Nothing`'s memory offset: see ThreadJumps
 };
 
 /* Super is the overridden engine UFunction (what makes e.g. ReceiveTick an event), or null. */

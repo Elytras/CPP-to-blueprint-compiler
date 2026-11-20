@@ -4,13 +4,14 @@
 
 UE_MOD_PACKAGE("/Game/_ElytrasMods/OptTest");
 
-/* DropUnusedPure: a pure call whose value is unused is dropped; one whose value is used, even twice, is kept. */
+/* DropUnusedPure: a pure call whose value is unused is dropped; one whose value is used is kept, and the same call
+   again reads the local the first one's value went to (ReuseCalls). */
 class OptTest : public AActor {
 public:
   int32 Drop(int32 A, int32 B) {
     UKismetMathLibrary::Abs_Int(A); // dropped
     int32 X = A * B;
-    return X + A * B;               // computed again
+    return X + A * B;               // X: not computed again
   }
 
   int32 Kept;
@@ -164,6 +165,178 @@ public:
     if (IsSquare(V * 2))
       return R;
     return R + 16;
+  }
+
+  /* ReuseCalls: a UE_STABLE call that an identical earlier one is sure to have run before is that call's value and out
+     value. Loads counts the runs, which a real UE_STABLE getter would not let anyone see. */
+  int32 Loads;
+  UE_STABLE int32 Load(int32 Slot, int32 &Twice) {
+    Loads += 1;
+    Twice = Slot * 2;
+    return Slot * 10;
+  }
+  int32 Reuse(int32 A, int32 B) {
+    int32 First = 0, Again = 0, Other = 0;
+    int32 X = Load(A, First);
+    int32 Y = Load(A, Again);       // the first's: Again is First
+    int32 Z = Load(B, Other);       // another argument: runs
+    if (B > 0) {
+      int32 Inner = 0;
+      int32 V = Load(A, Inner);     // the first's, under an if
+      Z += V + Inner;
+    }
+    Kept = B;                       // a store to a member reads no local: Load(A) stays known
+    int32 W = Load(A, Other);
+    Tick();                         // a call that may act: what follows runs again
+    int32 U = Load(A, Other);
+    return (X + Y + Z + W + U + First + Again + Other) * 100 + Loads;
+  }
+  /* Past a call that may act, pure math on locals it is not given keeps its value (A * B), and one on a local it is
+     given runs again (A * C after AddCalls(C)). Load, UE_STABLE, runs again past Tick, as in Reuse. */
+  int32 AcrossActs(int32 A, int32 B, int32 C) {
+    int32 Out = 0;
+    int32 X = A * B;
+    int32 Y = A * C;
+    int32 L = Load(A, Out);
+    Tick();
+    AddCalls(C);
+    int32 M = Load(A, Out);
+    return (X + A * B) * 10000 + (Y + A * C) * 100 + L + M + Loads;
+  }
+  /* Two `if`s on one value take the same branch: the second's Load is the first's. */
+  inline int32 Guarded(int32 A) {
+    if (A <= 0)
+      return -1;
+    int32 T = 0;
+    int32 V = Load(A, T);
+    return V + T;
+  }
+  int32 Correlated(int32 A) {
+    int32 P = Guarded(A);
+    int32 Q = Guarded(A);
+    return P * 1000 + Q + Loads * 1000000;
+  }
+  /* Only a call the first is sure to have run before: B decides whether the first ran at all. */
+  int32 NotHoisted(int32 A, int32 B) {
+    int32 T = 0, X = 0;
+    if (B > 0)
+      X = Load(A, T);
+    int32 Y = Load(A, T);
+    return X + Y + T + Loads * 1000000;
+  }
+
+  /* Early returns under `&&` guards, inlined twice in a loop (EMM's DevKey::Nibble): each return still leaves the
+     body, so a later guard never sees a digit and the trailing -1 never overwrites it. */
+  inline int32 Digit(int32 Code) {
+    if (Code >= 48 && Code <= 57)
+      return Code - 48;
+    if (Code >= 97 && Code <= 102)
+      return Code - 87;
+    if (Code >= 65 && Code <= 70)
+      return Code - 55;
+    return -1;
+  }
+  inline int32 Sign(int32 X) {
+    if (X > 0) {
+      if (X > 100)
+        return 2;
+      X = X + 1;
+    }
+    if (X < 0)
+      return -1;
+    return X == 0 ? 0 : 1;
+  }
+  int32 Digits(int32 From, int32 Count) {
+    int32 Sum = 0;
+    for (int32 I = 0; I < Count; ++I) {
+      int32 A = Digit(From + I);
+      int32 B = Digit(From + I + 1);
+      Sum = Sum + (A + 2) * (I + 1) + B * 100 + Sign(From + I - 60) * 10000;
+    }
+    return Sum;
+  }
+
+  /* MergeFind: `Map[Key]` where Contains(Key) surely ran is that Contains, made a Map_Find: one map call. Through an
+     `||` too, whose temp says Contains ran when it is false. */
+  TMap<FName, int32> Scores;
+  int32 Lookup(FName Key) {
+    if (!Scores.Contains(Key))
+      return -1;
+    return Scores[Key];
+  }
+  int32 LookupUnless(bool Skip, FName Key) {
+    if (Skip || !Scores.Contains(Key))
+      return -1;
+    return Scores[Key] * 10;
+  }
+
+  /* HoistInvariants: 16 * D, which no round changes, is multiplied once before both loops, even for a loop that runs
+     no round. Moved stays in the loop: a round changes D2. Handed too: AddCalls may write the D it is given. Q / D is a
+     division, which logs for a zero D, so it stays where it runs. */
+  void AddCalls(int32& V) { V = V + Calls; }
+  int32 Hoisted(int32 D, int32 N) {
+    int32 Sum = 0;
+    for (int32 I = 0; I < N; ++I)
+      for (int32 J = 0; J < 3; ++J)
+        Sum = Sum + 16 * D + I * J;
+    return Sum;
+  }
+  int32 Moved(int32 D, int32 N) {
+    int32 Sum = 0;
+    int32 D2 = D;
+    for (int32 I = 0; I < N; ++I) {
+      Sum = Sum + 16 * D2 + I;
+      if (I == 1) D2 = D2 + 1;
+    }
+    return Sum;
+  }
+  int32 Handed(int32 D, int32 N) {
+    int32 Sum = 0;
+    int32 D2 = D;
+    for (int32 I = 0; I < N; ++I) {
+      Sum = Sum + 16 * D2;
+      AddCalls(D2);
+    }
+    return Sum;
+  }
+  int32 Divided(int32 Q, int32 D, int32 N) {
+    int32 Sum = 0;
+    for (int32 I = 0; I < N; ++I) Sum = Sum + Q / D;
+    return Sum;
+  }
+
+  /* ShareRepeats: I * 2 - J is subtracted once for the element both sides name. Not where something in the statement acts
+     (Tick), nor under a `?:`, which may not run one of the copies. */
+  int32 Twice(int32 N) {
+    TArray<int32> Col;
+    Col.Resize(8);
+    for (int32 I = 1; I <= N; ++I)
+      for (int32 J = 0; J < 2; ++J) Col[I * 2 - J] = Col[I * 2 - J] + I * 10 + J;
+    return Col[1] + Col[2] * 100 + Col[3] * 10000 + Col[4] * 1000000;
+  }
+  int32 TwiceActs(int32 A, int32 B) { return (A + B) * Tick() + (A + B); }
+  int32 TwiceMaybe(int32 A, int32 B) { return A > 0 ? (A + B) * 2 : (A + B) * 3; }
+
+  /* `!= nullptr` and `== nullptr` test the pointer in one cast opcode, no call: NotEqual_ObjectObject's answer. */
+  AActor* Seen;
+  int32 Nulls(AActor* A) {
+    bool bSet = A != nullptr;
+    bool bNone = nullptr == A;
+    int32 R = int32(bSet) + 2 * int32(bNone);
+    if (A == nullptr)
+      R += 4;
+    if (Seen != nullptr)
+      R += 8;
+    return R;
+  }
+
+  /* An `if` / `else` that ends the function: the then branch's jump past the else is the return it lands on. */
+  int32 Ends;
+  void Tail(int32 A) {
+    if (A > 0)
+      Ends = 1;
+    else
+      Ends = 2;
   }
 
   /* UE_NO_OPTIMIZE: the unused pure call, the unread local and the branch all stay. */
