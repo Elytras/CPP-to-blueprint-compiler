@@ -417,19 +417,17 @@ def place_kept(mod, bp, stage_fsd):
     """A mod's `kept` packages - assets it ships as they were cooked, which no source of it builds (textures, fonts,
     a data asset no source fills) - into its FSD tree for the pak. `kept` is one `{from, paths}` entry or a list of
     them; `paths` lists /Game package paths or folders. Hard links where the volume allows: a texture folder runs to
-    gigabytes. Returns how many files it placed."""
+    gigabytes. Returns the files it placed."""
     kept = mod.get("kept")
-    if not kept:
-        return 0
-    n = 0
-    for i, entry in enumerate(kept if isinstance(kept, list) else [kept]):
-        n += place_kept_entry(entry, mod, bp, i, stage_fsd)
-    return n
+    placed = []
+    for i, entry in enumerate(kept if isinstance(kept, list) else [kept] if kept else []):
+        placed += place_kept_entry(entry, mod, bp, i, stage_fsd)
+    return placed
 
 
 def place_kept_entry(entry, mod, bp, i, stage_fsd):
     content = kept_source(entry, mod, bp, i)
-    n = 0
+    placed = []
     for path in entry.get("paths") or []:
         rel = path[len("/Game/"):] if path.startswith("/Game/") else path.lstrip("/")
         base = os.path.join(content, *rel.split("/"))
@@ -446,8 +444,30 @@ def place_kept_entry(entry, mod, bp, i, stage_fsd):
                 os.link(f, to)
             except OSError:
                 shutil.copy2(f, to)
-            n += 1
-    return n
+            placed.append(to)
+    return placed
+
+
+def register_shipped(stage_fsd, shipped, assetgen):
+    """Rows in the pak's FSD/AssetRegistry.bin for the packages it ships as they were cooked (`bundle`, `kept`;
+    `shipped` holds their staged files), which no compile adds: each asset export's package, name and class, as MINT's
+    integration writes them (no tags). Without them a registry search (CD2's descriptor scan, a class query) finds such
+    an asset only once MINT merges the pak."""
+    from uasset_io import summary, tables
+    content = os.path.join(stage_fsd, "Content")
+    rows = []
+    for f in shipped:
+        if not f.endswith((".uasset", ".umap")):
+            continue
+        b = open(f, "rb").read()
+        names, imps, exps = tables(b, summary(b))
+        nm = lambda v: names[v[0]] + ("" if v[1] == 0 else "_%d" % (v[1] - 1))
+        package = "/Game/" + os.path.relpath(f, content).replace("\\", "/").rsplit(".", 1)[0]
+        rows += ["%s\t%s\t%s" % (package, nm(e["name"]), nm(imps[-e["cls"] - 1]["name"]))
+                 for e in exps if e["is_asset"] and e["outer"] == 0 and e["cls"] < 0]
+    tsv = os.path.join(os.path.dirname(stage_fsd), "registry-rows.tsv")   # beside the FSD tree: not packed
+    io.open(tsv, "w", encoding="utf-8", newline="\n").write("".join(r + "\n" for r in rows))
+    return subprocess.run([assetgen, "registry-rows", os.path.join(stage_fsd, "AssetRegistry.bin"), tsv]).returncode == 0
 
 
 def staged_assets(stage_content):
@@ -908,8 +928,14 @@ def main():
                 failed.append(name)
                 continue
         stage_bundle(bundle, stage_fsd)
+        shipped = [os.path.join(stage_fsd, rel) for _src, rel in bundle]
         if mod.get("kept"):     # after the deps: a kept package wins over a rebuilt one of the same path
-            print("%-16s kept     %d files" % (name, place_kept(mod, bp, stage_fsd)))
+            kept_files = place_kept(mod, bp, stage_fsd)
+            print("%-16s kept     %d files" % (name, len(kept_files)))
+            shipped += kept_files
+        if shipped and not register_shipped(stage_fsd, shipped, assetgen):
+            failed.append(name)
+            continue
         if not os.path.isdir(os.path.dirname(pak)):
             os.makedirs(os.path.dirname(pak))
         if pakkit.pack(stage_fsd, pak, "../../../%s/" % PROJECT):

@@ -2,6 +2,7 @@
 usage: assetgen verify <out-dir> <reference-dir>     rebuilds Autosprint/InitCave and byte-diffs it against the cooked original
        assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>] [--game <folder /Game is in>]
        assetgen registry <out AssetRegistry.bin> <AssetRegistry.bin>...   merges registries assetgen wrote into one
+       assetgen registry-rows <out AssetRegistry.bin> <rows.tsv>   merges in "<package>\t<asset>\t<class>" rows
        assetgen roundtrip <dir>      reads every cooked package under dir and writes it back in memory: the S38 gate
        assetgen astcheck <source.cpp> <include-dir>   checks that the AST dump filter changes nothing on source's dump
        assetgen astcheck --dump <file.json>            ... on a saved dump
@@ -52,6 +53,36 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (argc >= 4 && std::string(argv[1]) == "registry-rows")
+    {
+        /* Rows for packages a pak ships as they were cooked (bpbuild's `kept` and `bundle`), which no compile wrote:
+           one "<package>\t<asset>\t<class>" line each, merged into the registry as a compile's rows are. */
+        std::vector<FRegistryAsset> Rows;
+        FILE* F = fopen(argv[3], "rb");
+        if (!F)
+        {
+            printf("  FAILED: cannot read %s\n", argv[3]);
+            return 1;
+        }
+        char Line[4096];
+        while (fgets(Line, sizeof(Line), F))
+        {
+            std::string L(Line);
+            while (!L.empty() && (L.back() == '\n' || L.back() == '\r')) L.pop_back();
+            const size_t A = L.find('\t'), B = A == std::string::npos ? A : L.find('\t', A + 1);
+            if (B == std::string::npos) continue;
+            Rows.push_back({ L.substr(0, A), L.substr(A + 1, B - A - 1), L.substr(B + 1) });
+        }
+        fclose(F);
+        std::string Err;
+        if (!MergeAssetRegistry(Rows, argv[2], &Err))
+        {
+            printf("  FAILED: %s\n", Err.c_str());
+            return 1;
+        }
+        return 0;
+    }
+
     if (argc >= 3 && std::string(argv[1]) == "roundtrip")
         return RoundTrip(argv[2]);
 
@@ -65,6 +96,7 @@ int main(int argc, char** argv)
     printf("usage: assetgen verify <out-dir> <reference-dir>\n"
            "       assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>] [--game <folder /Game is in>]\n"
            "       assetgen registry <out AssetRegistry.bin> <AssetRegistry.bin>...\n"
+           "       assetgen registry-rows <out AssetRegistry.bin> <rows.tsv>\n"
            "       assetgen roundtrip <dir>\n"
            "       assetgen astcheck <source.cpp> <include-dir>\n"
            "       assetgen astcheck --dump <file.json>\n");
