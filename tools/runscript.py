@@ -89,6 +89,7 @@ class P(W):
             if op != 0x31: n.val = s.i32()
             s.args(k, op + 1)
         elif op == 0x67: k.append(s.node())                          # SoftObjectConst: its path string
+        elif op == 0x38: n.val = s.u8(); k.append(s.node())          # PrimitiveCast: the cast, then its operand
         elif op == 0x20:                                             # ObjectConst: the object by bare name
             p = s.ptr().split(':', 1)[-1]
             n.val = p.split("'")[1] if "'" in p else p
@@ -793,6 +794,9 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x29: return ev(n.kids[0]) if n.kids else ''
         if o == 0x17: return SELF
         if o in (0x2A, 0x2D): return None
+        if o == 0x38:                                                # CST_ObjectToBool / CST_InterfaceToBool: not null
+            if n.val not in (0x47, 0x49): raise SystemExit('unsupported PrimitiveCast %#x at mem %d' % (n.val, n.mem))
+            return ev(n.kids[0]) not in (None, 0)
         # An object literal: here only a library's default object, the context a wildcard native (a container call)
         # runs in (KismetCompilerVMBackend.cpp 1222-1231), which is never null.
         if o == 0x20: return n.val

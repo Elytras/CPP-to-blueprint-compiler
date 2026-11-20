@@ -2663,6 +2663,9 @@ private:
     void PruneConstBranches(std::vector<FStmtIR>& Stmts);
     void ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<FStmtIR>& All);
     void FlattenBlocks(std::vector<FStmtIR>& Stmts);
+    bool ValueLocal(const FArgIR& A, const char* Prefix, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP, FStmtIR& Decl);
+    void HoistInvariants(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP, const FPackage& P);
+    void ShareRepeats(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP, const FPackage& P);
     void DropOverwritten(std::vector<FStmtIR>& Stmts);
     void DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals);
     void CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP);
@@ -8467,6 +8470,28 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         FArgIR LA, RA;
         if (!LowerArg(*LhsRaw, BP, LA, Err)) return false;
         if (!LowerArg(*RhsRaw, BP, RA, Err)) return false;
+        /* `Obj != nullptr` is EX_PrimitiveCast CST_ObjectToBool, execObjectToBool's `Obj != NULL` (ScriptCore.cpp):
+           the same test as NotEqual_ObjectObject against None, in one opcode instead of a native call. `==` is its
+           `!`, which an `if` takes by swapping its branches. No IsValid: a pending-kill object is not null. */
+        if (!bCurNoOpt && Flavour == "ObjectObject" && (Op == "==" || Op == "!=")
+            && (LA.K == FArgIR::NullObj) != (RA.K == FArgIR::NullObj))
+        {
+            const FArgIR& Obj = LA.K == FArgIR::NullObj ? RA : LA;
+            const FArgIR& Null = LA.K == FArgIR::NullObj ? LA : RA;
+            if (Null.CastOp != EX_NoInterface && IsObjectType(StripTypeKeywords(Obj.InnerType.empty() ? TypeOf(LA.K == FArgIR::NullObj ? *RhsRaw : *LhsRaw) : Obj.InnerType)))
+            {
+                FArgIR Test;
+                Test.K = FArgIR::DynCast;
+                Test.CastOp = EX_PrimitiveCast;
+                Test.I = CST_ObjectToBool;
+                Test.InnerType = "bool";
+                Test.Sub = std::make_shared<FCallIR>();
+                Test.Sub->Args.push_back(Obj);
+                Out = Op == "!=" ? std::move(Test) : NotOf(std::move(Test), BP);
+                Out.InnerType = "bool";
+                return true;
+            }
+        }
         /* Kismet's int64 is signed, and a uint64 is its bits (`*P` of a `uint64*`, `uint64(X)`). Unsigned order is the
            signed order of both sides with the top bit flipped. An unsigned division has no such form: it runs signed,
            right while neither side is past INT64_MAX, and says so. */
@@ -10822,7 +10847,7 @@ static bool IsLocalCopy(const FStmtIR& St)
 
 void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP)
 {
-    static const char* const kPooled[] = { "__Inl", "__DerefTmp", "__MapGet", "__Upd", "__PtrTmp", "__Switch" };
+    static const char* const kPooled[] = { "__Inl", "__DerefTmp", "__MapGet", "__Upd", "__PtrTmp", "__Switch", "__Hoist", "__Twice" };
     auto Pooled = [](const std::string& N) {
         for (const char* P : kPooled) if (N.compare(0, strlen(P), P) == 0) return true;
         return false;
@@ -13448,6 +13473,7 @@ struct FReuseFact
     std::set<std::string> Uses;     // the locals Key reads
     bool bMemory = false;           // Key reads memory or calls a pure function, which a UE_STABLE first call may change
     std::shared_ptr<FCallIR> Has;   // Holder "": this Map_Contains ran with the map and key Key names (MergeFind)
+    bool bStable = false;           // Key calls a UE_STABLE function, which a call that may act may change
 };
 struct FReuseBranch
 {
@@ -13526,12 +13552,14 @@ struct FCanon
     std::string Key;
     std::set<std::string> Uses;
     bool bMemory = false, bCall = false, bOk = true;
+    bool bStable = false;           // a UE_STABLE call is written in it
 };
 void Canon(const FArgIR& A, const FReuseState& S, FCanon& Out, bool bTop);
 void Canon(const FCallIR& C, const FReuseState& S, FCanon& Out, bool bTop)
 {
     if (!(Reusable(C) || (IsBranch(C.Intrinsic) && !C.Inline)) || (C.OutArgs && !bTop)) { Out.bOk = false; return; }
     Out.bCall = Out.bCall || Reusable(C);
+    Out.bStable = Out.bStable || C.bStable;
     /* A pure function given an object, or run on one, may read it; one of plain values reads nothing else. */
     const auto Object = [](const FArgIR& A) {
         const bool bVariable = A.K == FArgIR::Local || A.K == FArgIR::LocalOut || A.K == FArgIR::Field || A.K == FArgIR::Member
@@ -13569,6 +13597,7 @@ void Canon(const FArgIR& A, const FReuseState& S, FCanon& Out, bool bTop)
             Out.Key += "=" + F->Key;
             Out.Uses.insert(F->Uses.begin(), F->Uses.end());
             Out.bMemory = Out.bMemory || F->bMemory;
+            Out.bStable = Out.bStable || F->bStable;
         }
         else
         {
@@ -13623,6 +13652,8 @@ void Written(const FArgIR& A, FReuseState& S)
     else S.Flush();
 }
 
+void NamedLocals(const FArgIR& A, std::set<std::string>& Out);
+
 /* What evaluating a value does to the facts, its calls in the order they run. */
 void Effects(const FArgIR& A, FReuseState& S);
 void Effects(const FCallIR& C, FReuseState& S)
@@ -13642,7 +13673,20 @@ void Effects(const FCallIR& C, FReuseState& S)
     {
         for (size_t I = 0; I < C.Args.size(); ++I) if (I >= 64 || (C.WrittenArgs >> I & 1)) Written(C.Args[I], S);
     }
-    else S.Flush();
+    else
+    {
+        /* A call that may act reaches this frame's locals only through the ones it is given (by reference, or a
+           container it fills): pure math on other locals still has its value. Anything else is forgotten, a UE_STABLE
+           call too (the call may clear what it loaded), and what was known under an `if`. */
+        std::vector<FReuseFact> Kept;
+        for (const FReuseFact& F : S.Facts) if (!F.bMemory && !F.bStable && !F.Holder.empty()) Kept.push_back(F);
+        S.Flush();
+        S.Facts = std::move(Kept);
+        std::set<std::string> Given;
+        if (C.Target) NamedLocals(*C.Target, Given);
+        for (const FArgIR& A : C.Args) NamedLocals(A, Given);
+        for (const std::string& L : Given) S.Kill(L);
+    }
 }
 void Effects(const FArgIR& A, FReuseState& S)
 {
@@ -13745,7 +13789,7 @@ void AddOuts(const FArgIR& V, const FCanon& C, FReuseState& S)
             const FArgIR& Arg = V.Sub->Args[I];
             if (Arg.K != FArgIR::Local || Arg.Base) continue;
             S.Kill(Arg.S);
-            S.Add({ C.Key + "#" + std::to_string(I), Arg.S, C.Uses, C.bMemory });
+            S.Add({ C.Key + "#" + std::to_string(I), Arg.S, C.Uses, C.bMemory, nullptr, C.bStable });
         }
 }
 
@@ -13835,7 +13879,7 @@ void ReuseList(std::vector<FStmtIR>& Stmts, FReuseState& S)
             Written(St.Var, S);
             AddOuts(Was, C, S);
             if (C.bOk && St.Var.K == FArgIR::Local && !St.Var.Base && SameValueType(St.Var.InnerType, St.Value.InnerType))
-                S.Add({ C.Key, St.Var.S, C.Uses, C.bMemory });
+                S.Add({ C.Key, St.Var.S, C.Uses, C.bMemory, nullptr, C.bStable });
             NoteContains(St.Value, S, St.Var.K == FArgIR::Local && !St.Var.Base ? St.Var.S : std::string());
             break;
         }
@@ -13910,6 +13954,7 @@ void ReuseList(std::vector<FStmtIR>& Stmts, FReuseState& S)
                     else if (G && bCondStays)
                     {
                         FReuseFact P{ "phi(" + C.Key + "?" + F.Key + ":" + G->Key + ")", F.Holder, C.Uses, C.bMemory || F.bMemory || G->bMemory };
+                        P.bStable = C.bStable || F.bStable || G->bStable;
                         P.Uses.insert(F.Uses.begin(), F.Uses.end());
                         P.Uses.insert(G->Uses.begin(), G->Uses.end());
                         if (!P.Uses.count(P.Holder)) S.Facts.push_back(P);
@@ -13976,6 +14021,272 @@ void ReuseCalls(std::vector<FStmtIR>& Stmts)
 {
     FReuseState S;
     ReuseList(Stmts, S);
+}
+
+/*
+HoistInvariants and ShareRepeats compute a value once where the code computes it again and again. Both move only
+"quiet math": a Kismet operator or conversion on numbers, bools or vectors, which reads nothing but its arguments,
+never faults and never logs (no division, remainder, square root or logarithm, which warn on a bad operand). Running
+such a call where it did not run, or once instead of twice, changes nothing anyone can see; it costs a native call.
+*/
+namespace {
+bool QuietMath(const FCallIR& C, const FPackage& P)
+{
+    if (!C.bPure || !C.Intrinsic.empty() || C.Inline || C.Target || C.bInstance || C.bScript || C.bLocal || C.Context.V
+        || C.bSingleResult || !C.VirtualName.empty() || C.bOnArg0)
+        return false;
+    const FImport* Fn = P.ImportAt(C.Fn);
+    if (!Fn) return false;
+    const std::string& N = Fn->ObjectName;
+    static const std::set<std::string> kNamed = {
+        "Not_PreBool", "Not_Int", "Not_Int64", "BooleanAND", "BooleanOR", "BooleanXOR", "BooleanNAND", "BooleanNOR",
+        "Conv_IntToFloat", "Conv_IntToInt64", "Conv_Int64ToInt", "Conv_IntToByte", "Conv_ByteToInt", "Conv_BoolToInt",
+        "Conv_IntToBool", "Conv_ByteToFloat", "Conv_BoolToFloat", "Conv_BoolToByte", "Conv_IntToDouble", "Conv_FloatToDouble",
+        "Abs_Int", "Abs_Int64", "Abs", "Min", "Max", "FMin", "FMax", "MinInt64", "MaxInt64", "Clamp", "ClampInt64", "FClamp",
+        "SignOfInteger", "SignOfInteger64", "SignOfFloat", "MakeVector", "MakeRotator", "Negate_Vector" };
+    if (kNamed.count(N)) return true;
+    static const char* const kOps[] = { "Add_", "Subtract_", "Multiply_", "And_", "Or_", "Xor_", "Less_", "Greater_",
+                                        "LessEqual_", "GreaterEqual_", "EqualEqual_", "NotEqual_" };
+    static const char* const kTypes[] = { "IntInt", "Int64Int64", "FloatFloat", "DoubleDouble", "ByteByte", "BoolBool",
+                                          "VectorVector", "VectorFloat", "VectorInt" };
+    for (const char* Op : kOps)
+        if (N.compare(0, strlen(Op), Op) == 0)
+            for (const char* T : kTypes) if (N.compare(strlen(Op), std::string::npos, T) == 0) return true;
+    return false;
+}
+
+/* Every local A names, through any depth: what a call that may act could write when given A. */
+void NamedLocals(const FArgIR& A, std::set<std::string>& Out)
+{
+    if (A.K == FArgIR::Local) Out.insert(A.S);
+    if (A.Base) NamedLocals(*A.Base, Out);
+    if (A.Sub)
+    {
+        if (A.Sub->Target) NamedLocals(*A.Sub->Target, Out);
+        for (const FArgIR& X : A.Sub->Args) NamedLocals(X, Out);
+    }
+}
+
+/* The locals running a value may change, into Out; bAll when it may change ones no name says (an inline body, a
+   pointer intrinsic). A call that may act may write any local it is given: by reference, or as a container it fills. */
+void Changes(const FArgIR& A, std::set<std::string>& Out, bool& bAll);
+void Changes(const FCallIR& C, std::set<std::string>& Out, bool& bAll)
+{
+    if (C.Inline || (!C.Intrinsic.empty() && !IsBranch(C.Intrinsic))) { bAll = true; return; }
+    if (C.Target) Changes(*C.Target, Out, bAll);
+    for (const FArgIR& A : C.Args) Changes(A, Out, bAll);
+    if (C.bPure || IsBranch(C.Intrinsic)) return;
+    if (C.Target) NamedLocals(*C.Target, Out);
+    for (const FArgIR& A : C.Args) NamedLocals(A, Out);
+}
+void Changes(const FArgIR& A, std::set<std::string>& Out, bool& bAll)
+{
+    if (A.K == FArgIR::Delegate || A.K == FArgIR::LatentInfo || A.K == FArgIR::InterfaceCtx) { bAll = true; return; }
+    if (A.K == FArgIR::Call && !A.Sub) { bAll = true; return; }
+    if (A.K == FArgIR::Call) Changes(*A.Sub, Out, bAll);
+    else if (A.Sub) for (const FArgIR& X : A.Sub->Args) Changes(X, Out, bAll);     // an index, a literal's fields, a cast's operand
+    if (A.Base) Changes(*A.Base, Out, bAll);
+}
+void Changes(const std::vector<FStmtIR>& Stmts, std::set<std::string>& Out, bool& bAll)
+{
+    for (const FStmtIR& St : Stmts)
+    {
+        if (St.K == FStmtIR::Goto || St.K == FStmtIR::GotoLabel) bAll = true;
+        Changes(St.Target, Out, bAll);
+        Changes(St.Call, Out, bAll);
+        for (const FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) Changes(*A, Out, bAll);
+        if (St.K == FStmtIR::Assign || St.K == FStmtIR::Decl)
+        {
+            const FArgIR* R = &St.Var;
+            while ((R->K == FArgIR::Member || R->K == FArgIR::Index) && R->Base) R = R->Base.get();
+            if (R->K == FArgIR::Local) Out.insert(R->S);
+            else if (R->K != FArgIR::Field && R->K != FArgIR::LocalOut) bAll = true;
+        }
+        if (St.K == FStmtIR::Switch) NamedLocals(St.SwitchValue, Out);
+        for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) Changes(**L, Out, bAll);
+    }
+}
+
+/* Whether A is quiet math over constants and locals that Changed leaves alone. */
+bool Invariant(const FArgIR& A, const std::set<std::string>& Changed, const FPackage& P)
+{
+    if (A.Base) return false;
+    switch (A.K)
+    {
+    case FArgIR::Int: case FArgIR::Int64: case FArgIR::Float: case FArgIR::Bool: case FArgIR::Byte: return !A.Sub;
+    case FArgIR::Local: return !A.Sub && !Changed.count(A.S);
+    case FArgIR::Call:
+        return A.Sub && QuietMath(*A.Sub, P)
+            && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), [&](const FArgIR& X) { return Invariant(X, Changed, P); });
+    default: return false;
+    }
+}
+
+/* The canonical text of a value with no facts known: equal texts are the same computation. */
+std::string KeyOf(const FArgIR& A)
+{
+    FReuseState None;
+    FCanon C;
+    Canon(A, None, C, true);
+    return C.bOk ? C.Key : std::string();
+}
+
+/* Each part of a value, outermost first; Visit returns false to not look inside a part. */
+void EachPart(FArgIR& A, const std::function<bool(FArgIR&)>& Visit)
+{
+    if (!Visit(A)) return;
+    if (A.Base) { A.Base = std::make_shared<FArgIR>(*A.Base); EachPart(*A.Base, Visit); }
+    if (A.Sub)
+    {
+        A.Sub = std::make_shared<FCallIR>(*A.Sub);
+        if (A.Sub->Target) { A.Sub->Target = std::make_shared<FArgIR>(*A.Sub->Target); EachPart(*A.Sub->Target, Visit); }
+        for (FArgIR& X : A.Sub->Args) EachPart(X, Visit);
+    }
+}
+void EachPart(FStmtIR& St, const std::function<bool(FArgIR&)>& Visit)
+{
+    for (FCallIR* C : { &St.Target, &St.Call })
+    {
+        if (C->Target) { C->Target = std::make_shared<FArgIR>(*C->Target); EachPart(*C->Target, Visit); }
+        for (FArgIR& X : C->Args) EachPart(X, Visit);
+    }
+    for (FArgIR* A : { &St.Var, &St.Value, &St.Cond }) EachPart(*A, Visit);
+}
+void EachPart(std::vector<FStmtIR>& Stmts, const std::function<bool(FArgIR&)>& Visit)
+{
+    for (FStmtIR& St : Stmts)
+    {
+        EachPart(St, Visit);
+        for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L) { *L = std::make_shared<std::vector<FStmtIR>>(**L); EachPart(**L, Visit); }
+    }
+}
+}   // namespace
+
+/* A local of A's type for HoistInvariants / ShareRepeats, and the Decl that gives it A's value; false when A's type has
+   no property (the value then stays where it is). */
+bool FCompiler::ValueLocal(const FArgIR& A, const char* Prefix, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP,
+                           FStmtIR& Decl)
+{
+    const std::string Type = StripTypeKeywords(A.InnerType);
+    if (Type.empty() || (IsUE5() && (Type == "float" || Type == "double"))) return false;
+    const std::string Name = Prefix + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD;
+    std::string Why;
+    if (!TypeToProperty(Type, Name, 0, "a computed value", BP, &PD, &Why)) return false;
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    Locals.push_back(PD);
+    Decl = FStmtIR();
+    Decl.K = FStmtIR::Decl;
+    Decl.Var.K = FArgIR::Local;
+    Decl.Var.S = Name;
+    Decl.Var.InnerType = Type;
+    Decl.Var.LetOp = LetOpFor(Type);
+    Decl.bHasValue = true;
+    Decl.Value = A;
+    return true;
+}
+
+/*
+HoistInvariants: quiet math in a loop whose operands no round changes (`Regs[16 * D + I]`: 16 * D) is computed once,
+before the loop, into a local the loop reads. What a round changes is read from the loop alone: a store to a local,
+whole or in part, and every local given to a call that may act. A loop holding an inline body, a pointer intrinsic, a
+delegate or a goto is left as it is. Outer loops first, so a value no loop changes leaves them all.
+*/
+void FCompiler::HoistInvariants(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP, const FPackage& P)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        if (Stmts[I].K == FStmtIR::While)
+        {
+            FStmtIR& Loop = Stmts[I];
+            std::set<std::string> Changed;
+            bool bAll = false;
+            std::vector<FStmtIR> Whole(1, Loop);
+            Changes(Whole, Changed, bAll);
+            std::vector<FStmtIR> Pre;
+            if (!bAll)
+            {
+                std::map<std::string, std::string> Hoisted;     // key -> the local holding it
+                const auto Visit = [&](FArgIR& A) {
+                    if (A.K != FArgIR::Call || !Invariant(A, Changed, P)) return true;
+                    const std::string Key = KeyOf(A);
+                    if (Key.empty()) return true;
+                    auto H = Hoisted.find(Key);
+                    if (H == Hoisted.end())
+                    {
+                        FStmtIR Decl;
+                        if (!ValueLocal(A, "__Hoist", Locals, BP, Decl)) return true;
+                        H = Hoisted.emplace(Key, Decl.Var.S).first;
+                        Pre.push_back(std::move(Decl));
+                    }
+                    A = HolderRead(A, H->second);
+                    return false;
+                };
+                EachPart(Loop, Visit);
+                for (auto* L : { &Loop.Body, &Loop.Inc, &Loop.Trailer })
+                    if (*L) { *L = std::make_shared<std::vector<FStmtIR>>(**L); EachPart(**L, Visit); }
+            }
+            Stmts.insert(Stmts.begin() + I, std::make_move_iterator(Pre.begin()), std::make_move_iterator(Pre.end()));
+            I += Pre.size();
+        }
+        FStmtIR& St = Stmts[I];
+        for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L) { *L = std::make_shared<std::vector<FStmtIR>>(**L); HoistInvariants(**L, Locals, BP, P); }
+    }
+}
+
+/*
+ShareRepeats: quiet math written twice in one statement (`Col[I + J] = Col[I + J] + V`) is computed once, before it,
+into a local both places read. Only in a statement where nothing acts and no `&&`, `||` or `?:` decides what runs, so
+both copies were sure to run, on the same values. The largest repeat goes first; a loop's test, which runs each round,
+is left alone.
+*/
+void FCompiler::ShareRepeats(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP, const FPackage& P)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        for (auto* L : { &Stmts[I].Then, &Stmts[I].Else, &Stmts[I].Body, &Stmts[I].Inc, &Stmts[I].Trailer })
+            if (*L) { *L = std::make_shared<std::vector<FStmtIR>>(**L); ShareRepeats(**L, Locals, BP, P); }
+        FStmtIR& St = Stmts[I];
+        const bool bShape = St.K == FStmtIR::Assign || (St.K == FStmtIR::Decl && St.bHasValue) || St.K == FStmtIR::StaticCall
+                         || (St.K == FStmtIR::Return && St.bHasValue) || St.K == FStmtIR::If;
+        if (!bShape || CallsImpure(St.Var) || CallsImpure(St.Value) || CallsImpure(St.Cond)
+            || (St.K == FStmtIR::StaticCall && (St.Call.Target || std::any_of(St.Call.Args.begin(), St.Call.Args.end(),
+                                                                             [](const FArgIR& A) { return CallsImpure(A); }))))
+            continue;
+        bool bBranch = false;
+        EachPart(St, [&](FArgIR& A) { bBranch = bBranch || (A.K == FArgIR::Call && A.Sub && IsBranch(A.Sub->Intrinsic)); return true; });
+        if (bBranch) continue;
+        for (;;)
+        {
+            FStmtIR& Cur = Stmts[I];        // the inserts below move it
+            std::map<std::string, std::pair<int32, FArgIR>> Seen;
+            const std::set<std::string> NoChange;
+            EachPart(Cur, [&](FArgIR& A) {
+                if (A.K != FArgIR::Call || !Invariant(A, NoChange, P)) return true;
+                if (const std::string Key = KeyOf(A); !Key.empty())
+                {
+                    auto& [N, V] = Seen[Key];
+                    if (N++ == 0) V = A;
+                }
+                return true;
+            });
+            const std::pair<const std::string, std::pair<int32, FArgIR>>* Best = nullptr;
+            for (const auto& E : Seen)
+                if (E.second.first > 1 && (!Best || E.first.size() > Best->first.size())) Best = &E;
+            FStmtIR Decl;
+            if (!Best || !ValueLocal(Best->second.second, "__Twice", Locals, BP, Decl)) break;
+            const std::string Key = Best->first, Holder = Decl.Var.S;
+            EachPart(Cur, [&](FArgIR& A) {
+                if (A.K != FArgIR::Call || KeyOf(A) != Key) return true;
+                A = HolderRead(A, Holder);
+                return false;
+            });
+            Stmts.insert(Stmts.begin() + I, std::move(Decl));
+            ++I;
+        }
+    }
 }
 
 bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) const
@@ -25485,6 +25796,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (!bFnHasGoto && !bMadeLatentCall)
             {
                 FlattenBlocks(Stmts);
+                HoistInvariants(Stmts, Locals, BP, P);
+                ShareRepeats(Stmts, Locals, BP, P);
                 ReuseCalls(Stmts);
                 DropOverwritten(Stmts);
                 ForwardSingleUse(Stmts, Stmts);

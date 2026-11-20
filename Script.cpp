@@ -761,6 +761,7 @@ void FScript::EndFunctionParms() { Op(EX_EndFunctionParms); }
 
 void FScript::Return()
 {
+    BareReturnAt.insert(Memory);
     Op(EX_Return);
     Op(EX_Nothing);
 }
@@ -861,6 +862,12 @@ void FScript::ThreadJumps()
         }
         PatchJumpTarget(At, Target);
     }
+    for (const auto& [JumpAt, Operand] : PlainJumpAt)
+        if (BareReturnAt.count(Read(Operand)))
+        {
+            Ar.B[Operand - 1] = uint8(EX_Return);
+            for (int32 I = 0; I < 4; ++I) Ar.B[Operand + I] = uint8(EX_Nothing);
+        }
 }
 
 void FScript::FloatConst(double Value)
