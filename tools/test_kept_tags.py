@@ -37,6 +37,10 @@ assert len(ui) == 64 and all(tags_of(n) == [("MaterialDomain", "MD_UI")] for n i
 # their surface twins (when they ship) read as MD_Surface
 surface = [n[:-3] for n in ui if os.path.exists(os.path.join(PJ, n[:-3] + ".uasset"))]
 assert all(tags_of(n) == [("MaterialDomain", "MD_Surface")] for n in surface), [(n, tags_of(n)) for n in surface]
+# any other domain is read as it is (EMM's own post-process materials)
+b = open(os.path.join(PJ, "..", "MM_PanelPost.uasset"), "rb").read()
+names, imps, _ = tables(b, summary(b))
+assert bpbuild.material_tags(names, imps, "Material") == [("MaterialDomain", "MD_PostProcess")]
 print("ok  kept materials: MaterialDomain and Parent read off the cooked packages")
 
 with tempfile.TemporaryDirectory() as tmp:

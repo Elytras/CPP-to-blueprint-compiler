@@ -450,12 +450,12 @@ def place_kept_entry(entry, mod, bp, i, stage_fsd):
 
 def material_tags(names, imps, cls):
     """The registry tags the Material Creator filters on (ScanUiNames), for a kept material whose cook wrote none:
-    a Material's MaterialDomain (MD_UI when its name table holds that enum value, which a cooked material stores
-    only when its domain is not the default MD_Surface), a MaterialInstanceConstant's Parent (`<class>'<object
-    path>'` of its one Material or MaterialInstanceConstant import). Anything else gets none."""
+    a Material's MaterialDomain (the MD_ enum value its name table holds, which a cooked material stores only when
+    its domain is not the default MD_Surface: MD_UI, MD_PostProcess...), a MaterialInstanceConstant's Parent
+    (`<class>'<object path>'` of its one Material or MaterialInstanceConstant import). Anything else gets none."""
     if cls == "Material":
-        ui = "MD_UI" in names or "EMaterialDomain::MD_UI" in names
-        return [("MaterialDomain", "MD_UI" if ui else "MD_Surface")]
+        domains = [n.split("::")[-1] for n in names if n.split("::")[-1].startswith("MD_")]
+        return [("MaterialDomain", domains[0] if len(domains) == 1 else "MD_Surface")]
     if cls != "MaterialInstanceConstant":
         return []
     nm = lambda v: names[v[0]] + ("" if v[1] == 0 else "_%d" % (v[1] - 1))
