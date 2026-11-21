@@ -34,6 +34,9 @@ want = [("Parent", "Material'%s/M_SDF_Honeycomb_UI.M_SDF_Honeycomb_UI'" % GAME)]
 assert tags_of("MI_SDF_HoneycombGold_UI") == want, tags_of("MI_SDF_HoneycombGold_UI")
 ui = [os.path.basename(f)[:-7] for f in glob.glob(os.path.join(PJ, "M_*_UI.uasset"))]
 assert len(ui) == 64 and all(tags_of(n) == [("MaterialDomain", "MD_UI")] for n in ui)
+# their surface twins (when they ship) read as MD_Surface
+surface = [n[:-3] for n in ui if os.path.exists(os.path.join(PJ, n[:-3] + ".uasset"))]
+assert all(tags_of(n) == [("MaterialDomain", "MD_Surface")] for n in surface), [(n, tags_of(n)) for n in surface]
 print("ok  kept materials: MaterialDomain and Parent read off the cooked packages")
 
 with tempfile.TemporaryDirectory() as tmp:
