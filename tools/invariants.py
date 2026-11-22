@@ -289,7 +289,7 @@ class Package:
         if not 0 <= n <= len(s.exports): raise ValueError('children')
         st.children = [r.i32() for _ in range(n)]
         n = r.i32()
-        if not 0 <= n <= 4096: raise ValueError('props')
+        if not 0 <= n <= 65536: raise ValueError('props')   # a big class's ubergraph holds thousands of locals (HubTests: 4,123)
         st.props = [s._prop(r, s._name(r)) for _ in range(n)]
         st.script_mem, st.script_disk = r.i32(), r.i32()
         if not 0 <= st.script_disk <= len(b) - r.o: raise ValueError('script')
