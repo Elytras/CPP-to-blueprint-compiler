@@ -222,19 +222,22 @@ def native_kind(ctype):
 
 
 def sig_mismatch(f, parent):
-    """Why Blueprint function f's parameter block differs from `parent`'s, or None when they match."""
+    """Why Blueprint function f's parameter block differs from `parent`'s, or None when they match. An override of an
+    RPC takes the RPC's reference parameters by value, as AssetGen compiles it (Cpp.cpp LowerParams): the net driver
+    finds the topmost RPC's out-parms in a script caller's list by property, which an override's own never are."""
     mine = parms(f)
     theirs = parms(parent)
     if len(mine) != len(theirs):
         return '%d parameters, %s has %d' % (len(mine), parent.where, len(theirs))
+    mask = SIG_FLAGS & ~CPF_OutParm if f.flags & FUNC_Net else SIG_FLAGS
     for k, (a, b) in enumerate(zip(mine, theirs)):
         if not parent.native():
-            if bp_sig(f.pkg, a) != bp_sig(parent.pkg, b):
+            sa, sb = bp_sig(f.pkg, a), bp_sig(parent.pkg, b)
+            if sa[:2] + (sa[2] & mask,) + sa[3:] != sb[:2] + (sb[2] & mask,) + sb[3:]:
                 return 'parameter %d %s %s is %s %s there' % (k, a.type, a.name, b.type, b.name)
             continue
         name, ctype, _off, size, bits = b
         kinds, obj = native_kind(ctype)
-        mask = SIG_FLAGS
         if a.dim != 1 or (kinds and a.type not in kinds) or (a.flags & mask) != (bits & mask):
             return 'parameter %d %s %s flags %#x; %s has %s %s flags %#x' % (
                 k, a.type, a.name, a.flags & mask, parent.where, ctype, name, bits & mask)

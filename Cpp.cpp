@@ -21201,6 +21201,16 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
         ForEach(N, Locals);
     };
     Locals(M);
+    /* An override of an RPC takes its reference parameters by value. A script caller lists the out-parms it passes
+       by this function's properties (ProcessScriptFunction); the net driver sends the topmost RPC instead
+       (InternalProcessRemoteFunctionPrivate) and, finding each out-parm of that one in the list by property
+       (CopyOutParametersToLocalParameters, NetDriver.cpp:221-260), walks off its end: a null read on the server, once a
+       client is connected. By value the list is empty, which it skips, and the value is in the frame it sends, at the
+       offset the topmost one's has. A received RPC is laid out by the topmost one and run through ProcessEvent on this
+       one (DataReplication.cpp:1220-1240), which reads it there too. */
+    uint32 SuperNet = 0;
+    if (Cur) FindEvent(BP, Cur->CppName, Fn, &SuperNet, true);
+    const bool bRpcOverride = (SuperNet & FUNC_Net) != 0;
     size_t Index = 0;
     ForEach(M, [&](const Json& C) {
         if (Kind(C) != "ParmVarDecl" || !bOk) return;
@@ -21232,6 +21242,13 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
             *Err = Fn + ": UE_OUT(" + PName + ") requires a non-const reference parameter";
             bOk = false;
             return;
+        }
+        if (bOutParm && bRpcOverride)
+        {
+            if (!bConstRef)
+                printf("  warning: %s::%s overrides an RPC, so it takes %s by value: what it writes there stays in it\n",
+                       Cur->CppName.c_str(), Fn.c_str(), PName.c_str());
+            bOutParm = false;
         }
         const uint64 Flags = bOutParm ? uint64(CPF_OutParm | (bOutputOnly ? 0 : CPF_ReferenceParm)
                                                | (bConstRef ? CPF_ConstParm : 0)) : 0;

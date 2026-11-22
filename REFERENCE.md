@@ -5722,6 +5722,7 @@ Notes:
 |---|---|---|
 | <a id="rpcs-in-subclasses.void-serveropen-bool-bvalue-seen"></a>`void ServerOpen(bool bValue) { Seen = bValue ? 7 : 8; }` in a subclass | An override without a marker keeps the parent's net flags (Server, Reliable) and is still that RPC. | Yes |
 | <a id="rpcs-in-subclasses.void-onrep-open-seen-10"></a>`void OnRep_Open() { Seen = 10; }` in a subclass | When the parent's code assigns the variable, the subclass's OnRep runs in the parent's place, because the call goes by name. | Yes |
+| <a id="rpcs-in-subclasses.void-multiat-const-fvector"></a>`void MultiAt(const FVector &Where, int32 N) { Seen = Where.Y + N; }` overriding an RPC | The override takes `Where` by value; the body reads it the same. The net driver sends the topmost RPC and looks for that one's reference parameters among the caller's, which an override's never are, so by reference it would crash a listen server once a client is connected. A non-const `T&` gets the same, with a warning that writes stay in the override. | Yes |
 | <a id="rpcs-in-subclasses.ue-server-void-serveropen-bool"></a>`UE_SERVER void ServerOpen(bool bValue) { Seen = 2; }` in a subclass | Refused: "an override takes its parent's replication; drop the RPC marker". The engine asserts on a mismatch. Any RPC marker on any override is refused, one on an engine event such as `UE_MULTICAST void ReceiveBeginPlay()` included. | Refused |
 
 ```cpp

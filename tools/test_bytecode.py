@@ -9387,6 +9387,35 @@ def func_qualified_multicast():
         assert 'Ping' not in exports_of(os.path.join(tmp, 'QcMulti')), exports_of(os.path.join(tmp, 'QcMulti'))
 
 
+def rpc_override_ref_params():
+    """An override of an RPC takes the RPC's reference parameters by value. The net driver sends the topmost RPC and
+    looks each of its out-parms up in a script caller's out-parm list, by property (InternalProcessRemoteFunctionPrivate,
+    CopyOutParametersToLocalParameters): the override's own properties are never there, and the walk read null on a
+    listen server once a client was connected (EnemyTemplates' spider All_Ragdoll, 2026-11-22). By value the list is
+    empty and the value sits in the frame, at the topmost RPC's offset; func_override_params still holds the rest."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'RpcRefKid.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/RpcRefKid");\n'
+                    'class RpcRefBase : public AActor {\npublic:\n  float Seen = 0;\n'
+                    '  UE_MULTICAST UE_RELIABLE void MultiAt(const FVector &Where, int32 N) { Seen = Where.X; }\n};\n'
+                    'class RpcRefKid : public RpcRefBase {\npublic:\n'
+                    '  void MultiAt(const FVector &Where, int32 N) { Seen = Where.Y + N; }\n};\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'RpcRefKid')    # the rules find the parent under Content
+        os.makedirs(out)
+        proc = assetgen_compile([src, UEAPI, out])
+        assert proc.returncode == 0, proc.stdout
+        base, kid = os.path.join(out, 'RpcRefBase'), os.path.join(out, 'RpcRefKid')
+        flags = lambda b: {p.name: p.flags for p in invariants.Package(b).struct(int(export_index(b, 'MultiAt'))).props}
+        proves('rpcs-in-subclasses.void-multiat-const-fvector')
+        assert flags(base)['Where'] & 0x8000100 == 0x8000100, flags(base)     # the RPC's own: OutParm | ReferenceParm
+        assert flags(kid)['Where'] & 0x8000100 == 0, flags(kid)               # the override's: by value
+        assert not func_findings(kid, ['func_override_params', 'func_override_flags', 'func_super_link']), func_findings(kid, ['func_override_params'])
+        fields = {}
+        run_as([kid, base], 'MultiAt', fields, Where={'X': 1.0, 'Y': 2.5, 'Z': 0.0}, N=3)
+        assert fields.get('Seen') == 5.5, fields                              # the body reads it as before
+
+
 def func_ancestor_iface():
     """FuncAncestorIface: OnMessageAI on an AWoodLouse child replaces /Script/FSD.TriggerAI:OnMessageAI - linked as its
     super with the interface function's inherited flags and parameters - and runs as written."""
@@ -9411,6 +9440,8 @@ func_qualified_call()
 print('ok  FuncQualifiedCall: Parent::Fn() runs the parent\'s function, copied in or bound from a forwarding override')
 func_qualified_multicast()
 print('ok  a qualified call to a multicast from a class without one warns and gets no forwarding override')
+rpc_override_ref_params()
+print('ok  an override of an RPC takes its reference parameters by value (the net driver finds no out-parm of its own)')
 func_ancestor_iface()
 print('ok  FuncAncestorIface: an override of a native ancestor\'s interface function links it as super (TriggerAI:OnMessageAI)')
 refused('FuncAncestorParams', '', 'OnMessageAI',
