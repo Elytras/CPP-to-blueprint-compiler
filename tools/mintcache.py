@@ -33,12 +33,24 @@ def modio_url(name_id, mod_id, modfile=None):
 
 
 def index(cache=MINT_CACHE, url=""):
-    """cache.json's mod.io section. `url` only prefixes the Miss message."""
+    """cache.json's mod.io section, over deprecated_mods.json's when there is one: MINT builds whose Update cache
+    archived the mods no profile uses moved their entries there, and left their blobs in place. `url` only
+    prefixes the Miss message."""
     path = os.path.join(cache, "cache.json")
     if not os.path.exists(path):
         raise Miss("%s: no MINT cache at %s (set MINT_CACHE to the folder that holds cache.json)" % (url, cache))
-    return json.load(io.open(path, encoding="utf-8"))["cache"].get("modio") or {
-        "mod_id_map": {}, "mods": {}, "modfile_blobs": {}, "dependencies": {}, "last_update_time": None}
+    modio = {"mod_id_map": {}, "mods": {}, "modfile_blobs": {}, "dependencies": {}, "last_update_time": None}
+    for name in ("deprecated_mods.json", "cache.json"):   # the live cache last, so its entries win
+        part = os.path.join(cache, name)
+        if not os.path.exists(part):
+            continue
+        section = (json.load(io.open(part, encoding="utf-8")).get("cache") or {}).get("modio") or {}
+        for key, value in section.items():
+            if isinstance(value, dict) and isinstance(modio.get(key), dict):
+                modio[key].update(value)
+            else:
+                modio[key] = value
+    return modio
 
 
 def find(query, modio):
