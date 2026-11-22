@@ -1,4 +1,7 @@
-"""usage: python AssetGen/tools/test_kept_tags.py --assetgen <x64/Release/assetgen.exe>
+"""usage: python AssetGen/tools/test_kept_tags.py --assetgen <assetgen.exe> --kept <Paintjobs folder>
+
+`--kept` is a kept-content folder that holds the M_SDF_*_UI paintjob materials (cooked into
+/Game/_ElytrasMods/_Shared/Materials/UI/Paintjobs) and MM_PanelPost one level up.
 
 bpbuild's registry rows for kept materials carry the tags the Material Creator filters on: MaterialDomain on a
 Material (read off its name table), Parent on a MaterialInstanceConstant (its one material import), and
@@ -16,8 +19,7 @@ import bpbuild  # noqa: E402
 import dumpar  # noqa: E402
 from uasset_io import summary, tables  # noqa: E402
 
-REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-PJ = os.path.join(REPO, "BpMods/ElytrasModManager/Kept/Content/_ElytrasMods/_Shared/Materials/UI/Paintjobs")
+PJ = os.path.abspath(sys.argv[sys.argv.index("--kept") + 1])
 GAME = "/Game/_ElytrasMods/_Shared/Materials/UI/Paintjobs"
 ASSETGEN = os.path.abspath(sys.argv[sys.argv.index("--assetgen") + 1])
 
