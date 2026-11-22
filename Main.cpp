@@ -2,7 +2,7 @@
 usage: assetgen verify <out-dir> <reference-dir>     rebuilds Autosprint/InitCave and byte-diffs it against the cooked original
        assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>] [--game <folder /Game is in>]
        assetgen registry <out AssetRegistry.bin> <AssetRegistry.bin>...   merges registries assetgen wrote into one
-       assetgen registry-rows <out AssetRegistry.bin> <rows.tsv>   merges in "<package>\t<asset>\t<class>" rows
+       assetgen registry-rows <out AssetRegistry.bin> <rows.tsv>   merges in "<package>\t<asset>\t<class>[\t<key>=<value>...]" rows
        assetgen roundtrip <dir>      reads every cooked package under dir and writes it back in memory: the S38 gate
        assetgen astcheck <source.cpp> <include-dir>   checks that the AST dump filter changes nothing on source's dump
        assetgen astcheck --dump <file.json>            ... on a saved dump
@@ -56,7 +56,8 @@ int main(int argc, char** argv)
     if (argc >= 4 && std::string(argv[1]) == "registry-rows")
     {
         /* Rows for packages a pak ships as they were cooked (bpbuild's `kept` and `bundle`), which no compile wrote:
-           one "<package>\t<asset>\t<class>" line each, merged into the registry as a compile's rows are. */
+           one "<package>\t<asset>\t<class>" line each, then any "\t<key>=<value>" columns as its tags (a kept
+           material's MaterialDomain or Parent), merged into the registry as a compile's rows are. */
         std::vector<FRegistryAsset> Rows;
         FILE* F = fopen(argv[3], "rb");
         if (!F)
@@ -69,9 +70,23 @@ int main(int argc, char** argv)
         {
             std::string L(Line);
             while (!L.empty() && (L.back() == '\n' || L.back() == '\r')) L.pop_back();
-            const size_t A = L.find('\t'), B = A == std::string::npos ? A : L.find('\t', A + 1);
-            if (B == std::string::npos) continue;
-            Rows.push_back({ L.substr(0, A), L.substr(A + 1, B - A - 1), L.substr(B + 1) });
+            std::vector<std::string> Cols;
+            for (size_t At = 0;;)
+            {
+                const size_t Tab = L.find('\t', At);
+                Cols.push_back(L.substr(At, Tab == std::string::npos ? std::string::npos : Tab - At));
+                if (Tab == std::string::npos) break;
+                At = Tab + 1;
+            }
+            if (Cols.size() < 3) continue;
+            FRegistryAsset Row{ Cols[0], Cols[1], Cols[2] };
+            for (size_t I = 3; I < Cols.size(); ++I)
+            {
+                const size_t Eq = Cols[I].find('=');
+                if (Eq != std::string::npos)
+                    Row.Tags.push_back({ Cols[I].substr(0, Eq), Cols[I].substr(Eq + 1) });
+            }
+            Rows.push_back(Row);
         }
         fclose(F);
         std::string Err;

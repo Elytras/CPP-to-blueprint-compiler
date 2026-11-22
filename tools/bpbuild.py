@@ -448,11 +448,30 @@ def place_kept_entry(entry, mod, bp, i, stage_fsd):
     return placed
 
 
+def material_tags(names, imps, cls):
+    """The registry tags the Material Creator filters on (ScanUiNames), for a kept material whose cook wrote none:
+    a Material's MaterialDomain (the MD_ enum value its name table holds, which a cooked material stores only when
+    its domain is not the default MD_Surface: MD_UI, MD_PostProcess...), a MaterialInstanceConstant's Parent
+    (`<class>'<object path>'` of its one Material or MaterialInstanceConstant import). Anything else gets none."""
+    if cls == "Material":
+        domains = [n.split("::")[-1] for n in names if n.split("::")[-1].startswith("MD_")]
+        return [("MaterialDomain", domains[0] if len(domains) == 1 else "MD_Surface")]
+    if cls != "MaterialInstanceConstant":
+        return []
+    nm = lambda v: names[v[0]] + ("" if v[1] == 0 else "_%d" % (v[1] - 1))
+    parents = [i for i in imps if nm(i["class_name"]) in ("Material", "MaterialInstanceConstant") and i["outer"] < 0
+               and not nm(i["name"]).startswith("Default__")]   # the class default object is imported too
+    if len(parents) != 1:
+        return []
+    p = parents[0]
+    return [("Parent", "%s'%s.%s'" % (nm(p["class_name"]), nm(imps[-p["outer"] - 1]["name"]), nm(p["name"])))]
+
+
 def register_shipped(stage_fsd, shipped, assetgen):
     """Rows in the pak's FSD/AssetRegistry.bin for the packages it ships as they were cooked (`bundle`, `kept`;
     `shipped` holds their staged files), which no compile adds: each asset export's package, name and class, as MINT's
-    integration writes them (no tags). Without them a registry search (CD2's descriptor scan, a class query) finds such
-    an asset only once MINT merges the pak."""
+    integration writes them, plus material_tags' tags on materials. Without them a registry search (CD2's descriptor
+    scan, a class query) finds such an asset only once MINT merges the pak."""
     from uasset_io import summary, tables
     content = os.path.join(stage_fsd, "Content")
     rows = []
@@ -463,8 +482,11 @@ def register_shipped(stage_fsd, shipped, assetgen):
         names, imps, exps = tables(b, summary(b))
         nm = lambda v: names[v[0]] + ("" if v[1] == 0 else "_%d" % (v[1] - 1))
         package = "/Game/" + os.path.relpath(f, content).replace("\\", "/").rsplit(".", 1)[0]
-        rows += ["%s\t%s\t%s" % (package, nm(e["name"]), nm(imps[-e["cls"] - 1]["name"]))
-                 for e in exps if e["is_asset"] and e["outer"] == 0 and e["cls"] < 0]
+        for e in exps:
+            if e["is_asset"] and e["outer"] == 0 and e["cls"] < 0:
+                cls = nm(imps[-e["cls"] - 1]["name"])
+                rows.append("\t".join([package, nm(e["name"]), cls] +
+                                      ["%s=%s" % t for t in material_tags(names, imps, cls)]))
     tsv = os.path.join(os.path.dirname(stage_fsd), "registry-rows.tsv")   # beside the FSD tree: not packed
     io.open(tsv, "w", encoding="utf-8", newline="\n").write("".join(r + "\n" for r in rows))
     return subprocess.run([assetgen, "registry-rows", os.path.join(stage_fsd, "AssetRegistry.bin"), tsv]).returncode == 0
