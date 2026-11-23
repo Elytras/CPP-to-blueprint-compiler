@@ -76,6 +76,17 @@ public:
   static int32        UseStatic(int32 V) { return SDouble(V) + SPred(V) + InlineTest::SDouble(3); }
   int32               StaticFromInst(int32 V) { return SDouble(V) + SPred(V); }
 
+  /* A static called through an object: the object runs for what it does and is not passed. */
+  static int32 Tripled(int32 V) { return V * 3; }
+  InlineTest  *Bumped() {
+    Counter += 1;
+    return this;
+  }
+  int32 StaticThroughObj(int32 V) {
+    InlineTest *Self = this;
+    return Self->Tripled(V) + (*this).SDouble(V) + Bumped()->SPred(V);
+  }
+
   int32 InCond(int32 V) {
     if (Twice(V) > 10 && Clamp(V, 0, 3) == 3)
       return 1;

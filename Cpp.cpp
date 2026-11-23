@@ -15292,6 +15292,34 @@ void FCompiler::RewriteLambdaCalls(Json& N)
     }
     if (auto In = N.find("inner"); In != N.end() && In->is_array())
         for (Json& C : *In) RewriteLambdaCalls(C);
+    /* `Obj->Static(A)` or `Obj.Static(A)`: a static member called through an object is a CallExpr whose callee is a
+       MemberExpr (a call of any other member is a CXXMemberCallExpr). It is rewritten into `Class::Static(A)`, the
+       DeclRefExpr callee every reader of a call by name expects. The object is not passed; one that does something
+       (`Next()->Static(A)`) runs first, as the comma `(Next(), Class::Static(A))`, the order C++ evaluates them in. */
+    if (Kind(N) == "CallExpr" && N.contains("inner") && !N["inner"].empty())
+    {
+        Json* Callee = &N["inner"][0];
+        while ((Kind(*Callee) == "ImplicitCastExpr" || Kind(*Callee) == "ParenExpr") && Callee->contains("inner")
+               && !(*Callee)["inner"].empty())
+            Callee = &(*Callee)["inner"][0];
+        if (Kind(*Callee) == "MemberExpr" && Callee->contains("referencedMemberDecl") && Callee->contains("inner")
+            && !(*Callee)["inner"].empty())
+        {
+            Json Obj = std::move((*Callee)["inner"][0]);
+            const Json Type = Callee->value("type", Json::object());
+            const std::string Id = Callee->value("referencedMemberDecl", std::string()), Fn = Name(*Callee);
+            *Callee = { {"kind", "DeclRefExpr"}, {"type", Type}, {"valueCategory", "lvalue"},
+                        {"referencedDecl", { {"id", Id}, {"kind", "CXXMethodDecl"}, {"name", Fn}, {"type", Type} }} };
+            if (!IsSideEffectFree(Obj))
+            {
+                Json Comma = { {"kind", "BinaryOperator"}, {"opcode", ","}, {"type", N.value("type", Json::object())},
+                               {"valueCategory", N.value("valueCategory", std::string("prvalue"))} };
+                Comma["inner"] = Json::array({ std::move(Obj), std::move(N) });
+                N = std::move(Comma);
+            }
+            return;
+        }
+    }
     if (Kind(N) != "CXXOperatorCallExpr" || !N.contains("inner") || N["inner"].size() < 2) return;
     const Json* Callee = Strip(&N["inner"][0]);
     if (!Callee || Kind(*Callee) != "DeclRefExpr" || !Callee->contains("referencedDecl")) return;

@@ -2411,6 +2411,13 @@ check('InlineTest', 'UseNest', lambda V: nest(V) + nest(V + 1), [dict(V=v) for v
 proves('inline-functions.static-inline-int32-addone-int32')
 check('InlineTest', 'UseStatic', lambda V: i32(V * 2 + V - 1 + 6), [dict(V=v) for v in (-3, 0, 7, 2**30)])
 check('InlineTest', 'StaticFromInst', lambda V: i32(V * 2 + V - 1), [dict(V=v) for v in (-3, 0, 7, 2**30)])
+proves('static-functions-and.self-tripled-v')
+for v in (-3, 0, 7, 2**29):
+    for c in (0, 5):
+        fields = dict(Counter=c)
+        got = run(asset('InlineTest'), 'StaticThroughObj', self_vars=fields, V=v)[0]
+        assert got == i32(6 * v - 1) and fields == dict(Counter=c + 1), ('StaticThroughObj', v, c, got, fields)
+print('ok  InlineTest.StaticThroughObj: a static called through an object, the object run once')
 check('InlineTest', 'TwiceTwice', lambda V: i32(4 * V + 12), [dict(V=v) for v in (-2, 0, 5, 2**29, -2**31)])
 check('InlineTest', 'ClampInArg', lambda V: max(4, clamp(V, 0, 10)), [dict(V=v) for v in (-3, 0, 2, 4, 5, 8, 9, 10, 11, 15)])
 check('InlineTest', 'InCond', lambda V: 1 if i32(V * 2) > 10 and clamp(V, 0, 3) == 3 else 0,
